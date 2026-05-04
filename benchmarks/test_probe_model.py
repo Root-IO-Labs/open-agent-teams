@@ -530,7 +530,7 @@ class TestYAMLGeneration(unittest.TestCase):
         self.assertIn("status: known", yaml_out)
         self.assertIn("probe_version: 2", yaml_out)
         self.assertIn("probe_set: default", yaml_out)
-        self.assertIn("supervisor_eligible: true", yaml_out)
+        self.assertIn("orchestrator_eligible: true", yaml_out)
         self.assertIn("worker_eligible: true", yaml_out)
         self.assertIn('reasoning_controls: "low, high"', yaml_out)
         self.assertIn("ttft_ms: 800", yaml_out)
@@ -561,11 +561,11 @@ class TestYAMLGeneration(unittest.TestCase):
         # Should have probes_skipped
         self.assertIn("probes_skipped:", yaml_out)
         self.assertIn("probe_set: minimum", yaml_out)
-        # Supervisor eligible should be true (untested probes don't penalize)
-        self.assertIn("supervisor_eligible: true", yaml_out)
+        # Orchestrator eligible should be true (untested probes don't penalize)
+        self.assertIn("orchestrator_eligible: true", yaml_out)
 
-    def test_supervisor_ineligible_low_multi_turn(self):
-        """Low multi_turn score should block supervisor."""
+    def test_orchestrator_ineligible_low_multi_turn(self):
+        """Low multi_turn score should block orchestrator."""
         probes = [
             pm.ProbeResult("basic_inference", True, 100),
             pm.ProbeResult("tool_calling", True, 100),
@@ -583,7 +583,7 @@ class TestYAMLGeneration(unittest.TestCase):
         ]
         report = self._make_report(probes, 88)
         yaml_out = pm._generate_yaml_profile(report)
-        self.assertIn("supervisor_eligible: false", yaml_out)
+        self.assertIn("orchestrator_eligible: false", yaml_out)
 
     def test_not_oat_compatible(self):
         """Failed core probes should produce restricted status."""
@@ -596,7 +596,7 @@ class TestYAMLGeneration(unittest.TestCase):
         yaml_out = pm._generate_yaml_profile(report)
         self.assertIn("status: restricted", yaml_out)
         self.assertIn("worker_eligible: false", yaml_out)
-        self.assertIn("supervisor_eligible: false", yaml_out)
+        self.assertIn("orchestrator_eligible: false", yaml_out)
 
     def test_probe_set_from_report_not_count(self):
         """probe_set_name should come from report.probe_set, not probe count."""

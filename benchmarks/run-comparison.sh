@@ -10,6 +10,11 @@ set -uo pipefail
 #   GH_TOKEN_CLASSIC=$GH_TOKEN_CLASSIC ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
 #     ./benchmarks/run-comparison.sh [--wave-timeout 45] [--timeout 360]
 #
+# (ANTHROPIC_API_KEY is only required because both legs run Anthropic models
+# by default. If you point this script at non-Anthropic models, set the
+# corresponding provider key instead — run.sh / summarize.sh /
+# judge-blackbox.sh resolve provider keys per-run via llm_call.py.)
+#
 # Results land in: benchmarks/results/comparison-<timestamp>/
 #   sonnet/        — full benchmark results + all logs
 #   haiku/         — full benchmark results + all logs
@@ -39,7 +44,16 @@ Results saved to benchmarks/results/comparison-<timestamp>/
 
 Required env vars:
   GH_TOKEN_CLASSIC    Classic PAT with repo scope
-  ANTHROPIC_API_KEY   Anthropic API key
+
+Optional env vars:
+  <PROVIDER>_API_KEY  API key for whichever provider each leg's model uses
+                      (ANTHROPIC_API_KEY for the default Sonnet+Haiku legs;
+                      OPENAI_API_KEY / GOOGLE_API_KEY / etc. if you swap
+                      models below). run.sh, summarize.sh, and
+                      judge-blackbox.sh surface a clear per-run error if
+                      the relevant key is missing.
+  OAT_BENCH_LLM_MODEL Optional override for the judge / summary models
+                      used by the per-run scripts.
 
 Defaults: --wave-timeout 45  --timeout 360  --convergence-timeout 90
 EOF
@@ -72,11 +86,11 @@ else
     echo "  OK  GH_TOKEN_CLASSIC is set"
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "  WARN ANTHROPIC_API_KEY not set — summaries will be skipped"
-else
-    echo "  OK  ANTHROPIC_API_KEY is set"
-fi
+# Provider API keys are checked per-run by llm_call.py (it knows which
+# provider each leg's model resolves to and emits an actionable
+# "missing FOO_API_KEY" error). We deliberately don't pin Anthropic at
+# startup so cross-provider comparison runs (e.g. Sonnet vs gpt-5.2) work
+# without requiring keys for both providers up front.
 
 # Verify gh auth actually works
 echo ""
@@ -86,19 +100,6 @@ if gh auth status &>/dev/null; then
 else
     echo "  FAIL gh auth status failed — run 'gh auth login' first"
     fail=true
-fi
-
-# Verify API key works (quick model list call)
-if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    if curl -s --max-time 10 -H "x-api-key: $ANTHROPIC_API_KEY" \
-        -H "anthropic-version: 2023-06-01" \
-        "https://api.anthropic.com/v1/messages" \
-        -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
-        | grep -q '"id"' 2>/dev/null; then
-        echo "  OK  Anthropic API key works"
-    else
-        echo "  WARN Anthropic API check failed — key may be invalid or rate-limited"
-    fi
 fi
 
 echo ""

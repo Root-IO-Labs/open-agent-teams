@@ -35,7 +35,6 @@ The benchmark evaluates a model's ability to:
   - [summarize.sh](#summarizesh----llm-powered-benchmark-analysis)
 - [Cleaning Up a Benchmark Run](#cleaning-up-a-benchmark-run)
 - [Using Ollama Models](#using-ollama-models)
-- [Troubleshooting](#troubleshooting)
 - [Files](#files)
 
 ## Quickstart
@@ -56,12 +55,17 @@ oat ui --repo oat-robotic-barista-sonnet46
 #      acceptance.json           Reference test results
 #      convergence.json          Convergence loop results (iterations, verdict)
 #      blackbox-acceptance.json  Model-generated test results (final convergence run)
-#      summary.md                LLM-generated analysis (requires ANTHROPIC_API_KEY)
+#      summary.md                LLM-generated analysis (requires API key for the orchestrator's provider, or --summary-model)
 #      log-signals.txt           Condensed agent log signals
 
-# 4. To include an LLM summary, pass ANTHROPIC_API_KEY:
+# 4. To include an LLM summary, ensure the API key for your --model's provider is set
+#    (the summary defaults to the orchestrator model so you don't get surprise
+#    charges from a different provider). Use any provider OAT supports:
 GH_TOKEN=$GH_TOKEN ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-    ./benchmarks/run.sh --model claude-sonnet-4-6 --name sonnet46
+    ./benchmarks/run.sh --model anthropic:claude-sonnet-4-6 --name sonnet46
+
+GH_TOKEN=$GH_TOKEN OPENAI_API_KEY=$OPENAI_API_KEY \
+    ./benchmarks/run.sh --model openai:gpt-5.2 --name gpt52
 
 # 5. Clean up when finished
 ./benchmarks/cleanup.sh --repo oat-robotic-barista-sonnet46 --delete-remote
@@ -74,7 +78,7 @@ GH_TOKEN=$GH_TOKEN ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
 - `oat` installed and daemon running (`oat start`)
 - `uv` (Python package manager) for acceptance tests and installing optional provider packages
 - `GH_TOKEN` environment variable set (token with `repo` scope -- needed to create benchmark repos and manage issues/PRs)
-- `ANTHROPIC_API_KEY` environment variable (optional -- needed for LLM-generated summaries via `summarize.sh`)
+- API key for whichever provider your `--model` resolves to, e.g. `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`. Local providers (e.g. `ollama:`) need no key. The same key is used by `summarize.sh` and `judge-blackbox.sh`, since they default to the orchestrator model.
 
 **Optional environment variables for tuning benchmark runs:**
 
@@ -84,6 +88,7 @@ GH_TOKEN=$GH_TOKEN ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
 | `OAT_WORKER_DORMANCY_CAP_MINUTES` | `15` | Max minutes a worker stays dormant before force-merge/cleanup |
 | `OAT_CORE_AGENT_SOFT_TIMEOUT` | `5` | Minutes before nudging stuck merge-queue/supervisor |
 | `OAT_CORE_AGENT_HARD_TIMEOUT` | `15` | Minutes before restarting stuck merge-queue/supervisor |
+| `OAT_BENCH_LLM_MODEL` | unset | Pin the model used by `summarize.sh` and `judge-blackbox.sh` when their `--model` / `--judge-model` flags are not passed (and `collect.json` has no `orchestrator_model`). Useful for reproducing a comparison across runs. Overridden by the explicit flags. |
 
 **Workspace stuck detection:** `setup.sh` automatically enables workspace stuck detection for benchmark repos (`oat config --workspace-stuck-detection=true`). This is off by default in normal OAT usage because the workspace is user-driven — going quiet just means the human stepped away. Benchmarks enable it because they are unattended: no human is at the keyboard to notice a stuck workspace, and a stuck agent wastes the fixed time budget.
 
@@ -103,37 +108,28 @@ The robotic-barista project is bundled in `benchmarks/robotic-barista/` and incl
 
 ```mermaid
 flowchart TD
-    setup["Setup: clone repo, create issues, start OAT"] --> waitReady["Wait for workspace agent"]
-    waitReady --> skipGate{Skip gate?}
-    skipGate -->|Yes| wave1
-    skipGate -->|No| gateWorker["Spawn workers for wave:0 issues #1-#4"]
-    gateWorker --> gateWait["Wait for all wave:0 issues to close"]
-    gateWait --> gateAssemble["Assemble modular test files into single script"]
-    gateAssemble --> gateJudge["LLM judge scores test vs reference"]
-    gateJudge --> gateCheck{Score >= threshold?}
-    gateCheck -->|Yes| smokeTest["Execution smoke test (--smoke)"]
-    gateCheck -->|No| gateOnlyCheck{Gate-only mode?}
-    smokeTest --> smokePass{Script runs?}
-    smokePass -->|Yes| gateOnlyCheck
-    smokePass -->|No| gateOnlyCheck
+    setup["Setup: clone repo, create issues, start OAT, wait for workspace"] --> skipGate{Skip gate?}
+    skipGate -->|Yes| waves
+    skipGate -->|No| gateBuild["Spawn wave:0 workers, assemble test"]
+    gateBuild --> gateJudge["LLM judge scores test vs reference"]
+    gateJudge --> gateScore{Score >= threshold?}
+    gateScore -->|No| results
+    gateScore -->|Yes| smokeTest["Execution smoke test (--smoke)"]
+    smokeTest --> smokeRuns{Test runs without crashing?}
+    smokeRuns -->|No| results
+    smokeRuns -->|Yes| gateOnlyCheck{Gate-only mode?}
     gateOnlyCheck -->|"Yes (--gate-only)"| results
-    gateOnlyCheck -->|No| gatePassed{Gate passed?}
-    gatePassed -->|No| results["Collect results + acceptance test"]
-    gatePassed -->|Yes| wave1["Wave 1: foundation issues"]
-    wave1 --> wave2["Wave 2: services + CLI"]
-    wave2 --> wave3["Wave 3: order workflow + tests"]
-    wave3 --> wave4["Wave 4: polish + coverage"]
-    wave4 --> skipConv{Skip convergence?}
+    gateOnlyCheck -->|No| waves["Waves 1-4: foundation, services, order workflow, polish"]
+    waves --> skipConv{Skip convergence?}
     skipConv -->|Yes| results
-    skipConv -->|No| runBB["Run blackbox test against built app"]
+    skipConv -->|No| runBB["Run model-generated blackbox test"]
     runBB --> bbPass{Exit code 0?}
     bbPass -->|Yes| results
-    bbPass -->|No| convTimeout{Convergence timeout?}
-    convTimeout -->|Yes| results
-    convTimeout -->|No| sendFix["Send failure report to workspace"]
-    sendFix --> waitFix["Wait for wave:fix-N issues to close"]
-    waitFix --> runBB
-    results --> summary["Generate LLM summary"]
+    bbPass -->|No| convCheck{Convergence timeout?}
+    convCheck -->|Yes| results
+    convCheck -->|No| fixCycle["Send failure report, wait for wave:fix-N PRs"]
+    fixCycle --> runBB
+    results["Collect results + acceptance test"] --> summary["Generate LLM summary"]
 ```
 
 ### Test Integrity
@@ -160,7 +156,9 @@ The LLM judge (`judge-blackbox.sh`) compares the model-generated test against th
 
 The default pass threshold is 70/100 (configurable via `--gate-threshold`). Results are saved to `gate.json` with the total score, per-dimension breakdown, and a textual analysis from the judge.
 
-The judge model defaults to `claude-sonnet-4-6` and can be overridden with `--judge-model`.
+The judge model defaults to whichever orchestrator model was passed to `run.sh --model`, so the gate uses the same provider you're testing and you won't get surprise charges from a different provider that happens to have an API key set in your environment. Override with `--judge-model <provider:model>` (or set `OAT_BENCH_LLM_MODEL` for a single-env-var pin).
+
+> **Comparing scores across runs:** LLM judges differ in strictness, so changing the judge model between runs makes gate scores non-comparable. Pin `--judge-model` to a single model (e.g. `--judge-model anthropic:claude-sonnet-4-6`) when running a comparison study across orchestrator models.
 
 ## Understanding Waves
 
@@ -363,7 +361,8 @@ Automates the entire benchmark lifecycle: setup, wave progression, results colle
 | `--gate-threshold <score>` | No | Pass/fail threshold for gate (default: 70) |
 | `--gate-only` | No | Run only the gate, skip waves even if gate passes |
 | `--gate-timeout <min>` | No | Max minutes for gate worker (default: 30) |
-| `--judge-model <model>` | No | Model for the LLM gate judge (default: `claude-sonnet-4-6`) |
+| `--judge-model <model>` | No | Model for the LLM gate judge (default: orchestrator `--model`, falling back to `anthropic:claude-sonnet-4-6` if `--model` is unset). Override to pin a fixed judge across runs when comparing orchestrators. |
+| `--summary-model <model>` | No | Model for the post-run LLM summary (default: orchestrator `--model`, falling back to `anthropic:claude-sonnet-4-6` if `--model` is unset). |
 | `--skip-convergence` | No | Skip the post-wave convergence loop |
 | `--convergence-timeout <min>` | No | Max total minutes for convergence loop (default: 60) |
 | `--convergence-iter-timeout <min>` | No | Max minutes per convergence iteration (default: 30) |
@@ -474,19 +473,23 @@ Tests whether the completed app actually works as specified. Clones the benchmar
 
 ### `summarize.sh` -- LLM-powered benchmark analysis
 
-Extracts key signals from agent/worker logs and sends them (along with the JSON results) to the Claude API for a human-readable summary. Automatically called by `run.sh` at the end of each benchmark run.
+Extracts key signals from agent/worker logs and sends them (along with the JSON results) to an LLM via `llm_call.py`, which routes to whichever provider the resolved model uses. Automatically called by `run.sh` at the end of each benchmark run.
 
 ```bash
-# Summarize results in a timestamped folder
-ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
-    --dir benchmarks/results/20260304-011245-sonnet46
+# Summarize results in a timestamped folder (uses orchestrator_model
+# from collect.json by default — set the matching API key)
+./benchmarks/summarize.sh --dir benchmarks/results/20260304-011245-run
 
 # Extract log signals only (no API key needed)
-./benchmarks/summarize.sh --dir benchmarks/results/20260304-011245-sonnet46 --signals-only
+./benchmarks/summarize.sh --dir benchmarks/results/20260304-011245-run --signals-only
+
+# Use a different summarizer than the orchestrator
+OPENAI_API_KEY=$OPENAI_API_KEY ./benchmarks/summarize.sh \
+    --dir benchmarks/results/my-run --model openai:gpt-5.2
 
 # Specify repo name manually (if auto-detect fails)
-ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
-    --dir benchmarks/results/my-run --repo oat-robotic-barista-sonnet46
+./benchmarks/summarize.sh --dir benchmarks/results/my-run \
+    --repo oat-robotic-barista-mytest
 ```
 
 **Flags:**
@@ -495,9 +498,9 @@ ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
 |------|----------|-------------|
 | `--dir <path>` | Yes | Path to timestamped results directory |
 | `--repo <name>` | No | OAT repo name for log lookup (auto-detected from collect.json) |
-| `--model <model>` | No | Claude model for summary (default: claude-sonnet-4-6; override if API model list changes) |
+| `--model <model>` | No | Model for the LLM summary. Resolution order: `--model` flag → `OAT_BENCH_LLM_MODEL` env var → `orchestrator_model` from `collect.json` → `anthropic:claude-sonnet-4-6` (hard fallback). Accepts any `provider:model` string OAT supports (anthropic, openai, google_genai, openrouter, deepseek, ollama, ...). |
 | `--output <path>` | No | Output file (default: `<dir>/summary.md`) |
-| `--signals-only` | No | Only extract log signals, skip Claude API call |
+| `--signals-only` | No | Only extract log signals, skip the LLM call |
 
 **What it analyzes:**
 - Operational metrics (collect.json) and functional test results (acceptance.json)
@@ -509,7 +512,7 @@ ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
 
 **Output:** A structured markdown report covering executive summary, scorecard, what went well/wrong, token efficiency concerns, per-wave breakdown, acceptance test analysis, blackbox gate analysis, dual-run comparison, and recommendations.
 
-**Cost:** Approximately $0.10-0.15 per summary using Claude Sonnet (25K input tokens, 4K output tokens). The default model is `claude-sonnet-4-6`; pass `--model` to use a different Anthropic model ID.
+**Cost:** Provider-dependent. The summary defaults to whatever model orchestrated the run, so cost tracks the orchestrator. As a reference point, a typical summary is roughly 25K input tokens and 4K output tokens — about $0.10-$0.15 with Claude Sonnet 4.6 at the time of writing. Pass `--model` (or set `OAT_BENCH_LLM_MODEL`) to use a different summarizer.
 
 ### Summarizing existing runs
 
@@ -520,9 +523,11 @@ mkdir -p benchmarks/results/20260303-1700-sonnet46
 mv benchmarks/results/oat-robotic-barista-sonnet46.json benchmarks/results/20260303-1700-sonnet46/collect.json
 mv benchmarks/results/oat-robotic-barista-sonnet46-acceptance.json benchmarks/results/20260303-1700-sonnet46/acceptance.json
 
-ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
+./benchmarks/summarize.sh \
     --dir benchmarks/results/20260303-1700-sonnet46 --repo oat-robotic-barista-sonnet46
 ```
+
+The summarizer picks up the orchestrator model from `collect.json`; make sure the matching provider's API key is set in your environment (or pass `--model` to use a different summarizer).
 
 ## Cleaning Up a Benchmark Run
 
@@ -565,16 +570,6 @@ cd agent-runtime/libs/cli && uv pip install langchain-ollama
 **Multiple Ollama models:** If using more than one Ollama model simultaneously, set `OLLAMA_MAX_LOADED_MODELS` to the number of models before starting Ollama.
 
 **Orchestrator vs worker:** Ollama models are best suited as **worker** models via `--available-worker-models`. The orchestrator (`--model`) should be a capable hosted model (e.g., `anthropic:claude-sonnet-4-6`) since it handles complex multi-step coordination that small local models struggle with.
-
-## Troubleshooting
-
-### ANSI escape codes appearing in the agent input box
-
-If you see raw terminal formatting (colored text, status-bar fragments like `[oat-oat-be: supervisor- 1: merge-queue 2: default…]`) in the agent's input area, this is ANSI escape sequence leakage from tool output.
-
-**Cause:** When the workspace agent runs tools that capture terminal content (e.g. reading agent output logs), the raw output may include ANSI escape sequences for colors and cursor positioning. If the agent runtime renders that tool output without stripping ANSI codes, the sequences appear as visible garbage in the input box.
-
-**Where the fix belongs:** The agent runtime (oat-agent) should strip ANSI escape sequences from terminal/tool output before rendering it or adding it to the model context. OAT itself does not inject terminal output into messages, so no OAT code change is required unless a future feature adds terminal output to messages (in which case, strip ANSI there too).
 
 ## Files
 

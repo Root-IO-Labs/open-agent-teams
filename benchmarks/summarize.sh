@@ -8,7 +8,8 @@ usage() {
 Usage: ./benchmarks/summarize.sh --dir <results-dir> [options]
 
 Extract log signals from an OAT benchmark run and generate an LLM-powered
-summary using the Claude API.
+summary using the model that was used to orchestrate the run (or any model
+OAT supports if overridden).
 
 Required:
   --dir <path>              Path to timestamped results directory
@@ -17,21 +18,38 @@ Required:
 Options:
   --repo <name>             OAT repo name for log lookup
                             (auto-detected from collect.json if omitted)
-  --model <claude-model>    Claude model for summary (default: claude-sonnet-4-6)
+  --model <provider:model>  Model to use for the summary. Resolution order:
+                              1. --model flag (this option)
+                              2. OAT_BENCH_LLM_MODEL env var
+                              3. orchestrator_model from collect.json
+                              4. anthropic:claude-sonnet-4-6 (hard fallback)
+                            Accepts any provider:model string OAT supports
+                            (anthropic, openai, google_genai, openrouter,
+                            deepseek, ollama, ...).
   --output <path>           Output file (default: <dir>/summary.md)
-  --signals-only            Only extract log signals, skip Claude API call
+  --signals-only            Only extract log signals, skip the LLM call
   --help                    Show this help message
 
 Environment:
-  ANTHROPIC_API_KEY         Required for LLM summary (signals extracted regardless)
+  OAT_BENCH_LLM_MODEL       Optional fallback model used when --model is
+                            absent and collect.json has no orchestrator_model.
+  <PROVIDER>_API_KEY        API key for whichever provider the resolved model
+                            uses (ANTHROPIC_API_KEY / OPENAI_API_KEY /
+                            GOOGLE_API_KEY / OPENROUTER_API_KEY / etc.).
+                            Local providers (ollama:) need no key. If the
+                            required key is missing the summary step is
+                            skipped (signals are still extracted).
 
 Examples:
-  # Summarize a completed benchmark run
-  ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
-      --dir benchmarks/results/20260304-011245-sonnet46
+  # Summarize a completed benchmark run using whichever model orchestrated it
+  ./benchmarks/summarize.sh --dir benchmarks/results/20260304-011245-run
 
   # Extract signals only (no API key needed)
-  ./benchmarks/summarize.sh --dir benchmarks/results/20260304-011245-sonnet46 --signals-only
+  ./benchmarks/summarize.sh --dir benchmarks/results/20260304-011245-run --signals-only
+
+  # Use a different summarizer than the orchestrator
+  ./benchmarks/summarize.sh --dir benchmarks/results/my-run \
+      --model openai:gpt-5.2
 
   # Use a specific repo name for log lookup
   ./benchmarks/summarize.sh --dir benchmarks/results/my-run --repo oat-robotic-barista-sonnet46
@@ -41,8 +59,10 @@ EOF
 
 RESULTS_DIR=""
 REPO_NAME=""
-# Default model ID per https://docs.anthropic.com/en/docs/models-overview; override with --model if needed
-CLAUDE_MODEL="claude-sonnet-4-6"
+# LLM_MODEL is resolved after we read collect.json so the orchestrator
+# model can win if the user didn't pass --model. Empty here means "not
+# explicitly set on the CLI".
+LLM_MODEL=""
 OUTPUT=""
 SIGNALS_ONLY=false
 
@@ -50,7 +70,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --dir) RESULTS_DIR="$2"; shift 2 ;;
         --repo) REPO_NAME="$2"; shift 2 ;;
-        --model) CLAUDE_MODEL="$2"; shift 2 ;;
+        --model) LLM_MODEL="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --signals-only) SIGNALS_ONLY=true; shift ;;
         --help) usage ;;
@@ -329,10 +349,36 @@ extract_signals() {
 }
 
 # =============================================================================
-# Step 2: Call Claude API
+# Step 2: Resolve model + call LLM
 # =============================================================================
 
-call_claude_api() {
+# Resolve the summarizer model using the documented priority chain.
+# Sets the global RESOLVED_MODEL. Echoes a one-line log explaining the source.
+resolve_summary_model() {
+    if [[ -n "$LLM_MODEL" ]]; then
+        RESOLVED_MODEL="$LLM_MODEL"
+        log "Summary model: ${RESOLVED_MODEL} (from --model)"
+        return 0
+    fi
+    if [[ -n "${OAT_BENCH_LLM_MODEL:-}" ]]; then
+        RESOLVED_MODEL="$OAT_BENCH_LLM_MODEL"
+        log "Summary model: ${RESOLVED_MODEL} (from OAT_BENCH_LLM_MODEL)"
+        return 0
+    fi
+    if [[ -f "$COLLECT_JSON" ]]; then
+        local from_collect
+        from_collect=$(jq -r '.orchestrator_model // .model // empty' "$COLLECT_JSON" 2>/dev/null || true)
+        if [[ -n "$from_collect" && "$from_collect" != "null" ]]; then
+            RESOLVED_MODEL="$from_collect"
+            log "Summary model: ${RESOLVED_MODEL} (from collect.json orchestrator_model)"
+            return 0
+        fi
+    fi
+    RESOLVED_MODEL="anthropic:claude-sonnet-4-6"
+    log "Summary model: ${RESOLVED_MODEL} (hard fallback — no --model, env var, or collect.json present)"
+}
+
+call_llm_api() {
     local signals_file="$1"
     local output_file="$2"
 
@@ -504,82 +550,66 @@ PROMPT_END
         user_prompt+="(not available)"
     fi
 
-    log "Calling Claude API (model: ${CLAUDE_MODEL})..."
+    log "Calling LLM via llm_call.py (model: ${RESOLVED_MODEL})..."
 
-    # Build the JSON payload using jq for proper escaping
-    local payload
-    payload=$(jq -n \
-        --arg model "$CLAUDE_MODEL" \
-        --arg content "$user_prompt" \
-        '{
-            model: $model,
-            max_tokens: 8192,
-            messages: [{role: "user", content: $content}]
-        }')
-
+    # Build the payload as JSON via jq so embedded quotes/newlines in the
+    # prompt are escaped safely.
     local payload_file
     payload_file=$(mktemp)
-    echo "$payload" > "$payload_file"
+    # RETURN trap fires on function return (success or failure) so the
+    # tempfile is always cleaned up.
     trap "rm -f '$payload_file'" RETURN
 
-    local response=""
-    local curl_exit=0
-    local max_attempts=3
-    local attempt=1
-    local backoff=5
+    jq -n \
+        --arg content "$user_prompt" \
+        '{
+            messages: [{role: "user", content: $content}],
+            max_tokens: 8192
+        }' > "$payload_file"
 
-    while [[ $attempt -le $max_attempts ]]; do
-        response=$(curl -sS --connect-timeout 30 --max-time 300 \
-            https://api.anthropic.com/v1/messages \
-            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d @"$payload_file" 2>&1)
-        curl_exit=$?
+    local response_json=""
+    local helper_exit=0
+    response_json=$(python3 "${SCRIPT_DIR}/llm_call.py" \
+        --model "$RESOLVED_MODEL" \
+        --payload "$payload_file") || helper_exit=$?
 
-        if [[ $curl_exit -eq 0 && -n "$response" ]]; then
-            break
-        fi
-        if [[ $attempt -lt $max_attempts ]]; then
-            log "Attempt ${attempt}/${max_attempts} failed (curl exit: ${curl_exit}). Retrying in ${backoff}s..."
-            sleep "$backoff"
-            backoff=$((backoff * 2))
-        fi
-        attempt=$((attempt + 1))
-    done
-
-    if [[ $curl_exit -ne 0 ]]; then
-        log "Claude API curl failed after ${max_attempts} attempts (exit: ${curl_exit})"
-        log "Last response: ${response:0:500}"
+    if [[ $helper_exit -ne 0 ]]; then
+        case $helper_exit in
+            2) log "LLM helper: missing API key for the resolved provider. See stderr above." ;;
+            3) log "LLM helper: provider call failed after retries. See stderr above." ;;
+            4) log "LLM helper: model resolution failed. See stderr above." ;;
+            *) log "LLM helper exited with code ${helper_exit}. See stderr above." ;;
+        esac
         return 1
     fi
 
-    # Check for API-level errors
-    local error_type
-    error_type=$(echo "$response" | jq -r '.error.type // empty' 2>/dev/null || true)
-    if [[ -n "$error_type" ]]; then
-        local error_msg
-        error_msg=$(echo "$response" | jq -r '.error.message // "unknown error"' 2>/dev/null || true)
-        log "Claude API error: ${error_type}: ${error_msg}"
+    if [[ -z "$response_json" ]]; then
+        log "LLM helper returned no JSON output (unexpected — see stderr)"
         return 1
     fi
 
-    # Extract the text content
-    local summary
-    summary=$(echo "$response" | jq -r '.content[0].text // empty' 2>/dev/null || true)
+    local summary input_tokens output_tokens resolved_provider_model
+    summary=$(echo "$response_json" | jq -r '.text // empty')
+    input_tokens=$(echo "$response_json" | jq -r '.input_tokens // 0')
+    output_tokens=$(echo "$response_json" | jq -r '.output_tokens // 0')
+    resolved_provider_model=$(echo "$response_json" | jq -r '.model // empty')
 
     if [[ -z "$summary" ]]; then
-        log "Claude API returned empty response"
-        log "Raw response: ${response:0:500}"
+        log "LLM returned empty text content"
         return 1
     fi
 
-    # Write the summary
-    echo "$summary" > "$output_file"
-
-    local input_tokens output_tokens
-    input_tokens=$(echo "$response" | jq -r '.usage.input_tokens // "?"' 2>/dev/null || true)
-    output_tokens=$(echo "$response" | jq -r '.usage.output_tokens // "?"' 2>/dev/null || true)
+    # Provenance header: HTML comment so it doesn't render in GitHub's
+    # markdown view but is grep-able. Use the resolved provider:model
+    # string so a bare "claude-sonnet-4-6" gets recorded as
+    # "anthropic:claude-sonnet-4-6".
+    local provenance_model="${resolved_provider_model:-$RESOLVED_MODEL}"
+    local generated_at
+    generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    {
+        echo "<!-- Generated by ${provenance_model} at ${generated_at} -->"
+        echo "$summary"
+    } > "$output_file"
 
     log "Summary generated: ${output_file}"
     log "Token usage: ${input_tokens} input, ${output_tokens} output"
@@ -644,18 +674,19 @@ fi
 # Step 2: Generate LLM summary
 if [[ "$SIGNALS_ONLY" == true ]]; then
     log "Signals-only mode, skipping LLM summary"
-elif [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    log "Skipping LLM summary (ANTHROPIC_API_KEY not set)"
-    log "To generate a summary, run again with ANTHROPIC_API_KEY set"
 else
-    if call_claude_api "$SIGNALS_FILE" "$OUTPUT"; then
+    resolve_summary_model
+    # llm_call.py handles the missing-API-key case with a clear error and
+    # exit code 2. The summary is optional, so we don't want a missing key
+    # to fail the whole benchmark — log the helper's complaint and move on.
+    if call_llm_api "$SIGNALS_FILE" "$OUTPUT"; then
         echo ""
         log "--- Summary Preview ---"
         head -20 "$OUTPUT"
         echo "..."
         log "(full summary at ${OUTPUT})"
     else
-        log "LLM summary generation failed"
+        log "LLM summary generation skipped or failed (see helper messages above)"
     fi
 fi
 
