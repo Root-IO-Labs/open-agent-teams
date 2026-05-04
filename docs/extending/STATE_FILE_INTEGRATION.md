@@ -60,7 +60,7 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
   "nudge_count": 0,                   // Nudges since last git activity
   "nudge_reset_used": false,          // One-time supervisor reset flag
   "last_branch_sha": "abc123",        // Last known commit SHA on agent branch
-  "model": "claude-sonnet-4-5",       // LLM model override (agent-level)
+  "model": "claude-sonnet-4-6",       // LLM model override (agent-level)
   "input_tokens": 0,                  // Cumulative input tokens
   "output_tokens": 0,                 // Cumulative output tokens
   "total_tokens": 0,                  // input + output

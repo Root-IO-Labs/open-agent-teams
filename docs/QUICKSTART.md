@@ -328,7 +328,7 @@ oat cleanup                          # clean orphaned worktrees/messages
 | `OAT_CORE_AGENT_SOFT_TIMEOUT` | `5` | Minutes before nudging stuck core agents |
 | `OAT_STUCK_SUPERVISOR_NUDGE` | `10` | Nudge count before alerting supervisor |
 | `OAT_STUCK_DAEMON_NUDGE` | `16` | Nudge count before daemon takeover |
-| `OAT_STUCK_MAX_NUDGE` | `40` | Nudge count before force-removal |
+| `OAT_STUCK_MAX_NUDGE` | `30` | Nudge count before force-removal |
 | `OAT_WAKE_INTERVAL_SECONDS` | `60` | Wake/nudge loop interval |
 | `OAT_TEST_MODE` | *(unset)* | Skip real agent spawning (for tests) |
 

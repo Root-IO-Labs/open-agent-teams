@@ -62,7 +62,7 @@ OAT - Open Agent Teams ready! What would you like to build?
 
 ## Requirements
 
-- Go 1.21+ for building
+- Go 1.24.2+ for building
 - Python 3.11+ runtime
 - The agent-runtime dependencies installed (automatically detected)
 

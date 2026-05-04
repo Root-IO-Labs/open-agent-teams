@@ -56,7 +56,7 @@ OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (d
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
 │  │ Health   │  │ Message  │  │ Wake/    │  │ Socket   │        │
 │  │ Check    │  │ Router   │  │ Nudge    │  │ Server   │        │
-│  │ (2min)   │  │ (2min)   │  │ (2min)   │  │          │        │
+│  │ (2min)   │  │ (60s)    │  │ (60s)    │  │          │        │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
 └────────────────────────────────┬────────────────────────────────┘
                                  │

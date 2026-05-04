@@ -16,7 +16,6 @@ Works with Anthropic, OpenAI, Google, DeepSeek, Groq, Mistral, and [17+ LLM prov
 - [Commands](#commands)
 - [Built-in Agents](#built-in-agents)
 - [Customize Your Team](#customize-your-team)
-- [Coming Soon: Spec Builder](#coming-soon-spec-builder)
 - [Documentation](#documentation)
 - [Public Libraries](#public-libraries)
 - [Building from Source](#building-from-source)
@@ -116,11 +115,10 @@ That's it. You now have a supervisor, merge queue, and worker grinding away. Ope
 OAT ships with a built-in benchmark: the **robotic barista** — a Python CLI project defined by a detailed spec, interface contracts, and 24 issues organized into dependency waves. No implementation code is provided; the model has to build the entire application from scratch, design its own acceptance test, and self-correct until it passes.
 
 ```bash
-cd benchmarks
-./scripts/run.sh --model anthropic:claude-sonnet-4-6 --repo my-bench-run
+./benchmarks/run.sh --model anthropic:claude-sonnet-4-6 --name my-bench-run
 ```
 
-This single command sets up the benchmark repo, drives OAT through all four waves, and collects results. See [benchmarks/README.md](benchmarks/README.md) for the full workflow.
+This single command sets up the benchmark repo (under your authenticated GitHub account), drives OAT through all four waves, and collects results. See [benchmarks/README.md](benchmarks/README.md) for the full workflow.
 
 ## How It Works
 
@@ -140,7 +138,7 @@ oat worker create "Refactor database layer" --model claude-opus-4-6
 
 Each worker works independently. When done, they verify their changes (via `oat worker verify` or by requesting an independent review from a verification agent), open a PR with `oat pr create`, and enter a zero-token dormant state. The daemon monitors GitHub for CI results, merge conflicts, review comments, and merges — waking the worker only when action is needed.
 
-If a worker gets stuck, a three-tier escalation kicks in automatically: gentle nudges, then supervisor intervention, then programmatic git-level diagnosis. Hard cap at ~40 minutes.
+If a worker gets stuck, a three-tier escalation kicks in automatically: gentle nudges, then supervisor intervention, then programmatic git-level diagnosis. Hard cap at ~30 minutes.
 
 **Your workspace** is your persistent session. Chat with it, spawn workers, check status. It's always there when you come back.
 
@@ -265,10 +263,6 @@ oat agents spawn --name security-auditor --class persistent --prompt-file ./audi
 oat agents list                # see available definitions
 oat agents reset               # reset to defaults
 ```
-
-## Coming Soon: Spec Builder
-
-OAT works best with well-structured specs. We are building a companion workflow — human-in-the-loop — that generates high-efficacy implementation specs from your requirements, purpose-built for OAT agent teams. Better spec, better result.
 
 ## Documentation
 

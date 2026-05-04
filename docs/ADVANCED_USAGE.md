@@ -30,7 +30,7 @@ Use conventional commit messages (feat:, fix:, chore:).
 EOF
 ```
 
-Valid filenames: `worker.md`, `merge-queue.md`, `review.md`, `pr-shepherd.md`.
+Valid filenames: `worker.md`, `merge-queue.md`, `reviewer.md`, `pr-shepherd.md`.
 
 ### Spawn a fully custom agent
 
@@ -161,7 +161,7 @@ This folder is version-controlled, so the whole team shares the same worker cont
 
 ## Dormancy and PR Monitoring
 
-After a worker creates a PR, it enters a **dormant state** with zero token consumption. The daemon's PR monitor loop (every 2 minutes) watches the PR and wakes the worker when action is needed.
+After a worker creates a PR, it enters a **dormant state** with zero token consumption. The daemon's PR monitor loop (every 60 seconds) watches the PR and wakes the worker when action is needed.
 
 ### Wake triggers
 
@@ -211,18 +211,16 @@ The daemon runs a three-tier escalation for agents that stop making progress. Nu
 
 | Time window | Action | Cost |
 |-------------|--------|------|
-| 0-8 min | Status nudges every 2 min | Normal token use |
-| 8-14 min | Daemon alerts supervisor, who inspects logs and intervenes. Supervisor can call `oat worker reset-nudge` once to buy another round. | Supervisor tokens |
-| 16-38 min | Daemon takeover: checks git state, auto-completes workers with open PRs, sends directives. **No LLM calls.** | Zero tokens |
-| ~40 min | Hard removal: worker is terminated, resources freed | Zero tokens |
+| 0-9 min | Status nudges every 60 s | Normal token use |
+| 10-15 min | Daemon alerts supervisor, who inspects logs and intervenes. Supervisor can call `oat worker reset-nudge` once to buy another round. | Supervisor tokens |
+| 16-29 min | Daemon takeover: checks git state, auto-completes workers with open PRs, sends directives. **No LLM calls.** | Zero tokens |
+| ~30 min | Hard removal: worker is terminated, resources freed | Zero tokens |
 
-The key insight: recovery at the 20-minute mark uses shell commands and git state checks, not LLM conversations. This prevents recovery from compounding costs.
+The key insight: recovery past the 16-minute mark uses shell commands and git state checks, not LLM conversations. This prevents recovery from compounding costs.
 
 ---
 
 ## Verification System
-
-> **Note:** Available in the `feature/integrate-verification` branch (PR #45). Not yet on main.
 
 Workers must pass verification before creating a PR. Three options, in order of rigor:
 

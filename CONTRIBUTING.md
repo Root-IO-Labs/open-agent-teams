@@ -4,7 +4,7 @@ Thank you for your interest in contributing to OAT (Open Agent Teams). This guid
 
 ## Prerequisites
 
-- **Go 1.24+** (with toolchain 1.25)
+- **Go 1.24.2+** (with toolchain 1.25)
 - **Python 3.11+** and **[uv](https://docs.astral.sh/uv/)** for agent-runtime work
 - **[GitHub CLI (`gh`)](https://cli.github.com/)** authenticated with your account
 - **Git** with access to the repository

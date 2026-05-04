@@ -9,10 +9,10 @@ OAT consists of several components that can fail independently:
 | Component | Description | Persistence |
 |-----------|-------------|-------------|
 | **Daemon** | Central coordinator process | `daemon.pid`, `state.json` |
-| **Supervisor** | agent agent managing workers | in-memory session, no special state |
-| **Merge-Queue** | agent agent processing PRs | in-memory session, no special state |
-| **Workers** | agent agents executing tasks | in-memory sessions, git worktrees, branches |
-| **Workspace** | User's interactive agent agent | in-memory session, git worktree |
+| **Supervisor** | LLM agent managing workers | in-memory session, no special state |
+| **Merge-Queue** | LLM agent processing PRs | in-memory session, no special state |
+| **Workers** | LLM agents executing tasks | in-memory sessions, git worktrees, branches |
+| **Workspace** | User's interactive LLM agent | in-memory session, git worktree |
 | **Backend Session** | Container for all agents in a repo | daemon process memory |
 | **Git Worktrees** | Isolated working directories | filesystem + git metadata |
 
@@ -77,8 +77,8 @@ oat daemon status
 # Check supervisor window
 oat agent attach supervisor
 
-# Use the oat agent command to restart (auto-detects context and resumes)
-oat agent
+# Restart the supervisor (auto-resumes the existing session)
+oat agent restart supervisor
 ```
 
 **Impact:**
@@ -394,7 +394,7 @@ oat start
 tail -f ~/.oat/daemon.log   # look for "Woke agent" or "skipping wake"
 ```
 
-Task messages from the supervisor are delivered by the **message router** (every 2 minutes) and do not depend on the PID check; only the periodic nudge does.
+Task messages from the supervisor are delivered by the **message router** (every 60 seconds) and do not depend on the PID check; only the periodic nudge does.
 
 ### Workers: messages appear in prompt but are not processed
 
@@ -419,7 +419,7 @@ If text sent to agents (nudges, task messages, or manual `oat agent tell`) appea
 ### System Configuration
 
 1. **Process supervisor** - Use systemd/launchd to auto-restart daemon
-3. **Log rotation** - Daemon log can grow large
+2. **Log rotation** - Daemon log can grow large
 
 ---
 
@@ -449,7 +449,7 @@ The state file is written atomically (write to temp file, then rename) because:
 
 ## Future Improvements
 
-See GitHub issue #23 for tracking. Potential enhancements:
+Potential enhancements (track via GitHub issues):
 
 1. **State backup** - Periodic backups of state.json
 2. **Process monitoring** - Detect dead agent processes, not just missing windows

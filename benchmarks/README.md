@@ -241,14 +241,14 @@ For more control, you can run each step separately:
 ./benchmarks/setup.sh --model claude-sonnet-4-6 --name sonnet46-baseline --setup-only
 ```
 
-Check the created repo at `https://github.com/Root-IO-Labs/oat-robotic-barista-sonnet46-baseline`.
+Check the created repo at `https://github.com/<your-org>/oat-robotic-barista-sonnet46-baseline`.
 
 #### 2. Initialize OAT
 
 If your default `GH_TOKEN` doesn't have access to the benchmark repo owner, set it explicitly:
 
 ```bash
-GH_TOKEN=$GH_TOKEN oat init https://github.com/Root-IO-Labs/oat-robotic-barista-sonnet46-baseline --model claude-sonnet-4-6
+GH_TOKEN=$GH_TOKEN oat init https://github.com/<your-org>/oat-robotic-barista-sonnet46-baseline --model claude-sonnet-4-6
 ```
 
 Alternatively, skip `--setup-only` in step 1 to have `setup.sh` run `oat init` for you automatically.
@@ -408,7 +408,7 @@ Automates the entire benchmark lifecycle: setup, wave progression, results colle
 | `--name <suffix>` | No | Repo name suffix (default: Unix timestamp) |
 | `--setup-only` | No | Only create repo + issues, skip OAT init |
 
-Repos are created as `Root-IO-Labs/oat-robotic-barista-<suffix>`.
+Repos are created as `<your-org>/oat-robotic-barista-<suffix>`.
 
 The bundled source in `benchmarks/robotic-barista/` already includes all spec clarifications (required flags, data file path, `BARISTA_DATA_DIR` env var, recipe output format, entry point packaging, development environment setup, etc.). No patching is needed at setup time.
 
@@ -536,7 +536,7 @@ Use `cleanup.sh` to remove all local state from a failed or completed benchmark 
 ./benchmarks/cleanup.sh --repo oat-robotic-barista-sonnet46-auto --delete-remote
 ```
 
-If `--delete-remote` fails due to token permissions, delete the GitHub repo manually at `https://github.com/Root-IO-Labs/oat-robotic-barista-<name>/settings` (Danger Zone > Delete).
+If `--delete-remote` fails due to token permissions, delete the GitHub repo manually at `https://github.com/<your-org>/oat-robotic-barista-<name>/settings` (Danger Zone > Delete).
 
 Alternatively, skip cleanup entirely by using a different `--name` for each run.
 

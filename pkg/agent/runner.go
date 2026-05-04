@@ -17,16 +17,17 @@
 //	    "github.com/Root-IO-Labs/open-agent-teams/pkg/backend"
 //	)
 //
-//	// Create a backend client and agent runner
-//	client := backend.NewClient()
-//	runner := agent.NewRunner(agent.WithTerminal(client))
+//	// Create a ProcessBackend and adapt it to the TerminalRunner interface.
+//	b := backend.NewBackend("", "")
+//	adapter := backend.NewTerminalAdapter(b)
+//	runner := agent.NewRunner(agent.WithTerminal(adapter))
 //
-//	// Start an agent in a session
+//	// Create a session, then start an agent inside it.
 //	ctx := context.Background()
-//	config := agent.Config{
+//	if err := b.CreateSession(ctx, "my-session"); err != nil { /* ... */ }
+//	result, err := runner.Start(ctx, "my-session", "agent-window", agent.Config{
 //	    WorkDir: "/path/to/workspace",
-//	}
-//	result, err := runner.Start(ctx, "my-session", "agent-window", config)
+//	})
 //
 // # Sending Messages
 //
@@ -210,7 +211,7 @@ type Config struct {
 	// Used so core agents started by the daemon inherit user environment (GH_TOKEN, etc.). Never logged.
 	EnvPrefix string
 
-	// Model is the LLM model spec (e.g., "claude-sonnet-4-5"). Passed via --model to the agent CLI.
+	// Model is the LLM model spec (e.g., "claude-sonnet-4-6"). Passed via --model to the agent CLI.
 	// If empty, the agent CLI auto-detects from available API keys.
 	Model string
 

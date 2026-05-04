@@ -157,8 +157,9 @@ type Daemon struct {
 |------|----------|---------|
 | `serverLoop` | Continuous | Handle incoming socket requests |
 | `healthCheckLoop` | 2 min | Verify agents are alive, cleanup dead ones |
-| `messageRouterLoop` | 2 min | Deliver pending messages to agents |
-| `wakeLoop` | 2 min | Nudge idle agents with status checks |
+| `messageRouterLoop` | 60 s | Deliver pending messages to agents |
+| `wakeLoop` | 60 s | Nudge idle agents with status checks |
+| `prMonitorLoop` | 60 s | Watch dormant workers' PRs for CI/merge events |
 
 ### State Management (`internal/state/state.go`)
 
@@ -300,7 +301,7 @@ Prompts are written to `.oat/AGENTS.md` in each agent's worktree before launch. 
 Repositories can customize agent behavior with files in `.oat/agents/`:
 - `.oat/agents/worker.md` — Worker agent definition
 - `.oat/agents/merge-queue.md` — Merge-queue agent definition
-- `.oat/agents/review.md` — Review agent definition
+- `.oat/agents/reviewer.md` — Reviewer agent definition
 
 ### CLI (`internal/cli/cli.go`)
 
@@ -406,7 +407,7 @@ When launching an agent, the model is resolved in priority order:
 3. **Auto-detect** — if neither is set, the OAT - Open Agent Teams CLI picks a model based on available API keys
 
 The resolved model is passed as `--model <spec>` to the OAT - Open Agent Teams CLI. The spec can be a bare model
-name (e.g., `claude-sonnet-4-5`) or provider-prefixed (e.g., `anthropic:claude-sonnet-4-5`).
+name (e.g., `claude-sonnet-4-6`) or provider-prefixed (e.g., `anthropic:claude-sonnet-4-6`).
 
 All agent launch paths (daemon `startAgentWithConfig`, daemon `restartAgent`)
 use `resolveAgentModel()` to apply this resolution.
@@ -513,12 +514,12 @@ Workers use an escalating nudge system based on `NudgeCount` (tracked per worker
 
 | NudgeCount | Time (~) | Action |
 |------------|----------|--------|
-| 1-4 | 0-8 min | Normal status check nudge |
-| 5-7 | 8-14 min | Daemon alerts supervisor; worker gets directive nudge |
-| 8-19 | 16-38 min | Daemon takeover: programmatic git checks with auto-complete or directive nudge |
-| 20 | ~40 min | Hard cap: force-remove (auto-complete if PR exists, otherwise remove with failure reason) |
+| 1-9 | 0-9 min | Normal status check nudge |
+| 10-15 | 10-15 min | Daemon alerts supervisor; worker gets directive nudge |
+| 16-29 | 16-29 min | Daemon takeover: programmatic git checks with auto-complete or directive nudge |
+| 30 | ~30 min | Hard cap: force-remove (auto-complete if PR exists, otherwise remove with failure reason) |
 
-Thresholds are configurable via environment variables: `OAT_STUCK_SUPERVISOR_NUDGE` (default 5), `OAT_STUCK_DAEMON_NUDGE` (default 8), `OAT_STUCK_MAX_NUDGE` (default 20).
+Thresholds are configurable via environment variables: `OAT_STUCK_SUPERVISOR_NUDGE` (default 10), `OAT_STUCK_DAEMON_NUDGE` (default 16), `OAT_STUCK_MAX_NUDGE` (default 30).
 
 ## Key Design Decisions
 

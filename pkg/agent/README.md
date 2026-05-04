@@ -16,6 +16,7 @@ package main
 import (
     "context"
     "log"
+
     "github.com/Root-IO-Labs/open-agent-teams/pkg/agent"
     "github.com/Root-IO-Labs/open-agent-teams/pkg/backend"
 )
@@ -23,21 +24,27 @@ import (
 func main() {
     ctx := context.Background()
 
-    // Create a backend client for terminal session management
-    client := backend.NewClient()
+    // 1. Get a ProcessBackend (the direct PTY backend by default).
+    //    Pass an empty preference and an empty data dir for an in-memory backend.
+    b := backend.NewBackend("", "")
 
-    // Create agent runner
+    // 2. Adapt the ProcessBackend to the TerminalRunner interface that
+    //    agent.Runner expects.
+    adapter := backend.NewTerminalAdapter(b)
+
+    // 3. Build the runner.
     runner := agent.NewRunner(
-        agent.WithTerminal(client),
-        agent.WithBinaryPath(agent.ResolveBinaryPath()),
+        agent.WithTerminal(adapter),
+        agent.WithBinaryPath("oat-agent"), // or an absolute path
     )
 
-    // Create session and window
-    client.CreateSession(ctx, "my-session", true)
-    defer client.KillSession(ctx, "my-session")
-    client.CreateWindow(ctx, "my-session", "agent")
+    // 4. Create a session that will hold one or more agents.
+    if err := b.CreateSession(ctx, "my-session"); err != nil {
+        log.Fatal(err)
+    }
+    defer b.DestroySession(context.Background(), "my-session")
 
-    // Start agent
+    // 5. Start an agent within the session.
     result, err := runner.Start(ctx, "my-session", "agent", agent.Config{
         SystemPromptFile: "/path/to/prompt.md",
         WorkDir:          "/path/to/workspace",
@@ -45,10 +52,9 @@ func main() {
     if err != nil {
         log.Fatal(err)
     }
-
     log.Printf("agent started: session=%s, pid=%d", result.SessionID, result.PID)
 
-    // Send a message
+    // 6. Send a message.
     if err := runner.SendMessage(ctx, "my-session", "agent", "Hello, agent!"); err != nil {
         log.Fatal(err)
     }
@@ -232,7 +238,7 @@ promptText := builder.Build()
 ## Requirements
 
 - OAT Agent Runtime installed and available
-- Go 1.21 or later
+- Go 1.24.2 or later
 
 ## License
 
