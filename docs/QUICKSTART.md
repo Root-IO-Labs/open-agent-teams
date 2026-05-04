@@ -189,16 +189,20 @@ tail -f ~/.oat/daemon.log
 
 ## Worker Lifecycle
 
+**If the diagram does not render** (plain-text viewer): happy path is `create → active → verify → PR → dormant → complete`. From **dormant**, either the PR is finished → **complete**, or the daemon wakes the worker → **active** again (CI fail, merge conflict, PR comments), then **verify → PR → dormant** repeats.
+
+```mermaid
+flowchart LR
+  create(["create"]) --> active --> verify --> PR --> dormant
+  dormant -->|"PR merged · done"| complete(["complete"])
+  dormant -->|"wake: CI fail · conflict · comments"| active
 ```
-create --> active --> verify --> PR --> dormant --> complete
-                        |                           ^
-                        |   (CI fail / conflict)     |
-                        +---> fix --> PR again ------+
-```
+
+While **dormant**, the daemon polls GitHub (~2 min). After a wake, the worker fixes on the same `work/<name>` branch, runs **verify** again, updates the PR as needed, and calls **`oat agent waiting`** to return to **dormant**. **`oat agent complete`** finishes the worker; the daemon cleans up the worktree on the next health check (~2 min).
 
 1. **Active** — Worker codes, commits, pushes on `work/<name>` branch
 2. **Verify** — Quality gate before PR: `oat worker verify`, `oat worker request-review`, or `oat pr create --force` to skip
-3. **PR** — `oat pr create` opens a pull request with the `oat` label
+3. **PR** — `oat pr create` opens a pull request with the `oat` label (later rounds update the same branch / PR)
 4. **Dormant** — Zero-token sleep; daemon monitors PR for CI, conflicts, comments, merge
 5. **Complete** — `oat agent complete`; daemon cleans up worktree on next health check (~2 min)
 
