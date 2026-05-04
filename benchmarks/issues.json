@@ -1,0 +1,275 @@
+[
+  {
+    "number": 1,
+    "title": "Blackbox Tests: Inventory Commands",
+    "body": "## Blackbox Tests: Inventory Commands\n\n**Type**: Test\n**Wave**: 0\n\n> **Wave 0 context**: This is a pre-implementation issue. The CLI is NOT implemented yet -- you are writing tests BEFORE implementation. Your tests will fail when run against the empty scaffold, and that is expected. Focus on encoding the specified behavior as test cases using the helpers API. Do NOT implement the CLI yourself.\n\n### What to Read\n\n**Testing methodology (read this before writing your test):**\n- `docs/blackbox-testing.md` -- Best practices for writing robust CLI blackbox tests. Follow these patterns for flexible output parsing, assertions, partial credit, data isolation, and error case testing.\n\n**Test framework (read this to understand the API you must use):**\n- `scripts/blackbox-tests/helpers.sh` -- Shared test infrastructure already provided. Contains `run_cmd()`, `pass()`/`fail()`/`pass_partial()`, `assert_success()`/`assert_error()`/`assert_empty()`, `setup_cmd()`, `new_data_dir()`, scoring, and JSON output. Your file will be auto-sourced by `scripts/blackbox-test.sh` -- do NOT duplicate these functions.\n\n> **Common mistakes (your PR will be rejected if you do any of these):**\\n> - `run_cmd \"inventory add espresso 100 ml\"` -- WRONG (single string). Correct: `run_cmd inventory add espresso 100 ml` (separate args)\\n> - `source helpers.sh` or `source scripts/blackbox-tests/helpers.sh` -- WRONG. helpers.sh is auto-sourced by the entry point. Do NOT source it yourself.\\n> - `detect_cli` -- WRONG. Do NOT call detect_cli. It is called once by the entry point.\\n> - `barista inventory list` -- WRONG. Use `run_cmd inventory list` (no `barista` prefix; `run_cmd` handles CLI detection).\\n> - `return 0` or `exit 0` at the top of your test function -- WRONG (stub test). Your function must contain real `run_cmd`/`assert_*` calls that actually exercise the CLI.\\n> - Calling both `assert_success \"name\" \"cat\"` and `pass \"name\" \"cat\"` for the same check -- WRONG (double-counting). `assert_success` already calls `pass` internally.\\n> - `[[ \"$OUTPUT_TEXT\" == \"espresso: 100 ml\" ]]` -- FRAGILE. Use pattern matching (`espresso.*100.*ml`) to tolerate whitespace and formatting differences.\n\n**Specification (the source of truth for expected behavior):**\n- `docs/operational-specification.md` -- Read ONLY the Inventory Commands section and the Persistence section. Do NOT read the entire spec or other command sections.\n\n### Requirements\n\n- Create `scripts/blackbox-tests/test-inventory.sh` with test functions that use the helpers from `helpers.sh`\n- Define a `test_inventory_commands()` function containing all your tests\n- Register a category with `register_category \"inventory\" 25 \"Inventory\"` at the top of your file (outside the function)\n- Test ALL inventory commands: `inventory list`, `inventory add`\n- Test error cases: unit mismatch when adding with wrong unit for existing ingredient\n- Test quantity accumulation (add same ingredient twice, verify total increases)\n- Test empty inventory list (exits 0, no errors)\n- Test data persistence across CLI invocations (add item, run list in new invocation, verify item present)\n- Use `new_data_dir()` for test isolation between test groups. **WARNING:** Do NOT call `new_data_dir` inside `$()` (e.g., `data_dir=$(new_data_dir)`). The function exports `BARISTA_DATA_DIR` as a side-effect, and `$()` runs it in a subshell where the export is silently discarded. Call it bare: `new_data_dir` then use `$BARISTA_DATA_DIR`.\n- Do NOT read all open issues or the full operational spec\n\n### Files to Touch\n\n- Create: `scripts/blackbox-tests/test-inventory.sh`\n\n### Definition of Done\n\n- [ ] `scripts/blackbox-tests/test-inventory.sh` created and executable\n- [ ] Tests all inventory CLI commands from the spec\n- [ ] Tests all inventory error cases from the spec\n- [ ] Uses helpers.sh framework (no duplicated helper functions)\n- [ ] Uses data isolation via `new_data_dir()`\n- [ ] PR created and merged",
+    "labels": [
+      "wave:0",
+      "type:test",
+      "area:testing"
+    ]
+  },
+  {
+    "number": 2,
+    "title": "Blackbox Tests: Recipe Commands",
+    "body": "## Blackbox Tests: Recipe Commands\n\n**Type**: Test\n**Wave**: 0\n\n> **Wave 0 context**: This is a pre-implementation issue. The CLI is NOT implemented yet -- you are writing tests BEFORE implementation. Your tests will fail when run against the empty scaffold, and that is expected. Focus on encoding the specified behavior as test cases using the helpers API. Do NOT implement the CLI yourself.\n\n### What to Read\n\n**Testing methodology (read this before writing your test):**\n- `docs/blackbox-testing.md` -- Best practices for writing robust CLI blackbox tests. Follow these patterns for flexible output parsing, assertions, partial credit, data isolation, and error case testing.\n\n**Test framework (read this to understand the API you must use):**\n- `scripts/blackbox-tests/helpers.sh` -- Shared test infrastructure already provided. Contains `run_cmd()`, `pass()`/`fail()`/`pass_partial()`, `assert_success()`/`assert_error()`/`assert_empty()`, `setup_cmd()`, `new_data_dir()`, scoring, and JSON output. Your file will be auto-sourced by `scripts/blackbox-test.sh` -- do NOT duplicate these functions.\n\n> **Common mistakes (your PR will be rejected if you do any of these):**\\n> - `run_cmd \"recipes add ...\"` -- WRONG (single string). Correct: `run_cmd recipes add ...` (separate args)\\n> - `source helpers.sh` or `source scripts/blackbox-tests/helpers.sh` -- WRONG. helpers.sh is auto-sourced by the entry point. Do NOT source it yourself.\\n> - `detect_cli` -- WRONG. Do NOT call detect_cli. It is called once by the entry point.\\n> - `barista recipes list` -- WRONG. Use `run_cmd recipes list` (no `barista` prefix; `run_cmd` handles CLI detection).\\n> - `return 0` or `exit 0` at the top of your test function -- WRONG (stub test). Your function must contain real `run_cmd`/`assert_*` calls that actually exercise the CLI.\\n> - Calling both `assert_success \"name\" \"cat\"` and `pass \"name\" \"cat\"` for the same check -- WRONG (double-counting). `assert_success` already calls `pass` internally.\\n> - `[[ \"$OUTPUT_TEXT\" == \"latte: 2 steps\" ]]` -- FRAGILE. Use a plain substring or regex (`latte`) to tolerate whitespace and formatting differences.\n\n**Specification (the source of truth for expected behavior):**\n- `docs/operational-specification.md` -- Read ONLY the Recipe Commands section. Do NOT read the entire spec or other command sections.\n\n### Requirements\n\n- Create `scripts/blackbox-tests/test-recipes.sh` with test functions that use the helpers from `helpers.sh`\n- Define a `test_recipe_commands()` function containing all your tests\n- Register a category with `register_category \"recipes\" 25 \"Recipes\"` at the top of your file (outside the function)\n- Test ALL recipe commands: `recipes list`, `recipes show`, `recipes add`\n- Test recipe creation with `--name`, `--ingredient`, and `--step` flags\n- Test duplicate recipe name error\n- Test missing ingredients error (recipe must have at least 1 ingredient)\n- Test missing steps error (recipe must have at least 1 step)\n- Test recipe not-found error (`recipes show nonexistent`)\n- Test recipe lookup by name\n- Use `new_data_dir()` for test isolation between test groups. **WARNING:** Do NOT call `new_data_dir` inside `$()` (e.g., `data_dir=$(new_data_dir)`). The function exports `BARISTA_DATA_DIR` as a side-effect, and `$()` runs it in a subshell where the export is silently discarded. Call it bare: `new_data_dir` then use `$BARISTA_DATA_DIR`.\n- Do NOT read all open issues or the full operational spec\n\n### Files to Touch\n\n- Create: `scripts/blackbox-tests/test-recipes.sh`\n\n### Definition of Done\n\n- [ ] `scripts/blackbox-tests/test-recipes.sh` created and executable\n- [ ] Tests all recipe CLI commands from the spec\n- [ ] Tests all recipe error cases from the spec\n- [ ] Uses helpers.sh framework (no duplicated helper functions)\n- [ ] Uses data isolation via `new_data_dir()`\n- [ ] PR created and merged",
+    "labels": [
+      "wave:0",
+      "type:test",
+      "area:testing"
+    ]
+  },
+  {
+    "number": 3,
+    "title": "Blackbox Tests: Order Commands",
+    "body": "## Blackbox Tests: Order Commands\n\n**Type**: Test\n**Wave**: 0\n\n> **Wave 0 context**: This is a pre-implementation issue. The CLI is NOT implemented yet -- you are writing tests BEFORE implementation. Your tests will fail when run against the empty scaffold, and that is expected. Focus on encoding the specified behavior as test cases using the helpers API. Do NOT implement the CLI yourself.\n\n### What to Read\n\n**Testing methodology (read this before writing your test):**\n- `docs/blackbox-testing.md` -- Best practices for writing robust CLI blackbox tests. Follow these patterns for flexible output parsing, assertions, partial credit, data isolation, and error case testing.\n\n**Test framework (read this to understand the API you must use):**\n- `scripts/blackbox-tests/helpers.sh` -- Shared test infrastructure already provided. Contains `run_cmd()`, `pass()`/`fail()`/`pass_partial()`, `assert_success()`/`assert_error()`/`assert_empty()`, `setup_cmd()`, `new_data_dir()`, `extract_id()`, scoring, and JSON output. Your file will be auto-sourced by `scripts/blackbox-test.sh` -- do NOT duplicate these functions.\n\n> **Common mistakes (your PR will be rejected if you do any of these):**\\n> - `run_cmd \"order place ...\"` -- WRONG (single string). Correct: `run_cmd order place ...` (separate args)\\n> - `source helpers.sh` or `source scripts/blackbox-tests/helpers.sh` -- WRONG. helpers.sh is auto-sourced by the entry point. Do NOT source it yourself.\\n> - `detect_cli` -- WRONG. Do NOT call detect_cli. It is called once by the entry point.\\n> - `barista order place ...` -- WRONG. Use `run_cmd order place ...` (no `barista` prefix; `run_cmd` handles CLI detection).\\n> - `return 0` or `exit 0` at the top of your test function -- WRONG (stub test). Your function must contain real `run_cmd`/`assert_*` calls that actually exercise the CLI.\\n> - Calling both `assert_success \"name\" \"cat\"` and `pass \"name\" \"cat\"` for the same check -- WRONG (double-counting). `assert_success` already calls `pass` internally.\\n> - `[[ \"$OUTPUT_TEXT\" == \"Order placed: abc-123\" ]]` -- FRAGILE. Use a substring or regex (`Order.*placed` or `abc-123`) to tolerate whitespace and formatting differences.\n\n**Specification (the source of truth for expected behavior):**\n- `docs/operational-specification.md` -- Read the Order Commands section (`order place`, `order validate`, `order brew`), the Orders List section (`orders list`, `--status` filter), and the Size Scaling section (S=1.0x, M=1.5x, L=2.0x). Do NOT read the entire spec or other command sections.\n\n### Requirements\n\n- Create `scripts/blackbox-tests/test-orders.sh` with test functions that use the helpers from `helpers.sh`\n- Define a `test_order_commands()` function containing all your tests\n- Register a category with `register_category \"orders\" 25 \"Orders\"` at the top of your file (outside the function)\n- Test `order place` with recipe name and `--size` flag\n- Test `order validate` state transition (PLACED -> VALIDATED)\n- Test `order brew` state transition (VALIDATED -> COMPLETED) and brew plan output\n- Test `orders list` and `orders list --status COMPLETED` filter\n- Test size scaling: place orders with S, M, L sizes\n- Test invalid state transitions (e.g., validate an already-brewed order)\n- Test ordering a nonexistent recipe (error)\n- Test brewing without validating first (error, per spec)\n- Use `extract_id()` from helpers to capture order IDs from command output\n- Use `setup_cmd()` to seed inventory and recipes before testing orders\n- Use `new_data_dir()` for test isolation between test groups. **WARNING:** Do NOT call `new_data_dir` inside `$()` (e.g., `data_dir=$(new_data_dir)`). The function exports `BARISTA_DATA_DIR` as a side-effect, and `$()` runs it in a subshell where the export is silently discarded. Call it bare: `new_data_dir` then use `$BARISTA_DATA_DIR`.\n- Do NOT read all open issues or the full operational spec\n\n### Files to Touch\n\n- Create: `scripts/blackbox-tests/test-orders.sh`\n\n### Definition of Done\n\n- [ ] `scripts/blackbox-tests/test-orders.sh` created and executable\n- [ ] Tests all order CLI commands from the spec\n- [ ] Tests all order error cases from the spec\n- [ ] Tests size scaling with all three sizes (S, M, L)\n- [ ] Uses helpers.sh framework (no duplicated helper functions)\n- [ ] Uses data isolation via `new_data_dir()`\n- [ ] PR created and merged",
+    "labels": [
+      "wave:0",
+      "type:test",
+      "area:testing"
+    ]
+  },
+  {
+    "number": 4,
+    "title": "Blackbox Tests: End-to-End Workflows",
+    "body": "## Blackbox Tests: End-to-End Workflows\n\n**Type**: Test\n**Wave**: 0\n\n> **Wave 0 context**: This is a pre-implementation issue. The CLI is NOT implemented yet -- you are writing tests BEFORE implementation. Your tests will fail when run against the empty scaffold, and that is expected. Focus on encoding the specified behavior as test cases using the helpers API. Do NOT implement the CLI yourself.\n\n### What to Read\n\n**Testing methodology (read this before writing your test):**\n- `docs/blackbox-testing.md` -- Best practices for writing robust CLI blackbox tests. Follow these patterns for flexible output parsing, assertions, partial credit, data isolation, and error case testing.\n\n**Test framework (read this to understand the API you must use):**\n- `scripts/blackbox-tests/helpers.sh` -- Shared test infrastructure already provided. Contains `run_cmd()`, `pass()`/`fail()`/`pass_partial()`, `assert_success()`/`assert_error()`/`assert_empty()`, `setup_cmd()`, `new_data_dir()`, `extract_id()`, scoring, and JSON output. Your file will be auto-sourced by `scripts/blackbox-test.sh` -- do NOT duplicate these functions.\n\n> **Common mistakes (your PR will be rejected if you do any of these):**\\n> - `run_cmd \"inventory add espresso 100 ml\"` -- WRONG (single string). Correct: `run_cmd inventory add espresso 100 ml` (separate args)\\n> - `source helpers.sh` or `source scripts/blackbox-tests/helpers.sh` -- WRONG. helpers.sh is auto-sourced by the entry point. Do NOT source it yourself.\\n> - `detect_cli` -- WRONG. Do NOT call detect_cli. It is called once by the entry point.\\n> - `barista inventory list` -- WRONG. Use `run_cmd inventory list` (no `barista` prefix; `run_cmd` handles CLI detection).\\n> - `return 0` or `exit 0` at the top of your test function -- WRONG (stub test). Your function must contain real `run_cmd`/`assert_*` calls that actually exercise the CLI.\\n> - Calling both `assert_success \"name\" \"cat\"` and `pass \"name\" \"cat\"` for the same check -- WRONG (double-counting). `assert_success` already calls `pass` internally.\\n> - `[[ \"$OUTPUT_TEXT\" == \"espresso: 100 ml\" ]]` -- FRAGILE. Use pattern matching (`espresso.*100.*ml`) to tolerate whitespace and formatting differences.\n\n**Specification (the source of truth for expected behavior):**\n- `docs/operational-specification.md` -- Read the User Workflows section. This section describes multi-step scenarios that chain commands together. Also skim the Persistence section for data isolation requirements. Do NOT read other sections in detail.\n\n### Requirements\n\n- Create `scripts/blackbox-tests/test-workflows.sh` with test functions that use the helpers from `helpers.sh`\n- Define a `test_workflow_commands()` function containing all your tests\n- Register a category with `register_category \"workflows\" 25 \"Workflows\"` at the top of your file (outside the function)\n- Test full order lifecycle: add inventory -> add recipe -> place order -> validate -> brew -> verify state\n- After brewing, verify inventory was consumed (quantities decreased by correct scaled amounts)\n- Test insufficient inventory rejection: drain inventory, then verify validation rejects\n- Test data persistence: write data in one CLI invocation, read it back in another\n- Test round-trip verification: create a resource, immediately read it back and verify it exists\n- Use `extract_id()` from helpers to capture IDs from command output and pass to subsequent commands\n- Use `setup_cmd()` to seed inventory and recipes, aborting on failure\n- Use `new_data_dir()` for each test group to prevent state pollution. **WARNING:** Do NOT call `new_data_dir` inside `$()` (e.g., `dir=$(new_data_dir)`). The function exports `BARISTA_DATA_DIR` as a side-effect, and `$()` runs it in a subshell where the export is silently discarded. Call it bare: `new_data_dir` then use `$BARISTA_DATA_DIR`.\n- Do NOT read all open issues or the full operational spec\n\n### Files to Touch\n\n- Create: `scripts/blackbox-tests/test-workflows.sh`\n\n### Definition of Done\n\n- [ ] `scripts/blackbox-tests/test-workflows.sh` created and executable\n- [ ] Tests end-to-end workflows from the spec\n- [ ] Tests inventory consumption after brewing\n- [ ] Tests insufficient inventory handling\n- [ ] Tests data persistence across CLI invocations\n- [ ] Uses helpers.sh framework (no duplicated helper functions)\n- [ ] Uses data isolation via `new_data_dir()`\n- [ ] PR created and merged",
+    "labels": [
+      "wave:0",
+      "type:test",
+      "area:testing"
+    ]
+  },
+  {
+    "number": 5,
+    "title": "Test: CLI Commands Interface Contract",
+    "body": "## Test: CLI Commands Interface Contract\n\n**Type**: Test\n**Layer**: Interface\n**Wave**: 1\n\n### Test Specification\n\n**What to test**: Create interface contract tests for all CLI commands. Define expected input/output formats, error message formats, and exit codes.\n\n**Operational spec reference**: `docs/operational-specification.md` (CLI Commands section)\n**Interface contract**: `contracts/cli-commands.yaml` (to be created)\n\n**Resilience**: Since implementation happens in parallel across multiple workers and PRs, contract tests must be resilient to incremental implementation. Use conditional skip markers (e.g., `pytest.importorskip`, `@pytest.mark.skipif`) for command groups not yet registered. Tests should validate what exists without hard-failing on what doesn't.\n\n**Expected behaviors**:\n- [ ] CLI command interfaces defined in `contracts/cli-commands.yaml`\n- [ ] All command argument parsing tested\n- [ ] Output format consistency verified\n- [ ] Error message formats verified\n- [ ] Exit codes verified (0 for success, non-zero for errors)\n\n### Access Restrictions\n\n⚠️ **IMPORTANT**: Test implementation code should NOT be accessible to implementation workers.\n- Workers should only see this test specification\n- Workers should implement based on operational spec, not test code\n- Test results (pass/fail) will validate implementation\n\n### Files to Touch\n\n- Create: `contracts/cli-commands.yaml`\n- Create: `tests/interfaces/cli-commands-contract.test.py`\n- Update: `scripts/check.sh` (add interface tests)\n\n### Definition of Done\n\n- [ ] Contract file created (`contracts/cli-commands.yaml`)\n- [ ] Interface tests created in `tests/interfaces/cli-commands-contract.test.py`\n- [ ] Tests cover all behaviors listed\n- [ ] Tests are documented\n- [ ] Tests integrated into `check.sh`\n- [ ] Tests pass\n- [ ] Test implementation is NOT exposed to implementation workers\n- [ ] `./scripts/check.sh` passes",
+    "labels": [
+      "wave:1",
+      "area:testing",
+      "risk:low",
+      "type:test",
+      "layer:interface"
+    ]
+  },
+  {
+    "number": 6,
+    "title": "Test: Data Schema Interface Contract",
+    "body": "## Test: Data Schema Interface Contract\n\n**Type**: Test\n**Layer**: Interface\n**Wave**: 1\n\n### Test Specification\n\n**What to test**: Create interface contract tests for JSON data schema. Define expected data structure, types, and validation rules.\n\n**Operational spec reference**: `docs/operational-specification.md` (Data Format section)\n**Interface contract**: `contracts/data-schema.json` (to be created)\n\n**Expected behaviors**:\n- [ ] JSON schema defined in `contracts/data-schema.json`\n- [ ] Data structure validation tested\n- [ ] Type validation tested\n- [ ] Required fields validated\n\n### Access Restrictions\n\n⚠️ **IMPORTANT**: Test implementation code should NOT be accessible to implementation workers.\n- Workers should only see this test specification\n- Workers should implement based on operational spec, not test code\n- Test results (pass/fail) will validate implementation\n\n### Files to Touch\n\n- Create: `contracts/data-schema.json`\n- Create: `tests/interfaces/data-schema-contract.test.py`\n- Update: `scripts/check.sh` (add interface tests)\n\n### Definition of Done\n\n- [ ] Schema file created (`contracts/data-schema.json`)\n- [ ] Interface tests created in `tests/interfaces/data-schema-contract.test.py`\n- [ ] Tests cover all behaviors listed\n- [ ] Tests are documented\n- [ ] Tests integrated into `check.sh`\n- [ ] Tests pass\n- [ ] Test implementation is NOT exposed to implementation workers\n- [ ] `./scripts/check.sh` passes",
+    "labels": [
+      "wave:1",
+      "area:testing",
+      "risk:low",
+      "type:test",
+      "layer:interface"
+    ]
+  },
+  {
+    "number": 7,
+    "title": "Implement: Domain Entities",
+    "body": "## Implement: Domain Entities\n\n**Type**: Implementation\n**Wave**: 1\n**Depends on**: #5, #6\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Domain entities section\n**Deliver value**: Core business logic entities with validation and business rules.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (domain entities section)\n- ✅ Read `specs/plan.md` (Domain Layer section)\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Focus on delivering value per the specification\n- ✅ Ensure `pyproject.toml` has a `[project.scripts]` entry: `barista = \"robotic_barista.cli:cli\"` so `barista` works after `pip install -e .`\n- ✅ Create `src/robotic_barista/cli/__main__.py` that imports and calls the CLI so `python -m robotic_barista.cli` works\n\n**DO NOT**:\n- ❌ Access test implementation code from #5 or #6\n- ❌ Implement to pass tests; implement to meet specification\n- ❌ Look at test code to understand requirements\n\n### Test Validation\n\nTests from #5 and #6 will validate your implementation.\n- Tests are validation tools, not implementation guides\n- If tests fail, check your implementation against the operational spec at `docs/operational-specification.md`\n- If you believe a test is wrong, create issue with label `blocker:test-arbitration`\n\n### Files to Touch\n\n- Create: `src/robotic_barista/domain/ingredient.py`\n- Create: `src/robotic_barista/domain/inventory_item.py`\n- Create: `src/robotic_barista/domain/recipe.py`\n- Create: `src/robotic_barista/domain/order.py`\n- Create: `tests/unit/domain/test_size_scaling.py`\n- Create: `tests/unit/domain/test_order_state_machine.py`\n- Create: `tests/unit/domain/test_inventory_validation.py`\n- Update: `pyproject.toml` (add `[project.scripts]` entry for `barista`)\n- Create: `src/robotic_barista/cli/__main__.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] `barista` CLI entry point works after `pip install -e .`\n- [ ] All entities created with proper validation\n- [ ] Size scaling logic implemented (S=1.0x, M=1.5x, L=2.0x)\n- [ ] Order state machine implemented\n- [ ] Unit tests written (TDD) and passing\n- [ ] All interface contract tests from #5 and #6 pass\n- [ ] Code coverage >= 60%\n- [ ] `ruff check` passes with no errors\n- [ ] `ruff format --check .` passes (code is formatted)\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence\n- [ ] Review verifies value delivery, not just test passing",
+    "labels": [
+      "wave:1",
+      "area:domain",
+      "risk:medium",
+      "type:implementation",
+      "tdd:required"
+    ]
+  },
+  {
+    "number": 8,
+    "title": "Implement: Repository Interfaces",
+    "body": "## Implement: Repository Interfaces\n\n**Type**: Implementation\n**Wave**: 1\n**Depends on**: #7\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Storage layer section\n**Deliver value**: Repository interfaces for abstraction, enabling future SQLite migration.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (storage layer section)\n- ✅ Read `specs/plan.md` (Storage Layer section)\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Design interfaces to allow future SQLite migration\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Implement concrete storage yet (that's next task)\n- ❌ Make interfaces too specific to JSON\n\n### Files to Touch\n\n- Create: `src/robotic_barista/storage/repositories.py`\n- Create: `tests/unit/storage/test_repository_interfaces.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] RecipeRepository, InventoryRepository, OrderRepository interfaces defined\n- [ ] Unit tests written (TDD) and passing\n- [ ] Code coverage >= 60%\n- [ ] `ruff check` passes with no errors\n- [ ] `ruff format --check .` passes (code is formatted)\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "wave:1",
+      "risk:low",
+      "type:implementation",
+      "tdd:required",
+      "area:storage"
+    ]
+  },
+  {
+    "number": 9,
+    "title": "Implement: JSON Storage",
+    "body": "## Implement: JSON Storage\n\n**Type**: Implementation\n**Wave**: 1\n**Depends on**: #8\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Persistence section\n**Deliver value**: JSON file storage with atomic writes, ensuring data integrity.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (persistence section)\n- ✅ Read `specs/plan.md` (Data Model section)\n- ✅ Implement atomic write pattern (temp file → rename)\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Write integration tests for persistence\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Use in-memory storage\n- ❌ Skip atomic writes (data corruption risk)\n\n### Files to Touch\n\n- Create: `src/robotic_barista/storage/json_repository.py`\n- Create: `tests/unit/storage/test_json_repository.py`\n- Create: `tests/integration/test_persistence.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] JSON storage works correctly\n- [ ] Atomic writes prevent corruption (temp file → rename)\n- [ ] Data directory created on first use\n- [ ] Unit tests written (TDD) and passing\n- [ ] Integration tests for persistence passing\n- [ ] Code coverage >= 60%\n- [ ] `ruff check` passes with no errors\n- [ ] `ruff format --check .` passes (code is formatted)\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "wave:1",
+      "risk:medium",
+      "type:implementation",
+      "tdd:required",
+      "area:storage"
+    ]
+  },
+  {
+    "number": 10,
+    "title": "Implement: Recipe Service",
+    "body": "## Implement: Recipe Service\n\n**Type**: Implementation\n**Wave**: 2\n**Depends on**: #9\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Recipe management section\n**Deliver value**: Users can create, list, and view recipes.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (recipe commands section)\n- ✅ Read user manual (recipe workflows)\n- ✅ Support recipe name lookup (enhancement from spec)\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code from previous test tickets\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Create: `src/robotic_barista/services/recipe_service.py`\n- Create: `tests/unit/services/test_recipe_service.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Recipe service works correctly (create, list, show)\n- [ ] Recipe name lookup supported (enhancement)\n- [ ] Unit tests written (TDD) and passing\n- [ ] Code coverage >= 70%\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:medium",
+      "type:implementation",
+      "tdd:required",
+      "wave:2",
+      "area:services"
+    ]
+  },
+  {
+    "number": 11,
+    "title": "Implement: Inventory Service",
+    "body": "## Implement: Inventory Service\n\n**Type**: Implementation\n**Wave**: 2\n**Depends on**: #9\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Inventory management section\n**Deliver value**: Users can add and track ingredients.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (inventory commands section)\n- ✅ Handle ingredient creation if new\n- ✅ Validate unit matching\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code from previous test tickets\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Create: `src/robotic_barista/services/inventory_service.py`\n- Create: `tests/unit/services/test_inventory_service.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Inventory service works correctly (add, list)\n- [ ] Ingredient creation if new\n- [ ] Unit matching validation\n- [ ] Unit tests written (TDD) and passing\n- [ ] Code coverage >= 70%\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:medium",
+      "type:implementation",
+      "tdd:required",
+      "wave:2",
+      "area:services",
+      "parallel"
+    ]
+  },
+  {
+    "number": 12,
+    "title": "Implement: Recipe CLI Commands",
+    "body": "## Implement: Recipe CLI Commands\n\n**Type**: Implementation\n**Wave**: 2\n**Depends on**: #10\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Recipe CLI commands section\n**Deliver value**: Users can interact with recipes via CLI.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (recipe commands section)\n- ✅ Support recipe names (not just IDs)\n- ✅ Format output per spec\n- ✅ Handle errors with clear messages\n- ✅ Use `BARISTA_DATA_DIR` environment variable for data file location (see persistence section of spec)\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Create: `src/robotic_barista/cli/recipes.py`\n- Create: `tests/system/black-box/test_recipe_commands.py` (black box tests)\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] All recipe commands work (`recipes list`, `recipes show`, `recipes add`)\n- [ ] Recipe names supported (not just IDs)\n- [ ] Output format matches spec\n- [ ] Error handling works correctly\n- [ ] Black box tests pass\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:low",
+      "type:implementation",
+      "wave:2",
+      "area:cli"
+    ]
+  },
+  {
+    "number": 13,
+    "title": "Implement: Inventory CLI Commands",
+    "body": "## Implement: Inventory CLI Commands\n\n**Type**: Implementation\n**Wave**: 2\n**Depends on**: #11\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Inventory CLI commands section\n**Deliver value**: Users can manage inventory via CLI.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (inventory commands section)\n- ✅ Format output per spec\n- ✅ Handle errors (unit mismatch, etc.)\n- ✅ Use `BARISTA_DATA_DIR` environment variable for data file location (see persistence section of spec)\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Create: `src/robotic_barista/cli/inventory.py`\n- Create: `tests/system/black-box/test_inventory_commands.py` (black box tests)\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] All inventory commands work (`inventory list`, `inventory add`)\n- [ ] Output format matches spec\n- [ ] Error handling works correctly (unit mismatch, etc.)\n- [ ] Black box tests pass\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:low",
+      "type:implementation",
+      "wave:2",
+      "area:cli"
+    ]
+  },
+  {
+    "number": 14,
+    "title": "Implement: Order Placement",
+    "body": "## Implement: Order Placement\n\n**Type**: Implementation\n**Wave**: 2\n**Depends on**: #10\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Order place command section\n**Deliver value**: Users can place orders for drinks.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (order place command section)\n- ✅ Support recipe names (not just IDs)\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Create: `src/robotic_barista/services/order_service.py` (partial - placement only)\n- Create: `tests/unit/services/test_order_service_placement.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Order placement works correctly (PLACED state)\n- [ ] Recipe names supported (not just IDs)\n- [ ] Unit tests written (TDD) and passing\n- [ ] Code coverage >= 70%\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:medium",
+      "type:implementation",
+      "tdd:required",
+      "wave:2",
+      "area:services"
+    ]
+  },
+  {
+    "number": 15,
+    "title": "Implement: Order Place CLI Command",
+    "body": "## Implement: Order Place CLI Command\n\n**Type**: Implementation\n**Wave**: 2\n**Depends on**: #14\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Order place CLI command section\n**Deliver value**: Users can place orders via CLI.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (order place command section)\n- ✅ Print order ID on success\n- ✅ Format output per spec\n- ✅ Use `BARISTA_DATA_DIR` environment variable for data file location (see persistence section of spec)\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Create: `src/robotic_barista/cli/order.py` (partial - place command only)\n- Create: `tests/system/black-box/test_order_place_command.py` (black box tests)\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Order place command works\n- [ ] Output format matches spec (prints order ID)\n- [ ] Black box tests pass\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:low",
+      "type:implementation",
+      "wave:2",
+      "area:cli"
+    ]
+  },
+  {
+    "number": 16,
+    "title": "Implement: Order Validation",
+    "body": "## Implement: Order Validation\n\n**Type**: Implementation\n**Wave**: 3\n**Depends on**: #14, #11\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Order validate command section\n**Deliver value**: Orders can be validated against inventory before brewing.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (order validate command section)\n- ✅ Check inventory against scaled ingredient requirements\n- ✅ Apply size scaling (S=1.0x, M=1.5x, L=2.0x)\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Extend: `src/robotic_barista/services/order_service.py` (add validation logic)\n- Create: `tests/unit/services/test_order_service_validation.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Order validation works correctly\n- [ ] Size scaling applied correctly (S=1.0x, M=1.5x, L=2.0x)\n- [ ] Transitions to VALIDATED or FAILED correctly\n- [ ] Error messages are clear with missing ingredients\n- [ ] Unit tests written (TDD) and passing)\n- [ ] Code coverage >= 80%\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "type:implementation",
+      "tdd:required",
+      "area:services",
+      "wave:3",
+      "risk:high"
+    ]
+  },
+  {
+    "number": 17,
+    "title": "Implement: Order Brewing",
+    "body": "## Implement: Order Brewing\n\n**Type**: Implementation\n**Wave**: 3\n**Depends on**: #16\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Order brew command section\n**Deliver value**: Validated orders can be brewed with brew plan generation and inventory consumption.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (order brew command section)\n- ✅ Generate brew plan (scaled ingredients + steps)\n- ✅ Re-validate inventory before brewing\n- ✅ Consume inventory atomically\n- ✅ Write unit tests first (TDD), then implement\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Extend: `src/robotic_barista/services/order_service.py` (add brewing logic)\n- Create: `tests/unit/services/test_order_service_brewing.py`\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Order brewing works correctly\n- [ ] Brew plan format matches spec exactly\n- [ ] Inventory consumed correctly (atomically)\n- [ ] Re-validation works (fails if inventory changed)\n- [ ] Unit tests written (TDD) and passing\n- [ ] Code coverage >= 80%\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "type:implementation",
+      "tdd:required",
+      "area:services",
+      "wave:3",
+      "risk:high"
+    ]
+  },
+  {
+    "number": 18,
+    "title": "Implement: Order Validate and Brew CLI Commands",
+    "body": "## Implement: Order Validate and Brew CLI Commands\n\n**Type**: Implementation\n**Wave**: 3\n**Depends on**: #16, #17\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Order validate and brew CLI commands section\n**Deliver value**: Users can validate and brew orders via CLI.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (order validate and brew command sections)\n- ✅ Format brew plan output per spec exactly\n- ✅ Handle errors with clear messages\n- ✅ Use `BARISTA_DATA_DIR` environment variable for data file location (see persistence section of spec)\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Extend: `src/robotic_barista/cli/order.py` (add validate and brew commands)\n- Create: `tests/system/black-box/test_order_validate_brew_commands.py` (black box tests)\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Order validate command works\n- [ ] Order brew command works\n- [ ] Brew plan format matches spec exactly (see operational spec example)\n- [ ] Error handling works correctly\n- [ ] Black box tests pass\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:medium",
+      "type:implementation",
+      "area:cli",
+      "wave:3"
+    ]
+  },
+  {
+    "number": 19,
+    "title": "Implement: Orders List CLI Command",
+    "body": "## Implement: Orders List CLI Command\n\n**Type**: Implementation\n**Wave**: 3\n**Depends on**: #14\n\n### Primary Goal\n\n**Implement per operational specification** (`docs/operational-specification.md`): Orders list command section\n**Deliver value**: Users can list orders with optional status filter.\n\n### Implementation Guidance\n\n**DO**:\n- ✅ Read operational specification at `docs/operational-specification.md` (orders list command section)\n- ✅ Support --status filter\n- ✅ Format output per spec\n- ✅ Use `BARISTA_DATA_DIR` environment variable for data file location (see persistence section of spec)\n- ✅ Focus on delivering value per the specification\n\n**DO NOT**:\n- ❌ Access test implementation code\n- ❌ Implement to pass tests; implement to meet specification\n\n### Files to Touch\n\n- Extend: `src/robotic_barista/cli/order.py` (add list command)\n- Create: `tests/system/black-box/test_orders_list_command.py` (black box tests)\n\n### Definition of Done\n\n- [ ] Implementation matches operational specification (PRIMARY)\n- [ ] Orders list command works\n- [ ] Status filter works correctly\n- [ ] Output format matches spec\n- [ ] Black box tests pass\n- [ ] `./scripts/check.sh` passes\n- [ ] Documentation updated\n- [ ] PR includes test evidence",
+    "labels": [
+      "risk:low",
+      "type:implementation",
+      "area:cli",
+      "wave:3"
+    ]
+  },
+  {
+    "number": 20,
+    "title": "Test: Integration Tests",
+    "body": "## Test: Integration Tests\n\n**Type**: Test\n**Layer**: Integration\n**Wave**: 3\n**Depends on**: #18, #19\n\n### Test Specification\n\n**What to test**: Create integration tests for complete workflows.\n\n**Operational spec reference**: `docs/operational-specification.md` (User Workflows section)\n\n**Blackbox test reference**: Review `scripts/blackbox-test.sh` (if it exists) for additional context on expected CLI behaviors and workflows. Use it to inform your integration test design.\n\n**Expected behaviors**:\n- [ ] Complete order workflow (place → validate → brew)\n- [ ] Persistence across operations\n- [ ] Cross-component interactions\n- [ ] Error scenarios\n\n### Access Restrictions\n\n⚠️ **IMPORTANT**: Test implementation code should NOT be accessible to implementation workers.\n- Workers should only see this test specification\n- Workers should implement based on operational spec, not test code\n- Test results (pass/fail) will validate implementation\n\n### Files to Touch\n\n- Create: `tests/integration/test_order_workflow.py`\n- Create: `tests/integration/test_persistence.py`\n- Create: `tests/integration/test_inventory_recipe_order.py`\n- Update: `scripts/check.sh` (add integration tests)\n\n### Definition of Done\n\n- [ ] Integration tests created\n- [ ] Tests verify complete workflows\n- [ ] Tests verify persistence\n- [ ] Tests verify cross-component interactions\n- [ ] Tests pass\n- [ ] Tests integrated into `check.sh`\n- [ ] Test implementation is NOT exposed to implementation workers",
+    "labels": [
+      "area:testing",
+      "risk:low",
+      "type:test",
+      "wave:3",
+      "layer:integration"
+    ]
+  },
+  {
+    "number": 21,
+    "title": "Test: Black Box System Tests",
+    "body": "## Test: Black Box System Tests\n\n**Type**: Test\n**Layer**: System (Black Box)\n**Wave**: 3\n**Depends on**: #18, #19\n\n### Test Specification\n\n**What to test**: Create black box system tests derived from operational specification.\n\n**Operational spec reference**: `docs/operational-specification.md` (entire document - all CLI commands, workflows, behaviors)\n\n**Blackbox test reference**: Review `scripts/blackbox-test.sh` (if it exists) for additional context on expected CLI behaviors, workflows, and error cases. Use it to inform your system test design.\n\n**Expected behaviors**:\n- [ ] All CLI commands as black box (execute via subprocess)\n- [ ] Complete user workflows end-to-end\n- [ ] Error scenarios\n- [ ] Edge cases\n- [ ] Output format matches spec exactly\n- [ ] Exit codes verified (0 for success, non-zero for errors)\n\n### Access Restrictions\n\n⚠️ **IMPORTANT**: These tests are derived from operational specification.\n- Test implementation code should NOT be accessible to implementation workers\n- Workers should only see this test specification\n- Workers should implement based on operational spec, not test code\n- Test results (pass/fail) will validate implementation\n\n### Files to Touch\n\n- Create: `tests/system/black-box/cli-commands.test.py`\n- Create: `tests/system/black-box/user-workflows.test.py`\n- Update: `scripts/check.sh` (add system tests)\n\n### Definition of Done\n\n- [ ] Black box tests created in `tests/system/black-box/cli-commands.test.py`\n- [ ] Tests derived from operational specification\n- [ ] Tests verify all CLI commands as black box\n- [ ] Tests verify complete user workflows\n- [ ] Tests verify error scenarios\n- [ ] Tests verify output format matches spec exactly\n- [ ] Tests verify exit codes\n- [ ] Tests pass\n- [ ] Tests integrated into `check.sh`\n- [ ] Test implementation is NOT exposed to implementation workers",
+    "labels": [
+      "area:testing",
+      "risk:low",
+      "type:test",
+      "wave:3",
+      "layer:system"
+    ]
+  },
+  {
+    "number": 22,
+    "title": "Test: Comprehensive Test Coverage",
+    "body": "## Test: Comprehensive Test Coverage\n\n**Type**: Test\n**Wave**: 4\n**Depends on**: #21\n\n### Description\n\nEnsure comprehensive test coverage across all layers.\n\n**Blackbox test reference**: Review `scripts/blackbox-test.sh` (if it exists) for context on expected CLI behaviors and edge cases that should be covered by your tests.\n\n**Important**: Coverage is measured by `pytest-cov`. Subprocess-based black-box tests (e.g., tests that shell out to `barista` via `subprocess.run`) do NOT contribute to coverage measurement. Focus on unit and integration tests that import and call Python code directly for coverage improvement. You may exclude subprocess test files from coverage targets if needed.\n\n### Files to Touch\n\n- Review all test files\n- Add missing test cases\n- Add unit/integration tests for uncovered code paths\n- Update coverage thresholds\n\n### Definition of Done\n\n- [ ] Code coverage >= 80% (measured by pytest-cov; subprocess-based tests do not count)\n- [ ] All test layers have adequate coverage\n- [ ] Edge cases covered\n- [ ] `./scripts/check.sh` passes",
+    "labels": [
+      "area:testing",
+      "risk:low",
+      "type:test",
+      "wave:4"
+    ]
+  },
+  {
+    "number": 23,
+    "title": "Documentation: Complete Documentation",
+    "body": "## Documentation: Complete Documentation\n\n**Type**: Documentation\n**Wave**: 4\n**Depends on**: #21\n\n### Description\n\nComplete all documentation (README, user manual, etc.).\n\n### Files to Touch\n\n- Update: `README.md`\n- Create: `docs/user-manual.md`\n- Review all documentation\n\n### Definition of Done\n\n- [ ] README updated with examples\n- [ ] User manual complete\n- [ ] Operational specification complete\n- [ ] All documentation reviewed",
+    "labels": [
+      "risk:low",
+      "wave:4",
+      "area:documentation",
+      "type:documentation"
+    ]
+  },
+  {
+    "number": 24,
+    "title": "Implement: Performance and Edge Cases",
+    "body": "## Implement: Performance and Edge Cases\n\n**Type**: Implementation\n**Wave**: 4\n**Depends on**: #21\n\n### Description\n\nHandle remaining edge cases and optimize if needed.\n\n### Files to Touch\n\n- Review edge case handling\n- Optimize if needed\n\n### Definition of Done\n\n- [ ] All edge cases handled\n- [ ] Performance acceptable\n- [ ] `./scripts/check.sh` passes",
+    "labels": [
+      "risk:low",
+      "type:implementation",
+      "area:services",
+      "wave:4"
+    ]
+  }
+]

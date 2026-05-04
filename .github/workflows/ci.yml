@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Check go fmt
+        run: |
+          output=$(gofmt -l ./internal ./pkg ./cmd ./test 2>&1 || true)
+          if [ -n "$output" ]; then
+            echo "::error::Files not formatted with gofmt:"
+            echo "$output"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Build all packages
+        run: go build -v ./...
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Run unit tests with coverage
+        run: |
+          go test -race -coverprofile=coverage.out -covermode=atomic \
+            ./internal/... ./pkg/...
+
+      - name: Run integration tests
+        run: go test -race -timeout 120s ./test/...
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  # Python-side token tracking tests. These cover the emission path
+  # (_emit_oat_tokens → OAT_TOOL_LOG → daemon parser) and stress cases
+  # (sequential accuracy, concurrent writers, cache field handling).
+  # They run fast (<1s total) and need no API keys.
+  python-token-tests:
+    name: Python Token Tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        run: pip install uv
+      - name: Sync deepagents-cli dependencies
+        working-directory: agent-runtime/libs/cli
+        run: uv sync --frozen --group test
+      - name: Run token tracking unit + stress tests
+        working-directory: agent-runtime/libs/cli
+        run: |
+          uv run --group test pytest -q \
+            tests/unit_tests/test_token_tracker.py \
+            tests/unit_tests/test_token_tracking.py \
+            tests/unit_tests/test_token_emission_stress.py
+
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Install the gitleaks binary directly (Apache-2.0, free for orgs).
+      # The official gitleaks-action v2 now requires a paid license for
+      # GitHub organizations, so we invoke the CLI ourselves. This keeps
+      # us on the same scanner/config and still covers full history.
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.21.2
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Run gitleaks (full history)
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose --exit-code 1
+
+  # Keep existing branch protection for main
+  check-source:
+    name: Check Source Branch
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only allow merges from dev
+        if: github.head_ref != 'dev'
+        run: |
+          echo "Only the dev branch can merge into main."
+          exit 1

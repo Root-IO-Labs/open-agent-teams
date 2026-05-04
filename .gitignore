@@ -1,0 +1,111 @@
+# Binaries
+/oat
+/oat-agent
+/oats-bench
+bin/
+cmd/oat-agent/oat-agent
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files (never commit local credentials)
+.env
+.env.local
+.env.*
+!.env.example
+
+# Log files
+*.log
+
+# Node (defensive — no JS shipped today)
+node_modules/
+
+# oat runtime (but allow config files)
+.oat/*
+!.oat/*.md
+
+# OAT Agent Runtime prompt injection (written per-worktree)
+.deepagents/
+
+# Benchmark results (generated per-run)
+benchmarks/results/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Python coverage
+.coverage
+
+# Built agent binary
+/oat-agent
+
+# Python cache (duplicate guard)
+__pycache__
+
+# Generated coverage
+coverage.out
+# Claude Code settings
+.claude/settings.local.json
+
+# Debug files
+debug*.go
+
+# Go build cache
+.gocache/
+
+# Temp / scratch files
+.tmp-*
+
+# Terraform
+infra/.terraform/
+*.tfstate
+*.tfstate.backup
+
+# Python packaging artifacts
+*.egg-info/
+dist/
+build/
+
+# Python virtual environments
+.venv/
+
+# Model profile backups (auto-created by `oat model onboard` when a re-probe
+# scores lower than the previous run; kept on disk as a safety net but never
+# intended to be tracked in git).
+model-routing/profiles/*.yaml.bak
+
+# Audit artifacts (generated, not source)
+AUDIT_PLAN.md
+PUBLIC_REPO_AUDIT.md
+CODE_HYGIENE_REPORT.md
+
+# Blog drafts (publish separately)
+blog/
+
+# Local Bedrock benchmarking notes (not for the public repo)
+docs/bedrock-benchmarking.md

@@ -1,0 +1,474 @@
+package routing
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// minimumProbeSetPenalty is the score deduction applied to profiles that were
+// onboarded with --probe-set minimum. Untested probes in the minimum set default
+// to optimistic 1.0 scores; the penalty makes BestEligible prefer fully-probed
+// profiles when overall scores are close. Tuned to 5 per PR #2 brief (P0-C).
+const minimumProbeSetPenalty = 5
+
+// AgentRole represents what role the model will fill.
+type AgentRole int
+
+const (
+	RoleWorker AgentRole = iota
+	RoleOrchestrator
+)
+
+func (r AgentRole) String() string {
+	switch r {
+	case RoleWorker:
+		return "worker"
+	case RoleOrchestrator:
+		return "orchestrator"
+	default:
+		return "unknown"
+	}
+}
+
+// ModelProfile holds the parsed capability data from a YAML profile.
+type ModelProfile struct {
+	ModelID  string
+	Status   string // "known" or "restricted"
+	Provider string
+
+	// Capabilities (0.0–1.0 scores)
+	ToolReliability      float64
+	ShellReliability     float64
+	ShellRecovery        float64
+	FileWriteReliability float64
+	TokenReporting       float64
+	Streaming            float64
+	MultiTurn            float64
+	LargeOutput          float64
+
+	// Context
+	EffectiveContextClass string // "large", "medium", "small", "unknown"
+	MaxInputTokens        int64  // 0 if unknown
+
+	// Reasoning
+	ReasoningControls string // "none", "not_tested", or csv of controls
+
+	// Latency (ms, from probe measurements)
+	LatencyAvgMs            int // average across probes; 0 = not measured
+	LatencyBasicInferenceMs int
+	LatencyToolCallMs       int
+
+	// Routing
+	AutonomyTier string // "full", "standard", "limited", "restricted"
+	OverallScore int
+
+	// Contract
+	OnboardingPassed     bool
+	WorkerEligible       bool
+	OrchestratorEligible bool
+
+	// Evidence
+	ProbeSet     string // "default" or "minimum"
+	ProbesRun    int    // number of probes executed (0 if unknown / legacy profile)
+	ProbesPassed int    // number of probes that passed
+
+	// Warnings
+	Warnings []string
+}
+
+// IsEligible checks whether this profile is eligible for the given role.
+func (p *ModelProfile) IsEligible(role AgentRole) bool {
+	if p.Status == "restricted" {
+		return false
+	}
+	switch role {
+	case RoleWorker:
+		return p.WorkerEligible
+	case RoleOrchestrator:
+		return p.OrchestratorEligible
+	default:
+		return false
+	}
+}
+
+// HasReasoningControls returns true if the model supports reasoning effort tuning.
+func (p *ModelProfile) HasReasoningControls() bool {
+	return p.ReasoningControls != "" && p.ReasoningControls != "none" && p.ReasoningControls != "not_tested"
+}
+
+// HasLatencyData returns true if probe latency measurements are available.
+func (p *ModelProfile) HasLatencyData() bool {
+	return p.LatencyAvgMs > 0
+}
+
+// IsFullyProbed returns true if the model was onboarded with the full probe set.
+func (p *ModelProfile) IsFullyProbed() bool {
+	return p.ProbeSet == "" || p.ProbeSet == "default"
+}
+
+// ProfileStore loads and caches model profiles from disk.
+type ProfileStore struct {
+	mu       sync.RWMutex
+	profiles map[string]*ModelProfile // keyed by model_id
+	dir      string                   // path to profiles directory
+	logger   Logger                   // diagnostic logger; never nil (defaults to noopLogger)
+}
+
+// NewProfileStore creates a store and loads profiles from the given directory.
+// Diagnostics emitted during load (malformed YAML, missing required fields,
+// load-count summary) are discarded. Callers that want visibility into these
+// events should use NewProfileStoreWithLogger.
+func NewProfileStore(profileDir string) (*ProfileStore, error) {
+	return NewProfileStoreWithLogger(profileDir, nil)
+}
+
+// NewProfileStoreWithLogger creates a store and loads profiles from the given
+// directory, emitting diagnostic messages through logger. A nil logger is
+// replaced with a silent no-op implementation so callers can opt in without
+// changing behavior. See the Logger interface for the methods implementations
+// must provide.
+func NewProfileStoreWithLogger(profileDir string, logger Logger) (*ProfileStore, error) {
+	if logger == nil {
+		logger = noopLogger{}
+	}
+	ps := &ProfileStore{
+		profiles: make(map[string]*ModelProfile),
+		dir:      profileDir,
+		logger:   logger,
+	}
+	if err := ps.load(); err != nil {
+		return nil, err
+	}
+	return ps, nil
+}
+
+// Reload re-reads profiles from disk. Call after oat model onboard.
+func (ps *ProfileStore) Reload() error {
+	return ps.load()
+}
+
+// Get returns a profile by model ID, or nil if not found.
+func (ps *ProfileStore) Get(modelID string) *ModelProfile {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.profiles[modelID]
+}
+
+// All returns all loaded profiles.
+func (ps *ProfileStore) All() []*ModelProfile {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	result := make([]*ModelProfile, 0, len(ps.profiles))
+	for _, p := range ps.profiles {
+		result = append(result, p)
+	}
+	return result
+}
+
+// Eligible returns all profiles eligible for the given role.
+func (ps *ProfileStore) Eligible(role AgentRole) []*ModelProfile {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	var result []*ModelProfile
+	for _, p := range ps.profiles {
+		if p.IsEligible(role) {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// EligibleFiltered returns profiles eligible for the given role, intersected with
+// the allowed list. If allowed is empty/nil, returns all eligible profiles (no filtering).
+func (ps *ProfileStore) EligibleFiltered(role AgentRole, allowed []string) []*ModelProfile {
+	if len(allowed) == 0 {
+		return ps.Eligible(role)
+	}
+	allowSet := make(map[string]bool, len(allowed))
+	for _, m := range allowed {
+		allowSet[m] = true
+	}
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	var result []*ModelProfile
+	for _, p := range ps.profiles {
+		if p.IsEligible(role) && allowSet[p.ModelID] {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// Validate checks that a model is onboarded and eligible for the given role.
+// Returns nil if valid, or a descriptive error.
+func (ps *ProfileStore) Validate(modelID string, role AgentRole) error {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	p, ok := ps.profiles[modelID]
+	if !ok {
+		return fmt.Errorf("model %q is not onboarded — run: oat model onboard %s", modelID, modelID)
+	}
+	if !p.IsEligible(role) {
+		return fmt.Errorf("model %q is not eligible as %s (status=%s, tier=%s, worker=%v, orchestrator=%v)",
+			modelID, role, p.Status, p.AutonomyTier, p.WorkerEligible, p.OrchestratorEligible)
+	}
+	return nil
+}
+
+// BestEligible returns the highest-scoring eligible model for the given role.
+// If preferredModel is set and eligible, it is returned instead.
+// Tiebreaker: lower latency wins. If latency is equal or unknown, lexicographic model ID for stability.
+// Returns ("", error) if no eligible models exist.
+func (ps *ProfileStore) BestEligible(role AgentRole, preferredModel string) (string, error) {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	// If the user/repo has a preferred model and it's eligible, use it.
+	if preferredModel != "" {
+		if p, ok := ps.profiles[preferredModel]; ok && p.IsEligible(role) {
+			return preferredModel, nil
+		}
+	}
+
+	// effectiveScore penalises minimum-set profiles so BestEligible prefers
+	// fully-probed ones when overall scores are close. See minimumProbeSetPenalty
+	// comment for rationale.
+	effectiveScore := func(p *ModelProfile) int {
+		s := p.OverallScore
+		if p.ProbeSet == "minimum" {
+			s -= minimumProbeSetPenalty
+		}
+		return s
+	}
+
+	var best *ModelProfile
+	for _, p := range ps.profiles {
+		if !p.IsEligible(role) {
+			continue
+		}
+		if best == nil {
+			best = p
+			continue
+		}
+		pScore := effectiveScore(p)
+		bScore := effectiveScore(best)
+		if pScore > bScore {
+			best = p
+		} else if pScore == bScore {
+			// Tiebreaker 1: prefer lower latency (0 = unknown, sort last)
+			pLat := p.LatencyAvgMs
+			bLat := best.LatencyAvgMs
+			if pLat > 0 && (bLat == 0 || pLat < bLat) {
+				best = p
+			} else if pLat == bLat && p.ModelID < best.ModelID {
+				// Tiebreaker 2: lexicographic for determinism
+				best = p
+			}
+		}
+	}
+	if best == nil {
+		return "", fmt.Errorf("no eligible models onboarded for role %s — run: oat model onboard <provider:model>", role)
+	}
+	return best.ModelID, nil
+}
+
+// Count returns the number of loaded profiles.
+func (ps *ProfileStore) Count() int {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return len(ps.profiles)
+}
+
+// IsEmpty reports whether the store has zero loaded profiles. It is a
+// convenience for daemon startup code that wants to warn operators when the
+// profile directory is missing, empty, or entirely malformed.
+func (ps *ProfileStore) IsEmpty() bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return len(ps.profiles) == 0
+}
+
+// load reads all YAML files from the profile directory.
+//
+// Files are skipped (with a WARN or ERROR logged against ps.logger) when they
+// cannot be read, lack a model_id, or are missing required fields. A missing
+// profile directory is not an error — it is treated as an empty directory so
+// daemon startup remains non-fatal. Callers can detect the degenerate case via
+// IsEmpty after construction.
+func (ps *ProfileStore) load() error {
+	logger := ps.logger
+	if logger == nil {
+		logger = noopLogger{}
+	}
+
+	entries, err := os.ReadDir(ps.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No profiles directory yet — not an error, just empty. Emit an
+			// INFO with zero count so operators can still see the path the
+			// daemon checked in logs.
+			logger.Infof("loaded 0 model profile(s) from %s (directory does not exist)", ps.dir)
+			return nil
+		}
+		return fmt.Errorf("reading profile directory %s: %w", ps.dir, err)
+	}
+
+	loaded := make(map[string]*ModelProfile)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
+			continue
+		}
+		path := filepath.Join(ps.dir, e.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			logger.Warnf("skipping profile %s: read error: %v", e.Name(), err)
+			continue
+		}
+		p := parseProfile(string(data))
+		if p.ModelID == "" {
+			logger.Warnf("skipping profile %s: missing or malformed model_id", e.Name())
+			continue
+		}
+		if missing := validateRequiredFields(p); len(missing) > 0 {
+			logger.Errorf("skipping profile %s (%s): missing required fields: %s",
+				e.Name(), p.ModelID, strings.Join(missing, ", "))
+			continue
+		}
+		loaded[p.ModelID] = p
+	}
+
+	ps.mu.Lock()
+	ps.profiles = loaded
+	ps.mu.Unlock()
+
+	logger.Infof("loaded %d model profile(s) from %s", len(loaded), ps.dir)
+	return nil
+}
+
+// validateRequiredFields returns the names of required fields missing from p.
+// The rule is literal: Provider and AutonomyTier must be non-empty, and the
+// profile must carry either a non-zero OverallScore or OnboardingPassed=true.
+// The latter joint check mirrors how onboarding treats restricted profiles
+// (score=50, passed=false) as still loadable; fully unscored AND not-passed
+// profiles are rejected as "operator likely forgot to fill the file out".
+//
+// A P2 follow-up may tighten this to require both independently; until then
+// the function exists specifically to surface the "empty skeleton" case that
+// today loads silently with zero fields populated.
+func validateRequiredFields(p *ModelProfile) []string {
+	var missing []string
+	if p.Provider == "" {
+		missing = append(missing, "provider.name")
+	}
+	if p.AutonomyTier == "" {
+		missing = append(missing, "routing.autonomy_tier")
+	}
+	if p.OverallScore == 0 && !p.OnboardingPassed {
+		missing = append(missing, "routing.overall_score or contract.onboarding_passed")
+	}
+	return missing
+}
+
+// parseProfile extracts a ModelProfile from flat YAML content.
+// This is a simple line-based parser that handles the known profile schema
+// without requiring a YAML library dependency.
+func parseProfile(content string) *ModelProfile {
+	fields := make(map[string]string)
+	var warnings []string
+	inWarnings := false
+
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		// Skip comments and empty lines
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		// Detect warnings list
+		if trimmed == "warnings:" {
+			inWarnings = true
+			continue
+		}
+		if inWarnings {
+			if strings.HasPrefix(trimmed, "- ") {
+				w := strings.TrimPrefix(trimmed, "- ")
+				w = strings.Trim(w, "\"")
+				warnings = append(warnings, w)
+				continue
+			}
+			// End of warnings section
+			inWarnings = false
+		}
+
+		// Parse key: value
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			val = strings.Trim(val, "\"")
+			if val != "" {
+				fields[key] = val
+			}
+		}
+	}
+
+	return &ModelProfile{
+		ModelID:                 fields["model_id"],
+		Status:                  fields["status"],
+		Provider:                fields["name"], // under provider: block, "name" is the key
+		ToolReliability:         parseFloat(fields["tool_reliability"]),
+		ShellReliability:        parseFloatFallback(fields, "shell_roundtrip", "shell_reliability"),
+		ShellRecovery:           parseFloat(fields["shell_recovery"]),
+		FileWriteReliability:    parseFloat(fields["file_write_reliability"]),
+		TokenReporting:          parseFloat(fields["token_reporting"]),
+		Streaming:               parseFloat(fields["streaming"]),
+		MultiTurn:               parseFloat(fields["multi_turn"]),
+		LargeOutput:             parseFloat(fields["large_output"]),
+		EffectiveContextClass:   fields["effective_context_class"],
+		MaxInputTokens:          parseInt64(fields["max_input_tokens"]),
+		ReasoningControls:       fields["reasoning_controls"],
+		LatencyAvgMs:            parseInt(fields["avg_ms"]),
+		LatencyBasicInferenceMs: parseInt(fields["basic_inference_ms"]),
+		LatencyToolCallMs:       parseInt(fields["tool_calling_ms"]),
+		AutonomyTier:            fields["autonomy_tier"],
+		OverallScore:            parseInt(fields["overall_score"]),
+		OnboardingPassed:        fields["onboarding_passed"] == "true",
+		WorkerEligible:          fields["worker_eligible"] == "true",
+		OrchestratorEligible:    fields["orchestrator_eligible"] == "true" || fields["supervisor_eligible"] == "true",
+		ProbeSet:                fields["probe_set"],
+		ProbesRun:               parseInt(fields["probes_run"]),
+		ProbesPassed:            parseInt(fields["probes_passed"]),
+		Warnings:                warnings,
+	}
+}
+
+func parseFloat(s string) float64 {
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
+}
+
+// parseFloatFallback tries the primary key, falls back to the secondary.
+// Handles the shell_reliability → shell_roundtrip rename: new profiles write
+// shell_roundtrip, old profiles write shell_reliability.
+func parseFloatFallback(fields map[string]string, primary, fallback string) float64 {
+	if v, ok := fields[primary]; ok {
+		return parseFloat(v)
+	}
+	return parseFloat(fields[fallback])
+}
+
+func parseInt(s string) int {
+	v, _ := strconv.Atoi(s)
+	return v
+}
+
+func parseInt64(s string) int64 {
+	v, _ := strconv.ParseInt(s, 10, 64)
+	return v
+}

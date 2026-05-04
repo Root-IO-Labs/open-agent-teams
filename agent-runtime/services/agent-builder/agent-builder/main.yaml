@@ -1,0 +1,9 @@
+service:
+  name: "agent-builder"
+  version: "0.1.0"
+  entrypoint: orchestrator.yaml
+
+  default_model: "claude-sonnet-4-6"
+  default_temperature: 0
+
+  skills_dir: ./skills
