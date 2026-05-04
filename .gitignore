@@ -99,6 +99,9 @@ build/
 # intended to be tracked in git).
 model-routing/profiles/*.yaml.bak
 
+# GoReleaser output
+dist/
+
 # Audit artifacts (generated, not source)
 AUDIT_PLAN.md
 PUBLIC_REPO_AUDIT.md

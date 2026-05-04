@@ -23,7 +23,24 @@ Works with Anthropic, OpenAI, Google, DeepSeek, Groq, Mistral, and [17+ LLM prov
 
 ## Getting Started
 
-### Option A: Let your AI set it up (easiest)
+### Option A: One-line install (recommended)
+
+Pre-built binaries for macOS and Linux (x86_64 and arm64). Pulls the
+latest release from GitHub, drops the binaries into `~/.local/bin/`,
+and sets up the Python agent-runtime venv:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+```
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) on the
+target machine — the installer offers to install `uv` for you if it's
+missing. Pin a specific release with `OAT_VERSION=v0.1.0 curl … | bash`.
+
+After install, make sure `~/.local/bin` is on your `PATH`, then jump
+to step **3. Authenticate with GitHub** below.
+
+### Option B: Let your AI set it up
 
 Open **Cursor**, **Claude Code**, or your preferred AI assistant and paste this prompt:
 
@@ -36,7 +53,7 @@ Open **Cursor**, **Claude Code**, or your preferred AI assistant and paste this 
 
 [QUICKSTART.md](docs/QUICKSTART.md) contains the full setup walkthrough — prerequisites, install, API keys, first run — everything an AI (or human) needs.
 
-### Option B: Manual setup
+### Option C: Build from source
 
 #### 1. Prerequisites
 

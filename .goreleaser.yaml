@@ -1,0 +1,118 @@
+version: 2
+
+project_name: oat
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: oat
+    main: ./cmd/oat
+    binary: oat
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/cli.Version={{ .Version }}
+
+  - id: oat-agent
+    main: ./cmd/oat-agent
+    binary: oat-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: oat
+    ids:
+      - oat
+      - oat-agent
+    name_template: >-
+      oat_{{ .Version }}_
+      {{- if eq .Os "darwin" }}darwin
+      {{- else if eq .Os "linux" }}linux
+      {{- else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - SECURITY.md
+      - src: scripts/install-from-release.sh
+        dst: install.sh
+      - src: agent-runtime/**/*
+        dst: agent-runtime
+      # Sweep stragglers that os.PathSeparator + globs occasionally miss.
+      # If goreleaser ever fails because one of these doesn't exist on a
+      # particular run, drop the line — they're best-effort tidiness.
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Documentation
+      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: Root-IO-Labs
+    name: open-agent-teams
+  draft: false
+  prerelease: auto
+  name_template: "OAT {{ .Tag }}"
+  header: |
+    ## OAT {{ .Tag }}
+
+    Pre-built binaries for macOS and Linux. Install with:
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+    ```
+
+    Or download a tarball directly from the assets below and run `./install.sh`.
+
+    Each archive contains the `oat` and `oat-agent` Go binaries plus the
+    Python agent-runtime source. Install requires Python 3.11+ and
+    [uv](https://docs.astral.sh/uv/) on the target machine.
+  footer: |
+    **Full Changelog**: https://github.com/Root-IO-Labs/open-agent-teams/compare/{{ .PreviousTag }}...{{ .Tag }}
