@@ -119,6 +119,8 @@ This spawns a verification agent that independently reviews your work. After run
 
 **Note:** After going dormant, you may see `[daemon] Status check` messages that were sent during your active working period. These are stale -- ignore them.
 
+**Rejection limit:** There is a cap on verification rejections (default: 3). If you are rejected multiple times, the daemon will auto-complete you and escalate the task to the supervisor for reassignment. Each `[REJECTED]` message shows your current attempt count (e.g., "attempt 2/3"). Focus your fixes narrowly on what the verifier flagged — avoid scope creep that triggers additional rejections.
+
 **Option 2 — Self-verify (fallback):**
 ```bash
 oat worker verify

@@ -35,7 +35,21 @@ All subsequent commands (pytest, python, etc.) **must** run inside this venv. If
 git diff ${BASE_SHA}..HEAD
 ```
 
-`${BASE_SHA}` is the remote base commit at the moment the worker requested review (pinned by the daemon, not live `origin/main`). It is shown in the Verification Context header above. Diffing against this pinned base prevents commits that have landed on `main` since the worker rebased from appearing as "deletions" in the diff.
+`${BASE_SHA}` is the remote base commit at the moment the worker requested review (pinned by the daemon, not live `origin/main`). It is shown in the Verification Context header above.
+
+**IMPORTANT — Rebase-inherited changes:** If the worker rebased onto a newer `main` before requesting review, the diff may include changes from OTHER workers' merged PRs. These inherited changes are NOT the worker's responsibility. To distinguish:
+
+```bash
+git log --oneline ${BASE_SHA}..HEAD
+```
+
+If multiple commits appear, identify which are task-relevant (by commit message or files touched matching the task). Changes that appear in the diff but are NOT in the worker's own commits were inherited via rebase. You can confirm by checking if those changes already exist on `origin/main`:
+
+```bash
+git show origin/main:<path-to-file>  # If the change exists here, it was inherited
+```
+
+**Inherited changes must NOT count as scope creep or regressions for your verdict.** Only judge the worker on changes they authored.
 
 Understand what changed before doing anything else.
 

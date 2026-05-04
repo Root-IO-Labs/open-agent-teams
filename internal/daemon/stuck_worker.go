@@ -21,6 +21,10 @@ var (
 	stuckSupervisorNudge = getEnvInt("OAT_STUCK_SUPERVISOR_NUDGE", 10)
 	stuckDaemonNudge     = getEnvInt("OAT_STUCK_DAEMON_NUDGE", 16)
 	stuckMaxNudge        = getEnvInt("OAT_STUCK_MAX_NUDGE", 30)
+
+	// Max verification rejections before the worker is auto-completed and the
+	// task escalated to the supervisor for reassignment.
+	maxRejections = getEnvInt("OAT_MAX_REJECTIONS", 3)
 )
 
 // getEnvInt reads an integer from the environment variable, returning the default if unset or invalid.
@@ -534,6 +538,43 @@ func (d *Daemon) forceRemoveWorker(repoName, repoPath, agentName string, agent s
 	}
 
 	d.triggerRouteMessages()
+}
+
+// rejectionCapReached handles the case where a worker has been rejected too many
+// times. It auto-completes the worker and sends an escalation to the supervisor
+// advising reassignment (potentially to a different model).
+func (d *Daemon) rejectionCapReached(repoName, workerName string, agent state.Agent, rejectionCount int, lastReason string) {
+	task := agent.Task
+	if task == "" {
+		task = "unknown task"
+	}
+	model := agent.Model
+	if model == "" {
+		model = "default"
+	}
+
+	d.logger.Warn("Worker %s/%s hit rejection cap (%d rejections), escalating to supervisor", repoName, workerName, rejectionCount)
+
+	// Notify supervisor with context for reassignment
+	msgMgr := d.getMessageManager()
+	supervisorMsg := fmt.Sprintf(
+		"[daemon] Worker '%s' was auto-completed after %d verification rejections (cap: %d). "+
+			"The worker could not converge on an acceptable solution.\n\n"+
+			"Task: %s\nModel: %s\nLast rejection reason: %s\n\n"+
+			"Consider asking workspace to spawn a replacement worker for this task, "+
+			"preferably with a different/stronger model:\n"+
+			"  oat message send workspace \"Worker %s failed after %d rejections on task: %s. Spawn a replacement with a different model.\"",
+		workerName, rejectionCount, maxRejections,
+		task, model, lastReason,
+		workerName, rejectionCount, task,
+	)
+	if _, err := msgMgr.Send(repoName, "daemon", "supervisor", supervisorMsg); err != nil {
+		d.logger.Error("Failed to send rejection-cap escalation to supervisor for %s/%s: %v", repoName, workerName, err)
+	}
+
+	// Auto-complete the worker
+	summary := fmt.Sprintf("Auto-completed: exceeded max rejection limit (%d rejections, cap: %d)", rejectionCount, maxRejections)
+	d.autoCompleteWorker(repoName, workerName, agent, summary)
 }
 
 // resolveGitDir returns the actual .git directory for a worktree path.
