@@ -94,7 +94,6 @@ tail -n 500 ~/.oat/output/<repo>/default.log
 The direct backend works for benchmarks (agents run autonomously), but some benchmark scripts required updates:
 - `run.sh` readiness checks were updated to use backend-agnostic `oat` CLI commands
 - Agent instructions were updated to reference log files instead of terminal capture
-- See `docs/known-issues.md` "Direct Backend (Tmux Decoupling) Issues" for the full list of fixes
 
 ## 7. Agent Interrupt Sends Ctrl-C, Not Escape (Fixed)
 

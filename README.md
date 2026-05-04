@@ -120,7 +120,7 @@ cd benchmarks
 ./scripts/run.sh --model anthropic:claude-sonnet-4-6 --repo my-bench-run
 ```
 
-This single command sets up the benchmark repo, drives OAT through all four waves, and collects results. See [benchmarks/README.md](benchmarks/README.md) for the full workflow and [benchmarks/MODEL_COMPARISON.md](benchmarks/MODEL_COMPARISON.md) for results from previous runs across different models.
+This single command sets up the benchmark repo, drives OAT through all four waves, and collects results. See [benchmarks/README.md](benchmarks/README.md) for the full workflow.
 
 ## How It Works
 

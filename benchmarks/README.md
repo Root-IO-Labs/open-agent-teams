@@ -12,8 +12,6 @@ The benchmark evaluates a model's ability to:
 - Self-correct via a convergence loop when the blackbox test fails
 - Coordinate multiple workers, resolve merge conflicts, and pass CI
 
-For results from previous benchmark runs, see [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
-
 ## Table of Contents
 
 - [Quickstart](#quickstart)
@@ -564,7 +562,7 @@ cd agent-runtime/libs/cli && uv pip install langchain-ollama
 
 4. **Onboard the model:** `oat model onboard ollama:gemma4 --save`
 
-**Multiple Ollama models:** If using more than one Ollama model simultaneously, set `OLLAMA_MAX_LOADED_MODELS` to the number of models before starting Ollama. See [known issues](../docs/known-issues.md) for platform-specific instructions.
+**Multiple Ollama models:** If using more than one Ollama model simultaneously, set `OLLAMA_MAX_LOADED_MODELS` to the number of models before starting Ollama.
 
 **Orchestrator vs worker:** Ollama models are best suited as **worker** models via `--available-worker-models`. The orchestrator (`--model`) should be a capable hosted model (e.g., `anthropic:claude-sonnet-4-6`) since it handles complex multi-step coordination that small local models struggle with.
 
@@ -592,5 +590,4 @@ If you see raw terminal formatting (colored text, status-bar fragments like `[oa
 | `cleanup.sh` | Clean up local and remote state from a benchmark run |
 | `blackbox-testing.md` | General CLI blackbox testing methodology guide (copied into target repo during setup) |
 | `issues.json` | Pre-captured issue data (24 issues with titles, bodies, labels) |
-| `MODEL_COMPARISON.md` | Cross-model benchmark comparison (scores, strengths, weaknesses) |
 | `results/` | Output directory for timestamped result folders (gitignored) |
