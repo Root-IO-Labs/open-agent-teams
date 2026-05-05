@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from deepagents_cli.app import DeepAgentsApp, _format_compact_limit, _format_token_count
-from deepagents_cli.config import settings
-from deepagents_cli.widgets.autocomplete import SLASH_COMMANDS
-from deepagents_cli.widgets.messages import AppMessage, ErrorMessage
+from oat_cli.app import OatSdksApp, _format_compact_limit, _format_token_count
+from oat_cli.config import settings
+from oat_cli.widgets.autocomplete import SLASH_COMMANDS
+from oat_cli.widgets.messages import AppMessage, ErrorMessage
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -20,11 +20,11 @@ if TYPE_CHECKING:
 _TOKEN_COUNT_PATH = "langchain_core.messages.utils.count_tokens_approximately"
 
 # Patch targets for middleware-based partitioning in _handle_compact
-_CREATE_MODEL_PATH = "deepagents_cli.app.create_model"
+_CREATE_MODEL_PATH = "oat_cli.app.create_model"
 _COMPUTE_DEFAULTS_PATH = (
-    "deepagents.middleware.summarization.compute_summarization_defaults"
+    "oat_sdk.middleware.summarization.compute_summarization_defaults"
 )
-_LC_MIDDLEWARE_PATH = "deepagents.middleware.summarization.SummarizationMiddleware"
+_LC_MIDDLEWARE_PATH = "oat_sdk.middleware.summarization.SummarizationMiddleware"
 _GET_BUFFER_STRING_PATH = "langchain_core.messages.get_buffer_string"
 
 
@@ -125,7 +125,7 @@ class TestCompactGuards:
 
     async def test_no_agent_shows_error(self) -> None:
         """Should show error when there is no active agent."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent = None
@@ -139,7 +139,7 @@ class TestCompactGuards:
 
     async def test_agent_running_shows_error(self) -> None:
         """Should show error when agent is currently running."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent = MagicMock()
@@ -157,7 +157,7 @@ class TestCompactGuards:
 
     async def test_cutoff_zero_shows_not_enough(self) -> None:
         """Should show info when middleware cutoff is zero (within budget)."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=3)
@@ -175,7 +175,7 @@ class TestCompactGuards:
 
     async def test_empty_state_shows_error(self) -> None:
         """Should show error when state has no values."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent = MagicMock()
@@ -195,7 +195,7 @@ class TestCompactGuards:
 
     async def test_state_read_failure_shows_error(self) -> None:
         """Should show error when reading state raises an exception."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent = MagicMock()
@@ -227,7 +227,7 @@ def _make_messages(n: int) -> list[MagicMock]:
 
 
 def _setup_compact_app(
-    app: DeepAgentsApp,
+    app: OatSdksApp,
     n_messages: int = 10,
     *,
     prior_event: dict[str, Any] | None = None,
@@ -263,7 +263,7 @@ class TestCompactSuccess:
 
     async def test_successful_compaction_sets_event(self) -> None:
         """Should set _summarization_event with cutoff and summary message."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -300,7 +300,7 @@ class TestCompactSuccess:
 
     async def test_compaction_shows_feedback_message(self) -> None:
         """Should display feedback with message count and token change."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -326,7 +326,7 @@ class TestCompactSuccess:
 
     async def test_compaction_updates_token_tracker(self) -> None:
         """Should update token tracker after compaction."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -349,7 +349,7 @@ class TestCompactSuccess:
 
     async def test_no_ui_clear_reload(self) -> None:
         """Should NOT clear/reload UI since messages stay in state."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -382,7 +382,7 @@ class TestCompactEdgeCases:
 
     async def test_cutoff_zero_does_not_update_state(self) -> None:
         """When middleware returns cutoff=0, state should not be modified."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=6)
@@ -401,7 +401,7 @@ class TestCompactEdgeCases:
 
     async def test_cutoff_zero_overhead_dominated(self) -> None:
         """Show overhead message when context exceeds limit."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=3)
@@ -425,7 +425,7 @@ class TestCompactEdgeCases:
 
     async def test_cutoff_one_compacts_single_message(self) -> None:
         """With cutoff=1, event should have cutoff_index=1."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=7)
@@ -450,7 +450,7 @@ class TestCompactEdgeCases:
 
     async def test_middleware_cutoff_called_with_effective_messages(self) -> None:
         """Should pass effective messages to middleware cutoff logic."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             messages = _setup_compact_app(app, n_messages=10)
@@ -480,7 +480,7 @@ class TestReCompaction:
 
     async def test_recompact_calculates_absolute_cutoff(self) -> None:
         """Re-compaction should compute state_cutoff = old_cutoff + new_cutoff - 1."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
@@ -521,7 +521,7 @@ class TestAgentRunningGuard:
 
     async def test_agent_running_set_during_compaction(self) -> None:
         """Should set _agent_running=True during compaction and reset after."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -555,7 +555,7 @@ class TestAgentRunningGuard:
 
     async def test_agent_running_reset_after_failure(self) -> None:
         """Should reset _agent_running=False even when compaction fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -575,7 +575,7 @@ class TestCompactErrorHandling:
 
     async def test_offload_failure_proceeds_without_path(self) -> None:
         """Should proceed with compaction even if offload fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -606,7 +606,7 @@ class TestCompactErrorHandling:
 
     async def test_summary_generation_failure_shows_error(self) -> None:
         """Should show error and leave state untouched when summary fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -626,7 +626,7 @@ class TestCompactErrorHandling:
 
     async def test_state_update_failure_shows_error(self) -> None:
         """Should show error when aupdate_state raises."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -652,7 +652,7 @@ class TestCompactErrorHandling:
 
     async def test_spinner_hidden_after_failure(self) -> None:
         """Should hide spinner even when compaction fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -683,7 +683,7 @@ class TestCreateModelFailure:
 
     async def test_create_model_failure_shows_error(self) -> None:
         """Should show error when create_model() raises."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -707,7 +707,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_filters_summary_messages(self) -> None:
         """Should use middleware._filter_summary_messages to exclude summaries."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -736,7 +736,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_all_summary_messages_returns_empty(self) -> None:
         """Should return empty string when all messages are summaries."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -750,7 +750,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_appends_to_existing_content(self) -> None:
         """Should append new section to existing history file."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -779,7 +779,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_creates_new_file_when_none_exists(self) -> None:
         """Should call awrite when no existing file is found."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -806,7 +806,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_read_failure_returns_none(self) -> None:
         """Should return None when reading existing file fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -829,7 +829,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_write_failure_returns_none(self) -> None:
         """Should return None when writing to backend fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -854,7 +854,7 @@ class TestOffloadMessagesForCompact:
 
     async def test_write_error_result_returns_none(self) -> None:
         """Should return None when write result contains an error."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app)
@@ -885,7 +885,7 @@ class TestCompactRouting:
 
     async def test_compact_routed_from_handle_command(self) -> None:
         """'/compact' should be correctly routed through _handle_command."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent = None
@@ -952,7 +952,7 @@ class TestCompactProfileOverride:
 
     async def test_compact_applies_context_limit_to_model_profile(self) -> None:
         """Model profile should be patched to settings.model_context_limit."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=5)
@@ -987,7 +987,7 @@ class TestCompactProfileOverride:
 
     async def test_compact_matching_override_preserves_original_profile(self) -> None:
         """When override matches native profile value, no mutation occurs."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=5)
@@ -1021,7 +1021,7 @@ class TestCompactProfileOverride:
 
     async def test_compact_override_triggers_compaction(self) -> None:
         """With a small override, conversation 'within budget' should compact."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=8)
@@ -1067,7 +1067,7 @@ class TestCompactProfileOverride:
 
     async def test_compact_override_none_uses_model_profile(self) -> None:
         """When model_context_limit is None, model profile is untouched."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=5)
@@ -1100,7 +1100,7 @@ class TestCompactProfileOverride:
 
     async def test_compact_override_with_no_model_profile(self) -> None:
         """When model.profile is None, override creates a new profile dict."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             _setup_compact_app(app, n_messages=5)

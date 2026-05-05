@@ -1,5 +1,7 @@
 # Known Backend Limitations
 
+> Last verified: 2026-04-24 (commit `738f97b`, post-sidecar merge)
+
 This document describes known limitations of the PTY backend. These are architectural constraints of the current implementation, not bugs.
 
 ## 1. Read-Only Attach (No Interactive Agent Access)
@@ -48,7 +50,7 @@ Put tokens in `~/.oat/.env` so the daemon loads them regardless of shell:
 
 ```bash
 # ~/.oat/.env
-GH_TOKEN=<your-classic-pat-with-org-access>
+GH_TOKEN=ghp_your_classic_token_with_org_access
 ```
 
 The daemon's `loadEnvFiles()` reads this file and applies it to all agents.
@@ -94,6 +96,7 @@ tail -n 500 ~/.oat/output/<repo>/default.log
 The direct backend works for benchmarks (agents run autonomously), but some benchmark scripts required updates:
 - `run.sh` readiness checks were updated to use backend-agnostic `oat` CLI commands
 - Agent instructions were updated to reference log files instead of terminal capture
+- See `docs/known-issues.md` "Direct Backend (Tmux Decoupling) Issues" for the full list of fixes
 
 ## 7. Agent Interrupt Sends Ctrl-C, Not Escape (Fixed)
 

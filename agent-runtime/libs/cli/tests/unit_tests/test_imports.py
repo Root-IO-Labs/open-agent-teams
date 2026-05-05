@@ -2,9 +2,9 @@
 
 
 def test_imports() -> None:
-    """Test importing deepagents modules."""
-    from deepagents_cli import (
+    """Test importing oat_sdk modules."""
+    from oat_cli import (
         agent,
         integrations,
     )
-    from deepagents_cli.main import cli_main
+    from oat_cli.main import cli_main

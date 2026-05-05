@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from deepagents_cli import model_config
-from deepagents_cli.app import DeepAgentsApp
-from deepagents_cli.config import ModelResult, settings
-from deepagents_cli.model_config import ModelConfigError, clear_caches
-from deepagents_cli.widgets.messages import AppMessage, ErrorMessage
+from oat_cli import model_config
+from oat_cli.app import OatSdksApp
+from oat_cli.config import ModelResult, settings
+from oat_cli.model_config import ModelConfigError, clear_caches
+from oat_cli.widgets.messages import AppMessage, ErrorMessage
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +34,7 @@ class TestModelSwitchNoOp:
         from the model selector would print "Switched to X" even though no
         actual switch occurred.
         """
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         # Replace method with mock to track calls (hence ignore)
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()  # Enable hot-swap path
@@ -52,7 +52,7 @@ class TestModelSwitchNoOp:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
             patch.object(AppMessage, "__init__", capture_init),
@@ -73,7 +73,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_missing_credentials_shows_error(self) -> None:
         """_switch_model shows error when provider credentials are missing."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -90,11 +90,11 @@ class TestModelSwitchErrorHandling:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=False,
             ),
             patch(
-                "deepagents_cli.model_config.get_credential_env_var",
+                "oat_cli.model_config.get_credential_env_var",
                 return_value="ANTHROPIC_API_KEY",
             ),
             patch.object(ErrorMessage, "__init__", capture_init),
@@ -108,7 +108,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_create_model_config_error_shows_error(self) -> None:
         """_switch_model shows error when create_model raises ModelConfigError."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -126,10 +126,10 @@ class TestModelSwitchErrorHandling:
         error = ModelConfigError("Missing package for provider 'anthropic'")
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", side_effect=error),
+            patch("oat_cli.app.create_model", side_effect=error),
             patch.object(ErrorMessage, "__init__", capture_init),
         ):
             await app._switch_model("anthropic:invalid-model")
@@ -140,7 +140,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_create_model_exception_shows_error(self) -> None:
         """_switch_model shows error when create_model raises an exception."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -158,10 +158,10 @@ class TestModelSwitchErrorHandling:
         model_error = ValueError("Invalid model")
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", side_effect=model_error),
+            patch("oat_cli.app.create_model", side_effect=model_error),
             patch.object(ErrorMessage, "__init__", capture_init),
         ):
             await app._switch_model("anthropic:claude-sonnet-4-5")
@@ -175,7 +175,7 @@ class TestModelSwitchErrorHandling:
         self,
     ) -> None:
         """_switch_model shows error and preserves settings on agent failure."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -202,11 +202,11 @@ class TestModelSwitchErrorHandling:
         agent_error = RuntimeError("Agent creation failed")
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
-            patch("deepagents_cli.agent.create_cli_agent", side_effect=agent_error),
+            patch("oat_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.agent.create_cli_agent", side_effect=agent_error),
             patch.object(ErrorMessage, "__init__", capture_init),
         ):
             await app._switch_model("anthropic:claude-sonnet-4-5")
@@ -223,7 +223,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_context_limit_cleared_when_new_model_has_none(self) -> None:
         """Switching to a model without a context limit clears the old value."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -242,15 +242,15 @@ class TestModelSwitchErrorHandling:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.app.create_model", return_value=mock_result),
             patch(
-                "deepagents_cli.agent.create_cli_agent",
+                "oat_cli.agent.create_cli_agent",
                 return_value=(mock_agent, mock_backend),
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=True),
+            patch("oat_cli.app.save_recent_model", return_value=True),
         ):
             await app._switch_model("ollama:custom-model")
 
@@ -258,7 +258,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_agent_failure_rollback_with_none_context_limit(self) -> None:
         """Rollback restores previous context limit when new model has None."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -275,12 +275,12 @@ class TestModelSwitchErrorHandling:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.app.create_model", return_value=mock_result),
             patch(
-                "deepagents_cli.agent.create_cli_agent",
+                "oat_cli.agent.create_cli_agent",
                 side_effect=RuntimeError("fail"),
             ),
         ):
@@ -290,7 +290,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_no_checkpointer_saves_preference(self) -> None:
         """_switch_model without checkpointer saves preference but doesn't hot-swap."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = None  # No checkpointer
 
@@ -307,10 +307,10 @@ class TestModelSwitchErrorHandling:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=True),
+            patch("oat_cli.app.save_recent_model", return_value=True),
             patch.object(AppMessage, "__init__", capture_init),
         ):
             await app._switch_model("anthropic:claude-sonnet-4-5")
@@ -322,7 +322,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_no_checkpointer_save_failure_shows_error(self) -> None:
         """_switch_model without checkpointer shows error when save fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = None
 
@@ -338,10 +338,10 @@ class TestModelSwitchErrorHandling:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=False),
+            patch("oat_cli.app.save_recent_model", return_value=False),
             patch.object(ErrorMessage, "__init__", capture_init),
         ):
             await app._switch_model("anthropic:claude-sonnet-4-5")
@@ -352,7 +352,7 @@ class TestModelSwitchErrorHandling:
 
     async def test_hot_swap_save_failure_warns_in_message(self) -> None:
         """Successful hot-swap warns when save_recent_model fails."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -377,15 +377,15 @@ class TestModelSwitchErrorHandling:
 
         with (
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.app.create_model", return_value=mock_result),
             patch(
-                "deepagents_cli.agent.create_cli_agent",
+                "oat_cli.agent.create_cli_agent",
                 return_value=(mock_agent, mock_backend),
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=False),
+            patch("oat_cli.app.save_recent_model", return_value=False),
             patch.object(AppMessage, "__init__", capture_init),
         ):
             await app._switch_model("anthropic:claude-sonnet-4-5")
@@ -415,7 +415,7 @@ class TestModelSwitchConfigProvider:
 models = ["llama-v3p1-70b"]
 api_key_env = "FIREWORKS_API_KEY"
 """)
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -441,12 +441,12 @@ api_key_env = "FIREWORKS_API_KEY"
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch.dict("os.environ", {"FIREWORKS_API_KEY": "test-key"}),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.app.create_model", return_value=mock_result),
             patch(
-                "deepagents_cli.agent.create_cli_agent",
+                "oat_cli.agent.create_cli_agent",
                 return_value=(mock_agent, mock_backend),
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=True),
+            patch("oat_cli.app.save_recent_model", return_value=True),
             patch.object(AppMessage, "__init__", capture_app),
         ):
             await app._switch_model("fireworks:llama-v3p1-70b")
@@ -463,7 +463,7 @@ api_key_env = "FIREWORKS_API_KEY"
 models = ["llama-v3p1-70b"]
 api_key_env = "FIREWORKS_API_KEY"
 """)
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -496,7 +496,7 @@ api_key_env = "FIREWORKS_API_KEY"
 [models.providers.ollama]
 models = ["llama3"]
 """)
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -521,12 +521,12 @@ models = ["llama3"]
 
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.app.create_model", return_value=mock_result),
             patch(
-                "deepagents_cli.agent.create_cli_agent",
+                "oat_cli.agent.create_cli_agent",
                 return_value=(mock_agent, mock_backend),
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=True),
+            patch("oat_cli.app.save_recent_model", return_value=True),
             patch.object(AppMessage, "__init__", capture_app),
         ):
             await app._switch_model("ollama:llama3")
@@ -539,7 +539,7 @@ class TestModelSwitchBareModelName:
 
     async def test_bare_model_name_auto_detects_provider(self) -> None:
         """Bare model name like 'gpt-4o' auto-detects provider and succeeds."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -563,17 +563,17 @@ class TestModelSwitchBareModelName:
         mock_backend = MagicMock()
 
         with (
-            patch("deepagents_cli.app.detect_provider", return_value="openai"),
+            patch("oat_cli.app.detect_provider", return_value="openai"),
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
-            patch("deepagents_cli.app.create_model", return_value=mock_result),
+            patch("oat_cli.app.create_model", return_value=mock_result),
             patch(
-                "deepagents_cli.agent.create_cli_agent",
+                "oat_cli.agent.create_cli_agent",
                 return_value=(mock_agent, mock_backend),
             ),
-            patch("deepagents_cli.app.save_recent_model", return_value=True),
+            patch("oat_cli.app.save_recent_model", return_value=True),
             patch.object(AppMessage, "__init__", capture_init),
         ):
             await app._switch_model("gpt-4o")
@@ -582,7 +582,7 @@ class TestModelSwitchBareModelName:
 
     async def test_bare_model_name_missing_credentials(self) -> None:
         """Bare model name shows credential error when provider creds are missing."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -597,13 +597,13 @@ class TestModelSwitchBareModelName:
             original_init(self, message, **kwargs)
 
         with (
-            patch("deepagents_cli.app.detect_provider", return_value="openai"),
+            patch("oat_cli.app.detect_provider", return_value="openai"),
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=False,
             ),
             patch(
-                "deepagents_cli.model_config.get_credential_env_var",
+                "oat_cli.model_config.get_credential_env_var",
                 return_value="OPENAI_API_KEY",
             ),
             patch.object(ErrorMessage, "__init__", capture_init),
@@ -617,7 +617,7 @@ class TestModelSwitchBareModelName:
 
     async def test_bare_model_name_already_using(self) -> None:
         """Bare model name matching current model shows 'Already using'."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._mount_message = AsyncMock()  # type: ignore[method-assign]
         app._checkpointer = MagicMock()
 
@@ -632,9 +632,9 @@ class TestModelSwitchBareModelName:
             original_init(self, message, **kwargs)
 
         with (
-            patch("deepagents_cli.app.detect_provider", return_value="openai"),
+            patch("oat_cli.app.detect_provider", return_value="openai"),
             patch(
-                "deepagents_cli.model_config.has_provider_credentials",
+                "oat_cli.model_config.has_provider_credentials",
                 return_value=True,
             ),
             patch.object(AppMessage, "__init__", capture_init),

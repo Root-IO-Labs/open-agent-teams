@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Quick validation script for skills - minimal version.
 
-For deepagents CLI, skills are located at:
-~/.deepagents/<agent>/skills/<skill-name>/
+For oat_sdk CLI, skills are located at:
+~/.oat_sdk/<agent>/skills/<skill-name>/
 
 Example:
 ```python
-python quick_validate.py ~/.deepagents/agent/skills/my-skill
+python quick_validate.py ~/.oat_sdk/agent/skills/my-skill
 ```
 """
 

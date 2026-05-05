@@ -1,14 +1,14 @@
 """CLI-specific tests for compact_conversation tool (HITL gating, display).
 
 Core compact tool logic tests live in the SDK at
-`libs/deepagents/tests/unit_tests/middleware/test_compact_tool.py`.
+`libs/oat_sdk/tests/unit_tests/middleware/test_compact_tool.py`.
 """
 
 from __future__ import annotations
 
 from unittest.mock import patch
 
-from deepagents_cli.tool_display import format_tool_display
+from oat_cli.tool_display import format_tool_display
 
 
 class TestHITLGating:
@@ -16,16 +16,16 @@ class TestHITLGating:
 
     def test_hitl_gating_when_enabled(self) -> None:
         """With REQUIRE_COMPACT_TOOL_APPROVAL=True, tool should be gated."""
-        with patch("deepagents_cli.agent.REQUIRE_COMPACT_TOOL_APPROVAL", True):
-            from deepagents_cli.agent import _add_interrupt_on
+        with patch("oat_cli.agent.REQUIRE_COMPACT_TOOL_APPROVAL", True):
+            from oat_cli.agent import _add_interrupt_on
 
             result = _add_interrupt_on()
             assert "compact_conversation" in result
 
     def test_hitl_gating_when_disabled(self) -> None:
         """With REQUIRE_COMPACT_TOOL_APPROVAL=False, tool should NOT be gated."""
-        with patch("deepagents_cli.agent.REQUIRE_COMPACT_TOOL_APPROVAL", False):
-            from deepagents_cli.agent import _add_interrupt_on
+        with patch("oat_cli.agent.REQUIRE_COMPACT_TOOL_APPROVAL", False):
+            from oat_cli.agent import _add_interrupt_on
 
             result = _add_interrupt_on()
             assert "compact_conversation" not in result

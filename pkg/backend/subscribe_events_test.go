@@ -95,11 +95,6 @@ func TestSubscribeEvents_EndToEndThroughBridge(t *testing.T) {
 
 	// Log file should contain the [OAT_TOKENS] line for token_usage
 	// but NOT the assistant_message payload (bridge gates by kind).
-	deadline = time.After(1 * time.Second)
-	for time.Now().Before(time.Now().Add(-time.Second)) || time.Now().Sub(time.Now()) < time.Second {
-		// loop guard replaced below
-		break
-	}
 	// Wait for the bridge's log-file write to land.
 	var logContent []byte
 	for i := 0; i < 100; i++ {
@@ -116,7 +111,6 @@ func TestSubscribeEvents_EndToEndThroughBridge(t *testing.T) {
 	if strings.Contains(s, "assistant_message") || strings.Contains(s, `"content":"hello"`) {
 		t.Errorf("log leaked assistant_message content:\n%s", s)
 	}
-	_ = deadline
 }
 
 // TestSubscribeEvents_UnknownAgentErrors ensures the public API

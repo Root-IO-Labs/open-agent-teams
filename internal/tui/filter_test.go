@@ -30,7 +30,7 @@ func TestClassify_ToolOutput(t *testing.T) {
 		line string
 		want LineCategory
 	}{
-		{`⎿     .deepagents/`, CatToolOutput},
+		{`⎿     .oat_sdk/`, CatToolOutput},
 		{`  [Command succeeded with exit code 0]`, CatToolOutput},
 		{`… 6 more — click or Ctrl+E to expand`, CatChrome},
 		{`  | > What repository am I working in?`, CatToolOutput},
@@ -176,7 +176,7 @@ func TestClassify_Banner(t *testing.T) {
 		{`   Enter send - Ctrl+J newline - @ files - / commands`, CatChrome},
 		{`   Thread: 6e9f918d`, CatChrome},
 		{`Starting with thread: 6e9f918d`, CatChrome},
-		{`<frozen runpy>:128: RuntimeWarning: 'deepagents_cli.main' found in sys.modules`, CatChrome},
+		{`<frozen runpy>:128: RuntimeWarning: 'oat_cli.main' found in sys.modules`, CatChrome},
 	}
 	for _, tt := range tests {
 		got := f.Classify(tt.line)

@@ -8,7 +8,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Container
 from textual.screen import ModalScreen
 
-from deepagents_cli.widgets.model_selector import ModelSelectorScreen
+from oat_cli.widgets.model_selector import ModelSelectorScreen
 
 
 class ModelSelectorTestApp(App):
@@ -37,7 +37,7 @@ class ModelSelectorTestApp(App):
 
 
 class AppWithEscapeBinding(App):
-    """Test app that has a conflicting escape binding like DeepAgentsApp.
+    """Test app that has a conflicting escape binding like OatSdksApp.
 
     This reproduces the real-world scenario where the app binds escape
     to action_interrupt, which would intercept escape before the modal.
@@ -115,7 +115,7 @@ class TestModelSelectorEscapeKey:
     async def test_escape_with_conflicting_app_binding(self) -> None:
         """ESC should dismiss modal even when app has its own escape binding.
 
-        This test reproduces the bug where DeepAgentsApp's escape binding
+        This test reproduces the bug where OatSdksApp's escape binding
         for action_interrupt would intercept escape before the modal could
         handle it, causing the modal to not close.
         """

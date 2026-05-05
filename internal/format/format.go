@@ -170,7 +170,7 @@ func (t *Table) String() string {
 		if i > 0 {
 			sb.WriteString("  ")
 		}
-		sb.WriteString(fmt.Sprintf("%-*s", t.widths[i], h))
+		fmt.Fprintf(&sb, "%-*s", t.widths[i], h)
 	}
 	sb.WriteString("\n")
 
@@ -189,7 +189,7 @@ func (t *Table) String() string {
 			if i > 0 {
 				sb.WriteString("  ")
 			}
-			sb.WriteString(fmt.Sprintf("%-*s", t.widths[i], cell))
+			fmt.Fprintf(&sb, "%-*s", t.widths[i], cell)
 		}
 		sb.WriteString("\n")
 	}

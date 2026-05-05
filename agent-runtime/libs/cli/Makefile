@@ -16,7 +16,7 @@ integration_test integration_tests: TEST_FILE=tests/integration_tests/
 test: ## Run unit tests
 test tests:
 	uv run --group test pytest -n auto --disable-socket --allow-unix-socket $(TEST_FILE) \
-		--cov=deepagents_cli \
+		--cov=oat_cli \
 		--cov-report=term-missing
 
 coverage: ## Run unit tests with coverage
@@ -49,7 +49,7 @@ PYTHON_FILES=.
 lint format: PYTHON_FILES=.
 lint_diff format_diff: PYTHON_FILES=$(shell git diff --relative=libs/cli --name-only --diff-filter=d main | grep -E '\.py$$|\.ipynb$$')
 lint_package: ## Lint only the package
-lint_package: PYTHON_FILES=deepagents_cli
+lint_package: PYTHON_FILES=oat_cli
 lint_tests: ## Lint only tests
 lint_tests: PYTHON_FILES=tests
 
@@ -69,7 +69,7 @@ format format_diff:
 	[ "$(PYTHON_FILES)" = "" ] || uv run --all-groups ruff check --fix $(PYTHON_FILES)
 
 check_imports: ## Check imports
-check_imports: $(shell find deepagents_cli -name '*.py')
+check_imports: $(shell find oat_cli -name '*.py')
 	uv run --all-groups python ./scripts/check_imports.py $^
 
 ######################

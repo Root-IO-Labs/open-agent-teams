@@ -1,6 +1,8 @@
 package worktree
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,20 +10,37 @@ import (
 	"strings"
 )
 
-// Manager handles git worktree operations
+// Manager handles git worktree operations.
+//
+// Every git command run by a Manager uses exec.CommandContext with the
+// Manager's ctx. NewManager() defaults to context.Background() for
+// back-compat; long-lived callers (the daemon) should construct with
+// NewManagerWithContext so git calls get canceled on shutdown.
 type Manager struct {
 	repoPath string
+	ctx      context.Context
 }
 
-// NewManager creates a new worktree manager for a repository
+// NewManager creates a new worktree manager with a background context.
+// Prefer NewManagerWithContext when a cancellable context is available.
+//
+//nolint:contextcheck // intentional: compat constructor used when the caller has no ctx.
 func NewManager(repoPath string) *Manager {
-	return &Manager{repoPath: repoPath}
+	return NewManagerWithContext(context.Background(), repoPath)
+}
+
+// NewManagerWithContext creates a new worktree manager whose git commands
+// are canceled when ctx is canceled. Callers with a cancelable lifetime
+// (daemon loops, long-running commands) should use this form. ctx must not
+// be nil — NewManager is the right helper when no ctx is available.
+func NewManagerWithContext(ctx context.Context, repoPath string) *Manager {
+	return &Manager{repoPath: repoPath, ctx: ctx}
 }
 
 // runGit runs a git command in the repository directory and returns output.
 // If the command fails, the error includes the command output for debugging.
 func (m *Manager) runGit(args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(m.ctx, "git", args...)
 	cmd.Dir = m.repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -42,7 +61,7 @@ func resolvePathWithSymlinks(path string) (string, error) {
 	evalPath, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
 		// Path might not exist yet or symlink resolution failed, use absPath
-		return absPath, nil
+		return absPath, nil //nolint:nilerr // graceful fallback to abs-only path
 	}
 
 	return evalPath, nil
@@ -67,13 +86,13 @@ func (m *Manager) CreateDetached(path, commit string) error {
 // If the branch is already checked out in another worktree (e.g., the main clone),
 // falls back to creating a local tracking branch (e.g., supervisor-main).
 func (m *Manager) CheckoutBranch(worktreePath, branch string) error {
-	cmd := exec.Command("git", "checkout", branch)
+	cmd := exec.CommandContext(m.ctx, "git", "checkout", branch)
 	cmd.Dir = worktreePath
 	if _, err := cmd.CombinedOutput(); err == nil {
 		return nil
 	}
 	localBranch := filepath.Base(worktreePath) + "-" + branch
-	cmd = exec.Command("git", "checkout", "-b", localBranch, "origin/"+branch)
+	cmd = exec.CommandContext(m.ctx, "git", "checkout", "-b", localBranch, "origin/"+branch)
 	cmd.Dir = worktreePath
 	_, err := cmd.CombinedOutput()
 	return err
@@ -138,7 +157,7 @@ func (m *Manager) Remove(path string, force bool) error {
 
 // List returns a list of all worktrees
 func (m *Manager) List() ([]WorktreeInfo, error) {
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+	cmd := exec.CommandContext(m.ctx, "git", "worktree", "list", "--porcelain")
 	cmd.Dir = m.repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -181,8 +200,8 @@ func (m *Manager) Prune() error {
 
 // HasUncommittedChanges checks if a worktree has uncommitted changes,
 // excluding OAT's own runtime directory (.oat/) which is always safe to ignore.
-func HasUncommittedChanges(path string) (bool, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
+func HasUncommittedChanges(ctx context.Context, path string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain")
 	cmd.Dir = path
 	output, err := cmd.Output()
 	if err != nil {
@@ -209,25 +228,25 @@ func HasUncommittedChanges(path string) (bool, error) {
 }
 
 // HasUnpushedCommits checks if a worktree has unpushed commits
-func HasUnpushedCommits(path string) (bool, error) {
+func HasUnpushedCommits(ctx context.Context, path string) (bool, error) {
 	// First verify this is a valid git repository
-	verifyCmd := exec.Command("git", "rev-parse", "--git-dir")
+	verifyCmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
 	verifyCmd.Dir = path
 	if err := verifyCmd.Run(); err != nil {
 		return false, fmt.Errorf("not a git repository: %w", err)
 	}
 
 	// Check if there's a tracking branch
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	cmd.Dir = path
 	if err := cmd.Run(); err != nil {
 		// No tracking branch, so no unpushed commits
 		// This is a valid state (branch has no upstream configured)
-		return false, nil
+		return false, nil //nolint:nilerr // no tracking branch -> no unpushed commits
 	}
 
 	// Check for commits ahead of upstream
-	cmd = exec.Command("git", "rev-list", "--count", "@{u}..")
+	cmd = exec.CommandContext(ctx, "git", "rev-list", "--count", "@{u}..")
 	cmd.Dir = path
 	output, err := cmd.Output()
 	if err != nil {
@@ -239,8 +258,8 @@ func HasUnpushedCommits(path string) (bool, error) {
 }
 
 // GetCurrentBranch returns the current branch name for a worktree
-func GetCurrentBranch(path string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+func GetCurrentBranch(ctx context.Context, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = path
 	output, err := cmd.Output()
 	if err != nil {
@@ -298,12 +317,13 @@ func parseWorktreeList(output string) []WorktreeInfo {
 
 // BranchExists checks if a branch exists in the repository
 func (m *Manager) BranchExists(branchName string) (bool, error) {
-	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
+	cmd := exec.CommandContext(m.ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
 	cmd.Dir = m.repoPath
 	err := cmd.Run()
 	if err != nil {
 		// Exit code 1 means branch doesn't exist
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check branch existence: %w", err)
@@ -325,7 +345,7 @@ func (m *Manager) DeleteBranch(branchName string) error {
 
 // ListBranchesWithPrefix lists all branches that start with the given prefix
 func (m *Manager) ListBranchesWithPrefix(prefix string) ([]string, error) {
-	cmd := exec.Command("git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"+prefix)
+	cmd := exec.CommandContext(m.ctx, "git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"+prefix)
 	cmd.Dir = m.repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -457,14 +477,14 @@ To fix this, you can either:
 // It prefers "upstream" if it exists, otherwise falls back to "origin"
 func (m *Manager) GetUpstreamRemote() (string, error) {
 	// Check if "upstream" remote exists
-	cmd := exec.Command("git", "remote", "get-url", "upstream")
+	cmd := exec.CommandContext(m.ctx, "git", "remote", "get-url", "upstream")
 	cmd.Dir = m.repoPath
 	if err := cmd.Run(); err == nil {
 		return "upstream", nil
 	}
 
 	// Fall back to "origin"
-	cmd = exec.Command("git", "remote", "get-url", "origin")
+	cmd = exec.CommandContext(m.ctx, "git", "remote", "get-url", "origin")
 	cmd.Dir = m.repoPath
 	if err := cmd.Run(); err == nil {
 		return "origin", nil
@@ -476,7 +496,7 @@ func (m *Manager) GetUpstreamRemote() (string, error) {
 // GetDefaultBranch returns the default branch name for a remote (e.g., "main" or "master")
 func (m *Manager) GetDefaultBranch(remote string) (string, error) {
 	// Try to get the default branch from the remote's HEAD
-	cmd := exec.Command("git", "symbolic-ref", fmt.Sprintf("refs/remotes/%s/HEAD", remote))
+	cmd := exec.CommandContext(m.ctx, "git", "symbolic-ref", fmt.Sprintf("refs/remotes/%s/HEAD", remote))
 	cmd.Dir = m.repoPath
 	output, err := cmd.Output()
 	if err == nil {
@@ -490,7 +510,7 @@ func (m *Manager) GetDefaultBranch(remote string) (string, error) {
 
 	// Fallback: check for common branch names
 	for _, branch := range []string{"main", "master"} {
-		cmd := exec.Command("git", "rev-parse", "--verify", fmt.Sprintf("refs/remotes/%s/%s", remote, branch))
+		cmd := exec.CommandContext(m.ctx, "git", "rev-parse", "--verify", fmt.Sprintf("refs/remotes/%s/%s", remote, branch))
 		cmd.Dir = m.repoPath
 		if err := cmd.Run(); err == nil {
 			return branch, nil
@@ -530,7 +550,7 @@ func (m *Manager) FindMergedUpstreamBranches(branchPrefix string) ([]string, err
 
 	// Get branches merged into upstream's default branch
 	upstreamRef := fmt.Sprintf("%s/%s", remote, defaultBranch)
-	cmd := exec.Command("git", "branch", "--merged", upstreamRef, "--format=%(refname:short)")
+	cmd := exec.CommandContext(m.ctx, "git", "branch", "--merged", upstreamRef, "--format=%(refname:short)")
 	cmd.Dir = m.repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -686,11 +706,11 @@ func CleanupOrphanedWithDetails(wtRootDir string, manager *Manager, protectedPat
 			// been committed or pushed. These catch cases where git tracking
 			// gets corrupted by concurrent agent operations but the worktree
 			// still contains valuable in-progress work.
-			if hasChanges, err := HasUncommittedChanges(path); err == nil && hasChanges {
+			if hasChanges, err := HasUncommittedChanges(manager.ctx, path); err == nil && hasChanges {
 				result.Errors[path] = "skipped: has uncommitted changes"
 				continue
 			}
-			if hasUnpushed, err := HasUnpushedCommits(path); err == nil && hasUnpushed {
+			if hasUnpushed, err := HasUnpushedCommits(manager.ctx, path); err == nil && hasUnpushed {
 				result.Errors[path] = "skipped: has unpushed commits"
 				continue
 			}
@@ -721,19 +741,19 @@ type WorktreeState struct {
 }
 
 // GetWorktreeState checks the current state of a worktree and whether it can be safely refreshed
-func GetWorktreeState(worktreePath string, remote string, mainBranch string) (WorktreeState, error) {
+func GetWorktreeState(ctx context.Context, worktreePath string, remote string, mainBranch string) (WorktreeState, error) {
 	state := WorktreeState{
 		Path:       worktreePath,
 		CanRefresh: true,
 	}
 
 	// Get current branch (or detect detached HEAD)
-	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
 	cmd.Dir = worktreePath
 	output, err := cmd.Output()
 	if err != nil {
 		// Check if it's detached HEAD (different error than not being a git repo)
-		cmd2 := exec.Command("git", "rev-parse", "--verify", "HEAD")
+		cmd2 := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "HEAD")
 		cmd2.Dir = worktreePath
 		if err2 := cmd2.Run(); err2 != nil {
 			return state, fmt.Errorf("not a git repository or invalid state: %w", err)
@@ -772,7 +792,7 @@ func GetWorktreeState(worktreePath string, remote string, mainBranch string) (Wo
 	}
 
 	// Check for uncommitted changes
-	hasChanges, err := HasUncommittedChanges(worktreePath)
+	hasChanges, err := HasUncommittedChanges(ctx, worktreePath)
 	if err == nil {
 		state.HasUncommitted = hasChanges
 	}
@@ -790,7 +810,7 @@ func GetWorktreeState(worktreePath string, remote string, mainBranch string) (Wo
 	}
 
 	// Check commits behind/ahead of remote main
-	cmd = exec.Command("git", "rev-list", "--left-right", "--count", fmt.Sprintf("%s/%s...HEAD", remote, mainBranch))
+	cmd = exec.CommandContext(ctx, "git", "rev-list", "--left-right", "--count", fmt.Sprintf("%s/%s...HEAD", remote, mainBranch))
 	cmd.Dir = worktreePath
 	output, err = cmd.Output()
 	if err != nil {
@@ -803,8 +823,8 @@ func GetWorktreeState(worktreePath string, remote string, mainBranch string) (Wo
 	// Parse output like "3\t5" (behind\tahead)
 	parts := strings.Fields(strings.TrimSpace(string(output)))
 	if len(parts) == 2 {
-		fmt.Sscanf(parts[0], "%d", &state.CommitsBehind)
-		fmt.Sscanf(parts[1], "%d", &state.CommitsAhead)
+		_, _ = fmt.Sscanf(parts[0], "%d", &state.CommitsBehind) // parse error leaves zero
+		_, _ = fmt.Sscanf(parts[1], "%d", &state.CommitsAhead)
 	}
 
 	// If not behind, no need to refresh
@@ -817,8 +837,8 @@ func GetWorktreeState(worktreePath string, remote string, mainBranch string) (Wo
 }
 
 // IsBehindMain checks if a worktree is behind the remote main branch
-func IsBehindMain(worktreePath string, remote string, mainBranch string) (bool, int, error) {
-	state, err := GetWorktreeState(worktreePath, remote, mainBranch)
+func IsBehindMain(ctx context.Context, worktreePath string, remote string, mainBranch string) (bool, int, error) {
+	state, err := GetWorktreeState(ctx, worktreePath, remote, mainBranch)
 	if err != nil {
 		return false, 0, err
 	}
@@ -842,7 +862,7 @@ type RefreshResult struct {
 // RefreshWorktree syncs a worktree with the latest changes from the main branch.
 // It fetches from the remote, stashes any uncommitted changes, rebases onto main,
 // and restores the stash. Returns detailed results about what happened.
-func RefreshWorktree(worktreePath string, remote string, mainBranch string) RefreshResult {
+func RefreshWorktree(ctx context.Context, worktreePath string, remote string, mainBranch string) RefreshResult {
 	result := RefreshResult{
 		WorktreePath: worktreePath,
 	}
@@ -875,12 +895,12 @@ func RefreshWorktree(worktreePath string, remote string, mainBranch string) Refr
 	}
 
 	// Get current branch (also detects detached HEAD)
-	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
 	cmd.Dir = worktreePath
 	output, err := cmd.Output()
 	if err != nil {
 		// Check if it's detached HEAD vs not a git repo
-		cmd2 := exec.Command("git", "rev-parse", "--verify", "HEAD")
+		cmd2 := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "HEAD")
 		cmd2.Dir = worktreePath
 		if cmd2.Run() == nil {
 			result.Skipped = true
@@ -901,7 +921,7 @@ func RefreshWorktree(worktreePath string, remote string, mainBranch string) Refr
 	}
 
 	// Fetch latest from remote
-	cmd = exec.Command("git", "fetch", remote, mainBranch)
+	cmd = exec.CommandContext(ctx, "git", "fetch", remote, mainBranch)
 	cmd.Dir = worktreePath
 	if output, err := cmd.CombinedOutput(); err != nil {
 		result.Error = fmt.Errorf("failed to fetch from %s: %w\nOutput: %s", remote, err, output)
@@ -909,7 +929,7 @@ func RefreshWorktree(worktreePath string, remote string, mainBranch string) Refr
 	}
 
 	// Check for uncommitted changes
-	hasChanges, err := HasUncommittedChanges(worktreePath)
+	hasChanges, err := HasUncommittedChanges(ctx, worktreePath)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to check for uncommitted changes: %w", err)
 		return result
@@ -919,7 +939,7 @@ func RefreshWorktree(worktreePath string, remote string, mainBranch string) Refr
 	stashName := ""
 	if hasChanges {
 		stashName = fmt.Sprintf("refresh-stash-%d", os.Getpid())
-		cmd = exec.Command("git", "stash", "push", "--include-untracked", "-m", stashName)
+		cmd = exec.CommandContext(ctx, "git", "stash", "push", "--include-untracked", "-m", stashName)
 		cmd.Dir = worktreePath
 		if output, err := cmd.CombinedOutput(); err != nil {
 			result.Error = fmt.Errorf("failed to stash changes: %w\nOutput: %s", err, output)
@@ -929,35 +949,35 @@ func RefreshWorktree(worktreePath string, remote string, mainBranch string) Refr
 	}
 
 	// Get current commit count before rebase
-	cmd = exec.Command("git", "rev-list", "--count", fmt.Sprintf("%s/%s..HEAD", remote, mainBranch))
+	cmd = exec.CommandContext(ctx, "git", "rev-list", "--count", fmt.Sprintf("%s/%s..HEAD", remote, mainBranch))
 	cmd.Dir = worktreePath
 	countOutput, _ := cmd.Output()
 	commitsBefore := strings.TrimSpace(string(countOutput))
 
 	// Rebase onto main
-	cmd = exec.Command("git", "rebase", fmt.Sprintf("%s/%s", remote, mainBranch))
+	cmd = exec.CommandContext(ctx, "git", "rebase", fmt.Sprintf("%s/%s", remote, mainBranch))
 	cmd.Dir = worktreePath
 	rebaseOutput, rebaseErr := cmd.CombinedOutput()
 
 	if rebaseErr != nil {
 		// Check if there are conflicts
-		cmd = exec.Command("git", "diff", "--name-only", "--diff-filter=U")
+		cmd = exec.CommandContext(ctx, "git", "diff", "--name-only", "--diff-filter=U")
 		cmd.Dir = worktreePath
 		conflictOutput, _ := cmd.Output()
 		conflictFiles := strings.Split(strings.TrimSpace(string(conflictOutput)), "\n")
 		if len(conflictFiles) > 0 && conflictFiles[0] != "" {
 			result.HasConflicts = true
 			result.ConflictFiles = conflictFiles
-			// Abort the rebase to leave the worktree in a clean state
-			abortCmd := exec.Command("git", "rebase", "--abort")
+			// Abort the rebase to leave the worktree in a clean state; best-effort cleanup.
+			abortCmd := exec.CommandContext(ctx, "git", "rebase", "--abort")
 			abortCmd.Dir = worktreePath
-			abortCmd.Run()
+			_ = abortCmd.Run()
 		}
 		result.Error = fmt.Errorf("rebase failed: %w\nOutput: %s", rebaseErr, rebaseOutput)
 
 		// Restore stash if we stashed
 		if result.WasStashed {
-			popCmd := exec.Command("git", "stash", "pop")
+			popCmd := exec.CommandContext(ctx, "git", "stash", "pop")
 			popCmd.Dir = worktreePath
 			if popCmd.Run() == nil {
 				result.StashRestored = true
@@ -969,12 +989,12 @@ func RefreshWorktree(worktreePath string, remote string, mainBranch string) Refr
 	// Calculate commits rebased (commits that were ahead of main)
 	// This is an approximation based on the output
 	if commitsBefore != "" && commitsBefore != "0" {
-		fmt.Sscanf(commitsBefore, "%d", &result.CommitsRebased)
+		_, _ = fmt.Sscanf(commitsBefore, "%d", &result.CommitsRebased) // parse error leaves zero
 	}
 
 	// Restore stash if we stashed
 	if result.WasStashed {
-		cmd = exec.Command("git", "stash", "pop")
+		cmd = exec.CommandContext(ctx, "git", "stash", "pop")
 		cmd.Dir = worktreePath
 		if err := cmd.Run(); err != nil {
 			// Stash pop might fail if there are conflicts
@@ -1007,5 +1027,5 @@ func (m *Manager) RefreshWorktreeWithDefaults(worktreePath string) RefreshResult
 		}
 	}
 
-	return RefreshWorktree(worktreePath, remote, mainBranch)
+	return RefreshWorktree(m.ctx, worktreePath, remote, mainBranch)
 }

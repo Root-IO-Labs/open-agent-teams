@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from deepagents_cli import sessions
-from deepagents_cli.app import TextualSessionState
-from deepagents_cli.sessions import get_thread_limit
+from oat_cli import sessions
+from oat_cli.app import TextualSessionState
+from oat_cli.sessions import get_thread_limit
 
 
 class TestGenerateThreadId:
@@ -615,7 +615,7 @@ class TestPrewarmThreadMessageCounts:
         """Unexpected prewarm failures should be visible at warning level."""
         with (
             patch(
-                "deepagents_cli.sessions.list_threads",
+                "oat_cli.sessions.list_threads",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("unexpected type mismatch"),
             ),

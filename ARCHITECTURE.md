@@ -157,9 +157,8 @@ type Daemon struct {
 |------|----------|---------|
 | `serverLoop` | Continuous | Handle incoming socket requests |
 | `healthCheckLoop` | 2 min | Verify agents are alive, cleanup dead ones |
-| `messageRouterLoop` | 60 s | Deliver pending messages to agents |
-| `wakeLoop` | 60 s | Nudge idle agents with status checks |
-| `prMonitorLoop` | 60 s | Watch dormant workers' PRs for CI/merge events |
+| `messageRouterLoop` | 2 min | Deliver pending messages to agents |
+| `wakeLoop` | 2 min | Nudge idle agents with status checks |
 
 ### State Management (`internal/state/state.go`)
 
@@ -301,7 +300,7 @@ Prompts are written to `.oat/AGENTS.md` in each agent's worktree before launch. 
 Repositories can customize agent behavior with files in `.oat/agents/`:
 - `.oat/agents/worker.md` — Worker agent definition
 - `.oat/agents/merge-queue.md` — Merge-queue agent definition
-- `.oat/agents/reviewer.md` — Reviewer agent definition
+- `.oat/agents/review.md` — Review agent definition
 
 ### CLI (`internal/cli/cli.go`)
 
@@ -407,7 +406,7 @@ When launching an agent, the model is resolved in priority order:
 3. **Auto-detect** — if neither is set, the OAT - Open Agent Teams CLI picks a model based on available API keys
 
 The resolved model is passed as `--model <spec>` to the OAT - Open Agent Teams CLI. The spec can be a bare model
-name (e.g., `claude-sonnet-4-6`) or provider-prefixed (e.g., `anthropic:claude-sonnet-4-6`).
+name (e.g., `claude-sonnet-4-5`) or provider-prefixed (e.g., `anthropic:claude-sonnet-4-5`).
 
 All agent launch paths (daemon `startAgentWithConfig`, daemon `restartAgent`)
 use `resolveAgentModel()` to apply this resolution.
@@ -510,7 +509,7 @@ Agents can get stuck. The daemon pokes them every 2 minutes, per repo. When a re
 
 ### Worker Escalation Ladder
 
-Workers use an escalating nudge system based on `NudgeCount` (tracked per worker, resets when new git activity is detected):
+Workers use an escalating nudge system based on `NudgeCount` (tracked per worker, resets when new git activity is detected). The wake loop runs every 60s (`OAT_WAKE_INTERVAL_SECONDS`), so nudge counts ≈ minutes.
 
 | NudgeCount | Time (~) | Action |
 |------------|----------|--------|
@@ -519,7 +518,7 @@ Workers use an escalating nudge system based on `NudgeCount` (tracked per worker
 | 16-29 | 16-29 min | Daemon takeover: programmatic git checks with auto-complete or directive nudge |
 | 30 | ~30 min | Hard cap: force-remove (auto-complete if PR exists, otherwise remove with failure reason) |
 
-Thresholds are configurable via environment variables: `OAT_STUCK_SUPERVISOR_NUDGE` (default 10), `OAT_STUCK_DAEMON_NUDGE` (default 16), `OAT_STUCK_MAX_NUDGE` (default 30).
+Thresholds are configurable via environment variables: `OAT_STUCK_SUPERVISOR_NUDGE` (default 10), `OAT_STUCK_DAEMON_NUDGE` (default 16), `OAT_STUCK_MAX_NUDGE` (default 30), `OAT_WAKE_INTERVAL_SECONDS` (default 60).
 
 ## Key Design Decisions
 

@@ -17,7 +17,7 @@ type SelectableItem struct {
 }
 
 // SelectFromList displays a list of items and prompts the user to select one.
-// Returns the selected item name, or empty string if cancelled.
+// Returns the selected item name, or empty string if canceled.
 // If there's only one item, it's auto-selected without prompting.
 func SelectFromList(prompt string, items []SelectableItem) (string, error) {
 	if len(items) == 0 {

@@ -75,7 +75,7 @@ func runPythonClient(
 	defer cancel()
 
 	args := []string{
-		"-m", "deepagents_cli.sidecar_client",
+		"-m", "oat_cli.sidecar_client",
 		socketPath, fmtInt(count), mode,
 	}
 	if queueSize > 0 {

@@ -74,11 +74,11 @@ func TestLayout_ResizeNarrow_WithAgentList(t *testing.T) {
 		t.Error("viewport content should differ after resize (different wrapping)")
 	}
 
-	// Verify ALL agents' caches were invalidated (not just active)
-	if _, ok := app.renderer.cache["workspace"]; ok {
-		// Cache entry exists — but rawCount should be reset OR it was re-populated
-		// by updateViewport. The key invariant is width changed.
-	}
+	// Verify ALL agents' caches were invalidated (not just active).
+	// The "workspace" entry may or may not have been re-populated by updateViewport
+	// after the width change; the key invariant we care about is that width changed,
+	// which is asserted earlier. We just keep the cache lookup as a smoke check.
+	_ = app.renderer.cache["workspace"]
 	if _, ok := app.renderer.cache["worker-1"]; ok && w1HadCache {
 		t.Error("worker-1 cache should have been wiped by InvalidateCache")
 	}

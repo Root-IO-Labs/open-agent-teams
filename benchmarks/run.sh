@@ -2,6 +2,21 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
+# Cache the expected wave composition from issues.json once at startup so the
+# per-tick count_total_wave_issues() helper (called ~240 times per benchmark
+# from wait_for_wave) is a pure indirect global lookup, no jq re-parse.
+# expected_wave_count() returns "0" for unknown labels / missing JSON, so this
+# is safe for custom benchmarks that don't ship an issues.json.
+EXPECTED_WAVE_0=$(expected_wave_count "wave:0")
+EXPECTED_WAVE_1=$(expected_wave_count "wave:1")
+EXPECTED_WAVE_2=$(expected_wave_count "wave:2")
+EXPECTED_WAVE_3=$(expected_wave_count "wave:3")
+EXPECTED_WAVE_4=$(expected_wave_count "wave:4")
+
 GITHUB_OWNER="${GITHUB_OWNER:-$(gh api /user --jq '.login' 2>/dev/null || echo 'Root-IO-Labs')}"
 
 usage() {
@@ -303,11 +318,19 @@ assemble_gate_test() {
         entry_content=$(gh api "repos/${repo_full}/contents/scripts/blackbox-test.sh" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)
 
         if [[ $file_count -gt 0 ]]; then
-            # Assemble: shebang + comment + helpers + modules (sorted) + entry point
+            # Assemble: shebang + comment + helpers + modules (sorted) + entry point.
+            # Bash 3.2 + set -u: empty-array expansions like "${module_files[@]}"
+            # raise "unbound variable", so guard with ${#arr[@]} before any [@]
+            # expansion. This path can hit zero test-*.sh modules when the repo
+            # has only helpers.sh (e.g., the pre-release-sanity-check fixture).
             {
                 echo "#!/usr/bin/env bash"
                 echo "# Assembled from modular blackbox test files ($(date -u +"%Y-%m-%dT%H:%M:%SZ"))"
-                echo "# Files: helpers.sh $(printf '%s ' "${module_files[@]##*/}")blackbox-test.sh"
+                if [[ ${#module_files[@]} -gt 0 ]]; then
+                    echo "# Files: helpers.sh $(printf '%s ' "${module_files[@]##*/}")blackbox-test.sh"
+                else
+                    echo "# Files: helpers.sh blackbox-test.sh"
+                fi
                 echo ""
 
                 if [[ -n "$helpers_file" && -f "$helpers_file" ]]; then
@@ -317,15 +340,24 @@ assemble_gate_test() {
                     echo ""
                 fi
 
-                # Sort module files for deterministic ordering
-                IFS=$'\n' sorted_modules=($(sort <<< "$(printf '%s\n' "${module_files[@]}")"))
-                unset IFS
-                for mod in "${sorted_modules[@]}"; do
-                    [[ -f "$mod" ]] || continue
-                    echo "# === $(basename "$mod") ==="
-                    sed '1{/^#!/d;}' "$mod"
-                    echo ""
-                done
+                # Sort module files for deterministic ordering. Build the
+                # sorted_modules array via a portable read-loop (avoids both
+                # `read -d ''`/mapfile bashisms and the empty-array unbound
+                # expansion that the previous one-liner triggered).
+                local sorted_modules=()
+                if [[ ${#module_files[@]} -gt 0 ]]; then
+                    while IFS= read -r mod; do
+                        [[ -n "$mod" ]] && sorted_modules+=("$mod")
+                    done < <(printf '%s\n' "${module_files[@]}" | sort)
+                fi
+                if [[ ${#sorted_modules[@]} -gt 0 ]]; then
+                    for mod in "${sorted_modules[@]}"; do
+                        [[ -f "$mod" ]] || continue
+                        echo "# === $(basename "$mod") ==="
+                        sed '1{/^#!/d;}' "$mod"
+                        echo ""
+                    done
+                fi
 
                 # Instead of appending the raw entry point (which has source
                 # commands for external files that don't exist in assembled mode),
@@ -412,7 +444,24 @@ count_open_issues() {
 count_total_wave_issues() {
     local repo_full="$1"
     local wave_num="$2"
-    gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state all --json number --jq 'length' 2>/dev/null || echo "0"
+    # Live count via gh issue list. May be silently undercounted during a
+    # GitHub indexing/search degradation (see Apr 27 2026 incident).
+    local live
+    live=$(gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state all --json number --jq 'length' 2>/dev/null || echo "0")
+    if [[ -z "$live" || ! "$live" =~ ^[0-9]+$ ]]; then
+        live=0
+    fi
+    # Floor to the JSON-derived expected count so wait_for_wave's
+    # closed=total-open arithmetic can't false-positive when the live list is
+    # missing issues. Indirect expansion with a default keeps this safe under
+    # set -u when the benchmark has no issues.json (custom run, expected=0).
+    local expected_var="EXPECTED_WAVE_${wave_num}"
+    local expected="${!expected_var:-0}"
+    if [[ "$expected" -gt "$live" ]]; then
+        echo "$expected"
+    else
+        echo "$live"
+    fi
 }
 
 has_active_workers() {
@@ -565,7 +614,12 @@ if [[ "$ROUTING_MODE" == true ]]; then
             ONBOARD_FAILURES=$((ONBOARD_FAILURES + 1))
         fi
     done
-    PROFILE_COUNT=$(oat model list 2>/dev/null | tail -n +3 | grep -c "true" || echo 0)
+    # Same `grep -c || echo 0` trap as PRE_COUNT in the gate phase: grep -c
+    # always emits the count to stdout AND exits 1 when the count is zero, so
+    # the fallback echoes a *second* "0", producing PROFILE_COUNT="0\n0".
+    # Use `|| true` to swallow the exit code only.
+    PROFILE_COUNT=$(oat model list 2>/dev/null | tail -n +3 | grep -c "true" || true)
+    [[ -z "$PROFILE_COUNT" ]] && PROFILE_COUNT=0
     log "Model onboarding complete. ${PROFILE_COUNT} eligible profiles available."
     if [[ "$PROFILE_COUNT" -eq 0 ]]; then
         log "FATAL: No eligible models after onboarding. Check API keys and Python dependencies (pip install langchain-anthropic langchain-openai langchain-google-genai)."
@@ -719,17 +773,34 @@ if [[ "$SKIP_GATE" == false ]]; then
         MODEL_FLAG=" --model ${WORKER_MODEL}"
     fi
 
-    # Discover all wave:0 issues from the repo
-    PRE_ISSUES=$(gh issue list --repo "$REPO_FULL" --label "wave:0" --state open --json number,title --jq '.[].number' 2>/dev/null | sort -n || echo "")
-    PRE_COUNT=$(echo "$PRE_ISSUES" | grep -c '[0-9]' || echo "0")
+    # Discover wave:0 issues with retry-and-fallback against degraded GitHub
+    # indexing. Single network call on the healthy path; falls back to
+    # issues.json with a loud WARNING (and ERROR for genuine 404s) when the
+    # live list undercounts. See benchmarks/lib.sh.
+    PRE_ISSUES=$(discover_wave_issues_with_retry "$REPO_FULL" "wave:0")
+    # `grep -c` always prints the count to stdout AND exits 1 when there are
+    # zero matches; `|| true` swallows just the exit code so we get a clean
+    # "0" instead of "0\n0" and avoid `[[: 0 0: ...]]` errors downstream.
+    PRE_COUNT=$(echo "$PRE_ISSUES" | grep -c '^[0-9]' || true)
+    [[ -z "$PRE_COUNT" ]] && PRE_COUNT=0
+
+    # Inline annotation when live disagrees with expected (the WARNING with
+    # full diff is emitted once by discover_wave_issues_with_retry).
+    GATE_KICKOFF_ANNOTATION=""
+    if [[ "$EXPECTED_WAVE_0" -gt 0 && "$PRE_COUNT" -ne "$EXPECTED_WAVE_0" ]]; then
+        GATE_KICKOFF_ANNOTATION=" (live=${PRE_COUNT} expected=${EXPECTED_WAVE_0} indexed)"
+    fi
 
     if [[ "$PRE_COUNT" -eq 0 ]]; then
+        # Reachable when issues.json is missing (custom benchmark) AND the
+        # repo has no wave:0 issues, OR when the entire expected set probed
+        # 404 (setup catastrophic failure -- see ERRORs above).
         log "WARNING: No wave:0 issues found in repo -- falling back to issue #1"
         PRE_ISSUES="1"
         PRE_COUNT=1
     fi
 
-    log "Found ${PRE_COUNT} wave:0 issues: $(echo $PRE_ISSUES | tr '\n' ' ')"
+    log "Found ${PRE_COUNT} wave:0 issues${GATE_KICKOFF_ANNOTATION}: $(echo $PRE_ISSUES | tr '\n' ' ')"
 
     # Build worker commands for each wave:0 issue
     WORKER_CMDS=""
@@ -864,7 +935,7 @@ Do not change issue numbers, repo names, or task descriptions in the commands. D
 
     if [[ "$GATE_PASSED" == true && -f "$GENERATED_TEST" ]]; then
         log "Running judge-blackbox.sh..."
-        if "${SCRIPT_DIR}/judge-blackbox.sh" \
+        if "${SCRIPT_DIR}/scripts/judge-blackbox.sh" \
             --generated "$GENERATED_TEST" \
             --reference "${SCRIPT_DIR}/acceptance-test.sh" \
             --output "$RUN_DIR/gate.json" \
@@ -895,7 +966,7 @@ Do not change issue numbers, repo names, or task descriptions in the commands. D
         log "Running execution smoke test on generated blackbox test..."
         SMOKE_OUTPUT="$RUN_DIR/gate-smoke.json"
         SMOKE_EXIT=0
-        "${SCRIPT_DIR}/run-blackbox.sh" \
+        "${SCRIPT_DIR}/scripts/run-blackbox.sh" \
             --test "$GENERATED_TEST" \
             --repo "$REPO_NAME" \
             --smoke \
@@ -915,10 +986,18 @@ Do not change issue numbers, repo names, or task descriptions in the commands. D
             echo "  This usually means a syntax error, bash compatibility issue (e.g., declare -A"
             echo "  on macOS bash 3.2), or an unbound variable that prevented the test from running."
             echo ""
-            echo "  Issues: $(printf '%s; ' "${SMOKE_REASONS[@]}")"
+            # Diagnostic source-of-truth is the captured runtime output below.
+            # An earlier pre-flight design populated a SMOKE_REASONS array and
+            # rendered it here; that pre-flight was replaced (8a2f71d) by the
+            # current execution-based smoke runner, which surfaces the actual
+            # crash text via .raw_output. The orphaned SMOKE_REASONS read was
+            # left behind in a partial follow-up commit (f87f6d6) and would
+            # crash this branch under set -u with "unbound variable".
             RAW_SNIPPET=$(jq -r '.raw_output // ""' "$SMOKE_OUTPUT" 2>/dev/null | head -c 500 || true)
             if [[ -n "$RAW_SNIPPET" ]]; then
                 echo "  Output snippet: ${RAW_SNIPPET}"
+            else
+                echo "  (no captured output -- check ${SMOKE_OUTPUT} for raw runner JSON)"
             fi
             echo "  ========================================="
             log ""
@@ -977,8 +1056,32 @@ for wave_num in 1 2 3 4; do
 
     WAVE_START_TS=$(date +%s)
 
-    # Count issues in this wave so workspace can verify completeness
-    WAVE_ISSUE_COUNT=$(count_total_wave_issues "$REPO_FULL" "$wave_num")
+    # Discover the trustworthy list of OPEN wave issues for the kickoff
+    # message. Polls the live `gh issue list` against the JSON-derived
+    # expected count and falls back with a loud WARNING (or ERROR for any
+    # genuine 404s) under indexing degradation. Single network call on the
+    # healthy path.
+    WAVE_ISSUE_NUMBERS=$(discover_wave_issues_with_retry "$REPO_FULL" "wave:${wave_num}")
+    WAVE_ISSUE_COUNT=$(echo "$WAVE_ISSUE_NUMBERS" | grep -c '^[0-9]' || true)
+    [[ -z "$WAVE_ISSUE_COUNT" ]] && WAVE_ISSUE_COUNT=0
+
+    # Inline annotation when live disagrees with expected. The detailed
+    # WARNING (with the missing-issue list and status URL) is emitted once
+    # per wave by discover_wave_issues_with_retry.
+    EXPECTED_VAR="EXPECTED_WAVE_${wave_num}"
+    EXPECTED_THIS_WAVE="${!EXPECTED_VAR:-0}"
+    WAVE_KICKOFF_ANNOTATION=""
+    if [[ "$EXPECTED_THIS_WAVE" -gt 0 && "$WAVE_ISSUE_COUNT" -ne "$EXPECTED_THIS_WAVE" ]]; then
+        WAVE_KICKOFF_ANNOTATION=" (live=${WAVE_ISSUE_COUNT} expected=${EXPECTED_THIS_WAVE} indexed)"
+    fi
+    log "    Wave ${wave_num}: ${WAVE_ISSUE_COUNT} open issue(s) discovered${WAVE_KICKOFF_ANNOTATION}"
+
+    # Floor the count for the workspace prompt: even if some expected issues
+    # are currently invisible to gh issue list, the workspace agent should
+    # be told the JSON-truth count so it knows to re-fetch any it can't see.
+    if [[ "$EXPECTED_THIS_WAVE" -gt "$WAVE_ISSUE_COUNT" ]]; then
+        WAVE_ISSUE_COUNT="$EXPECTED_THIS_WAVE"
+    fi
 
     # Build the wave message
     if [[ $wave_num -eq 1 ]]; then
@@ -1150,7 +1253,7 @@ if [[ "$GATE_PASSED" == true && "$SKIP_CONVERGENCE" == false && -f "$RUN_DIR/gat
 
         ITER_BB_OUTPUT="$RUN_DIR/blackbox-iter-${conv_iter}.json"
         BB_EXIT=0
-        "${SCRIPT_DIR}/run-blackbox.sh" \
+        "${SCRIPT_DIR}/scripts/run-blackbox.sh" \
             --test "$RUN_DIR/gate-generated-test.sh" \
             --repo "$REPO_NAME" \
             --output "$ITER_BB_OUTPUT" && BB_EXIT=0 || BB_EXIT=$?
@@ -1352,22 +1455,27 @@ Focus on one specific failure per issue. Then spawn a worker for each issue with
     CONV_DURATION=$((CONV_END - CONV_START))
     log "Convergence loop finished: verdict=${CONVERGENCE_VERDICT}, iterations=${CONVERGENCE_ITERATIONS}, duration=$(format_duration "$CONV_DURATION")"
 
-    # Write convergence.json
+    # Write convergence.json. Guard the array expansion: bash 3.2 + set -u
+    # treats an empty CONVERGENCE_RESULTS=() as "unbound" when expanded with
+    # "${arr[@]}". The empty case is reachable if the convergence loop hits a
+    # timeout/break before its first iteration ever appends a result.
     CONV_RESULTS_JSON="[]"
-    for cr in "${CONVERGENCE_RESULTS[@]}"; do
-        iter_num=$(echo "$cr" | sed 's/iter\([0-9]*\):.*/\1/')
-        iter_exit=$(echo "$cr" | sed 's/.*exit=\([^,]*\).*/\1/')
-        iter_passed=$(echo "$cr" | sed 's/.*passed=\([^,]*\).*/\1/')
-        iter_failed=$(echo "$cr" | sed 's/.*failed=\([^,]*\).*/\1/')
-        iter_score=$(echo "$cr" | sed 's/.*score=\(.*\)/\1/')
-        CONV_RESULTS_JSON=$(echo "$CONV_RESULTS_JSON" | jq \
-            --argjson iter "$iter_num" \
-            --argjson exit_code "$iter_exit" \
-            --argjson passed "$iter_passed" \
-            --argjson failed "$iter_failed" \
-            --arg score "$iter_score" \
-            '. + [{"iteration": $iter, "exit_code": $exit_code, "passed": $passed, "failed": $failed, "score_estimate": $score}]')
-    done
+    if [[ ${#CONVERGENCE_RESULTS[@]} -gt 0 ]]; then
+        for cr in "${CONVERGENCE_RESULTS[@]}"; do
+            iter_num=$(echo "$cr" | sed 's/iter\([0-9]*\):.*/\1/')
+            iter_exit=$(echo "$cr" | sed 's/.*exit=\([^,]*\).*/\1/')
+            iter_passed=$(echo "$cr" | sed 's/.*passed=\([^,]*\).*/\1/')
+            iter_failed=$(echo "$cr" | sed 's/.*failed=\([^,]*\).*/\1/')
+            iter_score=$(echo "$cr" | sed 's/.*score=\(.*\)/\1/')
+            CONV_RESULTS_JSON=$(echo "$CONV_RESULTS_JSON" | jq \
+                --argjson iter "$iter_num" \
+                --argjson exit_code "$iter_exit" \
+                --argjson passed "$iter_passed" \
+                --argjson failed "$iter_failed" \
+                --arg score "$iter_score" \
+                '. + [{"iteration": $iter, "exit_code": $exit_code, "passed": $passed, "failed": $failed, "score_estimate": $score}]')
+        done
+    fi
 
     jq -n \
         --arg verdict "$CONVERGENCE_VERDICT" \
@@ -1389,7 +1497,7 @@ elif [[ "$GATE_PASSED" == true && "$SKIP_CONVERGENCE" == true && -f "$RUN_DIR/ga
     echo ""
     log "========== BLACKBOX TEST (single run, convergence skipped) =========="
     log "Running model-generated blackbox test against finished repo..."
-    "${SCRIPT_DIR}/run-blackbox.sh" \
+    "${SCRIPT_DIR}/scripts/run-blackbox.sh" \
         --test "$RUN_DIR/gate-generated-test.sh" \
         --repo "$REPO_NAME" \
         --output "$RUN_DIR/blackbox-acceptance.json" || log "Warning: run-blackbox.sh failed"

@@ -79,6 +79,8 @@ func (d *Daemon) checkWorkspaceHealth() {
 			modTime := info.ModTime()
 			staleDuration := time.Since(modTime)
 
+			// d.workspaceActivity is owned by this loop; no mutex required.
+			// See the field comment on Daemon before adding another accessor.
 			activity, exists := d.workspaceActivity[repoName]
 			if !exists {
 				d.workspaceActivity[repoName] = &workspaceActivity{

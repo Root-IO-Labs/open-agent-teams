@@ -14,15 +14,15 @@ specialized knowledge, workflows, and tools. Think of them as "onboarding guides
 domains or tasks—they transform a general-purpose agent into a specialized agent
 equipped with procedural knowledge and domain expertise.
 
-### Skill Location for Deepagents
+### Skill Location for OAT CLI
 
-The deepagents CLI loads skills from four directories, listed here from lowest to highest precedence:
+The oat_sdk CLI loads skills from four directories, listed here from lowest to highest precedence:
 
 | # | Directory | Scope | Notes |
 |---|-----------|-------|-------|
-| 1 | `~/.deepagents/<agent>/skills/` | User (deepagents alias) | Default for `deepagents skills create` |
+| 1 | `~/.oat_sdk/<agent>/skills/` | User (oat_sdk alias) | Default for `oat_sdk skills create` |
 | 2 | `~/.agents/skills/` | User | Shared across agent tools |
-| 3 | `.deepagents/skills/` | Project (deepagents alias) | Default for `deepagents skills create --project` |
+| 3 | `.oat_sdk/skills/` | Project (oat_sdk alias) | Default for `oat_sdk skills create --project` |
 | 4 | `.agents/skills/` | Project | Shared across agent tools |
 
 `<agent>` is the agent configuration name (default: `agent`). When two directories contain a skill with the same name, the higher-precedence version wins — project skills override user skills.
@@ -30,12 +30,12 @@ The deepagents CLI loads skills from four directories, listed here from lowest t
 Example directory layout:
 
 ```
-~/.deepagents/agent/skills/     # user skills (lowest precedence)
+~/.oat_sdk/agent/skills/     # user skills (lowest precedence)
 ├── skill-name-1/
 │   └── SKILL.md
 └── ...
 
-<project-root>/.deepagents/skills/   # project skills (higher precedence)
+<project-root>/.oat_sdk/skills/   # project skills (higher precedence)
 ├── skill-name-2/
 │   └── SKILL.md
 └── ...
@@ -297,14 +297,14 @@ Usage:
 scripts/init_skill.py <skill-name> --path <output-directory>
 ```
 
-For deepagents CLI, use any of the skill directories listed in "Skill Location for Deepagents" above:
+For oat_sdk CLI, use any of the skill directories listed in "Skill Location for OAT CLI" above:
 
 ```bash
 # User skills (default)
-scripts/init_skill.py <skill-name> --path ~/.deepagents/agent/skills
+scripts/init_skill.py <skill-name> --path ~/.oat_sdk/agent/skills
 
 # Project skills
-scripts/init_skill.py <skill-name> --path .deepagents/skills
+scripts/init_skill.py <skill-name> --path .oat_sdk/skills
 ```
 
 The script:
@@ -316,19 +316,19 @@ The script:
 
 After initialization, customize or remove the generated SKILL.md and example files as needed.
 
-#### Option B: `deepagents skills create` (quick start)
+#### Option B: `oat_sdk skills create` (quick start)
 
 The built-in CLI command creates a minimal skill with just a `SKILL.md` template — no resource directories. Use this for simple skills that only need instructions and no bundled scripts, references, or assets.
 
 ```bash
 # Create in user skills directory
-deepagents skills create <skill-name>
+oat_sdk skills create <skill-name>
 
 # Create in project skills directory
-deepagents skills create <skill-name> --project
+oat_sdk skills create <skill-name> --project
 ```
 
-Use `init_skill.py` when the skill will include bundled resources (`scripts/`, `references/`, `assets/`). Use `deepagents skills create` for a quick, minimal starting point.
+Use `init_skill.py` when the skill will include bundled resources (`scripts/`, `references/`, `assets/`). Use `oat_sdk skills create` for a quick, minimal starting point.
 
 ### Step 4: Edit the Skill
 

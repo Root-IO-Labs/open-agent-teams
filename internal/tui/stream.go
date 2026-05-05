@@ -102,19 +102,19 @@ func (s *LogStream) run(catchUp bool) {
 	defer f.Close()
 
 	if !catchUp {
-		f.Seek(0, io.SeekEnd)
+		_, _ = f.Seek(0, io.SeekEnd) // best-effort tail; on failure we start at 0
 	} else {
 		// Read last 4KB on catchup — enough for recent context without
 		// dumping too much history that overwhelms dedup on first render.
 		if info, statErr := f.Stat(); statErr == nil && info.Size() > 4096 {
-			f.Seek(-4096, io.SeekEnd)
+			_, _ = f.Seek(-4096, io.SeekEnd) // best-effort; fallthrough reads from 0
 		}
 	}
 
 	reader := bufio.NewReader(f)
 	if catchUp {
 		// Skip the first (likely partial) line after a mid-file seek.
-		reader.ReadString('\n')
+		_, _ = reader.ReadString('\n')
 	}
 
 	// Stream-side progressive dedup: the log file may contain streaming

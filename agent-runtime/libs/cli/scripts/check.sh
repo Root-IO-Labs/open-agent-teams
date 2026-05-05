@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check.sh — Run all contract and interface checks for deepagents-cli.
+# check.sh — Run all contract and interface checks for oat_sdk-cli.
 #
 # Usage:
 #   bash scripts/check.sh            # run everything
@@ -43,22 +43,22 @@ run() {
 # ── 1. Import sanity check ────────────────────────────────────────────────────
 run "Import check" \
   uv run --all-groups python ./scripts/check_imports.py \
-    $(find deepagents_cli -name '*.py' | tr '\n' ' ')
+    $(find oat_cli -name '*.py' | tr '\n' ' ')
 
 # ── 2. Linting (skippable) ────────────────────────────────────────────────────
 if [ "$NO_LINT" = false ]; then
   run "Ruff lint" \
-    uv run --all-groups ruff check deepagents_cli tests
+    uv run --all-groups ruff check oat_cli tests
 
   run "Ruff format check" \
-    uv run --all-groups ruff format deepagents_cli tests --diff
+    uv run --all-groups ruff format oat_cli tests --diff
 fi
 
 # ── 3. Unit tests ─────────────────────────────────────────────────────────────
 run "Unit tests" \
   uv run --group test pytest -n auto --disable-socket --allow-unix-socket \
     tests/unit_tests/ \
-    --cov=deepagents_cli \
+    --cov=oat_cli \
     --cov-report=term-missing \
     -q
 

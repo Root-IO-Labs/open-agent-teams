@@ -19,8 +19,8 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from deepagents_cli.app import TokenSpendAccumulator
-from deepagents_cli.textual_adapter import _commit_token_tracking, _emit_oat_tokens
+from oat_cli.app import TokenSpendAccumulator
+from oat_cli.textual_adapter import _commit_token_tracking, _emit_oat_tokens
 
 
 def _read_token_payloads(log_file: Path) -> list[dict]:

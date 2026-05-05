@@ -11,28 +11,6 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
-// AgentType is an alias for state.AgentType.
-// Deprecated: Use state.AgentType directly instead.
-type AgentType = state.AgentType
-
-// Deprecated: Use state.AgentTypeSupervisor directly.
-const TypeSupervisor = state.AgentTypeSupervisor
-
-// Deprecated: Use state.AgentTypeWorker directly.
-const TypeWorker = state.AgentTypeWorker
-
-// Deprecated: Use state.AgentTypeMergeQueue directly.
-const TypeMergeQueue = state.AgentTypeMergeQueue
-
-// Deprecated: Use state.AgentTypeWorkspace directly.
-const TypeWorkspace = state.AgentTypeWorkspace
-
-// Deprecated: Use state.AgentTypeReview directly.
-const TypeReview = state.AgentTypeReview
-
-// Deprecated: Use state.AgentTypePRShepherd directly.
-const TypePRShepherd = state.AgentTypePRShepherd
-
 // Embedded default prompts
 // Only supervisor and workspace are "hardcoded" - other agent types (worker, merge-queue, review)
 // should come from configurable agent definitions in agent-templates.
@@ -62,12 +40,10 @@ func GetDefaultPrompt(agentType state.AgentType) string {
 }
 
 // LoadCustomPrompt loads a custom prompt from the repository's .oat directory.
-// Returns empty string if the file doesn't exist.
-//
-// Deprecated: This function is deprecated. Use the configurable agent system instead:
-// - Agent definitions: <repo>/.oat/agents/<agent-name>.md
-// - Local overrides: ~/.oat/repos/<repo>/agents/<agent-name>.md
-// See internal/agents package for the new system.
+// Returns empty string if the file doesn't exist. This is still the canonical
+// way for the daemon to pick up repo-scoped prompt overrides; the configurable
+// agent system (internal/agents) supersedes it for agent-template loading but
+// both paths coexist.
 func LoadCustomPrompt(repoPath string, agentType state.AgentType) (string, error) {
 	var filename string
 	switch agentType {

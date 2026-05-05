@@ -194,11 +194,8 @@ func TestAckMessage(t *testing.T) {
 
 	if acked.AckedAt == nil {
 		t.Error("AckedAt is nil")
-	} else {
-		// Check that AckedAt is recent
-		if time.Since(*acked.AckedAt) > time.Minute {
-			t.Error("AckedAt is too old")
-		}
+	} else if time.Since(*acked.AckedAt) > time.Minute {
+		t.Error("AckedAt is too old")
 	}
 }
 

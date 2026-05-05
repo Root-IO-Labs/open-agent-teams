@@ -13,9 +13,9 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from deepagents_cli.app import DeepAgentsApp
-from deepagents_cli.sessions import ThreadInfo
-from deepagents_cli.widgets.thread_selector import ThreadSelectorScreen
+from oat_cli.app import OatSdksApp
+from oat_cli.sessions import ThreadInfo
+from oat_cli.widgets.thread_selector import ThreadSelectorScreen
 
 MOCK_THREADS: list[ThreadInfo] = [
     {
@@ -47,7 +47,7 @@ def _patch_list_threads(threads: list[ThreadInfo] | None = None) -> Any:  # noqa
     """
     data = threads if threads is not None else MOCK_THREADS
     return patch(
-        "deepagents_cli.sessions.list_threads",
+        "oat_cli.sessions.list_threads",
         new_callable=AsyncMock,
         return_value=data,
     )
@@ -449,7 +449,7 @@ class TestThreadSelectorClickHandling:
                 # Post a Clicked message from the second option widget.
                 # (pilot.click(type) always hits the first match, so we
                 # exercise the handler directly for an exact-widget test.)
-                from deepagents_cli.widgets.thread_selector import ThreadOption
+                from oat_cli.widgets.thread_selector import ThreadOption
 
                 assert len(screen._option_widgets) > 1, (
                     "Expected option widgets to be built"
@@ -464,7 +464,7 @@ class TestThreadSelectorClickHandling:
                 assert app.result == "def67890"
 
 
-_WEBBROWSER_OPEN = "deepagents_cli.widgets._links.webbrowser.open"
+_WEBBROWSER_OPEN = "oat_cli.widgets._links.webbrowser.open"
 
 
 class TestThreadSelectorOnClickOpensLink:
@@ -647,7 +647,7 @@ class TestFetchThreadUrl:
         with (
             _patch_list_threads(),
             patch(
-                "deepagents_cli.widgets.thread_selector.build_langsmith_thread_url",
+                "oat_cli.widgets.thread_selector.build_langsmith_thread_url",
                 return_value="https://smith.langchain.com/p/t/abc12345",
             ),
         ):
@@ -676,7 +676,7 @@ class TestFetchThreadUrl:
         with (
             _patch_list_threads(),
             patch(
-                "deepagents_cli.widgets.thread_selector.build_langsmith_thread_url",
+                "oat_cli.widgets.thread_selector.build_langsmith_thread_url",
                 side_effect=_blocking,
             ),
         ):
@@ -697,7 +697,7 @@ class TestFetchThreadUrl:
         with (
             _patch_list_threads(),
             patch(
-                "deepagents_cli.widgets.thread_selector.build_langsmith_thread_url",
+                "oat_cli.widgets.thread_selector.build_langsmith_thread_url",
                 side_effect=OSError("network failure"),
             ),
         ):
@@ -718,7 +718,7 @@ class TestFetchThreadUrl:
         with (
             _patch_list_threads(),
             patch(
-                "deepagents_cli.widgets.thread_selector.build_langsmith_thread_url",
+                "oat_cli.widgets.thread_selector.build_langsmith_thread_url",
                 side_effect=AttributeError("SDK changed"),
             ),
         ):
@@ -739,7 +739,7 @@ class TestFetchThreadUrl:
         with (
             _patch_list_threads(),
             patch(
-                "deepagents_cli.widgets.thread_selector.build_langsmith_thread_url",
+                "oat_cli.widgets.thread_selector.build_langsmith_thread_url",
                 return_value=None,
             ),
         ):
@@ -803,7 +803,7 @@ class TestThreadSelectorErrorHandling:
     async def test_list_threads_error_still_dismissable(self) -> None:
         """Database error should not crash; Escape still works."""
         with patch(
-            "deepagents_cli.sessions.list_threads",
+            "oat_cli.sessions.list_threads",
             new_callable=AsyncMock,
             side_effect=OSError("database is locked"),
         ):
@@ -834,7 +834,7 @@ class TestThreadSelectorLimit:
         """get_thread_limit() return value should be forwarded to list_threads."""
         with (
             patch(
-                "deepagents_cli.sessions.get_thread_limit",
+                "oat_cli.sessions.get_thread_limit",
                 return_value=5,
             ),
             _patch_list_threads() as mock_lt,
@@ -864,12 +864,12 @@ class TestThreadSelectorLimit:
 
         with (
             patch(
-                "deepagents_cli.sessions.list_threads",
+                "oat_cli.sessions.list_threads",
                 new_callable=AsyncMock,
                 return_value=threads_without_counts,
             ) as mock_lt,
             patch(
-                "deepagents_cli.sessions.populate_thread_message_counts",
+                "oat_cli.sessions.populate_thread_message_counts",
                 new_callable=AsyncMock,
                 side_effect=_populate,
             ) as mock_populate,
@@ -908,16 +908,16 @@ class TestThreadSelectorLimit:
 
         with (
             patch(
-                "deepagents_cli.sessions.list_threads",
+                "oat_cli.sessions.list_threads",
                 new_callable=AsyncMock,
                 return_value=threads_without_counts,
             ),
             patch(
-                "deepagents_cli.sessions.apply_cached_thread_message_counts",
+                "oat_cli.sessions.apply_cached_thread_message_counts",
                 side_effect=_apply_cached,
             ) as mock_apply_cached,
             patch(
-                "deepagents_cli.sessions.populate_thread_message_counts",
+                "oat_cli.sessions.populate_thread_message_counts",
                 new_callable=AsyncMock,
             ) as mock_populate,
         ):
@@ -952,12 +952,12 @@ class TestThreadSelectorMessageCountErrors:
 
         with (
             patch(
-                "deepagents_cli.sessions.populate_thread_message_counts",
+                "oat_cli.sessions.populate_thread_message_counts",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("unexpected type mismatch"),
             ),
             patch(
-                "deepagents_cli.widgets.thread_selector.logger.warning"
+                "oat_cli.widgets.thread_selector.logger.warning"
             ) as mock_warning,
         ):
             await screen._load_message_counts()
@@ -1003,7 +1003,7 @@ class TestThreadSelectorPrefetchedRows:
             return refreshed
 
         with patch(
-            "deepagents_cli.sessions.list_threads",
+            "oat_cli.sessions.list_threads",
             new_callable=AsyncMock,
             side_effect=_list_threads,
         ) as mock_list_threads:
@@ -1050,7 +1050,7 @@ class TestThreadSelectorPrefetchedRows:
         ]
         app = ThreadSelectorTestApp(current_thread="abc12345")
         with patch(
-            "deepagents_cli.sessions.list_threads",
+            "oat_cli.sessions.list_threads",
             new_callable=AsyncMock,
             return_value=refreshed,
         ) as mock_list_threads:
@@ -1095,11 +1095,11 @@ def _get_widget_text(widget: Static) -> str:
 
 
 class TestResumeThread:
-    """Tests for DeepAgentsApp._resume_thread."""
+    """Tests for OatSdksApp._resume_thread."""
 
     async def test_no_agent_shows_error(self) -> None:
         """_resume_thread with no agent should show an error message."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         mounted: list[Static] = []
         app._mount_message = AsyncMock(side_effect=lambda w: mounted.append(w))  # type: ignore[assignment]
         app._agent = None
@@ -1111,7 +1111,7 @@ class TestResumeThread:
 
     async def test_no_session_state_shows_error(self) -> None:
         """_resume_thread with no session state should show an error message."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         mounted: list[Static] = []
         app._mount_message = AsyncMock(side_effect=lambda w: mounted.append(w))  # type: ignore[assignment]
         app._agent = MagicMock()
@@ -1124,7 +1124,7 @@ class TestResumeThread:
 
     async def test_already_switching_shows_message(self) -> None:
         """_resume_thread should reject concurrent thread switches."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         mounted: list[Static] = []
         app._mount_message = AsyncMock(side_effect=lambda w: mounted.append(w))  # type: ignore[assignment]
         app._agent = MagicMock()
@@ -1139,7 +1139,7 @@ class TestResumeThread:
 
     async def test_already_on_thread_shows_message(self) -> None:
         """_resume_thread when already on the thread should show info message."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         mounted: list[Static] = []
         app._mount_message = AsyncMock(side_effect=lambda w: mounted.append(w))  # type: ignore[assignment]
         app._agent = MagicMock()
@@ -1155,7 +1155,7 @@ class TestResumeThread:
         """Successful _resume_thread should update thread IDs and load history."""
         from textual.css.query import NoMatches as _NoMatches
 
-        app = DeepAgentsApp(thread_id="old-thread")
+        app = OatSdksApp(thread_id="old-thread")
         app._agent = MagicMock()
         app._session_state = MagicMock()
         app._session_state.thread_id = "old-thread"
@@ -1187,7 +1187,7 @@ class TestResumeThread:
         """If _clear_messages raises, thread IDs should be restored."""
         from textual.css.query import NoMatches as _NoMatches
 
-        app = DeepAgentsApp(thread_id="old-thread")
+        app = OatSdksApp(thread_id="old-thread")
         app._agent = MagicMock()
         app._session_state = MagicMock()
         app._session_state.thread_id = "old-thread"
@@ -1215,7 +1215,7 @@ class TestResumeThread:
         """If _load_thread_history raises, thread IDs should be rolled back."""
         from textual.css.query import NoMatches as _NoMatches
 
-        app = DeepAgentsApp(thread_id="old-thread")
+        app = OatSdksApp(thread_id="old-thread")
         app._agent = MagicMock()
         app._session_state = MagicMock()
         app._session_state.thread_id = "old-thread"
@@ -1243,7 +1243,7 @@ class TestResumeThread:
 
     async def test_prefetch_failure_keeps_current_thread_visible(self) -> None:
         """Failed prefetch should not clear current conversation state."""
-        app = DeepAgentsApp(thread_id="old-thread")
+        app = OatSdksApp(thread_id="old-thread")
         app._agent = MagicMock()
         app._session_state = MagicMock()
         app._session_state.thread_id = "old-thread"
@@ -1268,7 +1268,7 @@ class TestResumeThread:
 
     async def test_prefetch_failure_clears_switch_lock_and_restores_input(self) -> None:
         """Prefetch failures should release switch lock and restore input state."""
-        app = DeepAgentsApp(thread_id="old-thread")
+        app = OatSdksApp(thread_id="old-thread")
         app._agent = MagicMock()
         app._session_state = MagicMock()
         app._session_state.thread_id = "old-thread"
@@ -1291,7 +1291,7 @@ class TestResumeThread:
         """If rollback restore fails, user-facing error should mention it."""
         from textual.css.query import NoMatches as _NoMatches
 
-        app = DeepAgentsApp(thread_id="old-thread")
+        app = OatSdksApp(thread_id="old-thread")
         app._agent = MagicMock()
         app._session_state = MagicMock()
         app._session_state.thread_id = "old-thread"
@@ -1318,11 +1318,11 @@ class TestResumeThread:
 
 
 class TestFetchThreadHistoryData:
-    """Tests for DeepAgentsApp._fetch_thread_history_data."""
+    """Tests for OatSdksApp._fetch_thread_history_data."""
 
     async def test_returns_empty_when_agent_missing(self) -> None:
         """No active agent should return an empty history payload."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._agent = None
 
         result = await app._fetch_thread_history_data("tid-1")
@@ -1331,7 +1331,7 @@ class TestFetchThreadHistoryData:
 
     async def test_returns_empty_when_state_missing(self) -> None:
         """Missing checkpoint state should return an empty history payload."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._agent = MagicMock()
         app._agent.aget_state = AsyncMock(return_value=None)
 
@@ -1344,7 +1344,7 @@ class TestFetchThreadHistoryData:
 
     async def test_returns_empty_when_messages_missing(self) -> None:
         """State with no messages should return an empty history payload."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._agent = MagicMock()
         state = MagicMock()
         state.values = {}
@@ -1356,9 +1356,9 @@ class TestFetchThreadHistoryData:
 
     async def test_offloads_conversion_to_thread(self) -> None:
         """Message conversion should be offloaded via `asyncio.to_thread`."""
-        from deepagents_cli.widgets.message_store import MessageData, MessageType
+        from oat_cli.widgets.message_store import MessageData, MessageType
 
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._agent = MagicMock()
         raw_messages = [object()]
         state = MagicMock()
@@ -1367,7 +1367,7 @@ class TestFetchThreadHistoryData:
         converted = [MessageData(type=MessageType.USER, content="hello")]
 
         with patch(
-            "deepagents_cli.app.asyncio.to_thread",
+            "oat_cli.app.asyncio.to_thread",
             new_callable=AsyncMock,
             return_value=converted,
         ) as to_thread_mock:
@@ -1381,13 +1381,13 @@ class TestFetchThreadHistoryData:
 
 
 class TestLoadThreadHistory:
-    """Tests for DeepAgentsApp._load_thread_history."""
+    """Tests for OatSdksApp._load_thread_history."""
 
     async def test_preloaded_history_skips_fetch_and_schedules_link(self) -> None:
         """Preloaded history should render without state fetch round-trip."""
-        from deepagents_cli.widgets.message_store import MessageData, MessageType
+        from oat_cli.widgets.message_store import MessageData, MessageType
 
-        app = DeepAgentsApp(thread_id="tid-1")
+        app = OatSdksApp(thread_id="tid-1")
         app._agent = MagicMock()
         fetch_history_mock = AsyncMock()
         mount_message_mock = AsyncMock()
@@ -1412,9 +1412,9 @@ class TestLoadThreadHistory:
 
     async def test_fallback_fetch_path_used_without_preloaded_data(self) -> None:
         """History should be fetched when preloaded data is not provided."""
-        from deepagents_cli.widgets.message_store import MessageData, MessageType
+        from oat_cli.widgets.message_store import MessageData, MessageType
 
-        app = DeepAgentsApp(thread_id="tid-1")
+        app = OatSdksApp(thread_id="tid-1")
         app._agent = MagicMock()
         fetched = [MessageData(type=MessageType.USER, content="hello")]
         fetch_history_mock = AsyncMock(return_value=fetched)
@@ -1439,10 +1439,10 @@ class TestLoadThreadHistory:
 
     async def test_assistant_render_failure_does_not_abort_history_load(self) -> None:
         """A single assistant render failure should not abort history loading."""
-        from deepagents_cli.widgets.message_store import MessageData, MessageType
-        from deepagents_cli.widgets.messages import AssistantMessage
+        from oat_cli.widgets.message_store import MessageData, MessageType
+        from oat_cli.widgets.messages import AssistantMessage
 
-        app = DeepAgentsApp(thread_id="tid-1")
+        app = OatSdksApp(thread_id="tid-1")
         app._agent = MagicMock()
         mount_message_mock = AsyncMock()
         schedule_link_mock = MagicMock()
@@ -1479,11 +1479,11 @@ class TestLoadThreadHistory:
 
     async def test_early_return_without_thread_id_logs_debug(self) -> None:
         """Missing thread ID should early-return with a debug log entry."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._lc_thread_id = None
         app._agent = MagicMock()
 
-        with patch("deepagents_cli.app.logger.debug") as debug_mock:
+        with patch("oat_cli.app.logger.debug") as debug_mock:
             await app._load_thread_history()
 
         debug_mock.assert_called_once_with(
@@ -1492,10 +1492,10 @@ class TestLoadThreadHistory:
 
     async def test_early_return_without_agent_logs_debug(self) -> None:
         """No agent and no preloaded payload should early-return with debug log."""
-        app = DeepAgentsApp(thread_id="tid-1")
+        app = OatSdksApp(thread_id="tid-1")
         app._agent = None
 
-        with patch("deepagents_cli.app.logger.debug") as debug_mock:
+        with patch("oat_cli.app.logger.debug") as debug_mock:
             await app._load_thread_history(thread_id="tid-1")
 
         debug_mock.assert_called_once_with(
@@ -1505,11 +1505,11 @@ class TestLoadThreadHistory:
 
 
 class TestUpgradeThreadMessageLink:
-    """Tests for DeepAgentsApp._upgrade_thread_message_link."""
+    """Tests for OatSdksApp._upgrade_thread_message_link."""
 
     async def test_noop_when_link_does_not_resolve(self) -> None:
         """Plain-string result should leave widget content unchanged."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._build_thread_message = AsyncMock(return_value="Resumed thread: tid-1")  # type: ignore[assignment]
         widget = MagicMock()
         widget.parent = object()
@@ -1528,7 +1528,7 @@ class TestUpgradeThreadMessageLink:
         """Unmounted widget should not be updated even when link resolves."""
         from rich.text import Text
 
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         app._build_thread_message = AsyncMock(  # type: ignore[assignment]
             return_value=Text("Resumed thread: tid-1")
         )
@@ -1548,7 +1548,7 @@ class TestUpgradeThreadMessageLink:
         """Resolved Rich text should replace widget content."""
         from rich.text import Text
 
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         linked = Text("Resumed thread: tid-1")
         app._build_thread_message = AsyncMock(return_value=linked)  # type: ignore[assignment]
         widget = MagicMock()
@@ -1566,12 +1566,12 @@ class TestUpgradeThreadMessageLink:
 
 
 class TestBuildThreadMessage:
-    """Tests for DeepAgentsApp._build_thread_message."""
+    """Tests for OatSdksApp._build_thread_message."""
 
     async def test_plain_text_when_tracing_not_configured(self) -> None:
         """Returns plain string when LangSmith URL is not available."""
-        app = DeepAgentsApp()
-        with patch("deepagents_cli.app.build_langsmith_thread_url", return_value=None):
+        app = OatSdksApp()
+        with patch("oat_cli.app.build_langsmith_thread_url", return_value=None):
             result = await app._build_thread_message("Resumed thread", "tid-123")
 
         assert result == "Resumed thread: tid-123"
@@ -1581,9 +1581,9 @@ class TestBuildThreadMessage:
         """Returns Rich Text with hyperlink when LangSmith URL is available."""
         from rich.text import Text
 
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         url = "https://smith.langchain.com/o/org/projects/p/proj/t/tid-123"
-        with patch("deepagents_cli.app.build_langsmith_thread_url", return_value=url):
+        with patch("oat_cli.app.build_langsmith_thread_url", return_value=url):
             result = await app._build_thread_message("Resumed thread", "tid-123")
 
         assert isinstance(result, Text)
@@ -1596,9 +1596,9 @@ class TestBuildThreadMessage:
 
     async def test_fallback_on_timeout(self) -> None:
         """Returns plain string when URL resolution times out."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         with patch(
-            "deepagents_cli.app.asyncio.wait_for",
+            "oat_cli.app.asyncio.wait_for",
             side_effect=TimeoutError,
         ):
             result = await app._build_thread_message("Resumed thread", "t-1")
@@ -1608,9 +1608,9 @@ class TestBuildThreadMessage:
 
     async def test_fallback_on_exception(self) -> None:
         """Returns plain string when URL resolution raises an exception."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         with patch(
-            "deepagents_cli.app.build_langsmith_thread_url",
+            "oat_cli.app.build_langsmith_thread_url",
             side_effect=OSError("network error"),
         ):
             result = await app._build_thread_message("Resumed thread", "t-1")
@@ -1620,7 +1620,7 @@ class TestBuildThreadMessage:
 
 
 class TestConvertMessagesToData:
-    """Tests for DeepAgentsApp._convert_messages_to_data."""
+    """Tests for OatSdksApp._convert_messages_to_data."""
 
     def _make_human(self, content: str) -> object:
         """Create a HumanMessage."""
@@ -1651,10 +1651,10 @@ class TestConvertMessagesToData:
 
     def test_human_message_conversion(self) -> None:
         """HumanMessage should become a USER MessageData."""
-        from deepagents_cli.widgets.message_store import MessageType
+        from oat_cli.widgets.message_store import MessageType
 
         msgs = [self._make_human("Hello")]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 1
         assert result[0].type == MessageType.USER
@@ -1666,17 +1666,17 @@ class TestConvertMessagesToData:
             self._make_human("[SYSTEM] Auto-injected context"),
             self._make_human("Real user message"),
         ]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 1
         assert result[0].content == "Real user message"
 
     def test_ai_message_text_content(self) -> None:
         """AIMessage with string content should become ASSISTANT MessageData."""
-        from deepagents_cli.widgets.message_store import MessageType
+        from oat_cli.widgets.message_store import MessageType
 
         msgs = [self._make_ai("Here is the answer.")]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 1
         assert result[0].type == MessageType.ASSISTANT
@@ -1684,14 +1684,14 @@ class TestConvertMessagesToData:
 
     def test_ai_message_content_block_list(self) -> None:
         """AIMessage with list-of-blocks content should extract text."""
-        from deepagents_cli.widgets.message_store import MessageType
+        from oat_cli.widgets.message_store import MessageType
 
         blocks: list[dict[str, str]] = [
             {"type": "text", "text": "Part 1. "},
             {"type": "text", "text": "Part 2."},
         ]
         msgs = [self._make_ai(blocks)]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 1
         assert result[0].type == MessageType.ASSISTANT
@@ -1700,13 +1700,13 @@ class TestConvertMessagesToData:
     def test_ai_message_empty_text_skipped(self) -> None:
         """AIMessage with empty text should not produce an ASSISTANT entry."""
         msgs = [self._make_ai("   ")]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 0
 
     def test_tool_call_matching(self) -> None:
         """ToolMessage should be matched to its AIMessage tool call by ID."""
-        from deepagents_cli.widgets.message_store import MessageType, ToolStatus
+        from oat_cli.widgets.message_store import MessageType, ToolStatus
 
         msgs = [
             self._make_ai(
@@ -1716,7 +1716,7 @@ class TestConvertMessagesToData:
             ),
             self._make_tool("file contents", tool_call_id="tc-1"),
         ]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 1
         assert result[0].type == MessageType.TOOL
@@ -1726,7 +1726,7 @@ class TestConvertMessagesToData:
 
     def test_tool_call_error_status(self) -> None:
         """ToolMessage with error status should set ERROR on the tool data."""
-        from deepagents_cli.widgets.message_store import ToolStatus
+        from oat_cli.widgets.message_store import ToolStatus
 
         msgs = [
             self._make_ai(
@@ -1734,26 +1734,26 @@ class TestConvertMessagesToData:
             ),
             self._make_tool("command failed", tool_call_id="tc-2", status="error"),
         ]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert result[0].tool_status == ToolStatus.ERROR
         assert result[0].tool_output == "command failed"
 
     def test_unmatched_tool_call_rejected(self) -> None:
         """Tool calls with no matching ToolMessage should be REJECTED."""
-        from deepagents_cli.widgets.message_store import ToolStatus
+        from oat_cli.widgets.message_store import ToolStatus
 
         msgs = [
             self._make_ai(tool_calls=[{"id": "tc-3", "name": "bash", "args": {}}]),
         ]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 1
         assert result[0].tool_status == ToolStatus.REJECTED
 
     def test_mixed_message_sequence(self) -> None:
         """Full conversation with mixed message types should convert correctly."""
-        from deepagents_cli.widgets.message_store import MessageType, ToolStatus
+        from oat_cli.widgets.message_store import MessageType, ToolStatus
 
         msgs = [
             self._make_human("What files are here?"),
@@ -1764,7 +1764,7 @@ class TestConvertMessagesToData:
             self._make_tool("file1.py\nfile2.py", tool_call_id="tc-a"),
             self._make_ai("I found 2 files."),
         ]
-        result = DeepAgentsApp._convert_messages_to_data(msgs)
+        result = OatSdksApp._convert_messages_to_data(msgs)
 
         assert len(result) == 4
         assert result[0].type == MessageType.USER
@@ -1777,5 +1777,5 @@ class TestConvertMessagesToData:
 
     def test_empty_messages(self) -> None:
         """Empty input should return empty output."""
-        result = DeepAgentsApp._convert_messages_to_data([])
+        result = OatSdksApp._convert_messages_to_data([])
         assert result == []

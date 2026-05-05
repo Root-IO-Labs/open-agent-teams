@@ -14,8 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from deepagents_cli.app import TextualTokenTracker, TokenSpendAccumulator
-from deepagents_cli.textual_adapter import (
+from oat_cli.app import TextualTokenTracker, TokenSpendAccumulator
+from oat_cli.textual_adapter import (
     _commit_token_tracking,
     _emit_oat_tokens,
     _is_summarization_chunk,
@@ -163,7 +163,7 @@ class TestCommitTokenTracking:
         """When no spend captured, no emission to daemon."""
         adapter = self._make_adapter()
         with patch(
-            "deepagents_cli.textual_adapter._emit_oat_tokens"
+            "oat_cli.textual_adapter._emit_oat_tokens"
         ) as mock_emit:
             _commit_token_tracking(adapter, 0, 0, 0, 0)
             mock_emit.assert_not_called()

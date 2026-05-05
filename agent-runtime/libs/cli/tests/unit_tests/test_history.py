@@ -9,7 +9,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from deepagents_cli.widgets.history import HistoryManager
+from oat_cli.widgets.history import HistoryManager
 
 
 @pytest.fixture

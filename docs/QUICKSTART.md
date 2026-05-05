@@ -2,6 +2,20 @@
 
 This guide is designed to be read by both humans and AI agents. It covers everything needed to install, configure, and operate OAT from scratch.
 
+## TL;DR
+
+If you already have Go 1.24.2+, Python 3.11+, `uv`, `git`, and `gh` installed and at least one provider API key exported (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or any other supported provider — see the [Prerequisites](#prerequisites) table below):
+
+```bash
+./scripts/install.sh                                # build + install oat and oat-agent
+oat doctor                                          # confirm your setup; 7 checks, read-only
+oat start                                           # start the background daemon
+oat init https://github.com/<your-org>/<your-repo>  # register a repo (creates supervisor + merge-queue)
+oat ui                                              # launch the dashboard; press ? for help
+```
+
+If any command fails, run `oat doctor` first — it tells you which prerequisite is missing and how to fix it. For a deeper walkthrough keep reading.
+
 ## Prerequisites
 
 | Dependency | Minimum Version | Install |
@@ -328,7 +342,7 @@ oat cleanup                          # clean orphaned worktrees/messages
 | `OAT_CORE_AGENT_SOFT_TIMEOUT` | `5` | Minutes before nudging stuck core agents |
 | `OAT_STUCK_SUPERVISOR_NUDGE` | `10` | Nudge count before alerting supervisor |
 | `OAT_STUCK_DAEMON_NUDGE` | `16` | Nudge count before daemon takeover |
-| `OAT_STUCK_MAX_NUDGE` | `30` | Nudge count before force-removal |
+| `OAT_STUCK_MAX_NUDGE` | `40` | Nudge count before force-removal |
 | `OAT_WAKE_INTERVAL_SECONDS` | `60` | Wake/nudge loop interval |
 | `OAT_TEST_MODE` | *(unset)* | Skip real agent spawning (for tests) |
 

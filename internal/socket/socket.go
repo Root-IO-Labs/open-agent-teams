@@ -3,6 +3,7 @@ package socket
 import (
 	"bufio"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log"
@@ -240,15 +241,58 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Serve accepts and handles connections
+// maxConcurrentHandlers bounds the number of request-response handlers that
+// can run simultaneously. When exceeded, new connections are rejected with a
+// quick "busy" response instead of piling up goroutines, which prevents a
+// slow/wedged handler from starving the daemon of goroutines or FDs.
+//
+// Streaming connections (stream_output, stream_events) are exempt from this
+// cap since they are long-lived by design — they have their own write
+// deadlines that eject stuck subscribers quickly.
+const maxConcurrentHandlers = 50
+
+// Serve accepts and handles connections with a bounded concurrency semaphore.
+// Non-stream handlers are capped at maxConcurrentHandlers; excess connections
+// get a fast-fail busy response so clients aren't stuck in uninterruptible
+// kernel waits when the daemon is overloaded.
+//
+// Transient Accept errors (EMFILE, EINTR, temporary kernel hiccups) are
+// logged and the loop continues. The accept loop only returns on
+// net.ErrClosed (clean listener shutdown). This closes the "daemon is
+// silently deaf" failure mode where one transient error would kill the
+// accept loop but leave the daemon process alive and logging.
 func (s *Server) Serve() error {
+	sem := make(chan struct{}, maxConcurrentHandlers)
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			return fmt.Errorf("failed to accept connection: %w", err)
+			if stderrors.Is(err, net.ErrClosed) {
+				return nil // clean shutdown
+			}
+			log.Printf("accept error (retrying): %v", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
-		go s.handleConnection(conn)
+		select {
+		case sem <- struct{}{}:
+			go func(c net.Conn) {
+				defer func() { <-sem }()
+				s.handleConnection(c)
+			}(conn)
+		default:
+			// Over capacity — fail the client fast with a bounded write so
+			// this goroutine can't wedge either. A client that retries after
+			// a short pause will likely succeed once inflight handlers drain.
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(1 * time.Second))
+				_ = json.NewEncoder(c).Encode(Response{
+					Success: false,
+					Error:   "daemon busy: too many concurrent handlers, retry in a moment",
+				})
+			}(conn)
+		}
 	}
 }
 
@@ -269,6 +313,14 @@ func (s *Server) Stop() error {
 }
 
 const serverConnectionTimeout = 30 * time.Second
+
+// handlerTimeout caps how long a synchronous (non-streaming) handler is
+// allowed to run before we abandon it and reply to the client with an error.
+// The handler goroutine continues if it's stuck on a mutex or syscall, but
+// the connection goroutine is freed so the client isn't blocked and the
+// semaphore slot is released. 20s is well under serverConnectionTimeout so
+// the response has time to be written before the connection deadline hits.
+const handlerTimeout = 20 * time.Second
 
 // handleConnection handles a single connection with a deadline to prevent
 // slow or stuck clients from tying up handler goroutines indefinitely.
@@ -307,9 +359,36 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Normal request-response path
+	// Normal request-response path.
+	// Run the handler in a goroutine with a hard timeout. If the handler is
+	// wedged on a mutex or slow syscall, we still reply within handlerTimeout
+	// and free this connection goroutine. The wedged handler goroutine
+	// eventually exits on its own (or leaks, but doesn't block new traffic).
 	defer conn.Close()
-	resp := s.handler.Handle(req)
+	done := make(chan Response, 1)
+	go func() {
+		// Recover so a panicking handler doesn't crash the daemon. Panics are
+		// reported as an error response to the client and logged for postmortem.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Handler panicked on command %q: %v", req.Command, r)
+				done <- Response{Success: false, Error: fmt.Sprintf("handler panic: %v", r)}
+			}
+		}()
+		done <- s.handler.Handle(req)
+	}()
+
+	var resp Response
+	select {
+	case resp = <-done:
+	case <-time.After(handlerTimeout):
+		log.Printf("Handler timeout on command %q after %s", req.Command, handlerTimeout)
+		resp = Response{
+			Success: false,
+			Error:   fmt.Sprintf("handler timed out after %s", handlerTimeout),
+		}
+	}
+
 	if err := json.NewEncoder(conn).Encode(resp); err != nil {
 		// Can't send error response at this point
 		return

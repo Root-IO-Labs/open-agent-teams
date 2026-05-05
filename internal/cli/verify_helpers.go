@@ -61,6 +61,34 @@ func (c *CLI) getOriginalTask(repoName, agentName string) (string, error) {
 	return "", fmt.Errorf("could not retrieve task for agent %s in repo %s", agentName, repoName)
 }
 
+// getDiffBaseRef returns the preferred diff base for self-verify
+// operations. It mirrors the same priority used by gatherVerificationContext:
+//
+//  1. The calling worker's pinned BaseSHA (set by the daemon at
+//     `oat worker request-review` time). Using the same base as the
+//     verifier ensures self-verify and verifier give consistent results
+//     when the verifier crashed and the worker falls back to self-verify.
+//  2. Live getBaseBranchRef() fallback (origin/main or origin/master)
+//     when the worker has no pinned BaseSHA — e.g. self-verify is
+//     being run BEFORE any request-review (the documented happy path
+//     for early-iteration sanity checks).
+//
+// inferAgentContext is best-effort: if cwd is not inside a worker
+// worktree we silently fall back to getBaseBranchRef rather than
+// erroring, since callers like getModifiedFiles also run from
+// non-worker contexts (e.g. tests).
+func (c *CLI) getDiffBaseRef() string {
+	repoName, workerName, err := c.inferAgentContext()
+	if err == nil && repoName != "" && workerName != "" {
+		if st, sErr := c.loadState(); sErr == nil {
+			if w, ok := st.GetAgent(repoName, workerName); ok && w.BaseSHA != "" {
+				return w.BaseSHA
+			}
+		}
+	}
+	return c.getBaseBranchRef()
+}
+
 // getBaseBranchRef returns the remote ref for the default branch (e.g., "origin/main" or "origin/master").
 // Mirrors the logic in worktree.Manager.GetDefaultBranch():
 //  1. Try git symbolic-ref refs/remotes/origin/HEAD
@@ -68,7 +96,7 @@ func (c *CLI) getOriginalTask(repoName, agentName string) (string, error) {
 //  3. Returns empty string if none found
 func (c *CLI) getBaseBranchRef() string {
 	// Try symbolic-ref first (most reliable when set)
-	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "symbolic-ref", "refs/remotes/origin/HEAD")
 	if out, err := cmd.Output(); err == nil {
 		refPath := strings.TrimSpace(string(out))
 		// refPath is like "refs/remotes/origin/main" → we want "origin/main"
@@ -79,7 +107,7 @@ func (c *CLI) getBaseBranchRef() string {
 
 	// Fallback: probe common branch names
 	for _, branch := range []string{"origin/main", "origin/master"} {
-		cmd := exec.Command("git", "rev-parse", "--verify", branch)
+		cmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", "--verify", branch)
 		if err := cmd.Run(); err == nil {
 			return branch
 		}
@@ -93,17 +121,18 @@ func (c *CLI) getBaseBranchRef() string {
 func (c *CLI) getImplementationSummary() string {
 	var statOutput, diffOutput []byte
 
-	// Build diff refs: base branch first, then HEAD as fallback
+	// Build diff refs: pinned BaseSHA (or live base branch) first, then
+	// HEAD as fallback for the case where no remote is configured.
 	refs := []string{"HEAD"}
-	if base := c.getBaseBranchRef(); base != "" {
+	if base := c.getDiffBaseRef(); base != "" {
 		refs = []string{base + "...HEAD", "HEAD"}
 	}
 
 	for _, ref := range refs {
-		cmd := exec.Command("git", "diff", "--stat", ref)
+		cmd := exec.CommandContext(c.cmdCtx(), "git", "diff", "--stat", ref)
 		if out, err := cmd.Output(); err == nil && len(out) > 0 {
 			statOutput = out
-			diffCmd := exec.Command("git", "diff", "--unified=3", ref)
+			diffCmd := exec.CommandContext(c.cmdCtx(), "git", "diff", "--unified=3", ref)
 			diffOutput, _ = diffCmd.Output()
 			break
 		}
@@ -131,9 +160,10 @@ func (c *CLI) getModifiedFiles() []string {
 	// Directories to skip — these contain templates/config, not user source code
 	skipPrefixes := []string{".oat/", ".oat\\", ".git/", ".git\\"}
 
-	// Build diff commands: base branch diff first, then HEAD and staged
+	// Build diff commands: pinned BaseSHA (or live base branch) diff
+	// first, then HEAD and staged.
 	baseDiff := []string{"git", "diff", "--name-only", "HEAD"}
-	if base := c.getBaseBranchRef(); base != "" {
+	if base := c.getDiffBaseRef(); base != "" {
 		baseDiff = []string{"git", "diff", "--name-only", base + "...HEAD"}
 	}
 
@@ -142,7 +172,7 @@ func (c *CLI) getModifiedFiles() []string {
 		{"git", "diff", "--name-only", "HEAD"}, // uncommitted changes
 		{"git", "diff", "--name-only", "--cached", "HEAD"}, // staged changes
 	} {
-		cmd := exec.Command(diffCmd[0], diffCmd[1:]...)
+		cmd := exec.CommandContext(c.cmdCtx(), diffCmd[0], diffCmd[1:]...)
 		output, err := cmd.Output()
 		if err != nil {
 			continue
@@ -281,7 +311,7 @@ func (c *CLI) checkTaskAlignmentHeuristic(ctx context.Context, originalTask, imp
 // hasEvidenceOfIssueReading checks if agent processed GitHub issues
 func (c *CLI) hasEvidenceOfIssueReading() bool {
 	// Check recent git log for issue references
-	cmd := exec.Command("git", "log", "--oneline", "-5")
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "log", "--oneline", "-5")
 	output, err := cmd.Output()
 	if err != nil {
 		return false
@@ -421,7 +451,7 @@ func hasRecursiveFile(root string, match func(path string, entry fs.DirEntry) bo
 	foundErr := errors.New("found match")
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // per-entry walk errors are non-fatal
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
@@ -751,7 +781,7 @@ func (c *CLI) presentVerificationResultsJSON(result *VerificationResult) error {
 
 // getCurrentCommitSHA returns the current HEAD commit SHA (short form).
 func (c *CLI) getCurrentCommitSHA() string {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -786,7 +816,7 @@ func (c *CLI) logVerificationResult(result *VerificationResult, repoName, agentN
 	if logContent, err := json.Marshal(logData); err == nil {
 		if f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 			defer f.Close()
-			f.WriteString(string(logContent) + "\n")
+			_, _ = f.WriteString(string(logContent) + "\n") // best-effort audit log; missed lines acceptable
 		}
 	}
 }

@@ -7,7 +7,7 @@ import pytest
 def _clear_langsmith_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent LangSmith env vars loaded from .env from leaking into tests.
 
-    ``dotenv.load_dotenv()`` runs at ``deepagents_cli.config`` import time and
+    ``dotenv.load_dotenv()`` runs at ``oat_cli.config`` import time and
     may inject ``LANGSMITH_*`` variables from a local ``.env`` file.  These
     cause spurious failures in unit tests that run with ``--disable-socket``
     because the LangSmith client attempts real HTTP requests.
@@ -21,6 +21,6 @@ def _clear_langsmith_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "LANGSMITH_TRACING",
         "LANGCHAIN_TRACING_V2",
         "LANGSMITH_PROJECT",
-        "DEEPAGENTS_LANGSMITH_PROJECT",
+        "OAT_LANGSMITH_PROJECT",
     ):
         monkeypatch.delenv(key, raising=False)

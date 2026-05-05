@@ -4,7 +4,7 @@ Legacy test file retained for backwards compatibility — see
 test_token_tracking.py for the comprehensive token tracking test suite.
 """
 
-from deepagents_cli.app import TextualTokenTracker
+from oat_cli.app import TextualTokenTracker
 
 
 class TestTextualTokenTracker:

@@ -1,0 +1,149 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- OSS meta files: `CHANGELOG.md`, `MAINTAINERS.md`, `AUTHORS`, `.github/FUNDING.yml`,
+  `.github/ISSUE_TEMPLATE/*`, `.github/PULL_REQUEST_TEMPLATE.md`.
+- `.github/dependabot.yml` for automated Go, Python, and GitHub Actions dependency updates.
+- `.github/workflows/codeql.yml` for weekly CodeQL security analysis (Go + Python).
+- `.github/workflows/auto-uv-lock.yml` to refresh `uv.lock` on Dependabot Python PRs.
+- `.golangci.yml` with an aggressive linter ruleset (gofmt, govet, errcheck,
+  staticcheck, ineffassign, unused, unconvert, goimports, misspell) wired into CI.
+- `internal/version` package with `Version`, `Commit`, `Date` injected via
+  `ldflags -X` at build time; `oat version` now reports all three.
+- `.github/workflows/release.yml` + `.goreleaser.yml` for tag-triggered binary
+  releases (linux/darwin × amd64/arm64) with GitHub Releases artifacts and
+  Homebrew tap auto-update.
+- `oat model set <provider:model> [--nudge-interval SECONDS] [--max-tokens N]`
+  CLI subcommand for tuning per-model runtime parameters.
+- `oat tokens report --repo <name> [--since <ts>] [--until <ts>] [--format json|table] [--wave N]`
+  CLI subcommand for historical per-wave token-usage analysis from agent logs
+  (distinct from `oat status --tokens` which reads live daemon state).
+- `runtime.max_tokens` and `runtime.nudge_interval_seconds` fields in model
+  profile YAMLs; daemon falls back to existing defaults when unset.
+- `benchmarks/summarize.sh` per-wave token-usage table via `oat tokens report`.
+
+### Changed
+
+- `LICENSE` copyright year updated from 2025 to 2026 (development began Jan/Feb 2026).
+- Final-nudge message templates in the daemon (`finalNudgeSupervisor`,
+  `finalNudgeMergeQueue`, `finalNudgePRShepherd`) compacted by ~55-65% with
+  no actionable information lost; merge-queue template preserves the
+  `sleep 30` polling instruction verbatim.
+- Benchmark script layout: internal helpers (`run-blackbox.sh`,
+  `judge-blackbox.sh`, `whitebox-shim.py`) moved to `benchmarks/scripts/`.
+  User-facing entry points (`run.sh`, `setup.sh`, `acceptance-test.sh`,
+  `summarize.sh`, `collect.sh`, `cleanup.sh`, comparison commands) remain at
+  the top level. All internal callers (`benchmarks/run.sh`,
+  `benchmarks/judge-cursor-gate.sh`, `benchmarks/README.md`) updated to the
+  new paths.
+- Go and Python dependencies refreshed to current minor/patch versions.
+- GitHub Actions pinned to latest stable versions across all workflows.
+
+### Documented
+
+- `oat status --tokens` CLI command and prompt-caching feature in
+  [`docs/COMMANDS.md`](docs/COMMANDS.md), [`docs/ADVANCED_USAGE.md`](docs/ADVANCED_USAGE.md),
+  and [`README.md`](README.md). The feature itself shipped earlier but was
+  previously undocumented.
+
+### Removed
+
+- Dead code surfaced by `unused` linter: `getOSInfo`, `writeMergeQueuePromptFile`,
+  `writePRShepherdPromptFile`, `quoteForShell`, `stdLogger` and its methods,
+  `worktreeRefreshLoop` empty shell, `App.err` and `pollResultMsg.repoName`
+  fields, `internal/cli/verify_simple.go` (abandoned duplicate-block detector,
+  superseded by `verify.go`).
+
+### Fixed
+
+- Duplicate `.github/workflows/main.yml` removed (byte-equivalent to the
+  `check-source` job in `ci.yml`).
+- **Verifier no longer rejects work on a stale-base race.** The daemon now
+  snapshots the remote default-branch SHA at `oat worker request-review` and
+  pins it on the worker as `BaseSHA`. Verifier prompts and self-verify both
+  diff against `${BASE_SHA}..HEAD` instead of live `origin/main`, so commits
+  that landed on `main` between the worker's rebase and the verifier's review
+  no longer appear as "deletions" and incorrectly fail the diff. Falls back
+  to live `origin/main` when `BaseSHA` is empty (in-flight verifications
+  during upgrade).
+- **Daemon false "verifier crashed" message.** `cleanupDeadAgents` now
+  guards the crash wake-message with `!agent.ReadyForCleanup`, so a verifier
+  that successfully delivered a verdict but had its worker status concurrently
+  reset by another `request-review` no longer prints a bogus "your verifier
+  crashed" message in the worker log.
+- **`benchmarks/collect.sh` worker-name collection on macOS.** Replaced
+  `declare -A WORKER_NAMES` (bash-4-only) with the same jq + `sort -u`
+  pattern already used in `summarize.sh`. macOS's default bash 3.2 was
+  silently failing the script and producing no `collect.json`.
+- **`benchmarks/run.sh` bash-3.2 portability.** Several latent
+  `set -euo pipefail` × bash-3.2 bugs that crashed real runs on macOS
+  default bash:
+  - `PRE_COUNT` / `PROFILE_COUNT` were computed with
+    `grep -c <pattern> || echo "0"`. `grep -c` always emits the count to
+    stdout AND exits 1 on zero matches, so the fallback was *appending* a
+    second `0`, producing values like `"0\n0"` and a downstream
+    `[[: 0 0: syntax error in expression`. Switched to `|| true` plus an
+    empty-string guard.
+  - `assemble_gate_test()` expanded `"${module_files[@]}"` and
+    `"${sorted_modules[@]}"` without length guards. Bash 3.2 + `set -u`
+    treats an empty array as unset; this crashed with
+    `unbound variable` on the new sanity-check fixture (zero
+    `test-*.sh` modules). All `[@]` expansions in that function now
+    sit behind `${#arr[@]} -gt 0` guards, and the `IFS=$'\n' arr=($(sort
+    <<< ...))` one-liner was replaced with a portable `while IFS= read`
+    loop that skips the printf entirely when the source array is empty.
+  - The convergence-loop result writer now guards
+    `for cr in "${CONVERGENCE_RESULTS[@]}"` so an early grand-timeout
+    or convergence-timeout (which can break out before the first
+    iteration appends a result) doesn't crash the JSON emitter.
+  - Removed an orphaned `"${SMOKE_REASONS[@]}"` reference left behind
+    by a partial revert (added in `9bcc051`, mostly removed in
+    `8a2f71d`'s execution-based smoke runner, but the read-side line
+    snuck back in `f87f6d6`). The `RAW_SNIPPET` immediately below
+    already provides the same diagnostic info from the actual runner
+    output.
+- **Benchmarks: harden `run.sh` and `collect.sh` against degraded GitHub
+  issue-list/search index.** Wave 0 gate discovery, per-wave kickoff totals,
+  `wait_for_wave`'s completion arithmetic, and post-run analysis collection
+  now treat [`benchmarks/issues.json`](benchmarks/issues.json) as the source
+  of truth and fall back to it (with a loud `WARNING:`, or `ERROR:` for
+  issues that genuinely 404 per per-issue probe) when `gh issue list`
+  returns fewer issues than expected. Per-issue endpoints are unaffected by
+  ElasticSearch degradation and are used both as the satisfaction check and
+  as the fallback fetch path. Prevents under-spawning workers, false-positive
+  wave completion, and silently-wrong analysis numbers during GitHub Issues
+  indexing degradation (e.g. the Apr 27 2026 incident, where
+  `gh issue list --label wave:0` returned only `#4` for ~14 minutes despite
+  `#1`/`#2`/`#3` being live and reachable). Polling timeout/interval are
+  tunable via `OAT_INDEX_POLL_TIMEOUT` (default 120s) and
+  `OAT_INDEX_POLL_INTERVAL` (default 10s); on the healthy path the new
+  helpers add ~0.5s per benchmark. Shared logic lives in the new
+  [`benchmarks/lib.sh`](benchmarks/lib.sh).
+
+### Added
+
+- **Pre-flight Python import check (verifier Step 5b).** Verifier prompt
+  now instructs Python projects to run `python -m pytest --collect-only
+  <test-file>` before writing black-box tests so hallucinated import paths
+  fail in seconds instead of waiting for full collection.
+- **Cost reporting in `oat tokens report` and `oat status --tokens`.** New
+  `COST_USD` column derived from the embedded `internal/routing/pricing.yaml`
+  (now with explicit `cache_creation_per_mtok` for Anthropic models and a
+  per-provider fallback helper for everything else). `--format json` exposes
+  `cost_usd` per agent and on the totals block. `benchmarks/summarize.sh`
+  appends a "Total cost (priced agents only)" line to the markdown summary.
+
+## [0.1.0] - TBD
+
+Initial public release.
+
+[Unreleased]: https://github.com/Root-IO-Labs/open-agent-teams/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Root-IO-Labs/open-agent-teams/releases/tag/v0.1.0

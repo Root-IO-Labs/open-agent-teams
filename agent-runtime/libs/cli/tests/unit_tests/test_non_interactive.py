@@ -12,8 +12,8 @@ from rich.console import Console
 from rich.style import Style
 from rich.text import Text
 
-from deepagents_cli.config import ModelResult
-from deepagents_cli.non_interactive import (
+from oat_cli.config import ModelResult
+from oat_cli.non_interactive import (
     ThreadUrlLookupState,
     _build_non_interactive_header,
     _make_hitl_decision,
@@ -40,7 +40,7 @@ class TestMakeHitlDecision:
 
     def test_shell_without_allow_list_rejected(self, console: Console) -> None:
         """Shell commands should be rejected when no allow-list is configured."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = None
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "rm -rf /"}}, console
@@ -50,7 +50,7 @@ class TestMakeHitlDecision:
 
     def test_shell_allowed_command_approved(self, console: Console) -> None:
         """Shell commands in the allow-list should be approved."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls", "cat", "grep"]
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "ls -la"}}, console
@@ -59,7 +59,7 @@ class TestMakeHitlDecision:
 
     def test_shell_disallowed_command_rejected(self, console: Console) -> None:
         """Shell commands not in the allow-list should be rejected."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls", "cat", "grep"]
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "rm -rf /"}}, console
@@ -72,7 +72,7 @@ class TestMakeHitlDecision:
         self, console: Console
     ) -> None:
         """Rejection message should list the allowed commands."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls", "cat"]
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "whoami"}}, console
@@ -87,7 +87,7 @@ class TestMakeHitlDecision:
 
     def test_shell_piped_command_allowed(self, console: Console) -> None:
         """Piped shell commands where all segments are allowed should pass."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls", "grep"]
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "ls | grep test"}}, console
@@ -98,7 +98,7 @@ class TestMakeHitlDecision:
         self, console: Console
     ) -> None:
         """Piped commands with a disallowed segment should be rejected."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls"]
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "ls | rm file"}}, console
@@ -107,7 +107,7 @@ class TestMakeHitlDecision:
 
     def test_shell_dangerous_pattern_rejected(self, console: Console) -> None:
         """Dangerous patterns rejected even if base command is allowed."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls"]
             result = _make_hitl_decision(
                 {"name": "execute", "args": {"command": "ls $(whoami)"}}, console
@@ -119,7 +119,7 @@ class TestMakeHitlDecision:
         self, tool_name: str, console: Console
     ) -> None:
         """All SHELL_TOOL_NAMES variants should be gated by the allow-list."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.shell_allow_list = ["ls"]
             result = _make_hitl_decision(
                 {"name": tool_name, "args": {"command": "rm -rf /"}}, console
@@ -132,7 +132,7 @@ class TestBuildNonInteractiveHeader:
 
     def test_includes_agent_id(self) -> None:
         """Header should contain the agent identifier."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = None
             header = _build_non_interactive_header("my-agent", "abc123")
         assert "Agent: my-agent" in header.plain
@@ -141,28 +141,28 @@ class TestBuildNonInteractiveHeader:
 
     def test_default_agent_label(self) -> None:
         """Header should show '(default)' for the default agent name."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = None
             header = _build_non_interactive_header("agent", "abc123")
         assert "Agent: agent (default)" in header.plain
 
     def test_includes_model_name(self) -> None:
         """Header should display model name when available."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = "gpt-5"
             header = _build_non_interactive_header("agent", "abc123")
         assert "Model: gpt-5" in header.plain
 
     def test_omits_model_when_none(self) -> None:
         """Header should not include model section when model_name is None."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = None
             header = _build_non_interactive_header("agent", "abc123")
         assert "Model:" not in header.plain
 
     def test_includes_thread_id(self) -> None:
         """Header should contain the thread ID."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = None
             header = _build_non_interactive_header("agent", "deadbeef")
         assert "Thread: deadbeef" in header.plain
@@ -170,10 +170,10 @@ class TestBuildNonInteractiveHeader:
     def test_thread_clickable_when_url_available(self) -> None:
         """Thread ID should be a hyperlink when LangSmith URL is available."""
         url = "https://smith.langchain.com/o/org/projects/p/proj/t/abc123"
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = None
             with patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
                 return_value=url,
             ):
                 header = _build_non_interactive_header(
@@ -192,10 +192,10 @@ class TestBuildNonInteractiveHeader:
 
     def test_default_header_does_not_lookup_langsmith(self) -> None:
         """Header should skip LangSmith lookup unless explicitly enabled."""
-        with patch("deepagents_cli.non_interactive.settings") as mock_settings:
+        with patch("oat_cli.non_interactive.settings") as mock_settings:
             mock_settings.model_name = None
             with patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
             ) as mock_build_url:
                 _build_non_interactive_header("agent", "abc123")
 
@@ -230,7 +230,7 @@ class TestSandboxSetupForwarding:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -238,25 +238,25 @@ class TestSandboxSetupForwarding:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
                 return_value=None,
             ),
             patch(
-                "deepagents_cli.integrations.sandbox_factory.create_sandbox",
+                "oat_cli.integrations.sandbox_factory.create_sandbox",
                 side_effect=fake_create_sandbox,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
             ) as mock_checkpointer,
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
         ):
             mock_settings.shell_allow_list = None
@@ -301,11 +301,11 @@ class TestQuietMode:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.Console",
+                "oat_cli.non_interactive.Console",
                 return_value=mock_console,
             ) as mock_console_cls,
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -313,21 +313,21 @@ class TestQuietMode:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
                 return_value=None,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
             ) as mock_checkpointer,
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
         ):
             mock_settings.shell_allow_list = None
@@ -369,7 +369,7 @@ class TestQuietMode:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -377,22 +377,22 @@ class TestQuietMode:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
                 return_value=None,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
                 return_value=mock_checkpointer_cm,
             ),
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
             patch.object(sys, "stdout", stdout_buf),
             patch.object(sys, "stderr", stderr_buf),
@@ -457,7 +457,7 @@ class TestNoStreamMode:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -465,22 +465,22 @@ class TestNoStreamMode:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
                 return_value=None,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
                 return_value=mock_checkpointer_cm,
             ),
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
             patch.object(sys, "stdout", stdout_buf),
         ):
@@ -533,7 +533,7 @@ class TestNoStreamMode:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -541,22 +541,22 @@ class TestNoStreamMode:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive.build_langsmith_thread_url",
+                "oat_cli.non_interactive.build_langsmith_thread_url",
                 return_value=None,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
                 return_value=mock_checkpointer_cm,
             ),
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
             patch.object(sys, "stdout", stdout_buf),
         ):
@@ -594,11 +594,11 @@ class TestFastFollowLangsmithLink:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.Console",
+                "oat_cli.non_interactive.Console",
                 return_value=mock_console,
             ),
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -606,21 +606,21 @@ class TestFastFollowLangsmithLink:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive._start_langsmith_thread_url_lookup",
+                "oat_cli.non_interactive._start_langsmith_thread_url_lookup",
                 return_value=ready_state,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
             ) as mock_checkpointer,
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
         ):
             mock_settings.shell_allow_list = None
@@ -654,11 +654,11 @@ class TestFastFollowLangsmithLink:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.Console",
+                "oat_cli.non_interactive.Console",
                 return_value=mock_console,
             ),
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -666,21 +666,21 @@ class TestFastFollowLangsmithLink:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive._start_langsmith_thread_url_lookup",
+                "oat_cli.non_interactive._start_langsmith_thread_url_lookup",
                 return_value=pending_state,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
             ) as mock_checkpointer,
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
         ):
             mock_settings.shell_allow_list = None
@@ -712,11 +712,11 @@ class TestFastFollowLangsmithLink:
 
         with (
             patch(
-                "deepagents_cli.non_interactive.Console",
+                "oat_cli.non_interactive.Console",
                 return_value=mock_console,
             ),
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -724,21 +724,21 @@ class TestFastFollowLangsmithLink:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive._start_langsmith_thread_url_lookup",
+                "oat_cli.non_interactive._start_langsmith_thread_url_lookup",
                 return_value=done_no_url,
             ),
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
             ) as mock_checkpointer,
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
         ):
             mock_settings.shell_allow_list = None
@@ -766,11 +766,11 @@ class TestFastFollowLangsmithLink:
         """Should not start LangSmith URL lookup when quiet=True."""
         with (
             patch(
-                "deepagents_cli.non_interactive.Console",
+                "oat_cli.non_interactive.Console",
                 return_value=MagicMock(spec=Console),
             ),
             patch(
-                "deepagents_cli.non_interactive.create_model",
+                "oat_cli.non_interactive.create_model",
                 return_value=ModelResult(
                     model=MagicMock(),
                     model_name="test-model",
@@ -778,20 +778,20 @@ class TestFastFollowLangsmithLink:
                 ),
             ),
             patch(
-                "deepagents_cli.non_interactive.generate_thread_id",
+                "oat_cli.non_interactive.generate_thread_id",
                 return_value="test-thread",
             ),
             patch(
-                "deepagents_cli.non_interactive.settings",
+                "oat_cli.non_interactive.settings",
             ) as mock_settings,
             patch(
-                "deepagents_cli.non_interactive._start_langsmith_thread_url_lookup",
+                "oat_cli.non_interactive._start_langsmith_thread_url_lookup",
             ) as mock_lookup,
             patch(
-                "deepagents_cli.non_interactive.get_checkpointer",
+                "oat_cli.non_interactive.get_checkpointer",
             ) as mock_checkpointer,
             patch(
-                "deepagents_cli.non_interactive.create_cli_agent",
+                "oat_cli.non_interactive.create_cli_agent",
             ) as mock_create_agent,
         ):
             mock_settings.shell_allow_list = None
@@ -820,7 +820,7 @@ class TestStartLangsmithThreadUrlLookup:
         """Should populate state.url when build succeeds."""
         url = "https://smith.langchain.com/o/org/projects/p/proj/t/tid"
         with patch(
-            "deepagents_cli.non_interactive.build_langsmith_thread_url",
+            "oat_cli.non_interactive.build_langsmith_thread_url",
             return_value=url,
         ):
             state = _start_langsmith_thread_url_lookup("tid")
@@ -830,7 +830,7 @@ class TestStartLangsmithThreadUrlLookup:
     def test_signals_done_on_exception(self) -> None:
         """Should signal done and leave url as None when build raises."""
         with patch(
-            "deepagents_cli.non_interactive.build_langsmith_thread_url",
+            "oat_cli.non_interactive.build_langsmith_thread_url",
             side_effect=RuntimeError("boom"),
         ):
             state = _start_langsmith_thread_url_lookup("tid")
@@ -840,7 +840,7 @@ class TestStartLangsmithThreadUrlLookup:
     def test_signals_done_when_url_is_none(self) -> None:
         """Should signal done when build returns None."""
         with patch(
-            "deepagents_cli.non_interactive.build_langsmith_thread_url",
+            "oat_cli.non_interactive.build_langsmith_thread_url",
             return_value=None,
         ):
             state = _start_langsmith_thread_url_lookup("tid")

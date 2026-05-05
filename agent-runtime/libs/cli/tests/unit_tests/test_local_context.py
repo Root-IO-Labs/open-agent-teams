@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 import pytest
 
-from deepagents_cli.local_context import (
+from oat_cli.local_context import (
     DETECT_CONTEXT_SCRIPT,
     LocalContextMiddleware,
     LocalContextState,
@@ -697,10 +697,10 @@ class TestSectionFiles:
         assert "__pycache__" not in out
         assert "keep.py" in out
 
-    def test_includes_deepagents(self, tmp_path: Path) -> None:
-        (tmp_path / ".deepagents").mkdir()
+    def test_includes_oat_sdk(self, tmp_path: Path) -> None:
+        (tmp_path / ".oat_sdk").mkdir()
         out = _run_section(_section_files(), tmp_path)
-        assert ".deepagents" in out
+        assert ".oat_sdk" in out
 
 
 class TestSectionTree:

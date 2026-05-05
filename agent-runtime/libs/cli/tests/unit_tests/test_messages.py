@@ -7,9 +7,9 @@ from rich.markup import render
 from rich.style import Style
 from rich.text import Text
 
-from deepagents_cli.config import COLORS
-from deepagents_cli.input import INPUT_HIGHLIGHT_PATTERN
-from deepagents_cli.widgets.messages import (
+from oat_cli.config import COLORS
+from oat_cli.input import INPUT_HIGHLIGHT_PATTERN
+from oat_cli.widgets.messages import (
     AppMessage,
     ErrorMessage,
     QueuedUserMessage,
@@ -362,7 +362,7 @@ class TestAppMessageAutoLinksDisabled:
         assert AppMessage.auto_links is False
 
 
-_WEBBROWSER_OPEN = "deepagents_cli.widgets._links.webbrowser.open"
+_WEBBROWSER_OPEN = "oat_cli.widgets._links.webbrowser.open"
 
 
 class TestAppMessageOnClickOpensLink:

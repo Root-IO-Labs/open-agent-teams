@@ -10,14 +10,14 @@ from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
-from deepagents_cli.image_utils import (
+from oat_cli.image_utils import (
     ImageData,
     create_multimodal_content,
     encode_image_to_base64,
     get_clipboard_image,
     get_image_from_path,
 )
-from deepagents_cli.input import ImageTracker
+from oat_cli.input import ImageTracker
 
 
 class TestImageData:
@@ -215,26 +215,26 @@ class TestCreateMultimodalContent:
 class TestGetClipboardImage:
     """Tests for clipboard image detection."""
 
-    @patch("deepagents_cli.image_utils.sys.platform", "linux")
+    @patch("oat_cli.image_utils.sys.platform", "linux")
     def test_unsupported_platform_returns_none_and_warns(self) -> None:
         """Test that non-macOS platforms return None and log a warning."""
-        with patch("deepagents_cli.image_utils.logger") as mock_logger:
+        with patch("oat_cli.image_utils.logger") as mock_logger:
             result = get_clipboard_image()
             assert result is None
             mock_logger.warning.assert_called_once()
             assert "linux" in mock_logger.warning.call_args[0][1]
 
-    @patch("deepagents_cli.image_utils.sys.platform", "darwin")
-    @patch("deepagents_cli.image_utils._get_macos_clipboard_image")
+    @patch("oat_cli.image_utils.sys.platform", "darwin")
+    @patch("oat_cli.image_utils._get_macos_clipboard_image")
     def test_macos_calls_macos_function(self, mock_macos_fn: MagicMock) -> None:
         """Test that macOS platform calls the macOS-specific function."""
         mock_macos_fn.return_value = None
         get_clipboard_image()
         mock_macos_fn.assert_called_once()
 
-    @patch("deepagents_cli.image_utils.sys.platform", "darwin")
-    @patch("deepagents_cli.image_utils.subprocess.run")
-    @patch("deepagents_cli.image_utils._get_executable")
+    @patch("oat_cli.image_utils.sys.platform", "darwin")
+    @patch("oat_cli.image_utils.subprocess.run")
+    @patch("oat_cli.image_utils._get_executable")
     def test_pngpaste_success(
         self, mock_get_executable: MagicMock, mock_run: MagicMock
     ) -> None:
@@ -259,9 +259,9 @@ class TestGetClipboardImage:
         assert result.format == "png"
         assert len(result.base64_data) > 0
 
-    @patch("deepagents_cli.image_utils.sys.platform", "darwin")
-    @patch("deepagents_cli.image_utils.subprocess.run")
-    @patch("deepagents_cli.image_utils._get_executable")
+    @patch("oat_cli.image_utils.sys.platform", "darwin")
+    @patch("oat_cli.image_utils.subprocess.run")
+    @patch("oat_cli.image_utils._get_executable")
     def test_pngpaste_not_installed_falls_back(
         self, mock_get_executable: MagicMock, mock_run: MagicMock
     ) -> None:
@@ -281,9 +281,9 @@ class TestGetClipboardImage:
         # Should have tried osascript (clipboard info check)
         assert mock_run.call_count == 1
 
-    @patch("deepagents_cli.image_utils.sys.platform", "darwin")
-    @patch("deepagents_cli.image_utils._get_clipboard_via_osascript")
-    @patch("deepagents_cli.image_utils.subprocess.run")
+    @patch("oat_cli.image_utils.sys.platform", "darwin")
+    @patch("oat_cli.image_utils._get_clipboard_via_osascript")
+    @patch("oat_cli.image_utils.subprocess.run")
     def test_no_image_in_clipboard(
         self, mock_run: MagicMock, mock_osascript: MagicMock
     ) -> None:

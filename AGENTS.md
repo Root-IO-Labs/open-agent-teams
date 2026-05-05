@@ -1,10 +1,10 @@
 # AGENTS.md
 
-This file provides guidance to OAT - Open Agent Teams when working with code in this repository.
+This file provides guidance to coding agents working with code in this repository.
 
 ## Project Overview
 
-**oat** is a lightweight orchestrator for running multiple OAT - Open Agent Teams agents on GitHub repositories. Each agent runs as its own process with an isolated git worktree, enabling parallel autonomous work on a shared codebase.
+**OAT** (Open Agent Teams) is a lightweight orchestrator for running multiple AI coding agents on GitHub repositories. Each agent runs as its own process with an isolated git worktree, enabling parallel autonomous work on a shared codebase.
 
 ### Principles
 
@@ -56,7 +56,7 @@ OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (d
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
 │  │ Health   │  │ Message  │  │ Wake/    │  │ Socket   │        │
 │  │ Check    │  │ Router   │  │ Nudge    │  │ Server   │        │
-│  │ (2min)   │  │ (60s)    │  │ (60s)    │  │          │        │
+│  │ (2min)   │  │ (2min)   │  │ (2min)   │  │          │        │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
 └────────────────────────────────┬────────────────────────────────┘
                                  │

@@ -372,7 +372,7 @@ func TestStartContextCancellation(t *testing.T) {
 
 	_, err := runner.Start(ctx, "session", "window", Config{})
 	if err == nil {
-		t.Error("expected error when context is cancelled")
+		t.Error("expected error when context is canceled")
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled error, got %v", err)

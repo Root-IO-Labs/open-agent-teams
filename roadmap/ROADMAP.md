@@ -67,7 +67,7 @@ Items planned after the core port and benchmarking are stable. Grouped by theme,
 
 ### Infrastructure & Architecture
 
-- [x] **Remove Deep Agents branding** - Integrated agent runtime internally with OAT branding
+- [x] **Remove Deep Agents branding** - OAT branding applied to CLI, TUI, docs, and user-facing surfaces. Python package internals (`oat_cli`) retain the upstream name pending a coordinated rename.
 - [x] **Remove tmux dependency** - Agents run as direct PTY child processes; no terminal multiplexer required
 - [ ] **Memory MCP Server** - Integrate a Reflection/Memory MCP server for structured context storage, episodic memory across restarts
 - [ ] **Model selection & configuration** - Per-agent model selection, open-source model support via SaaS providers, cost-aware scheduling

@@ -71,6 +71,7 @@ Each command below matches a `case` in `handleRequest`.
 | `route_messages` | Force message routing cycle | none |
 | `task_history` | Return task history for a repo | `repo` |
 | `spawn_agent` | Create a new agent worktree | `repo`, `type`, `task`, `name` (optional) |
+| `start_verification` | Mark a worker as awaiting verification, snapshot the remote default-branch SHA into `worker.BaseSHA`, and pin the verifier agent name. Called by `oat worker request-review` before `start_verification_agent`. | `repo`, `worker`, `verifier`, `commit_sha` |
 | `start_verification_agent` | Start a verification agent process via daemon backend (auto-retires completed verifiers on re-request) | `repo`, `agent`, `worktree_path` |
 
 ## Minimal client examples
@@ -362,7 +363,7 @@ class OATClient {
   "data": {
     "merge_queue_enabled": true,
     "merge_queue_track_mode": "all",
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-4-5",
     "allowed_worker_models": ["anthropic:claude-sonnet-4-6", "openrouter:deepseek/deepseek-v3.2:nitro"]
   }
 }

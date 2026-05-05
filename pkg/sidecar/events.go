@@ -1,6 +1,6 @@
 // Package sidecar defines the wire schema for events emitted by the Python
 // agent over the astream sidecar socket. Both sides must stay in sync with
-// agent-runtime/libs/cli/deepagents_cli/sidecar_events.py — change one,
+// agent-runtime/libs/cli/oat_cli/sidecar_events.py — change one,
 // change the other, add tests on both sides.
 //
 // Design notes:

@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 from rich.markup import render
 
-from deepagents_cli.config import get_glyphs
-from deepagents_cli.widgets.approval import (
+from oat_cli.config import get_glyphs
+from oat_cli.widgets.approval import (
     _SHELL_COMMAND_TRUNCATE_LENGTH,
     ApprovalMenu,
 )

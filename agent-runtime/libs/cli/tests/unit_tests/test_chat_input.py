@@ -9,10 +9,10 @@ from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.widgets import Static
 
-from deepagents_cli.input import ImageTracker
-from deepagents_cli.widgets import chat_input as chat_input_module
-from deepagents_cli.widgets.autocomplete import SLASH_COMMANDS
-from deepagents_cli.widgets.chat_input import (
+from oat_cli.input import ImageTracker
+from oat_cli.widgets import chat_input as chat_input_module
+from oat_cli.widgets.autocomplete import SLASH_COMMANDS
+from oat_cli.widgets.chat_input import (
     ChatInput,
     CompletionOption,
     CompletionPopup,

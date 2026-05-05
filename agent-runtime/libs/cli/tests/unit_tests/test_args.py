@@ -8,9 +8,9 @@ from unittest.mock import patch
 import pytest
 from rich.console import Console
 
-from deepagents_cli.agent import DEFAULT_AGENT_NAME
-from deepagents_cli.main import _DEFAULT_AGENT_NAME, parse_args
-from deepagents_cli.ui import show_help
+from oat_cli.agent import DEFAULT_AGENT_NAME
+from oat_cli.main import _DEFAULT_AGENT_NAME, parse_args
+from oat_cli.ui import show_help
 
 
 class TestInitialPromptArg:
@@ -18,26 +18,26 @@ class TestInitialPromptArg:
 
     def test_short_flag(self) -> None:
         """Verify -m sets initial_prompt."""
-        with patch.object(sys, "argv", ["deepagents", "-m", "hello world"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-m", "hello world"]):
             args = parse_args()
         assert args.initial_prompt == "hello world"
 
     def test_long_flag(self) -> None:
         """Verify --message sets initial_prompt."""
-        with patch.object(sys, "argv", ["deepagents", "--message", "hello world"]):
+        with patch.object(sys, "argv", ["oat_sdk", "--message", "hello world"]):
             args = parse_args()
         assert args.initial_prompt == "hello world"
 
     def test_no_flag(self) -> None:
         """Verify initial_prompt is None when not provided."""
-        with patch.object(sys, "argv", ["deepagents"]):
+        with patch.object(sys, "argv", ["oat_sdk"]):
             args = parse_args()
         assert args.initial_prompt is None
 
     def test_with_other_args(self) -> None:
         """Verify -m works alongside other arguments."""
         with patch.object(
-            sys, "argv", ["deepagents", "--agent", "myagent", "-m", "do something"]
+            sys, "argv", ["oat_sdk", "--agent", "myagent", "-m", "do something"]
         ):
             args = parse_args()
         assert args.initial_prompt == "do something"
@@ -45,7 +45,7 @@ class TestInitialPromptArg:
 
     def test_empty_string(self) -> None:
         """Verify empty string is accepted."""
-        with patch.object(sys, "argv", ["deepagents", "-m", ""]):
+        with patch.object(sys, "argv", ["oat_sdk", "-m", ""]):
             args = parse_args()
         assert args.initial_prompt == ""
 
@@ -55,38 +55,38 @@ class TestResumeArg:
 
     def test_short_flag_no_value(self) -> None:
         """Verify -r without value sets resume_thread to __MOST_RECENT__."""
-        with patch.object(sys, "argv", ["deepagents", "-r"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-r"]):
             args = parse_args()
         assert args.resume_thread == "__MOST_RECENT__"
 
     def test_short_flag_with_value(self) -> None:
         """Verify -r with ID sets resume_thread to that ID."""
-        with patch.object(sys, "argv", ["deepagents", "-r", "abc12345"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-r", "abc12345"]):
             args = parse_args()
         assert args.resume_thread == "abc12345"
 
     def test_long_flag_no_value(self) -> None:
         """Verify --resume without value sets resume_thread to __MOST_RECENT__."""
-        with patch.object(sys, "argv", ["deepagents", "--resume"]):
+        with patch.object(sys, "argv", ["oat_sdk", "--resume"]):
             args = parse_args()
         assert args.resume_thread == "__MOST_RECENT__"
 
     def test_long_flag_with_value(self) -> None:
         """Verify --resume with ID sets resume_thread to that ID."""
-        with patch.object(sys, "argv", ["deepagents", "--resume", "xyz99999"]):
+        with patch.object(sys, "argv", ["oat_sdk", "--resume", "xyz99999"]):
             args = parse_args()
         assert args.resume_thread == "xyz99999"
 
     def test_no_flag(self) -> None:
         """Verify resume_thread is None when not provided."""
-        with patch.object(sys, "argv", ["deepagents"]):
+        with patch.object(sys, "argv", ["oat_sdk"]):
             args = parse_args()
         assert args.resume_thread is None
 
     def test_with_other_args(self) -> None:
         """Verify -r works alongside --agent and -m."""
         with patch.object(
-            sys, "argv", ["deepagents", "--agent", "myagent", "-r", "thread123"]
+            sys, "argv", ["oat_sdk", "--agent", "myagent", "-r", "thread123"]
         ):
             args = parse_args()
         assert args.resume_thread == "thread123"
@@ -95,7 +95,7 @@ class TestResumeArg:
     def test_resume_with_message(self) -> None:
         """Verify -r works with -m initial message."""
         with patch.object(
-            sys, "argv", ["deepagents", "-r", "thread456", "-m", "continue work"]
+            sys, "argv", ["oat_sdk", "-r", "thread456", "-m", "continue work"]
         ):
             args = parse_args()
         assert args.resume_thread == "thread456"
@@ -103,16 +103,16 @@ class TestResumeArg:
 
 
 class TestTopLevelHelp:
-    """Test that `deepagents -h` shows the global help screen via _make_help_action."""
+    """Test that `oat_sdk -h` shows the global help screen via _make_help_action."""
 
     def test_top_level_help_exits_cleanly(self) -> None:
-        """Running `deepagents -h` should show help and exit with code 0."""
+        """Running `oat_sdk -h` should show help and exit with code 0."""
         buf = io.StringIO()
         test_console = Console(file=buf, highlight=False, width=120)
 
         with (
-            patch.object(sys, "argv", ["deepagents", "-h"]),
-            patch("deepagents_cli.ui.console", test_console),
+            patch.object(sys, "argv", ["oat_sdk", "-h"]),
+            patch("oat_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -121,15 +121,15 @@ class TestTopLevelHelp:
         output = buf.getvalue()
 
         # Should contain global help content
-        assert "deepagents" in output.lower()
+        assert "oat_sdk" in output.lower()
         assert "--help" in output
 
     def test_help_subcommand_parses(self) -> None:
-        """Running `deepagents help` should parse as command='help'.
+        """Running `oat_sdk help` should parse as command='help'.
 
         The actual help display happens in `cli_main()`, not `parse_args()`.
         """
-        with patch.object(sys, "argv", ["deepagents", "help"]):
+        with patch.object(sys, "argv", ["oat_sdk", "help"]):
             args = parse_args()
         assert args.command == "help"
 
@@ -152,7 +152,7 @@ class TestSubcommandHelpFlags:
 
         with (
             patch.object(sys, "argv", argv),
-            patch("deepagents_cli.ui.console", test_console),
+            patch("oat_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -163,33 +163,33 @@ class TestSubcommandHelpFlags:
         assert must_not_contain not in output
 
     def test_list_help(self) -> None:
-        """Running `deepagents list -h` should show list-specific help."""
+        """Running `oat_sdk list -h` should show list-specific help."""
         self._run_help(
-            ["deepagents", "list", "-h"],
+            ["oat_sdk", "list", "-h"],
             must_contain="List all agents",
             must_not_contain="--sandbox",
         )
 
     def test_reset_help(self) -> None:
-        """Running `deepagents reset -h` should show reset-specific help."""
+        """Running `oat_sdk reset -h` should show reset-specific help."""
         self._run_help(
-            ["deepagents", "reset", "-h"],
+            ["oat_sdk", "reset", "-h"],
             must_contain="--agent",
             must_not_contain="Start interactive thread",
         )
 
     def test_threads_list_help(self) -> None:
-        """Running `deepagents threads list -h` should show threads list help."""
+        """Running `oat_sdk threads list -h` should show threads list help."""
         self._run_help(
-            ["deepagents", "threads", "list", "-h"],
+            ["oat_sdk", "threads", "list", "-h"],
             must_contain="--limit",
             must_not_contain="--sandbox",
         )
 
     def test_threads_delete_help(self) -> None:
-        """Running `deepagents threads delete -h` should show threads delete help."""
+        """Running `oat_sdk threads delete -h` should show threads delete help."""
         self._run_help(
-            ["deepagents", "threads", "delete", "-h"],
+            ["oat_sdk", "threads", "delete", "-h"],
             must_contain="delete",
             must_not_contain="--sandbox",
         )
@@ -200,26 +200,26 @@ class TestShortFlags:
 
     def test_short_agent_flag(self) -> None:
         """Verify -a sets agent."""
-        with patch.object(sys, "argv", ["deepagents", "-a", "mybot"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-a", "mybot"]):
             args = parse_args()
         assert args.agent == "mybot"
 
     def test_short_model_flag(self) -> None:
         """Verify -M sets model."""
-        with patch.object(sys, "argv", ["deepagents", "-M", "gpt-4o"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-M", "gpt-4o"]):
             args = parse_args()
         assert args.model == "gpt-4o"
 
     def test_agent_default_value(self) -> None:
         """Verify -a defaults to DEFAULT_AGENT_NAME when omitted."""
-        with patch.object(sys, "argv", ["deepagents"]):
+        with patch.object(sys, "argv", ["oat_sdk"]):
             args = parse_args()
         assert args.agent == DEFAULT_AGENT_NAME
 
     def test_short_version_flag(self) -> None:
         """Verify -v shows version and exits."""
         with (
-            patch.object(sys, "argv", ["deepagents", "-v"]),
+            patch.object(sys, "argv", ["oat_sdk", "-v"]),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -231,25 +231,25 @@ class TestQuietArg:
 
     def test_short_flag(self) -> None:
         """Verify -q sets quiet=True."""
-        with patch.object(sys, "argv", ["deepagents", "-q", "-n", "task"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-q", "-n", "task"]):
             args = parse_args()
         assert args.quiet is True
 
     def test_long_flag(self) -> None:
         """Verify --quiet sets quiet=True."""
-        with patch.object(sys, "argv", ["deepagents", "--quiet", "-n", "task"]):
+        with patch.object(sys, "argv", ["oat_sdk", "--quiet", "-n", "task"]):
             args = parse_args()
         assert args.quiet is True
 
     def test_no_flag_defaults_false(self) -> None:
         """Verify quiet is False when not provided."""
-        with patch.object(sys, "argv", ["deepagents"]):
+        with patch.object(sys, "argv", ["oat_sdk"]):
             args = parse_args()
         assert args.quiet is False
 
     def test_combined_with_non_interactive(self) -> None:
         """Verify -q works alongside -n."""
-        with patch.object(sys, "argv", ["deepagents", "-q", "-n", "run tests"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-q", "-n", "run tests"]):
             args = parse_args()
         assert args.quiet is True
         assert args.non_interactive_message == "run tests"
@@ -260,7 +260,7 @@ class TestQuietArg:
         The usage-error guard now lives in `cli_main` (after stdin pipe
         processing), so `parse_args` itself should not reject this combo.
         """
-        with patch.object(sys, "argv", ["deepagents", "-q"]):
+        with patch.object(sys, "argv", ["oat_sdk", "-q"]):
             args = parse_args()
         assert args.quiet is True
         assert args.non_interactive_message is None
@@ -285,7 +285,7 @@ class TestHelpScreenDrift:
         #    argparse prints the full usage (all flags) to stderr, then exits.
         stderr_buf = io.StringIO()
         with (
-            patch.object(sys, "argv", ["deepagents", "--_x_"]),
+            patch.object(sys, "argv", ["oat_sdk", "--_x_"]),
             patch("sys.stderr", stderr_buf),
             pytest.raises(SystemExit),
         ):
@@ -295,7 +295,7 @@ class TestHelpScreenDrift:
         # 2. Render show_help() to a string.
         help_buf = io.StringIO()
         test_console = Console(file=help_buf, highlight=False, width=200)
-        with patch("deepagents_cli.ui.console", test_console):
+        with patch("oat_cli.ui.console", test_console):
             show_help()
         help_text = help_buf.getvalue()
 

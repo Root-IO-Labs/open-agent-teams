@@ -32,8 +32,10 @@ All subsequent commands (pytest, python, etc.) **must** run inside this venv. If
 ### Step 2: Read the diff
 
 ```bash
-git diff origin/main..HEAD
+git diff ${BASE_SHA}..HEAD
 ```
+
+`${BASE_SHA}` is the remote base commit at the moment the worker requested review (pinned by the daemon, not live `origin/main`). It is shown in the Verification Context header above. Diffing against this pinned base prevents commits that have landed on `main` since the worker rebased from appearing as "deletions" in the diff.
 
 Understand what changed before doing anything else.
 
@@ -101,6 +103,32 @@ it is a stub that never actually runs tests -- reject immediately:
 Conditional guard clauses that check prerequisites are fine -- e.g.,
 `if ! command -v barista; then return 0; fi` followed by real test logic.
 The rule targets **unconditional** early exits that make the entire suite a no-op.
+
+### Step 5b: Import dry-run (Python projects only)
+
+Before running your own black-box tests, do a fast pre-flight to catch
+hallucinated import paths in seconds rather than waiting ~30-60s for
+full pytest collection to fail:
+
+```bash
+python -m pytest --collect-only <your-test-file>
+```
+
+If you see `ImportError` or `ModuleNotFoundError` for a class or module
+name you assumed (e.g. `from app.models import RecipeIngredient`),
+grep the repo for the real location before writing more tests:
+
+```bash
+grep -rn "class RecipeIngredient" .
+grep -rn "RecipeIngredient" --include="*.py" .
+```
+
+Fix the import in your test file and re-run `--collect-only` until it
+collects cleanly. Only proceed to Step 6 once collection succeeds.
+
+Skip this step for Go / JS / TS projects -- Step 4 (`go build ./...`,
+`tsc`, etc.) already gives the same fail-fast guarantee for those
+languages.
 
 ### Step 6: Write and run black-box tests
 

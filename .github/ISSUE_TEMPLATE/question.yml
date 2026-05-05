@@ -1,0 +1,26 @@
+name: Question / support
+description: Ask a usage question or request help understanding something
+title: "[question] <short summary>"
+labels: ["question", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For open-ended discussion, please consider using
+        [GitHub Discussions](https://github.com/Root-IO-Labs/open-agent-teams/discussions)
+        instead. Use this template for questions that feel like they may surface a
+        documentation gap or bug.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+      description: Describe your use case and what you have tried so far.
+    validations:
+      required: true
+
+  - type: textarea
+    id: docs-checked
+    attributes:
+      label: Documentation consulted
+      description: Which docs, guides, or issues have you already read?

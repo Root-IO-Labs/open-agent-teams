@@ -1,7 +1,7 @@
 """Unit tests for UI rendering utilities."""
 
-from deepagents_cli.config import get_glyphs
-from deepagents_cli.tool_display import (
+from oat_cli.config import get_glyphs
+from oat_cli.tool_display import (
     _format_content_block,
     _format_timeout,
     format_tool_display,

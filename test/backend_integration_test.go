@@ -2,6 +2,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -236,7 +237,7 @@ func TestDirectBackendProcessReAdoption(t *testing.T) {
 
 	// Verify SendMessage returns ErrAgentAdopted
 	err = b2.SendMessage(ctx, "oat-test", "long-runner", "hello")
-	if err != backend.ErrAgentAdopted {
+	if !errors.Is(err, backend.ErrAgentAdopted) {
 		t.Fatalf("Expected ErrAgentAdopted, got: %v", err)
 	}
 

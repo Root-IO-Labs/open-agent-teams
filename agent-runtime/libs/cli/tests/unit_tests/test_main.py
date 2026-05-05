@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
-from deepagents_cli.app import AppResult, run_textual_app
-from deepagents_cli.config import build_langsmith_thread_url, reset_langsmith_url_cache
-from deepagents_cli.main import (
+from oat_cli.app import AppResult, run_textual_app
+from oat_cli.config import build_langsmith_thread_url, reset_langsmith_url_cache
+from oat_cli.main import (
     check_optional_tools,
     format_tool_warning_cli,
     format_tool_warning_tui,
@@ -171,14 +171,14 @@ class TestCheckOptionalTools:
 
     def test_returns_tool_name_when_rg_not_found(self) -> None:
         """Returns `['ripgrep']` when `rg` is not on PATH."""
-        with patch("deepagents_cli.main.shutil.which", return_value=None):
+        with patch("oat_cli.main.shutil.which", return_value=None):
             missing = check_optional_tools()
 
         assert missing == ["ripgrep"]
 
     def test_returns_empty_when_rg_found(self) -> None:
         """Returns empty list when `rg` is found on PATH."""
-        with patch("deepagents_cli.main.shutil.which", return_value="/usr/bin/rg"):
+        with patch("oat_cli.main.shutil.which", return_value="/usr/bin/rg"):
             missing = check_optional_tools()
 
         assert missing == []
@@ -188,7 +188,7 @@ class TestCheckOptionalTools:
         config_path = tmp_path / "config.toml"
         config_path.write_text('[warnings]\nsuppress = ["ripgrep"]\n')
 
-        with patch("deepagents_cli.main.shutil.which", return_value=None):
+        with patch("oat_cli.main.shutil.which", return_value=None):
             missing = check_optional_tools(config_path=config_path)
 
         assert missing == []
@@ -198,7 +198,7 @@ class TestCheckOptionalTools:
         config_path = tmp_path / "config.toml"
         config_path.write_text("this is not valid toml [[[")
 
-        with patch("deepagents_cli.main.shutil.which", return_value=None):
+        with patch("oat_cli.main.shutil.which", return_value=None):
             missing = check_optional_tools(config_path=config_path)
 
         assert missing == ["ripgrep"]
@@ -208,7 +208,7 @@ class TestCheckOptionalTools:
         config_path = tmp_path / "config.toml"
         config_path.write_text("[warnings]\nsuppress = true\n")
 
-        with patch("deepagents_cli.main.shutil.which", return_value=None):
+        with patch("oat_cli.main.shutil.which", return_value=None):
             missing = check_optional_tools(config_path=config_path)
 
         assert missing == ["ripgrep"]
@@ -218,7 +218,7 @@ class TestCheckOptionalTools:
         config_path = tmp_path / "config.toml"
         config_path.write_text('[warnings]\nsuppress = ["something_else"]\n')
 
-        with patch("deepagents_cli.main.shutil.which", return_value=None):
+        with patch("oat_cli.main.shutil.which", return_value=None):
             missing = check_optional_tools(config_path=config_path)
 
         assert missing == ["ripgrep"]

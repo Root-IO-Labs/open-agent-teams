@@ -2,6 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# shellcheck source=./lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 GITHUB_OWNER="${GITHUB_OWNER:-$(gh api /user --jq '.login' 2>/dev/null || echo 'Root-IO-Labs')}"
 
 usage() {
@@ -127,6 +131,63 @@ echo "    Model: ${MODEL}"
 echo "==> Collecting issue data..."
 
 ISSUES_JSON=$(gh issue list --repo "${REPO_FULL}" --state all --json number,title,state,labels,closedAt --limit 100 2>/dev/null)
+[[ -z "$ISSUES_JSON" ]] && ISSUES_JSON='[]'
+
+# Defensive: if the live list is short relative to issues.json (the static
+# source of truth shipped with the benchmark), poll briefly for indexing to
+# catch up, then per-issue-fetch any still-missing issues and merge them in.
+# This protects summarize.sh's per-wave completion %, per-worker attribution,
+# and token-cost-per-issue tables against degraded-index conditions at
+# collect time. No-op when issues.json is missing (custom benchmark).
+COLLECT_MISSING_NUMBERS=""
+COLLECT_EXPECTED_TOTAL=0
+for _wlbl in wave:0 wave:1 wave:2 wave:3 wave:4; do
+    _wn=$(expected_wave_count "$_wlbl")
+    [[ "$_wn" -eq 0 ]] && continue
+    COLLECT_EXPECTED_TOTAL=$((COLLECT_EXPECTED_TOTAL + _wn))
+    while IFS= read -r _enum; do
+        [[ -z "$_enum" ]] && continue
+        if ! echo "$ISSUES_JSON" | jq --argjson n "$_enum" -e 'any(.[]; .number == $n)' >/dev/null 2>&1; then
+            COLLECT_MISSING_NUMBERS="${COLLECT_MISSING_NUMBERS}${_enum} "
+        fi
+    done <<< "$(expected_wave_issues "$_wlbl")"
+done
+
+if [[ -n "$COLLECT_MISSING_NUMBERS" ]]; then
+    # Try a brief polling loop before falling back to per-issue probes; the
+    # index frequently catches up within one or two ticks.
+    _elapsed=0
+    while [[ "$_elapsed" -lt "$OAT_INDEX_POLL_TIMEOUT" && -n "$COLLECT_MISSING_NUMBERS" ]]; do
+        sleep "$OAT_INDEX_POLL_INTERVAL"
+        _elapsed=$((_elapsed + OAT_INDEX_POLL_INTERVAL))
+        ISSUES_JSON=$(gh issue list --repo "${REPO_FULL}" --state all --json number,title,state,labels,closedAt --limit 100 2>/dev/null)
+        [[ -z "$ISSUES_JSON" ]] && ISSUES_JSON='[]'
+        _still=""
+        for _n in $COLLECT_MISSING_NUMBERS; do
+            if ! echo "$ISSUES_JSON" | jq --argjson n "$_n" -e 'any(.[]; .number == $n)' >/dev/null 2>&1; then
+                _still="${_still}${_n} "
+            fi
+        done
+        COLLECT_MISSING_NUMBERS="$_still"
+    done
+
+    # Anything still missing: per-issue fetch + merge into ISSUES_JSON.
+    _lagging_disp=""
+    for _n in $COLLECT_MISSING_NUMBERS; do
+        _obj=$(_lib_gh_issue_view_json "$REPO_FULL" "$_n")
+        if [[ -n "$_obj" ]]; then
+            ISSUES_JSON=$(echo "$ISSUES_JSON" | jq --argjson obj "$_obj" '. + [$obj]')
+            _lagging_disp="${_lagging_disp}#${_n} "
+        else
+            echo "ERROR:   gh issue #${_n} missing from repo at collect time (per-issue probe failed) -- excluded from analysis" >&2
+        fi
+    done
+    if [[ -n "$_lagging_disp" ]]; then
+        _lagging_disp="${_lagging_disp% }"
+        echo "WARNING: gh issue list lagging at collect time -- merged ${_lagging_disp} via per-issue probes (likely GitHub indexing degradation, see https://www.githubstatus.com/)" >&2
+    fi
+fi
+
 ISSUES_TOTAL=$(echo "$ISSUES_JSON" | jq 'length')
 ISSUES_CLOSED=$(echo "$ISSUES_JSON" | jq '[.[] | select(.state == "CLOSED")] | length')
 ISSUES_OPEN=$(echo "$ISSUES_JSON" | jq '[.[] | select(.state == "OPEN")] | length')
@@ -384,6 +445,7 @@ WA_NON_SELF=0
 WA_DAEMON_AUTO_COMPLETED=0
 WA_DAEMON_FORCE_REMOVED=0
 WA_FAILED=0
+WA_RECOVERED=0
 
 if [[ -f "$OAT_STATE_FILE" ]]; then
     TASK_HISTORY=$(jq -r --arg repo "$REPO_NAME" '.repos[$repo].task_history // []' "$OAT_STATE_FILE" 2>/dev/null || echo "[]")
@@ -392,6 +454,7 @@ if [[ -f "$OAT_STATE_FILE" ]]; then
     WA_DAEMON_AUTO_COMPLETED=$(echo "$TASK_HISTORY" | jq '[.[] | select(.summary != null) | select(.summary | test("Auto-completed by daemon"; "i"))] | length')
     WA_DAEMON_FORCE_REMOVED=$(echo "$TASK_HISTORY" | jq '[.[] | select(.failure_reason != null) | select(.failure_reason | test("Force-removed by daemon"; "i"))] | length')
     WA_FAILED=$(echo "$TASK_HISTORY" | jq '[.[] | select(.status == "failed")] | length')
+    WA_RECOVERED=$(echo "$TASK_HISTORY" | jq '[.[] | select(.status == "recovered")] | length')
 
     # Self-completed = total minus daemon-intervened minus failed (avoid double counting force-removed which are also failed)
     WA_NON_SELF=$((WA_DAEMON_AUTO_COMPLETED + WA_DAEMON_FORCE_REMOVED))
@@ -427,6 +490,7 @@ echo "    Self-completed:        ${WA_SELF_COMPLETED}"
 echo "    Daemon auto-completed: ${WA_DAEMON_AUTO_COMPLETED}"
 echo "    Daemon force-removed:  ${WA_DAEMON_FORCE_REMOVED}"
 echo "    Failed:                ${WA_FAILED}"
+echo "    Recovered:             ${WA_RECOVERED}"
 echo "    Self-completion rate:  ${WA_SELF_RATE}"
 
 WA_TOTAL=$(ensure_number "$WA_TOTAL")
@@ -434,6 +498,7 @@ WA_SELF_COMPLETED=$(ensure_number "$WA_SELF_COMPLETED")
 WA_DAEMON_AUTO_COMPLETED=$(ensure_number "$WA_DAEMON_AUTO_COMPLETED")
 WA_DAEMON_FORCE_REMOVED=$(ensure_number "$WA_DAEMON_FORCE_REMOVED")
 WA_FAILED=$(ensure_number "$WA_FAILED")
+WA_RECOVERED=$(ensure_number "$WA_RECOVERED")
 [[ -z "$WA_SELF_RATE" ]] && WA_SELF_RATE="0"
 
 WORKER_AUTONOMY=$(jq -n \
@@ -442,6 +507,7 @@ WORKER_AUTONOMY=$(jq -n \
     --argjson daemon_auto_completed "$WA_DAEMON_AUTO_COMPLETED" \
     --argjson daemon_force_removed "$WA_DAEMON_FORCE_REMOVED" \
     --argjson failed "$WA_FAILED" \
+    --argjson recovered "$WA_RECOVERED" \
     --arg self_completion_rate "$WA_SELF_RATE" \
     '{
         total_workers: $total,
@@ -449,6 +515,7 @@ WORKER_AUTONOMY=$(jq -n \
         daemon_auto_completed: $daemon_auto_completed,
         daemon_force_removed: $daemon_force_removed,
         failed: $failed,
+        recovered: $recovered,
         self_completion_rate: ($self_completion_rate | tonumber)
     }')
 WORKER_AUTONOMY=$(ensure_json "$WORKER_AUTONOMY")
@@ -730,25 +797,29 @@ TU_WORKER_MIN=""
 TU_WORKER_MAX=""
 TU_PER_WORKER="{}"
 
-# Collect worker names from state.json (primary) and log files (fallback)
-declare -A WORKER_NAMES
-if [[ -f "$OAT_STATE_FILE" ]]; then
-    while IFS= read -r wname; do
-        [[ -n "$wname" ]] && WORKER_NAMES["$wname"]=1
-    done < <(jq -r --arg repo "$REPO_NAME" \
-        '.repos[$repo].agents // {} | to_entries[] | select(.value.type == "worker") | .key' \
-        "$OAT_STATE_FILE" 2>/dev/null)
-fi
+# Collect worker names from state.json (primary) and log files (fallback).
+# Bash 3.2 compat (macOS default shell): no associative arrays. Use
+# jq + sort -u to produce a deduplicated newline-separated list, then
+# iterate with `while IFS= read`. Same pattern used in summarize.sh.
 WORKERS_DIR="${OAT_OUTPUT_DIR}/workers"
-if [[ -d "$WORKERS_DIR" ]]; then
-    for wlog in "$WORKERS_DIR"/*.log; do
-        [[ -f "$wlog" ]] || continue
-        wname=$(basename "$wlog" .log)
-        WORKER_NAMES["$wname"]=1
-    done
-fi
+WORKER_NAMES_LIST=$(
+    {
+        if [[ -f "$OAT_STATE_FILE" ]]; then
+            jq -r --arg repo "$REPO_NAME" \
+                '.repos[$repo].agents // {} | to_entries[] | select(.value.type == "worker") | .key' \
+                "$OAT_STATE_FILE" 2>/dev/null
+        fi
+        if [[ -d "$WORKERS_DIR" ]]; then
+            for wlog in "$WORKERS_DIR"/*.log; do
+                [[ -f "$wlog" ]] || continue
+                basename "$wlog" .log
+            done
+        fi
+    } | sort -u
+)
 
-for wname in "${!WORKER_NAMES[@]}"; do
+while IFS= read -r wname; do
+    [[ -z "$wname" ]] && continue
     wtokens=$(extract_agent_tokens "$wname" "${WORKERS_DIR}/${wname}.log")
     if [[ -n "$wtokens" && "$wtokens" != "0" ]]; then
         TU_WORKER_COUNT=$((TU_WORKER_COUNT + 1))
@@ -771,7 +842,7 @@ for wname in "${!WORKER_NAMES[@]}"; do
     else
         TU_WORKER_NA=$((TU_WORKER_NA + 1))
     fi
-done
+done <<< "$WORKER_NAMES_LIST"
 
 # --- Compute totals ---
 TU_TOTAL=0

@@ -17,7 +17,7 @@ func TestCLIError_Unwrap(t *testing.T) {
 	cause := errors.New("underlying error")
 	err := Wrap(CategoryRuntime, "wrapper", cause)
 
-	if err.Unwrap() != cause {
+	if !errors.Is(err.Unwrap(), cause) {
 		t.Error("Unwrap should return the cause")
 	}
 }
@@ -121,7 +121,7 @@ func TestDaemonCommunicationFailed(t *testing.T) {
 	if err.Category != CategoryConnection {
 		t.Error("should have CategoryConnection")
 	}
-	if err.Cause != cause {
+	if !errors.Is(err.Cause, cause) {
 		t.Error("should wrap cause")
 	}
 
@@ -360,7 +360,7 @@ func TestGitOperationFailed(t *testing.T) {
 	if err.Category != CategoryRuntime {
 		t.Errorf("expected CategoryRuntime, got %v", err.Category)
 	}
-	if err.Cause != cause {
+	if !errors.Is(err.Cause, cause) {
 		t.Error("should wrap cause")
 	}
 	if err.Suggestion == "" {

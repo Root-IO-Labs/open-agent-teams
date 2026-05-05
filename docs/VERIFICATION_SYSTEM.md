@@ -111,6 +111,19 @@ In addition to the self-verification checks (`oat worker verify`), workers can r
 4. When the verifier delivers its verdict (`approved` or `rejected`), the daemon wakes the worker with a message
 5. Worker acts on the verdict: if approved, runs `oat pr create`; if rejected, fixes issues and re-requests review
 
+**Pinned diff base (`BaseSHA`).** When the worker calls `request-review`,
+the daemon snapshots the remote default-branch SHA (`origin/main` or
+`origin/master`) and persists it on the worker's state as `BaseSHA`.
+The verifier prompt and `oat worker verify` both diff against
+`${BASE_SHA}..HEAD` instead of live `origin/main`, so commits that land
+on `main` between the worker's rebase and the verifier's review do not
+appear as "deletions" and trigger spurious rejections. When `BaseSHA`
+is empty (in-flight verifications during upgrade, or self-verify run
+before any `request-review`) both surfaces fall back to live
+`origin/main`. The resolved base ref is included in the verifier
+prompt's "Verification Context" header so the verifier can see what
+it's diffing against.
+
 **5-minute timeout:** If verification remains pending for more than 5 minutes, the daemon wakes the worker with instructions to check the verifier's progress or self-verify as a fallback. If the verifier has crashed, the worker is told to self-verify immediately.
 
 **`oat pr create` verification gate:** PR creation requires either an approval from the verification agent (commit-bound) or a passing self-verification score. When the verifier is still running and under 5 minutes old, PR creation is blocked with a message telling the worker to wait. After 5 minutes, the self-verification fallback is allowed.

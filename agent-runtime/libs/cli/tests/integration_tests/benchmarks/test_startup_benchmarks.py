@@ -19,7 +19,7 @@ If a test fails
     when it shouldn't be. Move the offending import inside the function that
     needs it (see `main.cli_main` for examples of deferred imports).
 - **Timing failure** — an import or CLI command exceeded its threshold.
-    Profile with `python -X importtime -c "import deepagents_cli.main"`
+    Profile with `python -X importtime -c "import oat_cli.main"`
     to find the slow import.
 - **Deferred-import failure** — a heavy module was *not* loaded when it
     should have been. The deferred import is likely wired incorrectly; check
@@ -51,10 +51,10 @@ HEAVY_MODULES = frozenset(
         "langchain_core.runnables",
         "langchain_openai",
         "langchain_anthropic",
-        "deepagents_cli.agent",
-        "deepagents_cli.sessions",
-        "deepagents_cli.integrations.sandbox_factory",
-        "deepagents_cli.tools",
+        "oat_cli.agent",
+        "oat_cli.sessions",
+        "oat_cli.integrations.sandbox_factory",
+        "oat_cli.tools",
     }
 )
 
@@ -118,7 +118,7 @@ pytestmark = pytest.mark.benchmark
 class TestImportIsolation:
     """Guard that lightweight entry points don't pull in the heavy stack.
 
-    Without deferred imports, `deepagents --help` takes 3+ seconds because
+    Without deferred imports, `oat_sdk --help` takes 3+ seconds because
     langchain, agent, and sessions all load eagerly. These tests catch any
     accidental top-level import that would re-introduce that latency.
     """
@@ -126,10 +126,10 @@ class TestImportIsolation:
     @pytest.mark.parametrize(
         "import_stmt",
         [
-            "from deepagents_cli.main import parse_args",
-            "from deepagents_cli.main import check_cli_dependencies",
-            "import deepagents_cli.ui",
-            "import deepagents_cli.skills.commands",
+            "from oat_cli.main import parse_args",
+            "from oat_cli.main import check_cli_dependencies",
+            "import oat_cli.ui",
+            "import oat_cli.skills.commands",
         ],
         ids=[
             "main.parse_args",
@@ -169,7 +169,7 @@ class TestCLIStartupTime:
 
     @staticmethod
     def _time_cli_command(args: str) -> float:
-        """Return wall-clock seconds to run `python -m deepagents_cli <args>`.
+        """Return wall-clock seconds to run `python -m oat_cli <args>`.
 
         Args:
             args: CLI arguments string (e.g., `"--help"`).
@@ -181,7 +181,7 @@ class TestCLIStartupTime:
             import time, subprocess, sys
             start = time.perf_counter()
             subprocess.run(
-                [sys.executable, "-m", "deepagents_cli", {args!r}],
+                [sys.executable, "-m", "oat_cli", {args!r}],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -194,20 +194,20 @@ class TestCLIStartupTime:
         return float(result.stdout.strip())
 
     def test_help_under_threshold(self) -> None:
-        """`deepagents --help` should complete well under 10 s.
+        """`oat_sdk --help` should complete well under 10 s.
 
         A generous threshold to avoid flaky CI; the real goal is catching
         regressions where a heavy import is accidentally re-added at
         module level.
         """
         elapsed = self._time_cli_command("--help")
-        assert elapsed < 10, f"`deepagents --help` took {elapsed:.2f}s — expected < 10s"
+        assert elapsed < 10, f"`oat_sdk --help` took {elapsed:.2f}s — expected < 10s"
 
     def test_version_under_threshold(self) -> None:
-        """`deepagents --version` should complete well under 10 s."""
+        """`oat_sdk --version` should complete well under 10 s."""
         elapsed = self._time_cli_command("--version")
         assert elapsed < 10, (
-            f"`deepagents --version` took {elapsed:.2f}s — expected < 10s"
+            f"`oat_sdk --version` took {elapsed:.2f}s — expected < 10s"
         )
 
 
@@ -229,11 +229,11 @@ class TestImportTiming:
     @pytest.mark.parametrize(
         "module",
         [
-            "deepagents_cli.main",
-            "deepagents_cli.ui",
-            "deepagents_cli.config",
-            "deepagents_cli.skills.commands",
-            "deepagents_cli.tool_display",
+            "oat_cli.main",
+            "oat_cli.ui",
+            "oat_cli.config",
+            "oat_cli.skills.commands",
+            "oat_cli.tool_display",
         ],
         ids=[
             "main",
@@ -282,23 +282,23 @@ class TestDeferredImportsWork:
     """
 
     def test_agent_import_loads_langchain(self) -> None:
-        """Importing ``deepagents_cli.agent`` should pull in langchain."""
-        loaded = _get_loaded_modules("import deepagents_cli.agent")
+        """Importing ``oat_cli.agent`` should pull in langchain."""
+        loaded = _get_loaded_modules("import oat_cli.agent")
         langchain_modules = {m for m in loaded if m.startswith("langchain")}
         assert langchain_modules, (
-            "`deepagents_cli.agent` should transitively load `langchain` modules"
+            "`oat_cli.agent` should transitively load `langchain` modules"
         )
 
     def test_sessions_import_available(self) -> None:
-        """`deepagents_cli.sessions` should be importable."""
-        result = _run_python("import deepagents_cli.sessions")
+        """`oat_cli.sessions` should be importable."""
+        result = _run_python("import oat_cli.sessions")
         assert result.returncode == 0, (
-            f"Cannot import `deepagents_cli.sessions`:\n{result.stderr}"
+            f"Cannot import `oat_cli.sessions`:\n{result.stderr}"
         )
 
     def test_tool_display_loads_sdk_backends(self) -> None:
         """`tool_display` should load SDK backends."""
-        loaded = _get_loaded_modules("import deepagents_cli.tool_display")
-        assert "deepagents.backends" in loaded, (
+        loaded = _get_loaded_modules("import oat_cli.tool_display")
+        assert "oat_sdk.backends" in loaded, (
             "`tool_display` should import SDK `backends` for `DEFAULT_EXECUTE_TIMEOUT`"
         )

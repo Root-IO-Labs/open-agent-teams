@@ -84,9 +84,10 @@ func (s *ansiStripper) Write(p []byte) {
 				s.state = 0
 			}
 		case 3: // OSC: consume until BEL or ST
-			if b == 0x07 {
+			switch b {
+			case 0x07:
 				s.state = 0
-			} else if b == 0x1b {
+			case 0x1b:
 				s.state = 4
 			}
 		case 4: // OSC after ESC — expecting '\' for ST

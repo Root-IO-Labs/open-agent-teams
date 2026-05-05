@@ -2,7 +2,7 @@
 
 import pytest
 
-from deepagents_cli.config import contains_dangerous_patterns, is_shell_command_allowed
+from oat_cli.config import contains_dangerous_patterns, is_shell_command_allowed
 
 
 @pytest.fixture

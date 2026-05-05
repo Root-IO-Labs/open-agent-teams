@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-from deepagents_cli import model_config
-from deepagents_cli.model_config import (
+from oat_cli import model_config
+from oat_cli.model_config import (
     PROVIDER_API_KEY_ENV,
     ModelConfig,
     ModelConfigError,
@@ -542,10 +542,10 @@ class TestModelPersistenceBetweenSessions:
         2. Call _get_default_model_spec() without specifying a model
         3. Verify the saved recent model is used
         """
-        from deepagents_cli.config import _get_default_model_spec
+        from oat_cli.config import _get_default_model_spec
 
         # Use a temporary config path
-        config_path = tmp_path / ".deepagents" / "config.toml"
+        config_path = tmp_path / ".oat_sdk" / "config.toml"
 
         # Step 1: Save model to config (simulating /model anthropic:claude-opus-4-5)
         save_recent_model("anthropic:claude-opus-4-5", config_path)
@@ -579,10 +579,10 @@ class TestModelPersistenceBetweenSessions:
         When both a config file default AND API keys are present,
         the config file's default model should be used.
         """
-        from deepagents_cli.config import _get_default_model_spec
-        from deepagents_cli.model_config import save_default_model
+        from oat_cli.config import _get_default_model_spec
+        from oat_cli.model_config import save_default_model
 
-        config_path = tmp_path / ".deepagents" / "config.toml"
+        config_path = tmp_path / ".oat_sdk" / "config.toml"
 
         # Save an OpenAI model as default
         save_default_model("openai:gpt-5.2", config_path)
@@ -623,7 +623,7 @@ class TestGetAvailableModels:
             raise ImportError(msg)
 
         with patch(
-            "deepagents_cli.model_config._load_provider_profiles",
+            "oat_cli.model_config._load_provider_profiles",
             side_effect=mock_load,
         ):
             models = get_available_models()
@@ -638,10 +638,10 @@ class TestGetAvailableModels:
         """Logs debug message when provider package is not installed."""
         with (
             patch(
-                "deepagents_cli.model_config._load_provider_profiles",
+                "oat_cli.model_config._load_provider_profiles",
                 side_effect=ImportError("not installed"),
             ),
-            caplog.at_level(logging.DEBUG, logger="deepagents_cli.model_config"),
+            caplog.at_level(logging.DEBUG, logger="oat_cli.model_config"),
         ):
             get_available_models()
 
@@ -663,7 +663,7 @@ api_key_env = "FIREWORKS_API_KEY"
 """)
         with (
             patch(
-                "deepagents_cli.model_config._load_provider_profiles",
+                "oat_cli.model_config._load_provider_profiles",
                 side_effect=ImportError("not installed"),
             ),
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
@@ -692,7 +692,7 @@ models = ["claude-custom-finetune"]
 
         with (
             patch(
-                "deepagents_cli.model_config._load_provider_profiles",
+                "oat_cli.model_config._load_provider_profiles",
                 side_effect=mock_load,
             ),
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
@@ -721,7 +721,7 @@ models = ["claude-sonnet-4-5"]
 
         with (
             patch(
-                "deepagents_cli.model_config._load_provider_profiles",
+                "oat_cli.model_config._load_provider_profiles",
                 side_effect=mock_load,
             ),
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
@@ -739,7 +739,7 @@ api_key_env = "SOME_KEY"
 """)
         with (
             patch(
-                "deepagents_cli.model_config._load_provider_profiles",
+                "oat_cli.model_config._load_provider_profiles",
                 side_effect=ImportError("not installed"),
             ),
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
@@ -800,7 +800,7 @@ api_key_env = "FIREWORKS_API_KEY"
             "ollama": ("langchain_ollama", "ChatOllama", None),
         }
         with patch(
-            "deepagents_cli.model_config._get_builtin_providers",
+            "oat_cli.model_config._get_builtin_providers",
             return_value=fake_registry,
         ):
             assert has_provider_credentials("ollama") is None
@@ -1134,7 +1134,7 @@ models = ["llama3"]
 [models.providers.ollama.params."qwen3:4b"]
 temperature = 0.5
 """)
-        with caplog.at_level(logging.WARNING, logger="deepagents_cli.model_config"):
+        with caplog.at_level(logging.WARNING, logger="oat_cli.model_config"):
             ModelConfig.load(config_path)
 
         assert any(
@@ -1151,7 +1151,7 @@ models = ["qwen3:4b"]
 [models.providers.ollama.params."qwen3:4b"]
 temperature = 0.5
 """)
-        with caplog.at_level(logging.WARNING, logger="deepagents_cli.model_config"):
+        with caplog.at_level(logging.WARNING, logger="oat_cli.model_config"):
             ModelConfig.load(config_path)
 
         assert not any("params for" in record.message for record in caplog.records)
@@ -1166,7 +1166,7 @@ models = ["llama3"]
 [models.providers.ollama.params]
 temperature = 0
 """)
-        with caplog.at_level(logging.WARNING, logger="deepagents_cli.model_config"):
+        with caplog.at_level(logging.WARNING, logger="oat_cli.model_config"):
             ModelConfig.load(config_path)
 
         assert not any("params for" in record.message for record in caplog.records)
@@ -1183,7 +1183,7 @@ class TestModelConfigValidateClassPath:
 class_path = "my_package.MyChatModel"
 models = ["my-model"]
 """)
-        with caplog.at_level(logging.WARNING, logger="deepagents_cli.model_config"):
+        with caplog.at_level(logging.WARNING, logger="oat_cli.model_config"):
             ModelConfig.load(config_path)
 
         assert any("invalid class_path" in record.message for record in caplog.records)
@@ -1196,7 +1196,7 @@ models = ["my-model"]
 class_path = "my_package.models:MyChatModel"
 models = ["my-model"]
 """)
-        with caplog.at_level(logging.WARNING, logger="deepagents_cli.model_config"):
+        with caplog.at_level(logging.WARNING, logger="oat_cli.model_config"):
             ModelConfig.load(config_path)
 
         assert not any(
@@ -1216,7 +1216,7 @@ class TestGetProviderProfileModules:
             "fireworks": ("langchain_fireworks", "ChatFireworks", None),
         }
         with patch(
-            "deepagents_cli.model_config._get_builtin_providers",
+            "oat_cli.model_config._get_builtin_providers",
             return_value=fake_registry,
         ):
             result = _get_provider_profile_modules()
@@ -1237,7 +1237,7 @@ class TestGetProviderProfileModules:
             ),
         }
         with patch(
-            "deepagents_cli.model_config._get_builtin_providers",
+            "oat_cli.model_config._get_builtin_providers",
             return_value=fake_registry,
         ):
             result = _get_provider_profile_modules()
@@ -1424,7 +1424,7 @@ class TestGetAvailableModelsTextIO:
             raise ImportError(msg)
 
         with patch(
-            "deepagents_cli.model_config._load_provider_profiles",
+            "oat_cli.model_config._load_provider_profiles",
             side_effect=mock_load,
         ):
             models = get_available_models()
@@ -1446,7 +1446,7 @@ class TestGetAvailableModelsTextIO:
             raise ImportError(msg)
 
         with patch(
-            "deepagents_cli.model_config._load_provider_profiles",
+            "oat_cli.model_config._load_provider_profiles",
             side_effect=mock_load,
         ):
             models = get_available_models()
@@ -1471,7 +1471,7 @@ class TestGetAvailableModelsTextIO:
             raise ImportError(msg)
 
         with patch(
-            "deepagents_cli.model_config._load_provider_profiles",
+            "oat_cli.model_config._load_provider_profiles",
             side_effect=mock_load,
         ):
             models = get_available_models()
@@ -1491,7 +1491,7 @@ class TestGetAvailableModelsTextIO:
             raise ImportError(msg)
 
         with patch(
-            "deepagents_cli.model_config._load_provider_profiles",
+            "oat_cli.model_config._load_provider_profiles",
             side_effect=mock_load,
         ):
             models = get_available_models()
@@ -1607,7 +1607,7 @@ class TestModelPrecedenceOrder:
 
     def test_default_takes_priority_over_recent(self, tmp_path):
         """[models].default takes priority over [models].recent."""
-        from deepagents_cli.config import _get_default_model_spec
+        from oat_cli.config import _get_default_model_spec
 
         config_path = tmp_path / "config.toml"
         config_path.write_text("""
@@ -1630,7 +1630,7 @@ recent = "anthropic:claude-sonnet-4-5"
 
     def test_recent_takes_priority_over_env(self, tmp_path):
         """[models].recent takes priority over env var auto-detection."""
-        from deepagents_cli.config import _get_default_model_spec
+        from oat_cli.config import _get_default_model_spec
 
         config_path = tmp_path / "config.toml"
         config_path.write_text("""
@@ -1652,7 +1652,7 @@ recent = "openai:gpt-5.2"
 
     def test_env_used_when_neither_set(self, tmp_path):
         """Falls back to env var auto-detection when neither default nor recent set."""
-        from deepagents_cli.config import _get_default_model_spec, settings
+        from oat_cli.config import _get_default_model_spec, settings
 
         config_path = tmp_path / "config.toml"
         config_path.write_text("")

@@ -149,6 +149,87 @@ oat attach <agent-name>            # Watch an agent's output
 oat attach <agent-name> --read-only # Watch without touching
 ```
 
+## Monitoring Token Usage and Cache Efficiency
+
+Two commands cover the two natural questions ("what's happening right
+now?" vs "what did this run cost me?"). Both consume the same
+underlying token stream; they differ in whether they read live state
+or parse historical logs.
+
+```bash
+oat status --tokens                             # live, in-memory snapshot
+oat tokens report --repo <n> --format json      # historical / scripted
+oat tokens report --repo <n> --wave 2           # filter by benchmark wave
+```
+
+When to use which:
+
+| Want to... | Use |
+|------------|-----|
+| See which agent is burning tokens **right now** | `oat status --tokens` |
+| See cache-hit % drifting on a long-running agent | `oat status --tokens` (watch the `HIT%` column) |
+| Get a per-wave cost breakdown after a benchmark | `oat tokens report` |
+| Feed token counts into a script or dashboard | `oat tokens report --format json` |
+
+Sample `oat status --tokens` output:
+
+```
+OAT Token Usage
+
+  AGENT                                                    INPUT   OUTPUT   CACHE_READ   CACHE_CREATE   HIT%   COST_USD   LAST UPDATE
+  -------------------------------------------------------------------------------------------------------------------------------------
+  oat-myrepo/workspace                                    412100    18920       302150          48100   73.3%   $1.6712   12s ago
+  oat-myrepo/supervisor                                   189420     8211       126400          15800   66.7%   $0.7423   19s ago
+  oat-myrepo/warm-albatross                              2100430   194210      1603240         220110   76.3%   $9.2104    4s ago
+  -------------------------------------------------------------------------------------------------------------------------------------
+  TOTAL                                                  2701950   221341      2031790         284010   75.2%  $11.6239
+```
+
+**What `HIT%` means.** The share of input tokens served from Anthropic
+prompt cache (10% of fresh-input pricing) rather than being charged as
+new. A long-running agent holding steady above ~50% is healthy; under
+~50% usually means prompt-preamble invalidation churn (see
+[docs/ADVANCED_USAGE.md](ADVANCED_USAGE.md) → "Monitoring token usage
+and cache efficiency"). The runtime hint printed below the table
+agrees.
+
+**What `COST_USD` means.** Per-agent cost in US dollars derived from the
+embedded pricing table at [`internal/routing/pricing.yaml`](../internal/routing/pricing.yaml).
+The table covers input, output, cache-read, and cache-creation token
+prices for the models OAT ships with onboarded. A `—` in this column
+means the agent's model is not in `pricing.yaml` (or the agent has been
+GC'd from `state.json` so no model is recorded); add the model + verified
+prices to the YAML and rebuild to fix. The TOTAL is the sum across only
+the priced agents.
+
+Sample `oat tokens report --format json`:
+
+```json
+{
+  "repo": "oat-myrepo",
+  "agents": [
+    {"agent": "supervisor", "model": "anthropic:claude-sonnet-4-6",
+     "input_tokens": 189420, "output_tokens": 8211,
+     "cache_read_tokens": 126400, "cache_creation_tokens": 15800,
+     "cache_hit_pct": "66.7%", "cost_usd": 0.7423, "wave": ""},
+    {"agent": "warm-albatross", "model": "anthropic:claude-sonnet-4-6",
+     "input_tokens": 2100430, "output_tokens": 194210,
+     "cache_read_tokens": 1603240, "cache_creation_tokens": 220110,
+     "cache_hit_pct": "76.3%", "cost_usd": 9.2104, "wave": "wave:2"}
+  ],
+  "totals": {"input_tokens": 2289850, "output_tokens": 202421,
+             "cache_read_tokens": 1729640, "cache_creation_tokens": 235910,
+             "cache_hit_pct": "75.5%", "cost_usd": 9.9527}
+}
+```
+
+`cost_usd` on each agent and on `totals` is `null` when no priced
+agents were found, and otherwise the dollar amount. Unpriced agents
+contribute their tokens to the totals but not to the cost sum.
+
+`oat status --tokens` requires no daemon; both commands read their data
+straight off disk so they still work after a crash or hibernate.
+
 ## Messaging
 
 Agents talk to each other. You can eavesdrop. Or join the conversation.

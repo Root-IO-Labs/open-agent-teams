@@ -5,6 +5,7 @@ project_name: oat
 before:
   hooks:
     - go mod tidy
+    - bash scripts/stage-agent-runtime.sh
 
 builds:
   - id: oat
@@ -13,16 +14,14 @@ builds:
     env:
       - CGO_ENABLED=0
     goos:
-      - linux
       - darwin
+      - linux
     goarch:
       - amd64
       - arm64
-    flags:
-      - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/Root-IO-Labs/open-agent-teams/internal/cli.Version={{ .Version }}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/cli.Version={{.Version}}
 
   - id: oat-agent
     main: ./cmd/oat-agent
@@ -30,64 +29,44 @@ builds:
     env:
       - CGO_ENABLED=0
     goos:
-      - linux
       - darwin
+      - linux
     goarch:
       - amd64
       - arm64
-    flags:
-      - -trimpath
     ldflags:
       - -s -w
+      - -X main.Version={{.Version}}
 
 archives:
-  - id: oat
+  - id: default
     ids:
       - oat
       - oat-agent
-    name_template: >-
-      oat_{{ .Version }}_
-      {{- if eq .Os "darwin" }}darwin
-      {{- else if eq .Os "linux" }}linux
-      {{- else }}{{ .Os }}{{ end }}_
-      {{- if eq .Arch "amd64" }}x86_64
-      {{- else }}{{ .Arch }}{{ end }}
-    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
     files:
       - LICENSE
       - README.md
-      - SECURITY.md
-      - src: scripts/install-from-release.sh
-        dst: install.sh
-      - src: agent-runtime/**/*
+      - src: .release-stage/agent-runtime
         dst: agent-runtime
-      # Sweep stragglers that os.PathSeparator + globs occasionally miss.
-      # If goreleaser ever fails because one of these doesn't exist on a
-      # particular run, drop the line — they're best-effort tidiness.
+        info:
+          mode: 0644
 
 checksum:
   name_template: "checksums.txt"
+  algorithm: sha256
 
 snapshot:
-  version_template: "{{ incpatch .Version }}-next"
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
 
 changelog:
-  use: github
   sort: asc
-  groups:
-    - title: Features
-      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
-      order: 0
-    - title: Bug fixes
-      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
-      order: 1
-    - title: Documentation
-      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
-      order: 2
-    - title: Other
-      order: 999
+  use: github
   filters:
     exclude:
+      - "^docs:"
       - "^test:"
       - "^chore:"
       - "Merge pull request"
@@ -99,20 +78,50 @@ release:
     name: open-agent-teams
   draft: false
   prerelease: auto
-  name_template: "OAT {{ .Tag }}"
+  name_template: "v{{ .Version }}"
   header: |
     ## OAT {{ .Tag }}
 
-    Pre-built binaries for macOS and Linux. Install with:
-
-    ```bash
-    curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+    Install via Homebrew:
+    ```
+    brew install Root-IO-Labs/oat/oat
     ```
 
-    Or download a tarball directly from the assets below and run `./install.sh`.
-
-    Each archive contains the `oat` and `oat-agent` Go binaries plus the
-    Python agent-runtime source. Install requires Python 3.11+ and
-    [uv](https://docs.astral.sh/uv/) on the target machine.
+    Or download a tarball below for your platform.
   footer: |
+    ---
     **Full Changelog**: https://github.com/Root-IO-Labs/open-agent-teams/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+brews:
+  - name: oat
+    ids:
+      - default
+    repository:
+      owner: Root-IO-Labs
+      name: homebrew-oat
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/Root-IO-Labs/open-agent-teams"
+    description: "Open Agent Teams — coordinate teams of coding agents on real repos"
+    license: "MIT"
+    commit_author:
+      name: oat-release-bot
+      email: release@root-io-labs.invalid
+    commit_msg_template: "release: {{ .ProjectName }} {{ .Tag }}"
+    dependencies:
+      - name: uv
+      - name: python@3.12
+    install: |
+      libexec.install Dir["*"]
+      bin.install_symlink libexec/"oat"
+      bin.install_symlink libexec/"oat-agent"
+    post_install: |
+      cli_dir = libexec/"agent-runtime/libs/cli"
+      if cli_dir.directory?
+        ENV["UV_PYTHON"] = Formula["python@3.12"].opt_bin/"python3.12"
+        system Formula["uv"].opt_bin/"uv", "sync", "--directory", cli_dir.to_s
+      end
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/oat --version")
+      assert_match version.to_s, shell_output("#{bin}/oat-agent --version")

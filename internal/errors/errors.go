@@ -2,6 +2,7 @@
 package errors
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -72,7 +73,8 @@ func Format(err error) string {
 	var sb strings.Builder
 
 	// Check if it's a CLIError
-	if cliErr, ok := err.(*CLIError); ok {
+	cliErr := &CLIError{}
+	if errors.As(err, &cliErr) {
 		// Add category prefix
 		prefix := categoryPrefix(cliErr.Category)
 		sb.WriteString(prefix)
@@ -151,6 +153,23 @@ func NotInRepo() *CLIError {
 		Category:   CategoryConfig,
 		Message:    "not in a tracked repository",
 		Suggestion: "oat repo init <github-url> to track a repository, or use --repo flag",
+	}
+}
+
+// MissingAPIKey creates an error for when `oat init` is invoked without any
+// provider API key configured (neither in the environment nor in
+// ~/.oat/.env). Agents cannot do anything useful without one, so we fail
+// fast at the CLI layer rather than letting the failure propagate into the
+// daemon and surface as a Python traceback.
+func MissingAPIKey() *CLIError {
+	return &CLIError{
+		Category: CategoryConfig,
+		Message:  "no LLM provider key found in environment or ~/.oat/.env",
+		Suggestion: "set one of ANTHROPIC_API_KEY, OPENAI_API_KEY, " +
+			"OPENROUTER_API_KEY, GOOGLE_API_KEY, DEEPSEEK_API_KEY, " +
+			"MISTRAL_API_KEY, GROQ_API_KEY, XAI_API_KEY, TOGETHER_API_KEY, " +
+			"AZURE_OPENAI_API_KEY (and more — see docs/SUPPORTED_LLM_PROVIDERS.md), " +
+			"then rerun. `oat doctor` will verify your full setup.",
 	}
 }
 

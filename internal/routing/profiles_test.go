@@ -607,7 +607,7 @@ evidence:
 		t.Fatalf("BestEligible: %v", err)
 	}
 	if best != "test:default-70" {
-		t.Errorf("BestEligible = %q, want test:default-70 (minimum should be penalised)", best)
+		t.Errorf("BestEligible = %q, want test:default-70 (minimum should be penalized)", best)
 	}
 }
 

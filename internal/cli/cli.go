@@ -5,17 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/agents"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/bugreport"
@@ -27,53 +29,74 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/hooks"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/messages"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/names"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/preflight"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/prompts"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/templates"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/tui"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/version"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/worktree"
 	agent_pkg "github.com/Root-IO-Labs/open-agent-teams/pkg/agent"
 	backend_pkg "github.com/Root-IO-Labs/open-agent-teams/pkg/backend"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
 )
 
-// Version is the current version of oat (set at build time via ldflags)
+// ─── Function index (approximate line numbers) ──────────────────
+//
+// Types + constructors:           ~84   (Command, CLI, New, NewWithPaths)
+// registerCommands:               ~389  (all subcommand wiring)
+// Daemon lifecycle:               ~1063 (startDaemon, stopDaemon, nukeDaemon)
+// Repo commands:                  ~1875 (initRepo, listRepos, removeRepo)
+// Worker commands:                ~2939 (createWorker, listWorkers, removeWorker)
+// Agent definitions:              ~3396 (listAgentDefinitions, resetAgentDefinitions)
+// Message commands:               ~5322 (sendMessage, listMessages, readMessage)
+// Agent state:                    ~5853 (completeWorker, waitingForPR)
+// Attach / logs:                  ~6925 (listLogsForRepo, attachAgent)
+// Model commands:                 ~8602 (modelOnboard, modelList, modelSet, modelShow)
+// Doctor:                         ~8520 (doctor preflight)
+// Token reporting:                see tokens_report.go
+// Helpers:                        ~8153 (ParseFlags, collectCLIEnvVars)
+//
+// ─────────────────────────────────────────────────────────────────
+
+// Version is the current version of oat. Kept as a package-level alias for
+// backwards compatibility with callers that set it directly via older
+// `-ldflags "-X .../internal/cli.Version=..."` invocations. New build
+// tooling should set internal/version.Version instead; the canonical
+// getter (GetVersion) already consults that package.
 var Version = "dev"
 
-// GetVersion returns the semver-formatted version string
+// GetVersion returns the semver-formatted version string for the running
+// binary. Release builds inject the real version via ldflags into
+// internal/version; development builds fall back to Go's VCS stamps so
+// `go install …@sha` still produces a useful "0.0.0+<sha>-dev" label.
 func GetVersion() string {
-	if Version != "dev" {
+	// Honor the legacy override first so existing CI pipelines that stamp
+	// internal/cli.Version keep working during the release-infra rollout.
+	if Version != "dev" && Version != "" {
 		return Version
 	}
 
-	// Try to get VCS info embedded by Go at build time
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return "0.0.0-dev"
+	info := version.Current()
+	if !info.IsDev {
+		return info.Version
 	}
-
-	var commit string
-	for _, setting := range info.Settings {
-		if setting.Key == "vcs.revision" {
-			commit = setting.Value
-			if len(commit) > 7 {
-				commit = commit[:7] // Short commit hash
-			}
-			break
-		}
+	if info.Commit != "" && info.Commit != "none" {
+		return fmt.Sprintf("0.0.0+%s-dev", info.Commit)
 	}
-
-	if commit == "" {
-		return "0.0.0-dev"
-	}
-
-	return fmt.Sprintf("0.0.0+%s-dev", commit)
+	return "0.0.0-dev"
 }
 
-// IsDevVersion returns true if running a development build (not set via ldflags)
+// IsDevVersion reports whether the binary was built without a release
+// version stamp (either via the new internal/version package or the
+// legacy internal/cli.Version override).
 func IsDevVersion() bool {
-	return Version == "dev"
+	if Version != "dev" && Version != "" {
+		return false
+	}
+	return version.Current().IsDev
 }
 
 // Command represents a CLI command
@@ -85,12 +108,20 @@ type Command struct {
 	Subcommands map[string]*Command
 }
 
-// CLI manages the command-line interface
+// CLI manages the command-line interface.
+//
+// Every exec.Command and worktree.Manager constructed by a CLI method uses
+// ctx so that Ctrl-C (SIGINT) cancels in-flight git / gh / tmux calls
+// instead of orphaning them. The ctx is populated by Execute; when using
+// the CLI outside of a signal-aware entry point (tests), ctx defaults to
+// context.Background().
 type CLI struct {
 	rootCmd       *Command
 	paths         *config.Paths
 	backend       backend_pkg.ProcessBackend
-	documentation string // Auto-generated CLI documentation for prompts
+	documentation string                     // Full CLI reference (`oat docs`, tests)
+	docsByAgent   map[state.AgentType]string // Per-agent-type filtered reference, populated on demand
+	ctx           context.Context
 }
 
 // New creates a new CLI
@@ -103,6 +134,7 @@ func New() (*CLI, error) {
 	cli := &CLI{
 		paths:   paths,
 		backend: backend_pkg.BackendFromEnv(),
+		ctx:     context.Background(),
 		rootCmd: &Command{
 			Name:        "OAT",
 			Description: "Open Agent Teams",
@@ -123,6 +155,7 @@ func NewWithPaths(paths *config.Paths) *CLI {
 	cli := &CLI{
 		paths:   paths,
 		backend: backend_pkg.BackendFromEnv(),
+		ctx:     context.Background(),
 		rootCmd: &Command{
 			Name:        "OAT",
 			Description: "Open Agent Teams",
@@ -136,6 +169,24 @@ func NewWithPaths(paths *config.Paths) *CLI {
 	cli.documentation = cli.GenerateDocumentation()
 
 	return cli
+}
+
+// SetContext wires a cancellable context into the CLI. Must be called by
+// the entry point before Execute so that SIGINT / SIGTERM propagate into
+// exec.Command calls spawned by CLI commands.
+func (c *CLI) SetContext(ctx context.Context) {
+	c.ctx = ctx
+}
+
+// cmdCtx returns the CLI's context, falling back to context.Background()
+// when tests construct a bare &CLI{} without going through New/NewWithPaths.
+// Every exec.CommandContext / NewManagerWithContext call in this package
+// routes through cmdCtx so the struct is nil-safe.
+func (c *CLI) cmdCtx() context.Context {
+	if c.ctx == nil {
+		return context.Background()
+	}
+	return c.ctx
 }
 
 // getAgentBinary resolves the oat-agent binary path.
@@ -245,20 +296,26 @@ func (c *CLI) Execute(args []string) error {
 
 // showVersion displays the version information
 func (c *CLI) showVersion() error {
-	fmt.Printf("oat %s\n", GetVersion())
+	fmt.Println(version.Current().String())
 	return nil
 }
 
-// versionCommand displays version information with optional JSON output
+// versionCommand displays version information with optional JSON output.
+// Release builds (with ldflags injection into internal/version) emit the
+// tagged version, the short commit SHA, and the build date. Development
+// builds fall back to "0.0.0+<sha>-dev" via GetVersion.
 func (c *CLI) versionCommand(args []string) error {
 	flags, _ := ParseFlags(args)
 	outputJSON := flags["json"] == "true"
 
-	version := GetVersion()
+	info := version.Current()
+	displayVersion := GetVersion()
 
 	if outputJSON {
 		output := map[string]interface{}{
-			"version":    version,
+			"version":    displayVersion,
+			"commit":     info.Commit,
+			"date":       info.Date,
 			"isDev":      IsDevVersion(),
 			"rawVersion": Version,
 		}
@@ -267,7 +324,13 @@ func (c *CLI) versionCommand(args []string) error {
 		return encoder.Encode(output)
 	}
 
-	fmt.Printf("oat %s\n", version)
+	fmt.Printf("oat %s\n", displayVersion)
+	if info.Commit != "" && info.Commit != "none" {
+		fmt.Printf("  commit:  %s\n", info.Commit)
+	}
+	if info.Date != "" && info.Date != "unknown" {
+		fmt.Printf("  built:   %s\n", info.Date)
+	}
 	return nil
 }
 
@@ -370,8 +433,8 @@ func (c *CLI) registerCommands() {
 	// Root-level status command - comprehensive system overview
 	c.rootCmd.Subcommands["status"] = &Command{
 		Name:        "status",
-		Description: "Show all active agents and system status",
-		Usage:       "oat status",
+		Description: "Show system status and agent stats. Use --tokens for per-agent token and cache-hit breakdown.",
+		Usage:       "oat status [--tokens]",
 		Run:         c.systemStatus,
 	}
 
@@ -416,6 +479,13 @@ func (c *CLI) registerCommands() {
 		Run:         c.restartDaemon,
 	}
 
+	daemonCmd.Subcommands["nuke"] = &Command{
+		Name:        "nuke",
+		Description: "Force-cleanup when the daemon is wedged (bypasses socket)",
+		Usage:       "oat daemon nuke",
+		Run:         c.nukeDaemon,
+	}
+
 	daemonCmd.Subcommands["_run"] = &Command{
 		Name:        "_run",
 		Description: "Internal: run daemon in foreground (used by daemon start)",
@@ -442,7 +512,7 @@ func (c *CLI) registerCommands() {
 	repoCmd.Subcommands["init"] = &Command{
 		Name:        "init",
 		Description: "Initialize a repository for OAT agents",
-		Usage:       "oat repo init <github-url> [name] [--model=<model>]\n\nExample:\n  oat init https://github.com/myorg/myproject\n  oat init https://github.com/myorg/myproject --model claude-sonnet-4-6",
+		Usage:       "oat repo init <github-url> [name] [--model=<model>]\n\nExample:\n  oat init https://github.com/myorg/myproject\n  oat init https://github.com/myorg/myproject --model claude-sonnet-4-5",
 		Run:         c.initRepo,
 	}
 
@@ -586,7 +656,7 @@ func (c *CLI) registerCommands() {
 	modelCmd.Subcommands["onboard"] = &Command{
 		Name:        "onboard",
 		Description: "Probe a model's capabilities and generate a profile",
-		Usage:       "oat model onboard <provider:model> [--probe-set minimum|default] [--save]",
+		Usage:       "oat model onboard <provider:model> [--probe-set minimum|default] [--verbose]",
 		Run:         c.modelOnboard,
 	}
 
@@ -611,7 +681,54 @@ func (c *CLI) registerCommands() {
 		Run:         c.modelRestore,
 	}
 
+	modelCmd.Subcommands["set"] = &Command{
+		Name:        "set",
+		Description: "Update per-model runtime parameters (max_tokens, nudge_interval_seconds)",
+		Usage:       "oat model set <provider:model> [--max-tokens N] [--nudge-interval SECONDS]",
+		Run:         c.modelSet,
+	}
+
 	c.rootCmd.Subcommands["model"] = modelCmd
+
+	// Routing-history reporting + privacy. Read-only commands that surface
+	// the corpus collected at ~/.oat/routing-history.jsonl.
+	routingCmd := &Command{
+		Name:        "routing",
+		Description: "Inspect and manage the routing-history corpus",
+		Usage:       "oat routing <subcommand>",
+		Subcommands: make(map[string]*Command),
+	}
+	routingCmd.Subcommands["report"] = &Command{
+		Name:        "report",
+		Description: "Summarize routing history by model: success rate, p50/p95 wall, Wilson 95% lower bound",
+		Usage:       "oat routing report",
+		Run:         c.routingReport,
+	}
+	routingCmd.Subcommands["privacy"] = &Command{
+		Name:        "privacy",
+		Description: "Show current privacy mode + describe each level",
+		Usage:       "oat routing privacy",
+		Run:         c.routingPrivacy,
+	}
+	routingCmd.Subcommands["migrate-v1"] = &Command{
+		Name:        "migrate-v1",
+		Description: "Force a v1→v2 corpus migration (daemon also auto-migrates on start)",
+		Usage:       "oat routing migrate-v1",
+		Run:         c.routingMigrate,
+	}
+	routingCmd.Subcommands["share"] = &Command{
+		Name:        "share",
+		Description: "Build the opt-in upload payload (--dry-run only in v0; endpoint not yet live)",
+		Usage:       "oat routing share --dry-run",
+		Run:         c.routingShare,
+	}
+	routingCmd.Subcommands["route"] = &Command{
+		Name:        "route",
+		Description: "Preview the router's pick for a task (no worker spawn, no LLM calls)",
+		Usage:       "oat routing route --task \"<text>\" [--allow csv] [--v2 | --all]",
+		Run:         c.routingRoute,
+	}
+	c.rootCmd.Subcommands["routing"] = routingCmd
 
 	// Workspace commands
 	workspaceCmd := &Command{
@@ -930,6 +1047,14 @@ Aliases for --allowed-worker-models: --available-worker-models, --allowed-models
 		Run:         c.diagnostics,
 	}
 
+	// Doctor command — preflight checks for first-run and support triage.
+	c.rootCmd.Subcommands["doctor"] = &Command{
+		Name:        "doctor",
+		Description: "Run preflight checks for required tools, API keys, and daemon",
+		Usage:       "oat doctor [--json]",
+		Run:         c.doctor,
+	}
+
 	// Version command
 	c.rootCmd.Subcommands["version"] = &Command{
 		Name:        "version",
@@ -937,6 +1062,21 @@ Aliases for --allowed-worker-models: --available-worker-models, --allowed-models
 		Usage:       "oat version [--json]",
 		Run:         c.versionCommand,
 	}
+
+	tokensCmd := &Command{
+		Name:        "tokens",
+		Description: "Token usage reports (historical, parsed from agent logs)",
+		Subcommands: make(map[string]*Command),
+	}
+	tokensCmd.Subcommands["report"] = &Command{
+		Name: "report",
+		Description: "Historical per-agent token usage parsed from [OAT_TOKENS] log lines. " +
+			"Distinct from `oat status --tokens`, which reads live daemon state.",
+		Usage: "oat tokens report --repo <name> [--since <ts>] [--until <ts>] " +
+			"[--wave N] [--waves-file <path>] [--format table|json]",
+		Run: c.tokensReport,
+	}
+	c.rootCmd.Subcommands["tokens"] = tokensCmd
 
 	// Agents command - for managing agent definitions
 	agentsCmd := &Command{
@@ -988,20 +1128,211 @@ func (c *CLI) runDaemon(args []string) error {
 }
 
 func (c *CLI) stopDaemon(args []string) error {
-	_, err := c.sendDaemonRequest("stop", nil)
+	stopped, err := c.killDaemon()
 	if err != nil {
 		return err
 	}
-
+	if !stopped {
+		fmt.Println("Daemon is not running")
+		return nil
+	}
 	fmt.Println("Daemon stopped successfully")
 	return nil
 }
 
 func (c *CLI) restartDaemon(args []string) error {
-	_, _ = c.sendDaemonRequest("stop", nil)
+	if _, err := c.killDaemon(); err != nil {
+		return fmt.Errorf("failed to stop daemon: %w", err)
+	}
 	fmt.Println("Daemon stopped, restarting...")
-	time.Sleep(2 * time.Second)
 	return daemon.RunDetached()
+}
+
+// killDaemon stops the daemon, escalating from a graceful socket shutdown to
+// SIGTERM and finally SIGKILL if the daemon is unresponsive. It also cleans
+// up a stale PID file. Returns (stopped, err): stopped=false if no daemon was
+// running (nothing to do); stopped=true if we actually terminated something.
+func (c *CLI) killDaemon() (bool, error) {
+	pidFile := daemon.NewPIDFile(c.paths.DaemonPID)
+	running, pid, _ := pidFile.IsRunning()
+	if !running {
+		// Clean up a stale PID file if one exists so the next start isn't blocked.
+		_ = pidFile.Remove()
+		return false, nil
+	}
+
+	// 1) Try graceful shutdown via the socket. Short window because an
+	//    unresponsive daemon is exactly why we'd be calling this.
+	_, _ = c.sendDaemonRequest("stop", nil)
+	if waitForPIDExit(pid, 3*time.Second) {
+		_ = pidFile.Remove()
+		return true, nil
+	}
+
+	// 2) SIGTERM
+	if proc, err := os.FindProcess(pid); err == nil {
+		_ = proc.Signal(syscall.SIGTERM)
+	}
+	if waitForPIDExit(pid, 3*time.Second) {
+		_ = pidFile.Remove()
+		return true, nil
+	}
+
+	// 3) SIGKILL — last resort.
+	if proc, err := os.FindProcess(pid); err == nil {
+		_ = proc.Signal(syscall.SIGKILL)
+	}
+	if waitForPIDExit(pid, 2*time.Second) {
+		_ = pidFile.Remove()
+		return true, nil
+	}
+
+	return false, fmt.Errorf("daemon (PID %d) still alive after SIGKILL", pid)
+}
+
+// nukeDaemon is the "break glass" escape hatch for when the daemon is
+// wedged (socket unresponsive, processes in macOS UE state, etc.).
+//
+// Unlike stopDaemon/restartDaemon, nuke:
+//   - never talks to the daemon socket (which may be hung)
+//   - SIGKILLs every oat daemon + agent sidecar process
+//   - removes socket + pid files so a fresh daemon can start on a new inode
+//   - ignores UE/zombie processes it can't kill — they're fossils from the
+//     kernel's perspective and don't block a new daemon from binding a new
+//     socket inode at the same path
+//
+// Use this when `oat daemon status` hangs or `oat daemon stop` won't return.
+func (c *CLI) nukeDaemon(args []string) error {
+	fmt.Println("==> Force-cleaning OAT daemon state (bypasses socket)")
+
+	// 1) Record what's alive now so we can show the user what got cleaned up
+	//    vs. what is still lingering as a kernel fossil.
+	before := snapshotOatProcesses()
+
+	// 2) SIGKILL all daemon + agent processes. pkill returns non-zero if no
+	//    matches; ignore errors. Order: daemons first, then agents so the
+	//    daemon can't respawn supervisor/merge-queue before we kill them.
+	for _, pattern := range []string{
+		"oat daemon _run",
+		"oat ui",
+		"oat_cli.main",
+	} {
+		_ = exec.CommandContext(c.ctx, "pkill", "-9", "-f", pattern).Run()
+	}
+
+	// 3) Remove the pid + socket files. If a fossil process still holds the
+	//    old socket inode in kernel space, it's fine — removing the path
+	//    lets `net.Listen("unix", path)` create a fresh inode at the same
+	//    filesystem path, and the fossil's open FD is unrelated to new traffic.
+	removed := []string{}
+	for _, f := range []string{c.paths.DaemonPID, c.paths.DaemonSock} {
+		if err := os.Remove(f); err == nil {
+			removed = append(removed, f)
+		}
+	}
+
+	// Give SIGKILL a moment to propagate before we inspect what's left.
+	time.Sleep(500 * time.Millisecond)
+
+	after := snapshotOatProcesses()
+
+	// 4) Report. "Killed" = gone after our pkill. "Fossils" = still present,
+	//    almost certainly in UE state and unkillable until the kernel
+	//    releases them. The user can safely ignore fossils and start a new
+	//    daemon.
+	killed := diffProcesses(before, after)
+	fossils := after
+
+	if len(killed) > 0 {
+		fmt.Printf("  Killed %d process(es):\n", len(killed))
+		for _, p := range killed {
+			fmt.Printf("    %d  %s\n", p.pid, p.cmd)
+		}
+	}
+	for _, f := range removed {
+		fmt.Printf("  Removed: %s\n", f)
+	}
+	if len(fossils) > 0 {
+		fmt.Printf("  WARNING: %d process(es) still present (likely UE/zombie — kernel wedge):\n", len(fossils))
+		for _, p := range fossils {
+			fmt.Printf("    %d  %s\n", p.pid, p.cmd)
+		}
+		fmt.Println("  These are kernel fossils. They cannot be killed until the kernel")
+		fmt.Println("  releases them (usually a reboot). They do NOT block a new daemon —")
+		fmt.Println("  the new daemon binds a fresh socket inode at the same path.")
+	}
+
+	fmt.Println()
+	fmt.Println("==> Nuke complete. Next: oat daemon start")
+	return nil
+}
+
+// oatProcess is a minimal (pid, command) pair used by nukeDaemon for
+// before/after diffs. Not exposed.
+type oatProcess struct {
+	pid int
+	cmd string
+}
+
+// snapshotOatProcesses lists all live oat daemon / agent processes. Used by
+// nukeDaemon to report what it killed vs. what is still fossilized.
+func snapshotOatProcesses() []oatProcess {
+	out, _ := exec.CommandContext(context.Background(), "pgrep", "-fl",
+		"oat daemon _run|oat ui|oat_cli.main",
+	).Output()
+	var procs []oatProcess
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// pgrep -fl output: "<pid> <command>"
+		sp := strings.SplitN(line, " ", 2)
+		if len(sp) != 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(sp[0])
+		if err != nil {
+			continue
+		}
+		cmd := sp[1]
+		if len(cmd) > 80 {
+			cmd = cmd[:77] + "..."
+		}
+		procs = append(procs, oatProcess{pid: pid, cmd: cmd})
+	}
+	return procs
+}
+
+// diffProcesses returns processes present in `before` but not in `after` — i.e.
+// the ones our SIGKILL successfully terminated.
+func diffProcesses(before, after []oatProcess) []oatProcess {
+	afterPIDs := make(map[int]struct{}, len(after))
+	for _, p := range after {
+		afterPIDs[p.pid] = struct{}{}
+	}
+	var killed []oatProcess
+	for _, p := range before {
+		if _, stillAlive := afterPIDs[p.pid]; !stillAlive {
+			killed = append(killed, p)
+		}
+	}
+	return killed
+}
+
+// waitForPIDExit polls until the process is gone or the timeout elapses.
+func waitForPIDExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			return true
+		}
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			return true // ESRCH or similar — process is gone
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
 }
 
 func (c *CLI) daemonStatus(args []string) error {
@@ -1023,8 +1354,9 @@ func (c *CLI) daemonStatus(args []string) error {
 		Command: "status",
 	})
 	if err != nil {
+		// Daemon-unreachable is reportable status, not a CLI error.
 		fmt.Printf("Daemon PID file exists (PID: %d) but daemon is not responding\n", pid)
-		return nil
+		return nil //nolint:nilerr // graceful status reporting
 	}
 
 	if !resp.Success {
@@ -1088,6 +1420,16 @@ func (c *CLI) runUI(args []string) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 
+	// Honor OAT_THEME=dark|light to override lipgloss's background detection,
+	// which is unreliable across terminal emulators (tmux, some SSH clients,
+	// non-xterm-compatible terminals).
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("OAT_THEME"))) {
+	case "dark":
+		lipgloss.SetHasDarkBackground(true)
+	case "light":
+		lipgloss.SetHasDarkBackground(false)
+	}
+
 	app := tui.NewApp(c.paths.DaemonSock, repoName, c.paths)
 	// No mouse capture — allows standard terminal text selection and copy.
 	// Mouse scrolling is handled by the terminal emulator natively.
@@ -1135,7 +1477,7 @@ func (c *CLI) systemStatus(args []string) error {
 		fmt.Printf("  Daemon: %s (PID: %d, not responding)\n", format.Yellow.Sprint("unhealthy"), pid)
 		fmt.Println()
 		format.Dimmed("Try: oat restart")
-		return nil
+		return nil //nolint:nilerr // graceful status reporting
 	}
 
 	if !resp.Success {
@@ -1276,10 +1618,15 @@ func (c *CLI) systemStatusTokens() error {
 	type row struct {
 		repo, agent, model string
 		in, out, cr, cc    int64
+		cost               *float64
 		lastUpd            time.Time
 	}
 	var rows []row
 	var grandIn, grandOut, grandCR, grandCC int64
+	var grandCost float64
+	var grandCostAny bool
+
+	pricing := routing.LoadEmbeddedPricing()
 
 	repoNames := make([]string, 0, len(repos))
 	for name := range repos {
@@ -1299,6 +1646,14 @@ func (c *CLI) systemStatusTokens() error {
 		sort.Strings(agentNames)
 		for _, agentName := range agentNames {
 			a := repo.Agents[agentName]
+			cost := computeAgentCost(agentReport{
+				Agent:         agentName,
+				Model:         a.Model,
+				InputTokens:   a.InputTokens,
+				OutputTokens:  a.OutputTokens,
+				CacheRead:     a.CacheReadTokens,
+				CacheCreation: a.CacheCreationTokens,
+			}, pricing)
 			rows = append(rows, row{
 				repo:    repoName,
 				agent:   agentName,
@@ -1307,12 +1662,17 @@ func (c *CLI) systemStatusTokens() error {
 				out:     a.OutputTokens,
 				cr:      a.CacheReadTokens,
 				cc:      a.CacheCreationTokens,
+				cost:    cost,
 				lastUpd: a.LastTokenUpdate,
 			})
 			grandIn += a.InputTokens
 			grandOut += a.OutputTokens
 			grandCR += a.CacheReadTokens
 			grandCC += a.CacheCreationTokens
+			if cost != nil {
+				grandCost += *cost
+				grandCostAny = true
+			}
 		}
 	}
 
@@ -1322,10 +1682,11 @@ func (c *CLI) systemStatusTokens() error {
 		return nil
 	}
 
-	fmt.Printf("  %-55s %10s %8s %12s %12s %6s %12s\n",
-		"AGENT", "INPUT", "OUTPUT", "CACHE_READ", "CACHE_CREATE", "HIT%", "LAST UPDATE")
-	fmt.Println("  " + strings.Repeat("-", 124))
+	fmt.Printf("  %-55s %10s %8s %12s %12s %6s %10s %12s\n",
+		"AGENT", "INPUT", "OUTPUT", "CACHE_READ", "CACHE_CREATE", "HIT%", "COST_USD", "LAST UPDATE")
+	fmt.Println("  " + strings.Repeat("-", 137))
 
+	var unpriced int
 	for _, r := range rows {
 		hitPct := ""
 		if r.in > 0 {
@@ -1341,21 +1702,31 @@ func (c *CLI) systemStatusTokens() error {
 		// Staleness indicator: non-zero timestamp aged beyond threshold.
 		// No color — matches existing near-budget pattern (cli.go ⚠ suffix).
 		if !r.lastUpd.IsZero() && time.Since(r.lastUpd) > staleTokenAge {
-			age = age + " ⚠"
+			age += " ⚠"
 		}
-		fmt.Printf("  %-55s %10d %8d %12d %12d %6s %12s\n",
-			label, r.in, r.out, r.cr, r.cc, hitPct, age)
+		if r.cost == nil {
+			unpriced++
+		}
+		fmt.Printf("  %-55s %10d %8d %12d %12d %6s %10s %12s\n",
+			label, r.in, r.out, r.cr, r.cc, hitPct, fmtCost(r.cost), age)
 	}
 
-	fmt.Println("  " + strings.Repeat("-", 124))
+	fmt.Println("  " + strings.Repeat("-", 137))
 	hitPct := "—"
 	if grandIn > 0 {
 		hitPct = fmt.Sprintf("%.1f%%", float64(grandCR)/float64(grandIn)*100)
 	}
+	var grandCostPtr *float64
+	if grandCostAny {
+		grandCostPtr = &grandCost
+	}
 	// Grand-total row: aggregating ages across agents is misleading, leave "—".
-	fmt.Printf("  %-55s %10d %8d %12d %12d %6s %12s\n",
-		"TOTAL", grandIn, grandOut, grandCR, grandCC, hitPct, "—")
+	fmt.Printf("  %-55s %10d %8d %12d %12d %6s %10s %12s\n",
+		"TOTAL", grandIn, grandOut, grandCR, grandCC, hitPct, fmtCost(grandCostPtr), "—")
 	fmt.Println()
+	if unpriced > 0 {
+		format.Dimmed(fmt.Sprintf("Note: %d agent(s) show — for COST_USD — model not in internal/routing/pricing.yaml.", unpriced))
+	}
 	format.Dimmed("Hint: cache hit below 50 percent on a long-running agent is a red flag.")
 	format.Dimmed("Hint: ⚠ on LAST UPDATE means no token events for 5+ minutes (daemon down or hung watcher).")
 	return nil
@@ -1369,7 +1740,7 @@ func (c *CLI) daemonLogs(args []string) error {
 
 	if follow {
 		// Use tail -f to follow logs
-		cmd := exec.Command("tail", "-f", c.paths.DaemonLog)
+		cmd := exec.CommandContext(c.cmdCtx(), "tail", "-f", c.paths.DaemonLog)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return cmd.Run()
@@ -1381,7 +1752,7 @@ func (c *CLI) daemonLogs(args []string) error {
 		lines = n
 	}
 
-	cmd := exec.Command("tail", "-n", lines, c.paths.DaemonLog)
+	cmd := exec.CommandContext(c.cmdCtx(), "tail", "-n", lines, c.paths.DaemonLog)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -1519,7 +1890,7 @@ func (c *CLI) stopAll(args []string) error {
 			fmt.Printf("  Repository: %s\n", repoName)
 
 			// Delete work/* and oat/* branches
-			wt := worktree.NewManager(repoPath)
+			wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 			for _, prefix := range []string{"work/", "oat/"} {
 				branches, err := c.listBranchesWithPrefix(repoPath, prefix)
 				if err != nil {
@@ -1527,10 +1898,9 @@ func (c *CLI) stopAll(args []string) error {
 					continue
 				}
 				for _, branch := range branches {
-					// First remove any worktree associated with this branch
-					if err := wt.Remove(branch, true); err != nil {
-						// Ignore errors - worktree may not exist
-					}
+					// First remove any worktree associated with this branch.
+					// Ignore errors: worktree may not exist.
+					_ = wt.Remove(branch, true)
 					// Delete the branch
 					if err := c.deleteBranch(repoPath, branch); err != nil {
 						fmt.Printf("    Warning: failed to delete branch %s: %v\n", branch, err)
@@ -1550,8 +1920,9 @@ func (c *CLI) stopAll(args []string) error {
 		fmt.Println("\nClearing agent state...")
 		st, err := state.Load(c.paths.StateFile)
 		if err == nil {
-			st.ClearAllAgents()
-			if err := st.Save(); err != nil {
+			if err := st.ClearAllAgents(); err != nil {
+				fmt.Printf("  Warning: failed to clear agents: %v\n", err)
+			} else if err := st.Save(); err != nil {
 				fmt.Printf("  Warning: failed to save state: %v\n", err)
 			} else {
 				fmt.Println("  Cleared all agents from state")
@@ -1616,6 +1987,15 @@ func (c *CLI) initRepo(args []string) error {
 	// Validate repository name before any operations
 	if repoName == "" {
 		return errors.InvalidUsage("could not determine repository name from URL; please provide a name: oat init <url> <name>")
+	}
+
+	// Preflight: bail out if no provider API key is set. Without one,
+	// `start_repo_agents` succeeds at the daemon layer but every agent
+	// immediately fails its first LLM call — a terrible first-run UX.
+	// Uses the same detection as `oat doctor` (env + ~/.oat/.env).
+	// Skipped in test mode where no real agents are started.
+	if os.Getenv("OAT_TEST_MODE") != "1" && !preflight.HasAnyLLMKey(c.paths) {
+		return errors.MissingAPIKey()
 	}
 
 	// Parse merge queue configuration flags
@@ -1694,7 +2074,7 @@ func (c *CLI) initRepo(args []string) error {
 	// Clone repository
 	fmt.Printf("Cloning to: %s\n", repoPath)
 
-	cmd := exec.Command("git", "clone", githubURL, repoPath)
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "clone", githubURL, repoPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -1703,7 +2083,7 @@ func (c *CLI) initRepo(args []string) error {
 
 	// Ensure the "oat" label exists on the GitHub repo (workers tag PRs with it)
 	fmt.Println("Ensuring 'oat' label exists on GitHub repository...")
-	labelCmd := exec.Command("gh", "label", "create", "oat",
+	labelCmd := exec.CommandContext(c.cmdCtx(), "gh", "label", "create", "oat",
 		"--description", "Created by oat orchestrator",
 		"--color", "1d76db",
 		"--force",
@@ -1767,7 +2147,7 @@ func (c *CLI) initRepo(args []string) error {
 	// here and send start_repo_agents at the end.
 
 	// Create isolated worktrees for persistent agents so each gets its own .oat/AGENTS.md
-	wtMgr := worktree.NewManager(repoPath)
+	wtMgr := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 	supervisorWtPath := c.paths.AgentWorktree(repoName, "supervisor")
 	fmt.Printf("Creating supervisor worktree at: %s\n", supervisorWtPath)
 	if err := wtMgr.CreateDetached(supervisorWtPath, "HEAD"); err != nil {
@@ -1898,7 +2278,7 @@ func (c *CLI) initRepo(args []string) error {
 	}
 
 	// Create default workspace worktree
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 	workspacePath := c.paths.AgentWorktree(repoName, "default")
 
 	// Check for and migrate legacy "workspace" branch to "workspace/default"
@@ -2101,7 +2481,7 @@ func (c *CLI) removeRepo(args []string) error {
 			return err
 		}
 		if selected == "" {
-			fmt.Println("Cancelled")
+			fmt.Println("Canceled")
 			return nil
 		}
 		repoName = selected
@@ -2143,7 +2523,7 @@ func (c *CLI) removeRepo(args []string) error {
 					continue // Skip agents with invalid worktree_path field
 				}
 				if wtPath != "" {
-					hasUncommitted, err := worktree.HasUncommittedChanges(wtPath)
+					hasUncommitted, err := worktree.HasUncommittedChanges(c.cmdCtx(), wtPath)
 					if err == nil && hasUncommitted {
 						agentName, ok := agentMap["name"].(string)
 						if !ok {
@@ -2154,9 +2534,9 @@ func (c *CLI) removeRepo(args []string) error {
 						fmt.Print("Continue with removal? [y/N]: ")
 
 						var response string
-						fmt.Scanln(&response)
+						_, _ = fmt.Scanln(&response) // EOF/empty -> treated as "N" below
 						if response != "y" && response != "Y" {
-							fmt.Println("Removal cancelled")
+							fmt.Println("Removal canceled")
 							return nil
 						}
 						break // Only ask once
@@ -2177,7 +2557,7 @@ func (c *CLI) removeRepo(args []string) error {
 
 	// Remove worktrees for all agents
 	repoPath := c.paths.RepoDir(repoName)
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 	for _, agent := range agents {
 		if agentMap, ok := agent.(map[string]interface{}); ok {
 			wtPath, ok := agentMap["worktree_path"].(string)
@@ -2705,7 +3085,7 @@ func (c *CLI) createWorker(args []string) error {
 	// fails when main is checked out in the bare repo with:
 	// "fatal: refusing to fetch into branch 'refs/heads/main' checked out at ..."
 	fmt.Println("Fetching latest from origin...")
-	fetchCmd := exec.Command("git", "fetch", "origin")
+	fetchCmd := exec.CommandContext(c.cmdCtx(), "git", "fetch", "origin")
 	fetchCmd.Dir = repoPath
 	if err := fetchCmd.Run(); err != nil {
 		// Best effort - don't fail if offline or fetch fails
@@ -2716,7 +3096,7 @@ func (c *CLI) createWorker(args []string) error {
 	// Prefer origin/main if it exists (updated by fetch), otherwise fall back to HEAD
 	// This handles both normal repos and test repos without remotes
 	startBranch := "HEAD"
-	checkOriginCmd := exec.Command("git", "rev-parse", "--verify", "origin/main")
+	checkOriginCmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", "--verify", "origin/main")
 	checkOriginCmd.Dir = repoPath
 	if err := checkOriginCmd.Run(); err == nil {
 		startBranch = "origin/main"
@@ -2734,7 +3114,7 @@ func (c *CLI) createWorker(args []string) error {
 	fmt.Printf("Task: %s\n", task)
 
 	// Create worktree
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 	wtPath := c.paths.AgentWorktree(repoName, workerName)
 
 	var branchName string
@@ -2771,7 +3151,7 @@ func (c *CLI) createWorker(args []string) error {
 				return errors.WorktreeCreationFailed(err)
 			}
 			if !exists {
-				checkRemoteCmd := exec.Command("git", "ls-remote", "--heads", "origin", branchName)
+				checkRemoteCmd := exec.CommandContext(c.cmdCtx(), "git", "ls-remote", "--heads", "origin", branchName)
 				checkRemoteCmd.Dir = repoPath
 				output, _ := checkRemoteCmd.Output()
 				if len(output) == 0 {
@@ -2977,9 +3357,10 @@ func (c *CLI) listWorkers(args []string) error {
 	for _, agent := range agents {
 		if agentMap, ok := agent.(map[string]interface{}); ok {
 			agentType, _ := agentMap["type"].(string)
-			if agentType == "worker" {
+			switch agentType {
+			case "worker":
 				workers = append(workers, agentMap)
-			} else if agentType == "workspace" {
+			case "workspace":
 				workspace = agentMap
 			}
 		}
@@ -3514,7 +3895,7 @@ func (c *CLI) getPRStatusForBranch(repoPath, branch, existingPRURL string) (stat
 	}
 
 	// Query GitHub for PR associated with this branch using gh CLI
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state,url", "--limit", "1")
+	cmd := exec.CommandContext(c.cmdCtx(), "gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state,url", "--limit", "1")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -3612,7 +3993,7 @@ func (c *CLI) removeWorker(args []string) error {
 			return err
 		}
 		if selected == "" {
-			fmt.Println("Cancelled")
+			fmt.Println("Canceled")
 			return nil
 		}
 		workerName = selected
@@ -3644,7 +4025,7 @@ func (c *CLI) removeSingleWorker(client *socket.Client, repoName, workerName str
 
 	// Check for uncommitted changes (skip prompts when --force)
 	if !force {
-		hasUncommitted, err := worktree.HasUncommittedChanges(wtPath)
+		hasUncommitted, err := worktree.HasUncommittedChanges(c.cmdCtx(), wtPath)
 		if err != nil {
 			fmt.Printf("Warning: failed to check for uncommitted changes: %v\n", err)
 		} else if hasUncommitted {
@@ -3653,16 +4034,17 @@ func (c *CLI) removeSingleWorker(client *socket.Client, repoName, workerName str
 			fmt.Print("Continue with cleanup? [y/N]: ")
 
 			var response string
-			fmt.Scanln(&response)
+			_, _ = fmt.Scanln(&response) // EOF/empty -> treated as "N" below
 			if response != "y" && response != "Y" {
-				fmt.Println("Cleanup cancelled")
+				fmt.Println("Cleanup canceled")
 				return nil
 			}
 		}
 
-		// Check for unpushed commits
-		if err := checkUnpushedCommits(wtPath, "Worker", "cleanup"); err != nil {
-			return nil
+		// Check for unpushed commits; user declined cleanup -> exit early but
+		// not as an error.
+		if err := c.checkUnpushedCommits(wtPath, "Worker", "cleanup"); err != nil {
+			return nil //nolint:nilerr // user declined, not a CLI error
 		}
 	}
 
@@ -3670,7 +4052,7 @@ func (c *CLI) removeSingleWorker(client *socket.Client, repoName, workerName str
 
 	// Remove worktree
 	repoPath := c.paths.RepoDir(repoName)
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 
 	fmt.Printf("Removing worktree: %s\n", wtPath)
 	if err := wt.Remove(wtPath, force); err != nil {
@@ -3839,19 +4221,19 @@ func (c *CLI) requestVerification(args []string) error {
 	}
 
 	// Auto-commit and push if the worktree is dirty
-	statusCmd := exec.Command("git", "status", "--porcelain")
+	statusCmd := exec.CommandContext(c.cmdCtx(), "git", "status", "--porcelain")
 	if statusOut, err := statusCmd.Output(); err == nil && len(statusOut) > 0 {
 		fmt.Println("Uncommitted changes detected — auto-committing before verification...")
 		fmt.Printf("  Dirty files:\n%s\n", strings.TrimSpace(string(statusOut)))
 
-		addCmd := exec.Command("git", "add", "-A")
+		addCmd := exec.CommandContext(c.cmdCtx(), "git", "add", "-A")
 		if addOut, err := addCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("auto-commit failed (git add): %s\n%s", err, string(addOut))
+			return fmt.Errorf("auto-commit failed (git add): %w\n%s", err, string(addOut))
 		}
 
 		suspectPatterns := []string{".env", ".pem", ".key", ".secret", "credentials", ".p12", ".pfx", ".jks"}
 		var skippedFiles []string
-		cachedCmd := exec.Command("git", "diff", "--cached", "--name-only")
+		cachedCmd := exec.CommandContext(c.cmdCtx(), "git", "diff", "--cached", "--name-only")
 		if cachedOut, err := cachedCmd.Output(); err == nil {
 			for _, file := range strings.Split(strings.TrimSpace(string(cachedOut)), "\n") {
 				if file == "" {
@@ -3860,7 +4242,9 @@ func (c *CLI) requestVerification(args []string) error {
 				base := strings.ToLower(filepath.Base(file))
 				for _, pattern := range suspectPatterns {
 					if strings.Contains(base, pattern) {
-						exec.Command("git", "reset", "HEAD", "--", file).Run()
+						// Best-effort unstage; failure leaves the suspect file staged
+						// and the skip logged below.
+						_ = exec.CommandContext(c.cmdCtx(), "git", "reset", "HEAD", "--", file).Run()
 						skippedFiles = append(skippedFiles, file)
 						break
 					}
@@ -3868,7 +4252,7 @@ func (c *CLI) requestVerification(args []string) error {
 			}
 		}
 
-		remainingCmd := exec.Command("git", "diff", "--cached", "--quiet")
+		remainingCmd := exec.CommandContext(c.cmdCtx(), "git", "diff", "--cached", "--quiet")
 		if remainingCmd.Run() == nil {
 			fmt.Println("  No files to commit after filtering suspect files.")
 			if len(skippedFiles) > 0 {
@@ -3880,13 +4264,13 @@ func (c *CLI) requestVerification(args []string) error {
 				fmt.Println("  If they do contain secrets, add them to .gitignore.")
 			}
 		} else {
-			commitCmd := exec.Command("git", "commit", "-m", "pre-review commit")
+			commitCmd := exec.CommandContext(c.cmdCtx(), "git", "commit", "-m", "pre-review commit")
 			if commitOut, err := commitCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("auto-commit failed (git commit): %s\n%s", err, string(commitOut))
+				return fmt.Errorf("auto-commit failed (git commit): %w\n%s", err, string(commitOut))
 			}
-			pushCmd := exec.Command("git", "push", "-u", "origin", "HEAD")
+			pushCmd := exec.CommandContext(c.cmdCtx(), "git", "push", "-u", "origin", "HEAD")
 			if pushOut, err := pushCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("auto-commit failed (git push): %s\n%s", err, string(pushOut))
+				return fmt.Errorf("auto-commit failed (git push): %w\n%s", err, string(pushOut))
 			}
 			fmt.Println("  Auto-committed and pushed successfully.")
 			if len(skippedFiles) > 0 {
@@ -3901,18 +4285,18 @@ func (c *CLI) requestVerification(args []string) error {
 	}
 
 	// Handle committed-but-not-pushed
-	unpushedCmd := exec.Command("git", "log", "--oneline", "@{u}..", "--")
+	unpushedCmd := exec.CommandContext(c.cmdCtx(), "git", "log", "--oneline", "@{u}..", "--")
 	if unpushedOut, err := unpushedCmd.Output(); err == nil && len(strings.TrimSpace(string(unpushedOut))) > 0 {
 		fmt.Println("Unpushed commits detected — pushing...")
-		pushCmd := exec.Command("git", "push", "-u", "origin", "HEAD")
+		pushCmd := exec.CommandContext(c.cmdCtx(), "git", "push", "-u", "origin", "HEAD")
 		if pushOut, err := pushCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to push unpushed commits: %s\n%s", err, string(pushOut))
+			return fmt.Errorf("failed to push unpushed commits: %w\n%s", err, string(pushOut))
 		}
 		fmt.Println("  Pushed successfully.")
 	}
 
 	// Get current commit SHA (fresh, from worktree)
-	shaCmd := exec.Command("git", "rev-parse", "HEAD")
+	shaCmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", "HEAD")
 	shaOut, err := shaCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to get current commit SHA: %w", err)
@@ -3920,7 +4304,7 @@ func (c *CLI) requestVerification(args []string) error {
 	commitSHA := strings.TrimSpace(string(shaOut))
 
 	// Get branch name
-	branchCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	branchCmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", "--abbrev-ref", "HEAD")
 	branchOut, err := branchCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to get branch name: %w", err)
@@ -3975,8 +4359,11 @@ func (c *CLI) requestVerification(args []string) error {
 		return fmt.Errorf("failed to create worktree: %w", err)
 	}
 
-	// Gather project context for prompt injection
-	verifyCtx := c.gatherVerificationContext()
+	// Gather project context for prompt injection. Pass the workerName so
+	// gatherVerificationContext can look up the worker's pinned BaseSHA
+	// (set by the daemon during `start_verification` above) and diff
+	// against it instead of live origin/main.
+	verifyCtx := c.gatherVerificationContext(repoName, workerName)
 
 	// Write prompt file with template variable substitution
 	promptFile, err := c.writeVerificationPromptFile(c.paths.RepoDir(repoName), verifierName, workerName, workerBranch, workerTask, commitSHA, verifyCtx)
@@ -4053,23 +4440,40 @@ type verificationContext struct {
 	DiffStat       string
 	ProjectType    string
 	TestCommand    string
+	BaseRef        string // diff base used for ChangedFiles/DiffStat (BaseSHA when pinned, "origin/main" fallback)
 	FileCount      int
 	TimeoutMinutes int
 }
 
-// gatherVerificationContext collects project info for the verification agent prompt.
-func (c *CLI) gatherVerificationContext() verificationContext {
+// gatherVerificationContext collects project info for the verification
+// agent prompt. The diff base is the worker's pinned BaseSHA when set
+// (snapshotted by the daemon at request-review time), falling back to
+// origin/main when empty (back-compat for in-flight verifications during
+// upgrade).
+func (c *CLI) gatherVerificationContext(repoName, workerName string) verificationContext {
 	ctx := verificationContext{TimeoutMinutes: 15}
 
-	// Timeout from env
 	if envTimeout := os.Getenv("OAT_VERIFICATION_TIMEOUT_MINUTES"); envTimeout != "" {
 		if v, err := strconv.Atoi(envTimeout); err == nil && v > 0 {
 			ctx.TimeoutMinutes = v
 		}
 	}
 
-	// Changed files
-	if out, err := exec.Command("git", "diff", "--name-only", "origin/main..HEAD").Output(); err == nil {
+	// Resolve diff base: prefer worker's pinned BaseSHA, fall back to
+	// live origin/main. Empty BaseSHA means either an upgrade with
+	// in-flight verification or a daemon-side snapshot failure.
+	baseRef := "origin/main"
+	if repoName != "" && workerName != "" {
+		if st, err := c.loadState(); err == nil {
+			if w, ok := st.GetAgent(repoName, workerName); ok && w.BaseSHA != "" {
+				baseRef = w.BaseSHA
+			}
+		}
+	}
+	ctx.BaseRef = baseRef
+	diffRange := fmt.Sprintf("%s..HEAD", baseRef)
+
+	if out, err := exec.CommandContext(c.cmdCtx(), "git", "diff", "--name-only", diffRange).Output(); err == nil {
 		ctx.ChangedFiles = strings.TrimSpace(string(out))
 		ctx.FileCount = len(strings.Split(ctx.ChangedFiles, "\n"))
 		if ctx.ChangedFiles == "" {
@@ -4077,12 +4481,10 @@ func (c *CLI) gatherVerificationContext() verificationContext {
 		}
 	}
 
-	// Diff stat
-	if out, err := exec.Command("git", "diff", "--stat", "origin/main..HEAD").Output(); err == nil {
+	if out, err := exec.CommandContext(c.cmdCtx(), "git", "diff", "--stat", diffRange).Output(); err == nil {
 		ctx.DiffStat = strings.TrimSpace(string(out))
 	}
 
-	// Project type detection
 	ctx.ProjectType, ctx.TestCommand = detectProjectTypeAndTestCmd()
 
 	return ctx
@@ -4122,27 +4524,38 @@ func (c *CLI) writeVerificationPromptFile(repoPath, verifierName, workerName, wo
 	// Append CLI docs and slash commands
 	promptText = c.appendDocsAndSlashCommands(promptText, string(state.AgentTypeVerification))
 
+	// Substitute the ${BASE_SHA} template variable with the resolved
+	// diff base. When the daemon successfully snapshotted origin/main at
+	// request-review time, BaseRef is that pinned SHA; otherwise it falls
+	// back to the literal "origin/main" so the diff command still works.
+	baseRef := vCtx.BaseRef
+	if baseRef == "" {
+		baseRef = "origin/main"
+	}
+	promptText = strings.ReplaceAll(promptText, "${BASE_SHA}", baseRef)
+
 	// Build structured context block and prepend it
 	var ctx strings.Builder
 	ctx.WriteString("## Verification Context\n\n")
-	ctx.WriteString(fmt.Sprintf("- **Worker:** `%s`\n", workerName))
-	ctx.WriteString(fmt.Sprintf("- **Branch:** `%s`\n", workerBranch))
-	ctx.WriteString(fmt.Sprintf("- **Commit under review:** `%s`\n", commitSHA))
-	ctx.WriteString(fmt.Sprintf("- **Time budget:** %d minutes\n", vCtx.TimeoutMinutes))
-	ctx.WriteString(fmt.Sprintf("- **Project type:** %s\n", vCtx.ProjectType))
+	fmt.Fprintf(&ctx, "- **Worker:** `%s`\n", workerName)
+	fmt.Fprintf(&ctx, "- **Branch:** `%s`\n", workerBranch)
+	fmt.Fprintf(&ctx, "- **Commit under review:** `%s`\n", commitSHA)
+	fmt.Fprintf(&ctx, "- **Diff base (pinned):** `%s` -- snapshotted at request-review time, not live origin/main\n", baseRef)
+	fmt.Fprintf(&ctx, "- **Time budget:** %d minutes\n", vCtx.TimeoutMinutes)
+	fmt.Fprintf(&ctx, "- **Project type:** %s\n", vCtx.ProjectType)
 	if vCtx.TestCommand != "" {
-		ctx.WriteString(fmt.Sprintf("- **Test command:** `%s`\n", vCtx.TestCommand))
+		fmt.Fprintf(&ctx, "- **Test command:** `%s`\n", vCtx.TestCommand)
 	}
-	ctx.WriteString(fmt.Sprintf("\n**Original task:**\n%s\n", workerTask))
-	ctx.WriteString(fmt.Sprintf("\n**Files changed (%d):**\n```\n%s\n```\n", vCtx.FileCount, vCtx.ChangedFiles))
-	ctx.WriteString(fmt.Sprintf("\n**Diff summary:**\n```\n%s\n```\n", vCtx.DiffStat))
+	fmt.Fprintf(&ctx, "\n**Original task:**\n%s\n", workerTask)
+	fmt.Fprintf(&ctx, "\n**Files changed (%d):**\n```\n%s\n```\n", vCtx.FileCount, vCtx.ChangedFiles)
+	fmt.Fprintf(&ctx, "\n**Diff summary:**\n```\n%s\n```\n", vCtx.DiffStat)
 
 	// Verdict commands (so the agent doesn't have to figure out the exact syntax)
 	ctx.WriteString("\n**To approve:**\n```bash\n")
-	ctx.WriteString(fmt.Sprintf("oat worker set-verdict %s approved --sha %s --reason \"All checks passed: [summary]\"\n", workerName, commitSHA))
+	fmt.Fprintf(&ctx, "oat worker set-verdict %s approved --sha %s --reason \"All checks passed: [summary]\"\n", workerName, commitSHA)
 	ctx.WriteString("```\n")
 	ctx.WriteString("\n**To reject:**\n```bash\n")
-	ctx.WriteString(fmt.Sprintf("oat worker set-verdict %s rejected --sha %s --reason \"FAILED: [details]\"\n", workerName, commitSHA))
+	fmt.Fprintf(&ctx, "oat worker set-verdict %s rejected --sha %s --reason \"FAILED: [details]\"\n", workerName, commitSHA)
 	ctx.WriteString("```\n")
 
 	promptText = ctx.String() + "\n---\n\n" + promptText
@@ -4263,7 +4676,7 @@ func (c *CLI) hibernateRepo(args []string) error {
 
 		// Check for uncommitted changes
 		if wtPath != "" {
-			hasUncommitted, err := worktree.HasUncommittedChanges(wtPath)
+			hasUncommitted, err := worktree.HasUncommittedChanges(c.cmdCtx(), wtPath)
 			if err == nil && hasUncommitted {
 				agentsWithChanges = append(agentsWithChanges, agentMap)
 			}
@@ -4304,9 +4717,9 @@ func (c *CLI) hibernateRepo(args []string) error {
 	if !skipConfirm {
 		fmt.Print("\nContinue? [y/N]: ")
 		var response string
-		fmt.Scanln(&response)
+		_, _ = fmt.Scanln(&response) // EOF/empty -> treated as "N" below
 		if response != "y" && response != "Y" {
-			fmt.Println("Cancelled")
+			fmt.Println("Canceled")
 			return nil
 		}
 	}
@@ -4333,7 +4746,7 @@ func (c *CLI) hibernateRepo(args []string) error {
 
 		// Create patch file with git diff
 		patchPath := filepath.Join(archiveDir, name+".patch")
-		cmd := exec.Command("git", "diff", "HEAD", "--", ".", ":!.oat")
+		cmd := exec.CommandContext(c.cmdCtx(), "git", "diff", "HEAD", "--", ".", ":!.oat")
 		cmd.Dir = wtPath
 		output, err := cmd.Output()
 		if err != nil {
@@ -4342,7 +4755,7 @@ func (c *CLI) hibernateRepo(args []string) error {
 		}
 
 		// Include untracked files in the patch (excluding OAT runtime dir)
-		untrackedCmd := exec.Command("git", "ls-files", "--others", "--exclude-standard", "--", ".", ":!.oat")
+		untrackedCmd := exec.CommandContext(c.cmdCtx(), "git", "ls-files", "--others", "--exclude-standard", "--", ".", ":!.oat")
 		untrackedCmd.Dir = wtPath
 		untrackedOutput, _ := untrackedCmd.Output()
 
@@ -4355,7 +4768,9 @@ func (c *CLI) hibernateRepo(args []string) error {
 		// Write untracked files list if any
 		if len(untrackedOutput) > 0 {
 			untrackedPath := filepath.Join(archiveDir, name+".untracked")
-			os.WriteFile(untrackedPath, untrackedOutput, 0644)
+			if err := os.WriteFile(untrackedPath, untrackedOutput, 0644); err != nil {
+				fmt.Printf("Warning: failed to write untracked list for %s: %v\n", name, err)
+			}
 		}
 
 		// Write metadata for this agent
@@ -4369,7 +4784,9 @@ func (c *CLI) hibernateRepo(args []string) error {
 			"archived_at":   time.Now().Format(time.RFC3339),
 		}
 		metaData, _ := json.MarshalIndent(meta, "", "  ")
-		os.WriteFile(metaPath, metaData, 0644)
+		if err := os.WriteFile(metaPath, metaData, 0644); err != nil {
+			fmt.Printf("Warning: failed to write metadata for %s: %v\n", name, err)
+		}
 
 		archivedAgents = append(archivedAgents, name)
 	}
@@ -4384,13 +4801,15 @@ func (c *CLI) hibernateRepo(args []string) error {
 			"agents_archived":   archivedAgents,
 		}
 		summaryData, _ := json.MarshalIndent(summary, "", "  ")
-		os.WriteFile(summaryPath, summaryData, 0644)
+		if err := os.WriteFile(summaryPath, summaryData, 0644); err != nil {
+			fmt.Printf("Warning: failed to write hibernate summary: %v\n", err)
+		}
 	}
 
 	// Stop agents
 	sessionName := sanitizeSessionName(repoName)
 	repoPath := c.paths.RepoDir(repoName)
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 
 	fmt.Println()
 	for _, agent := range agentsToHibernate {
@@ -4408,10 +4827,10 @@ func (c *CLI) hibernateRepo(args []string) error {
 		// Remove worktree (force since we archived changes)
 		if wtPath != "" {
 			if err := wt.Remove(wtPath, true); err != nil {
-				// Try harder with force
-				cmd := exec.Command("git", "worktree", "remove", "--force", wtPath)
+				// Try harder with force; last-resort cleanup so errors are non-fatal.
+				cmd := exec.CommandContext(c.cmdCtx(), "git", "worktree", "remove", "--force", wtPath)
 				cmd.Dir = repoPath
-				cmd.Run()
+				_ = cmd.Run()
 			}
 		}
 
@@ -4516,7 +4935,7 @@ func (c *CLI) addWorkspace(args []string) error {
 	repoPath := c.paths.RepoDir(repoName)
 
 	// Create worktree
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 	wtPath := c.paths.AgentWorktree(repoName, workspaceName)
 	branchName := fmt.Sprintf("workspace/%s", workspaceName)
 
@@ -4657,7 +5076,7 @@ func (c *CLI) removeWorkspace(args []string) error {
 			return err
 		}
 		if selected == "" {
-			fmt.Println("Cancelled")
+			fmt.Println("Canceled")
 			return nil
 		}
 		workspaceName = selected
@@ -4686,7 +5105,7 @@ func (c *CLI) removeWorkspace(args []string) error {
 	wtPath := workspaceInfo["worktree_path"].(string)
 
 	// Check for uncommitted changes
-	hasUncommitted, err := worktree.HasUncommittedChanges(wtPath)
+	hasUncommitted, err := worktree.HasUncommittedChanges(c.cmdCtx(), wtPath)
 	if err != nil {
 		fmt.Printf("Warning: failed to check for uncommitted changes: %v\n", err)
 	} else if hasUncommitted {
@@ -4695,16 +5114,17 @@ func (c *CLI) removeWorkspace(args []string) error {
 		fmt.Print("Continue with removal? [y/N]: ")
 
 		var response string
-		fmt.Scanln(&response)
+		_, _ = fmt.Scanln(&response) // EOF/empty -> treated as "N" below
 		if response != "y" && response != "Y" {
-			fmt.Println("Removal cancelled")
+			fmt.Println("Removal canceled")
 			return nil
 		}
 	}
 
-	// Check for unpushed commits
-	if err := checkUnpushedCommits(wtPath, "Workspace", "removal"); err != nil {
-		return nil
+	// Check for unpushed commits; user declined cleanup -> exit early but not
+	// as an error.
+	if err := c.checkUnpushedCommits(wtPath, "Workspace", "removal"); err != nil {
+		return nil //nolint:nilerr // user declined, not a CLI error
 	}
 
 	// Stop agent via backend
@@ -4720,7 +5140,7 @@ func (c *CLI) removeWorkspace(args []string) error {
 
 	// Remove worktree
 	repoPath := c.paths.RepoDir(repoName)
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 
 	fmt.Printf("Removing worktree: %s\n", wtPath)
 	if err := wt.Remove(wtPath, false); err != nil {
@@ -4865,7 +5285,7 @@ func (c *CLI) connectWorkspace(args []string) error {
 			return err
 		}
 		if selected == "" {
-			fmt.Println("Cancelled")
+			fmt.Println("Canceled")
 			return nil
 		}
 		workspaceName = selected
@@ -5155,15 +5575,14 @@ func (c *CLI) ackMessage(args []string) error {
 // collectCLIEnvVars returns a map of environment variables from the CLI process
 // that should be forwarded to the daemon for agent startup. This ensures agents
 // inherit tokens and API keys even when the daemon was started in a different
-// environment (common with the direct backend).
+// environment (common with the direct backend). Uses the canonical provider
+// list from internal/preflight so `oat init`, `oat doctor`, and the daemon
+// agree on which keys count.
 func collectCLIEnvVars() map[string]string {
 	envKeys := []string{
 		"GH_TOKEN", "GITHUB_TOKEN", "GH_TOKEN_ORG", "GH_TOKEN_CLASSIC",
-		"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY",
-		"GOOGLE_CLOUD_PROJECT", "DEEPSEEK_API_KEY", "MISTRAL_API_KEY",
-		"GROQ_API_KEY", "XAI_API_KEY", "TOGETHER_API_KEY",
-		"OPENROUTER_API_KEY",
 	}
+	envKeys = append(envKeys, preflight.KeyProviders...)
 	result := make(map[string]string)
 	for _, key := range envKeys {
 		if val := os.Getenv(key); val != "" {
@@ -5333,7 +5752,7 @@ func checkPRCIStatus(ghRepo, agentName string) string {
 // and tries to match it against known repositories in state.
 func (c *CLI) findRepoFromGitRemote() (string, error) {
 	// Run git remote get-url origin
-	cmd := exec.Command("git", "remote", "get-url", "origin")
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "remote", "get-url", "origin")
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get git remote: %w", err)
@@ -5517,12 +5936,12 @@ func truncateString(s string, maxLen int) string {
 // Returns nil if the user wants to continue, or an error to cancel the operation.
 // The entityType parameter should be "Worker" or "Workspace" for appropriate messaging.
 // The action parameter should be "cleanup" or "removal" for appropriate messaging.
-func checkUnpushedCommits(wtPath, entityType, action string) error {
-	hasUnpushed, err := worktree.HasUnpushedCommits(wtPath)
+func (c *CLI) checkUnpushedCommits(wtPath, entityType, action string) error {
+	hasUnpushed, err := worktree.HasUnpushedCommits(c.cmdCtx(), wtPath)
 	if err != nil {
 		// This is ok - might not have a tracking branch
 		fmt.Printf("Note: Could not check for unpushed commits (no tracking branch?)\n")
-		return nil
+		return nil //nolint:nilerr // inability to check isn't a fatal CLI error
 	}
 
 	if !hasUnpushed {
@@ -5530,7 +5949,7 @@ func checkUnpushedCommits(wtPath, entityType, action string) error {
 	}
 
 	fmt.Printf("\nWarning: %s has unpushed commits!\n", entityType)
-	branch, err := worktree.GetCurrentBranch(wtPath)
+	branch, err := worktree.GetCurrentBranch(c.cmdCtx(), wtPath)
 	if err == nil {
 		fmt.Printf("Branch '%s' has commits not pushed to remote.\n", branch)
 	}
@@ -5538,12 +5957,12 @@ func checkUnpushedCommits(wtPath, entityType, action string) error {
 	fmt.Printf("Continue with %s? [y/N]: ", action)
 
 	var response string
-	fmt.Scanln(&response)
+	_, _ = fmt.Scanln(&response) // EOF/empty -> treated as "N" below
 	if response != "y" && response != "Y" {
 		// Capitalize first letter of action for the message
 		actionCapitalized := strings.ToUpper(action[:1]) + action[1:]
-		fmt.Printf("%s cancelled\n", actionCapitalized)
-		return fmt.Errorf("cancelled by user")
+		fmt.Printf("%s canceled\n", actionCapitalized)
+		return fmt.Errorf("canceled by user")
 	}
 	return nil
 }
@@ -5885,7 +6304,7 @@ func (c *CLI) prCreate(args []string) error {
 	}
 
 	// Detect current branch from worktree (handles fixup workers on different branches)
-	branchCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	branchCmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", "--abbrev-ref", "HEAD")
 	if branchOut, branchErr := branchCmd.Output(); branchErr == nil {
 		branch = strings.TrimSpace(string(branchOut))
 	}
@@ -6164,21 +6583,21 @@ func (c *CLI) issueCreate(args []string) error {
 	// Build structured body
 	var bodyBuilder strings.Builder
 	if isBlocker {
-		bodyBuilder.WriteString(fmt.Sprintf("## Blocker: %s\n\n", title))
+		fmt.Fprintf(&bodyBuilder, "## Blocker: %s\n\n", title)
 		bodyBuilder.WriteString("**Type**: Blocker\n")
 		if wave != "" {
-			bodyBuilder.WriteString(fmt.Sprintf("**Wave**: %s\n", wave))
+			fmt.Fprintf(&bodyBuilder, "**Wave**: %s\n", wave)
 		}
 	} else {
-		bodyBuilder.WriteString(fmt.Sprintf("## Fix: %s\n\n", title))
+		fmt.Fprintf(&bodyBuilder, "## Fix: %s\n\n", title)
 		bodyBuilder.WriteString("**Type**: Fix\n")
 		if wave != "" {
-			bodyBuilder.WriteString(fmt.Sprintf("**Wave**: %s\n", wave))
+			fmt.Fprintf(&bodyBuilder, "**Wave**: %s\n", wave)
 		}
 	}
 
 	if len(files) > 0 {
-		bodyBuilder.WriteString(fmt.Sprintf("**File(s)**: %s\n", strings.Join(files, ", ")))
+		fmt.Fprintf(&bodyBuilder, "**File(s)**: %s\n", strings.Join(files, ", "))
 	}
 	bodyBuilder.WriteString("\n")
 
@@ -6230,12 +6649,12 @@ func (c *CLI) issueCreate(args []string) error {
 	if len(files) > 0 {
 		bodyBuilder.WriteString("### Files to Touch\n")
 		for _, f := range files {
-			bodyBuilder.WriteString(fmt.Sprintf("- `%s`\n", f))
+			fmt.Fprintf(&bodyBuilder, "- `%s`\n", f)
 		}
 		bodyBuilder.WriteString("\n")
 	}
 
-	bodyBuilder.WriteString(fmt.Sprintf("\n---\n_Created by agent: %s_\n", agentName))
+	fmt.Fprintf(&bodyBuilder, "\n---\n_Created by agent: %s_\n", agentName)
 
 	bodyText := bodyBuilder.String()
 
@@ -6257,7 +6676,7 @@ func (c *CLI) issueCreate(args []string) error {
 			labelArgs := []string{"label", "create", l, "--repo", ghRepo, "--color", "ededed", "--force"}
 			labelCtx, labelCancel := context.WithTimeout(context.Background(), 15*time.Second)
 			labelCmd := exec.CommandContext(labelCtx, "gh", labelArgs...)
-			labelCmd.CombinedOutput() // ignore errors -- best-effort
+			_, _ = labelCmd.CombinedOutput() // best-effort; --force makes this idempotent
 			labelCancel()
 		}
 	}
@@ -6452,7 +6871,7 @@ func (c *CLI) reviewPR(args []string) error {
 	fmt.Printf("Fetching PR #%s...\n", prNumber)
 	prRef := fmt.Sprintf("refs/pull/%s/head", prNumber)
 	localRef := fmt.Sprintf("refs/oat/pr-%s", prNumber)
-	cmd := exec.Command("git", "fetch", "origin", fmt.Sprintf("%s:%s", prRef, localRef))
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "fetch", "origin", fmt.Sprintf("%s:%s", prRef, localRef))
 	cmd.Dir = repoPath
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return errors.Wrap(errors.CategoryRuntime, fmt.Sprintf("failed to fetch PR #%s: %s", prNumber, strings.TrimSpace(string(output))), err).
@@ -6460,7 +6879,7 @@ func (c *CLI) reviewPR(args []string) error {
 	}
 
 	// Create worktree for review
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 	wtPath := c.paths.AgentWorktree(repoName, reviewerName)
 	reviewBranch := fmt.Sprintf("review/%s", reviewerName)
 
@@ -6572,7 +6991,7 @@ func (c *CLI) viewLogs(args []string) error {
 	// Check for --follow flag
 	if _, ok := flags["follow"]; ok {
 		// Use tail -f
-		cmd := exec.Command("tail", "-f", logFile)
+		cmd := exec.CommandContext(c.cmdCtx(), "tail", "-f", logFile)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return cmd.Run()
@@ -6585,7 +7004,7 @@ func (c *CLI) viewLogs(args []string) error {
 	}
 
 	// Use tail to get recent lines
-	cmd := exec.Command("tail", "-n", lines, logFile)
+	cmd := exec.CommandContext(c.cmdCtx(), "tail", "-n", lines, logFile)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -6716,13 +7135,16 @@ func (c *CLI) searchLogs(args []string) error {
 	grepArgs := []string{"-r", "-n", "--include=*.log", pattern}
 	grepArgs = append(grepArgs, searchPaths...)
 
-	cmd := exec.Command("grep", grepArgs...)
+	cmd := exec.CommandContext(c.cmdCtx(), "grep", grepArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	// Run grep (exit code 1 means no matches, which is fine)
 	err := cmd.Run()
-	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+	// Direct type assertion is intentional: errors.As would unwrap past the
+	// ExitError and silently return the underlying cause, whose ExitCode()
+	// semantics differ. We specifically want grep's own exit code here.
+	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 { //nolint:errorlint // see comment above
 		fmt.Println("No matches found")
 		return nil
 	}
@@ -6740,7 +7162,7 @@ func (c *CLI) cleanLogs(args []string) error {
 	// Parse duration
 	duration, err := parseDuration(olderThan)
 	if err != nil {
-		return fmt.Errorf("invalid duration: %v", err)
+		return fmt.Errorf("invalid duration: %w", err)
 	}
 
 	cutoff := time.Now().Add(-duration)
@@ -6751,7 +7173,7 @@ func (c *CLI) cleanLogs(args []string) error {
 	// Walk output directory
 	err = filepath.Walk(c.paths.OutputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip errors
+			return nil //nolint:nilerr // per-entry walk errors are non-fatal
 		}
 		if info.IsDir() {
 			return nil
@@ -6761,7 +7183,11 @@ func (c *CLI) cleanLogs(args []string) error {
 		}
 		if info.ModTime().Before(cutoff) {
 			deletedBytes += info.Size()
-			if err := os.Remove(path); err != nil {
+			// TOCTOU (G122): this path came from a walk of the user's own ~/.oat
+			// output directory, the cleanup is user-invoked, and the attacker
+			// model requires the same user planting a symlink in their own home
+			// dir. Not a reachable exploit surface.
+			if err := os.Remove(path); err != nil { //nolint:gosec // G122 not reachable here
 				fmt.Printf("Warning: failed to remove %s: %v\n", path, err)
 			} else {
 				deletedCount++
@@ -6846,7 +7272,7 @@ func (c *CLI) attachAgent(args []string) error {
 			return err
 		}
 		if selected == "" {
-			fmt.Println("Cancelled")
+			fmt.Println("Canceled")
 			return nil
 		}
 		agentName = selected
@@ -6923,7 +7349,7 @@ func (c *CLI) tailFile(path string) error {
 	// Show recent context — seek near the end so the user sees
 	// what happened recently rather than the entire history.
 	if info, statErr := f.Stat(); statErr == nil && info.Size() > 8192 {
-		f.Seek(info.Size()-8192, 0) // 0 = SeekStart
+		_, _ = f.Seek(info.Size()-8192, 0) // 0 = SeekStart; best-effort, fall back to full read
 		// Skip the first (likely partial) line
 		scanner := bufio.NewScanner(f)
 		scanner.Scan()
@@ -6936,7 +7362,7 @@ func (c *CLI) tailFile(path string) error {
 			os.Stdout.Write(buf[:n])
 		}
 		if readErr != nil {
-			// At EOF — wait for more data (tail -f behaviour)
+			// At EOF — wait for more data (tail -f behavior)
 			time.Sleep(250 * time.Millisecond)
 		}
 	}
@@ -7021,7 +7447,7 @@ func (c *CLI) cleanupMergedBranches(dryRun bool, verbose bool) error {
 			fmt.Printf("\nRepository: %s\n", repoName)
 		}
 
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 
 		// Check for merged branches with common prefixes
 		for _, prefix := range []string{"oat/", "work/"} {
@@ -7230,7 +7656,7 @@ func (c *CLI) localCleanup(dryRun bool, verbose bool) error {
 				fmt.Printf("\nRepository: %s\n", repoName)
 			}
 
-			wt := worktree.NewManager(repoPath)
+			wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 
 			// Cleanup orphaned worktree directories
 			if !dryRun {
@@ -7563,7 +7989,7 @@ func (c *CLI) localRepair(verbose bool) error {
 			continue
 		}
 
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
 		removed, err := worktree.CleanupOrphaned(wtRootDir, wt)
 		if err != nil {
 			if verbose {
@@ -7653,8 +8079,11 @@ func (c *CLI) restartAgentInContext(args []string) error {
 		promptContent, err := os.ReadFile(promptFile)
 		if err == nil {
 			agentsDir := filepath.Join(agent.WorktreePath, ".oat")
-			os.MkdirAll(agentsDir, 0o755)
-			os.WriteFile(filepath.Join(agentsDir, "AGENTS.md"), promptContent, 0o644)
+			if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+				fmt.Printf("Warning: failed to create %s: %v\n", agentsDir, err)
+			} else if err := os.WriteFile(filepath.Join(agentsDir, "AGENTS.md"), promptContent, 0o644); err != nil {
+				fmt.Printf("Warning: failed to write AGENTS.md: %v\n", err)
+			}
 		}
 	}
 
@@ -7667,7 +8096,7 @@ func (c *CLI) restartAgentInContext(args []string) error {
 	}
 	fmt.Printf("Running: %s %s\n\n", agentPath, strings.Join(cmdArgs, " "))
 
-	cmd := exec.Command(agentPath, cmdArgs...)
+	cmd := exec.CommandContext(c.cmdCtx(), agentPath, cmdArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -7681,7 +8110,73 @@ func (c *CLI) showDocs(args []string) error {
 	return nil
 }
 
-// GenerateDocumentation generates markdown documentation for all CLI commands
+// humanOnlyCLICommands are top-level commands that agents should never see in
+// their injected CLI reference. They are operator/developer commands: daemon
+// lifecycle, kill-switches, repo setup, model onboarding, diagnostics, the
+// docs self-dump, and the TUI. Trimming them cuts the reference roughly in
+// half (~2k tokens) without touching any command an agent would invoke.
+var humanOnlyCLICommands = map[string]bool{
+	"start":       true,
+	"stop":        true,
+	"restart":     true,
+	"status":      true, // daemon-status alias; slash-command "/status" is separate
+	"daemon":      true,
+	"stop-all":    true,
+	"repo":        true,
+	"init":        true, // alias of `repo init`
+	"list":        true, // alias of `repo list`
+	"model":       true,
+	"bug":         true,
+	"diagnostics": true,
+	"version":     true,
+	"docs":        true,
+	"logs":        true,
+	"ui":          true,
+	"repair":      true,
+	"agents":      true, // agent-definition CRUD, user-facing
+	"cleanup":     true,
+}
+
+// agentRestrictedCLICommands lists top-level commands that are only relevant
+// to specific agent types. Commands not in this map are shown to every agent
+// type that passes the humanOnlyCLICommands filter.
+//
+// Example: only the supervisor spawns review agents (`oat review <url>`), so
+// workers and merge-queue never need to see that reference.
+var agentRestrictedCLICommands = map[string][]state.AgentType{
+	"review": {state.AgentTypeSupervisor},
+	"config": {state.AgentTypeSupervisor, state.AgentTypeMergeQueue},
+	// "history" is supervisor-only in practice but cheap to leave in for
+	// workspace too; keep unrestricted for now.
+}
+
+// commandVisibleForAgent reports whether a top-level CLI command named `name`
+// should appear in the reference injected into an agent's system prompt. An
+// empty agentType returns true for every non-human-only command (used by
+// `oat docs` and tests that want the full filtered-for-agent-use reference).
+func commandVisibleForAgent(name string, agentType state.AgentType) bool {
+	if humanOnlyCLICommands[name] {
+		return false
+	}
+	if agentType == "" {
+		return true
+	}
+	allowed, restricted := agentRestrictedCLICommands[name]
+	if !restricted {
+		return true
+	}
+	for _, t := range allowed {
+		if t == agentType {
+			return true
+		}
+	}
+	return false
+}
+
+// GenerateDocumentation generates the full markdown reference for every
+// registered CLI command. Used by `oat docs` and tests; agent prompts should
+// call GenerateDocumentationForAgent instead so human-only and
+// agent-irrelevant commands get trimmed.
 func (c *CLI) GenerateDocumentation() string {
 	var sb strings.Builder
 
@@ -7696,21 +8191,58 @@ func (c *CLI) GenerateDocumentation() string {
 	return sb.String()
 }
 
+// GenerateDocumentationForAgent returns a CLI reference trimmed to the
+// commands relevant to agentType. Pass an empty agentType to drop only
+// human-only commands while keeping everything else.
+func (c *CLI) GenerateDocumentationForAgent(agentType state.AgentType) string {
+	var sb strings.Builder
+
+	sb.WriteString("# OAT CLI Reference\n\n")
+	sb.WriteString("This is an automatically generated reference for all oat commands.\n\n")
+
+	for name, cmd := range c.rootCmd.Subcommands {
+		if !commandVisibleForAgent(name, agentType) {
+			continue
+		}
+		c.generateCommandDocs(&sb, name, cmd, 0)
+	}
+
+	return sb.String()
+}
+
+// docsFor returns the cached CLI reference for the given agent type, filling
+// the cache on first access. Falls back to the pre-computed full
+// documentation when the agent type is empty.
+func (c *CLI) docsFor(agentType state.AgentType) string {
+	if agentType == "" {
+		return c.documentation
+	}
+	if cached, ok := c.docsByAgent[agentType]; ok {
+		return cached
+	}
+	built := c.GenerateDocumentationForAgent(agentType)
+	if c.docsByAgent == nil {
+		c.docsByAgent = make(map[state.AgentType]string)
+	}
+	c.docsByAgent[agentType] = built
+	return built
+}
+
 // generateCommandDocs recursively generates documentation for a command and its subcommands
 func (c *CLI) generateCommandDocs(sb *strings.Builder, name string, cmd *Command, level int) {
 	indent := strings.Repeat("#", level+2)
 
 	// Command header
-	sb.WriteString(fmt.Sprintf("%s %s\n\n", indent, name))
+	fmt.Fprintf(sb, "%s %s\n\n", indent, name)
 
 	// Description
 	if cmd.Description != "" {
-		sb.WriteString(fmt.Sprintf("%s\n\n", cmd.Description))
+		fmt.Fprintf(sb, "%s\n\n", cmd.Description)
 	}
 
 	// Usage
 	if cmd.Usage != "" {
-		sb.WriteString(fmt.Sprintf("**Usage:** `%s`\n\n", cmd.Usage))
+		fmt.Fprintf(sb, "**Usage:** `%s`\n\n", cmd.Usage)
 	}
 
 	// Subcommands
@@ -7721,7 +8253,7 @@ func (c *CLI) generateCommandDocs(sb *strings.Builder, name string, cmd *Command
 			if strings.HasPrefix(subName, "_") {
 				continue
 			}
-			sb.WriteString(fmt.Sprintf("- `%s` - %s\n", subName, subCmd.Description))
+			fmt.Fprintf(sb, "- `%s` - %s\n", subName, subCmd.Description)
 		}
 		sb.WriteString("\n")
 
@@ -7829,8 +8361,9 @@ func (c *CLI) getAgentDefinition(repoName, repoPath, agentDefName string) (strin
 // appendDocsAndSlashCommands adds CLI documentation and slash commands to prompt text.
 // agentType is the string form of state.AgentType (e.g. "worker", "merge-queue").
 func (c *CLI) appendDocsAndSlashCommands(promptText string, agentType string) string {
-	if c.documentation != "" {
-		promptText += fmt.Sprintf("\n\n---\n\n%s", c.documentation)
+	docs := c.docsFor(state.AgentType(agentType))
+	if docs != "" {
+		promptText += fmt.Sprintf("\n\n---\n\n%s", docs)
 	}
 
 	slashCommands := prompts.GetSlashCommandsPrompt(agentType)
@@ -7843,55 +8376,13 @@ func (c *CLI) appendDocsAndSlashCommands(promptText string, agentType string) st
 
 // writePromptFile writes the agent prompt to a temporary file and returns the path
 func (c *CLI) writePromptFile(repoPath string, agentType state.AgentType, agentName string) (string, error) {
-	// Get the complete prompt (default + custom + CLI docs)
-	promptText, err := prompts.GetPrompt(repoPath, agentType, c.documentation)
+	// Get the complete prompt (default + custom + CLI docs). Pass the
+	// agent-type-filtered doc view so a workspace or review agent doesn't
+	// carry the full command tree in its system prompt.
+	promptText, err := prompts.GetPrompt(repoPath, agentType, c.docsFor(agentType))
 	if err != nil {
 		return "", fmt.Errorf("failed to get prompt: %w", err)
 	}
-
-	return c.savePromptToFile(agentName, promptText)
-}
-
-// writeMergeQueuePromptFile writes a merge-queue prompt file with tracking mode configuration.
-// It reads the merge-queue prompt from agent definitions (configurable agent system).
-func (c *CLI) writeMergeQueuePromptFile(repoPath string, agentName string, mqConfig state.MergeQueueConfig) (string, error) {
-	repoName := filepath.Base(repoPath)
-
-	promptText, err := c.getAgentDefinition(repoName, repoPath, "merge-queue")
-	if err != nil {
-		return "", err
-	}
-
-	// Add CLI documentation and slash commands
-	promptText = c.appendDocsAndSlashCommands(promptText, string(state.AgentTypeMergeQueue))
-
-	// Add tracking mode configuration to the prompt
-	trackingConfig := prompts.GenerateTrackingModePrompt(string(mqConfig.TrackMode))
-	promptText = trackingConfig + "\n\n" + promptText
-
-	return c.savePromptToFile(agentName, promptText)
-}
-
-// writePRShepherdPromptFile writes a pr-shepherd prompt file with fork context.
-// It reads the pr-shepherd prompt from agent definitions (configurable agent system).
-func (c *CLI) writePRShepherdPromptFile(repoPath string, agentName string, psConfig state.PRShepherdConfig, forkConfig state.ForkConfig) (string, error) {
-	repoName := filepath.Base(repoPath)
-
-	promptText, err := c.getAgentDefinition(repoName, repoPath, "pr-shepherd")
-	if err != nil {
-		return "", err
-	}
-
-	// Add CLI documentation and slash commands
-	promptText = c.appendDocsAndSlashCommands(promptText, string(state.AgentTypePRShepherd))
-
-	// Add fork workflow context
-	forkContext := prompts.GenerateForkWorkflowPrompt(forkConfig.UpstreamOwner, forkConfig.UpstreamRepo, forkConfig.UpstreamOwner)
-	promptText = forkContext + "\n\n" + promptText
-
-	// Add tracking mode configuration to the prompt
-	trackingConfig := prompts.GenerateTrackingModePrompt(string(psConfig.TrackMode))
-	promptText = trackingConfig + "\n\n" + promptText
 
 	return c.savePromptToFile(agentName, promptText)
 }
@@ -8140,9 +8631,63 @@ func (c *CLI) diagnostics(args []string) error {
 	return nil
 }
 
+// doctor runs preflight checks and prints either a human-readable summary
+// or a JSON report. Exits with a non-zero status (via returned error) when
+// any check fails, so CI and scripts can gate on `oat doctor`.
+func (c *CLI) doctor(args []string) error {
+	flags, _ := ParseFlags(args)
+	results := preflight.Run(c.paths)
+
+	// ParseFlags sets flags["json"] = "true" for bare --json as well as
+	// --json=true. Anything else (including "false") renders the text form.
+	if v, ok := flags["json"]; ok && v != "false" {
+		data, err := json.MarshalIndent(results, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format preflight results as JSON: %w", err)
+		}
+		fmt.Println(string(data))
+	} else {
+		printDoctorResults(os.Stdout, results)
+	}
+
+	_, _, fail := preflight.Summarize(results)
+	if fail > 0 {
+		return fmt.Errorf("%d preflight check(s) failed", fail)
+	}
+	return nil
+}
+
+// printDoctorResults renders a padded status table to w. Kept separate so
+// tests can render into a bytes.Buffer and assert on the output.
+func printDoctorResults(w io.Writer, results []preflight.CheckResult) {
+	maxName := 0
+	for _, r := range results {
+		if len(r.Name) > maxName {
+			maxName = len(r.Name)
+		}
+	}
+	for _, r := range results {
+		marker := "?"
+		switch r.Status {
+		case preflight.StatusOK:
+			marker = "OK  "
+		case preflight.StatusWarn:
+			marker = "WARN"
+		case preflight.StatusFail:
+			marker = "FAIL"
+		}
+		fmt.Fprintf(w, "  %s  %-*s  %s\n", marker, maxName, r.Name, r.Message)
+		if r.Hint != "" && r.Status != preflight.StatusOK {
+			fmt.Fprintf(w, "        %s  hint: %s\n", strings.Repeat(" ", maxName), r.Hint)
+		}
+	}
+	ok, warn, fail := preflight.Summarize(results)
+	fmt.Fprintf(w, "\n%d OK, %d WARN, %d FAIL\n", ok, warn, fail)
+}
+
 // listBranchesWithPrefix returns all local branches with the given prefix
 func (c *CLI) listBranchesWithPrefix(repoPath, prefix string) ([]string, error) {
-	cmd := exec.Command("git", "branch", "--list", prefix+"*")
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "branch", "--list", prefix+"*")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -8162,7 +8707,7 @@ func (c *CLI) listBranchesWithPrefix(repoPath, prefix string) ([]string, error) 
 
 // deleteBranch deletes a local git branch
 func (c *CLI) deleteBranch(repoPath, branch string) error {
-	cmd := exec.Command("git", "branch", "-D", branch)
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "branch", "-D", branch)
 	cmd.Dir = repoPath
 	return cmd.Run()
 }
@@ -8173,7 +8718,7 @@ func (c *CLI) deleteBranch(repoPath, branch string) error {
 
 func (c *CLI) modelOnboard(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: oat model onboard <provider:model> [--probe-set minimum|default]")
+		return fmt.Errorf("usage: oat model onboard <provider:model> [--probe-set minimum|default] [--verbose]")
 	}
 	modelStr := args[0]
 	flags, _ := ParseFlags(args[1:])
@@ -8182,6 +8727,7 @@ func (c *CLI) modelOnboard(args []string) error {
 	if ps, ok := flags["probe-set"]; ok {
 		probeSet = ps
 	}
+	_, verbose := flags["verbose"]
 
 	// Find probe script
 	probeScript := filepath.Join(c.findRepoRoot(), "benchmarks", "probe-model.py")
@@ -8193,11 +8739,27 @@ func (c *CLI) modelOnboard(args []string) error {
 	// and also to model-routing/profiles/ in the source tree for version control.
 	cmdArgs := []string{probeScript, modelStr, "--probe-set", probeSet, "--save"}
 
-	cmd := exec.Command("python3", cmdArgs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd := exec.CommandContext(c.cmdCtx(), "python3", cmdArgs...)
+
+	var stderrBuf strings.Builder
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	} else {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = &onboardStderrFilter{buf: &stderrBuf}
+	}
+
 	if err := cmd.Run(); err != nil {
+		if !verbose {
+			// On failure, dump captured stderr so operators can diagnose
+			os.Stderr.WriteString(stderrBuf.String())
+		}
 		return err
+	}
+
+	if !verbose {
+		c.printOnboardSummary(modelStr, probeSet, stderrBuf.String())
 	}
 
 	// Copy the generated profile to ~/.oat/model-profiles/ for daemon access.
@@ -8219,7 +8781,7 @@ func (c *CLI) modelOnboard(args []string) error {
 
 		if err := os.WriteFile(dstProfile, data, 0644); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not copy profile to %s: %v\n", dstDir, err)
-		} else {
+		} else if verbose {
 			fmt.Printf("Profile saved to %s\n", dstProfile)
 		}
 	}
@@ -8243,9 +8805,112 @@ func (c *CLI) modelOnboard(args []string) error {
 				"       (underlying error: %v)\n", err)
 		os.Exit(2)
 	}
-	fmt.Println("Daemon model profiles reloaded")
+	if verbose {
+		fmt.Println("Daemon model profiles reloaded")
+	}
 
 	return nil
+}
+
+// onboardStderrFilter captures all stderr output and shows progress lines
+// (probe execution status) live. The full report section is suppressed in
+// compact mode but available in the buffer for parsing.
+type onboardStderrFilter struct {
+	buf         *strings.Builder
+	lineBuf     []byte
+	showingLine bool
+}
+
+func (f *onboardStderrFilter) Write(p []byte) (n int, err error) {
+	f.buf.Write(p)
+	f.lineBuf = append(f.lineBuf, p...)
+
+	for {
+		idx := -1
+		for i, b := range f.lineBuf {
+			if b == '\n' {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			// No newline — check for partial progress line
+			line := string(f.lineBuf)
+			if !f.showingLine && (strings.Contains(line, "Running ") || strings.HasPrefix(strings.TrimSpace(line), "Resolving model:") || strings.HasPrefix(strings.TrimSpace(line), "Retrying ")) {
+				os.Stderr.WriteString(line)
+				f.lineBuf = f.lineBuf[:0]
+				f.showingLine = true
+			}
+			break
+		}
+
+		line := string(f.lineBuf[:idx+1])
+		f.lineBuf = f.lineBuf[idx+1:]
+
+		if f.showingLine {
+			// Continuation of a progress line — print the result portion
+			os.Stderr.WriteString(line)
+			f.showingLine = false
+		} else if strings.Contains(line, "Running ") ||
+			strings.HasPrefix(strings.TrimSpace(line), "Resolving model:") ||
+			strings.Contains(line, "Skipping remaining") ||
+			strings.HasPrefix(strings.TrimSpace(line), "Retrying ") {
+			os.Stderr.WriteString(line)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *CLI) printOnboardSummary(modelStr, probeSet, stderr string) {
+	// Parse key fields from captured stderr. The Python script emits the YAML
+	// profile to stderr after "Profile contents:". We extract fields with
+	// simple string matching to avoid a YAML dependency.
+	getField := func(key string) string {
+		for _, line := range strings.Split(stderr, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, key+":") {
+				return strings.TrimSpace(strings.TrimPrefix(trimmed, key+":"))
+			}
+		}
+		return ""
+	}
+
+	score := getField("overall_score")
+	workerEligible := getField("worker_eligible")
+	orchestratorEligible := getField("orchestrator_eligible")
+	probesRun := getField("probes_run")
+	probesPassed := getField("probes_passed")
+
+	if score == "" || probesRun == "" {
+		// Parsing failed — fall back to full stderr output
+		os.Stderr.WriteString(stderr)
+		return
+	}
+
+	yesNo := func(val string) string {
+		if val == "true" {
+			return "yes"
+		}
+		return "no"
+	}
+
+	fmt.Printf("  ✓ %s/%s probes passed\n", probesPassed, probesRun)
+	fmt.Printf("  Score: %s/100 | Worker: %s | Orchestrator: %s\n",
+		score, yesNo(workerEligible), yesNo(orchestratorEligible))
+
+	home, _ := os.UserHomeDir()
+	filename := strings.ReplaceAll(modelStr, ":", "__")
+	filename = strings.ReplaceAll(filename, "/", "__") + ".yaml"
+	fmt.Printf("  Profile saved to %s\n", filepath.Join(home, ".oat", "model-profiles", filename))
+	fmt.Printf("  (also written to model-routing/profiles/ in source tree)\n")
+
+	// Print any error/warning lines that would otherwise be hidden
+	for _, line := range strings.Split(stderr, "\n") {
+		upper := strings.ToUpper(line)
+		if strings.Contains(upper, "ERROR:") || strings.Contains(upper, "WARNING:") {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	}
 }
 
 func (c *CLI) modelList(args []string) error {
@@ -8365,6 +9030,205 @@ func (c *CLI) modelRestore(args []string) error {
 	return nil
 }
 
+// modelSet updates per-model runtime parameters in the profile YAML
+// (and the daemon's working copy under ~/.oat/model-profiles), then asks
+// the daemon to reload profiles. Intended as the operator-friendly
+// alternative to hand-editing the YAML. The same fields can be edited
+// directly in model-routing/profiles/<provider>__<model>.yaml — see
+// CONTRIBUTING.md § "Tuning model runtime parameters".
+func (c *CLI) modelSet(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: oat model set <provider:model> [--max-tokens N] [--nudge-interval SECONDS]")
+	}
+	modelStr := args[0]
+	flags, _ := ParseFlags(args[1:])
+
+	maxTokensStr, hasMaxTokens := flags["max-tokens"]
+	nudgeStr, hasNudge := flags["nudge-interval"]
+	if !hasMaxTokens && !hasNudge {
+		return fmt.Errorf("oat model set: at least one of --max-tokens or --nudge-interval is required")
+	}
+
+	var maxTokens, nudgeSecs int
+	if hasMaxTokens {
+		n, err := strconv.Atoi(maxTokensStr)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("--max-tokens must be a positive integer (got %q)", maxTokensStr)
+		}
+		maxTokens = n
+	}
+	if hasNudge {
+		n, err := strconv.Atoi(nudgeStr)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("--nudge-interval must be a positive integer seconds value (got %q)", nudgeStr)
+		}
+		nudgeSecs = n
+	}
+
+	filename := strings.ReplaceAll(modelStr, ":", "__")
+	filename = strings.ReplaceAll(filename, "/", "__") + ".yaml"
+
+	// Look up the profile — prefer the in-repo source of truth so edits stay
+	// version-controlled, then fall back to ~/.oat/ for operators running
+	// against a pre-built binary outside the repo.
+	var profilePath string
+	for _, dir := range c.modelProfileDirs() {
+		candidate := filepath.Join(dir, filename)
+		if _, err := os.Stat(candidate); err == nil {
+			profilePath = candidate
+			break
+		}
+	}
+	if profilePath == "" {
+		return fmt.Errorf("profile not found for %s\n  Run: oat model onboard %s", modelStr, modelStr)
+	}
+
+	data, err := os.ReadFile(profilePath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", profilePath, err)
+	}
+
+	updates := map[string]int{}
+	if hasMaxTokens {
+		updates["max_tokens"] = maxTokens
+	}
+	if hasNudge {
+		updates["nudge_interval_seconds"] = nudgeSecs
+	}
+	updated := updateRuntimeBlock(string(data), updates)
+
+	if err := os.WriteFile(profilePath, []byte(updated), 0644); err != nil {
+		return fmt.Errorf("write %s: %w", profilePath, err)
+	}
+	fmt.Printf("Updated runtime parameters in %s\n", profilePath)
+
+	// Mirror to ~/.oat/model-profiles/ so the running daemon sees the change
+	// without needing the repo on its PATH.
+	if home, _ := os.UserHomeDir(); home != "" {
+		dst := filepath.Join(home, ".oat", "model-profiles", filename)
+		if dst != profilePath {
+			_ = os.MkdirAll(filepath.Dir(dst), 0755)
+			if err := os.WriteFile(dst, []byte(updated), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not mirror profile to %s: %v\n", dst, err)
+			}
+		}
+	}
+
+	if _, err := c.sendDaemonRequest("reload_model_profiles", nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Note: daemon not running — new values take effect on next daemon start\n")
+	} else {
+		fmt.Println("Daemon model profiles reloaded")
+	}
+	return nil
+}
+
+// updateRuntimeBlock inserts or replaces entries under the top-level
+// `runtime:` mapping in a flat profile YAML. It preserves surrounding
+// content (comments, blank lines, other blocks) and only rewrites the
+// specific keys supplied in updates.
+//
+// The format we emit matches the schema in model-routing/profiles/README.md:
+//
+//	runtime:
+//	  max_tokens: 16000
+//	  nudge_interval_seconds: 120
+//
+// If the `runtime:` block is missing, we append it (with a preceding blank
+// line) so the resulting file reads cleanly next to hand-written profiles.
+func updateRuntimeBlock(content string, updates map[string]int) string {
+	if len(updates) == 0 {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+
+	blockStart := -1
+	blockEnd := -1 // exclusive; first line that leaves the block
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if blockStart == -1 {
+			if trimmed == "runtime:" && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+				blockStart = i
+				blockEnd = len(lines)
+				continue
+			}
+		} else {
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if !strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "\t") {
+				blockEnd = i
+				break
+			}
+		}
+	}
+
+	if blockStart == -1 {
+		// Append a new runtime block. Strip trailing blank lines so we
+		// don't stack them up on repeated edits.
+		for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+			lines = lines[:len(lines)-1]
+		}
+		lines = append(lines, "", "runtime:")
+		for _, key := range runtimeBlockOrder(updates) {
+			lines = append(lines, fmt.Sprintf("  %s: %d", key, updates[key]))
+		}
+		lines = append(lines, "")
+		return strings.Join(lines, "\n")
+	}
+
+	// Replace or insert inside the existing block.
+	remaining := make(map[string]int, len(updates))
+	for k, v := range updates {
+		remaining[k] = v
+	}
+	for i := blockStart + 1; i < blockEnd; i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		parts := strings.SplitN(trimmed, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		if v, ok := remaining[key]; ok {
+			lines[i] = fmt.Sprintf("  %s: %d", key, v)
+			delete(remaining, key)
+		}
+	}
+	if len(remaining) > 0 {
+		insertion := make([]string, 0, len(remaining))
+		for _, key := range runtimeBlockOrder(remaining) {
+			insertion = append(insertion, fmt.Sprintf("  %s: %d", key, remaining[key]))
+		}
+		tail := append([]string{}, lines[blockEnd:]...)
+		lines = append(lines[:blockEnd], insertion...)
+		lines = append(lines, tail...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// runtimeBlockOrder returns updates' keys in a stable, human-friendly
+// order (max_tokens before nudge_interval_seconds, then anything else
+// alphabetically) so successive edits produce minimal diffs.
+func runtimeBlockOrder(updates map[string]int) []string {
+	preferred := []string{"max_tokens", "nudge_interval_seconds"}
+	seen := make(map[string]bool, len(updates))
+	order := make([]string, 0, len(updates))
+	for _, k := range preferred {
+		if _, ok := updates[k]; ok {
+			order = append(order, k)
+			seen[k] = true
+		}
+	}
+	var extras []string
+	for k := range updates {
+		if !seen[k] {
+			extras = append(extras, k)
+		}
+	}
+	sort.Strings(extras)
+	order = append(order, extras...)
+	return order
+}
+
 // parseYAMLFlat does a simple key extraction from flat YAML (no nesting awareness).
 // Sufficient for reading profile summary fields.
 func parseYAMLFlat(content string) map[string]string {
@@ -8401,7 +9265,7 @@ func (c *CLI) findRepoRoot() string {
 // extractOwnerFromGitHubURL extracts the owner from a repository's origin URL.
 // It first tries to get the origin URL from git remote, then parses it.
 func (c *CLI) extractOwnerFromGitHubURL(repoPath string) string {
-	cmd := exec.Command("git", "remote", "get-url", "origin")
+	cmd := exec.CommandContext(c.cmdCtx(), "git", "remote", "get-url", "origin")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {

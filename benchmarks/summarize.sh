@@ -289,11 +289,177 @@ extract_signals() {
         # Extract key signals
         echo "--- Key signals ---" >> "$output_file"
         LC_ALL=C sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$agent_log" 2>/dev/null | \
-            grep -iE 'worker.*creat|worker.*remov|worker.*spawn|oat worker|merge.*pr|pr.*merg|identity|multiclaude|"I don.t have a formal role"|wave|error[: ]|\[daemon\]|stuck|idle.?mode' 2>/dev/null | \
+            grep -iE 'worker.*creat|worker.*remov|worker.*spawn|oat worker|merge.*pr|pr.*merg|identity|"I don.t have a formal role"|wave|error[: ]|\[daemon\]|stuck|idle.?mode' 2>/dev/null | \
             grep -ivE 'error.?handler|error.?handling|error.?message|error.?code|error.?class|test.*error|ErrorResponse' 2>/dev/null | \
             cut -c1-200 | tail -40 >> "$output_file" || true
         echo "" >> "$output_file"
     done
+
+    # --- Token usage breakdown (via `oat tokens report`) ---
+    #
+    # Historical token breakdown parsed from [OAT_TOKENS] log lines. This is
+    # distinct from `oat status --tokens` (live state) — we use the report
+    # flavor because by the time summarize.sh runs, all agents have already
+    # been cleaned up and their in-memory state is gone. The benchmark's
+    # wave mapping is derived below from state.json + gh issue labels so
+    # `oat tokens report --wave N` can group accurately.
+
+    emit_token_usage_section() {
+        local repo_name="$1"
+        local dest_file="$2"
+
+        echo "## TOKEN USAGE (per-agent, historical)" >> "$dest_file"
+        echo "" >> "$dest_file"
+
+        if ! command -v oat >/dev/null 2>&1; then
+            echo "(oat binary not found in PATH; skipping token report)" >> "$dest_file"
+            echo "" >> "$dest_file"
+            return
+        fi
+
+        # Build a per-worker wave mapping from state.json + collect.json. The
+        # resulting file is consumed by `oat tokens report --waves-file`.
+        local waves_map_file="${RESULTS_DIR}/token-waves.json"
+        build_token_waves_map "$repo_name" "$waves_map_file" || waves_map_file=""
+
+        # Global, per-agent table first (no wave filter).
+        echo "### All agents" >> "$dest_file"
+        echo "" >> "$dest_file"
+        echo '```' >> "$dest_file"
+        if [[ -n "$waves_map_file" && -f "$waves_map_file" ]]; then
+            oat tokens report --repo "$repo_name" --waves-file "$waves_map_file" \
+                --format table >> "$dest_file" 2>/dev/null || \
+                echo "(oat tokens report failed; check that ~/.oat/output/${repo_name}/ exists)" >> "$dest_file"
+        else
+            oat tokens report --repo "$repo_name" --format table >> "$dest_file" 2>/dev/null || \
+                echo "(oat tokens report failed; check that ~/.oat/output/${repo_name}/ exists)" >> "$dest_file"
+        fi
+        echo '```' >> "$dest_file"
+        echo "" >> "$dest_file"
+
+        # Total-cost summary line. Uses --format json so we get the
+        # exact totals.cost_usd that oat computes (priced agents only).
+        # Quietly skipped when jq is missing, the JSON command fails,
+        # or the field is null (no priced agents).
+        if command -v jq >/dev/null 2>&1; then
+            local total_cost
+            if [[ -n "$waves_map_file" && -f "$waves_map_file" ]]; then
+                total_cost=$(oat tokens report --repo "$repo_name" \
+                    --waves-file "$waves_map_file" --format json 2>/dev/null \
+                    | jq -r '.totals.cost_usd // empty' 2>/dev/null)
+            else
+                total_cost=$(oat tokens report --repo "$repo_name" \
+                    --format json 2>/dev/null \
+                    | jq -r '.totals.cost_usd // empty' 2>/dev/null)
+            fi
+            if [[ -n "$total_cost" ]]; then
+                printf "**Total cost (priced agents only): \$%.4f USD**\n\n" "$total_cost" >> "$dest_file"
+            fi
+        fi
+
+        # Per-wave breakdown only when we have the wave mapping.
+        if [[ -n "$waves_map_file" && -f "$waves_map_file" ]]; then
+            for w in 0 1 2 3 4; do
+                local wave_count
+                wave_count=$(jq --arg w "wave:${w}" '[.waves // . | to_entries[] | select(.value == $w)] | length' "$waves_map_file" 2>/dev/null || echo 0)
+                if [[ "${wave_count:-0}" -eq 0 ]]; then
+                    continue
+                fi
+                echo "### Wave ${w}" >> "$dest_file"
+                echo "" >> "$dest_file"
+                echo '```' >> "$dest_file"
+                oat tokens report --repo "$repo_name" --waves-file "$waves_map_file" \
+                    --wave "${w}" --format table >> "$dest_file" 2>/dev/null || true
+                echo '```' >> "$dest_file"
+                echo "" >> "$dest_file"
+            done
+        fi
+    }
+
+    # build_token_waves_map writes {agent_name: "wave:N"} JSON for every
+    # worker that has an assigned issue in state.json AND whose issue has a
+    # wave:N label in the GitHub repo. Falls back silently if gh is
+    # unavailable or the state file is missing — `oat tokens report` will
+    # still produce the ungrouped global table.
+    build_token_waves_map() {
+        local repo_name="$1"
+        local dest="$2"
+
+        if [[ ! -f "$oat_state" ]]; then
+            return 1
+        fi
+
+        # Collect (worker_name, issue_number) pairs from state.json for this
+        # repo's task history. Retired workers still appear there.
+        local pairs
+        pairs=$(jq -r --arg repo "$repo_name" '
+            .repos[$repo].task_history[]?
+            | select(.name and .task)
+            | "\(.name)\t\(.task | capture("#(?<n>[0-9]+)"; "g") | .n // "")"
+        ' "$oat_state" 2>/dev/null || true)
+
+        if [[ -z "$pairs" ]]; then
+            return 1
+        fi
+
+        # Pull wave labels from collect.json if present (no GH roundtrip).
+        # collect.json carries per-issue wave info indirectly via the
+        # waves[N].issues arrays. We use two parallel temp files (issue
+        # -> wave) instead of `declare -A`, which isn't available on
+        # macOS's default bash 3.2.
+        local issue_wave_map="${RESULTS_DIR}/.issue-to-wave.tsv"
+        : > "$issue_wave_map"
+        if [[ -f "$COLLECT_JSON" ]]; then
+            jq -r '
+                .waves // {} | to_entries[]?
+                | . as $wv
+                | ($wv.value.issues // []) | .[]?
+                | "\(.)\t\($wv.key)"
+            ' "$COLLECT_JSON" 2>/dev/null > "$issue_wave_map" || true
+        fi
+
+        # Lookup helper: given an issue number on stdin, print wave:N (or
+        # nothing) on stdout. Uses awk so we can share one subprocess per
+        # lookup without bash-only associative arrays.
+        lookup_wave() {
+            local n="$1"
+            awk -F'\t' -v want="$n" '$1 == want { print "wave:" $2; exit }' "$issue_wave_map"
+        }
+
+        # Emit {"waves": {"<worker>": "wave:N"}}; skip workers we can't place.
+        {
+            echo "{"
+            echo "  \"waves\": {"
+            local first=1
+            while IFS=$'\t' read -r worker issue_num; do
+                [[ -z "$worker" || -z "$issue_num" ]] && continue
+                local wave_label
+                wave_label=$(lookup_wave "$issue_num")
+                [[ -z "$wave_label" ]] && continue
+                if [[ $first -eq 1 ]]; then
+                    first=0
+                else
+                    echo ","
+                fi
+                printf '    "%s": "%s"' "$worker" "$wave_label"
+            done <<< "$pairs"
+            echo
+            echo "  }"
+            echo "}"
+        } > "$dest"
+
+        rm -f "$issue_wave_map"
+
+        # If we produced an empty mapping, delete the file so callers fall
+        # back to the ungrouped report.
+        if ! jq -e '.waves | length > 0' "$dest" >/dev/null 2>&1; then
+            rm -f "$dest"
+            return 1
+        fi
+        return 0
+    }
+
+    emit_token_usage_section "$repo" "$output_file"
 
     # --- Daemon log ---
 

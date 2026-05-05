@@ -1,0 +1,72 @@
+# Dependabot configuration for OAT.
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Open-limit kept modest on first rollout to avoid PR floods; bump later if needed.
+version: 2
+updates:
+  # Go modules at the repo root.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(go)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "go"
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions used across workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(actions)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # Python projects under agent-runtime/libs. We use `pip` ecosystem (reads
+  # pyproject.toml) paired with the auto-uv-lock workflow to keep uv.lock in
+  # sync once Dependabot bumps a dependency.
+  - package-ecosystem: "pip"
+    directory: "/agent-runtime/libs/oat_sdk"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(py-oat_sdk)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "python"
+    groups:
+      py-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "pip"
+    directory: "/agent-runtime/libs/cli"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "deps(py-cli)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "python"
+    groups:
+      py-minor-patch:
+        update-types: ["minor", "patch"]
+

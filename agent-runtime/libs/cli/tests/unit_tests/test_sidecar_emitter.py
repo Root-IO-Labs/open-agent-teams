@@ -18,8 +18,8 @@ import time
 
 import pytest
 
-from deepagents_cli import sidecar_emitter
-from deepagents_cli.sidecar_events import Event, Usage
+from oat_cli import sidecar_emitter
+from oat_cli.sidecar_events import Event, Usage
 
 
 def _short_sock_dir() -> str:

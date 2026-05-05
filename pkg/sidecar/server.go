@@ -32,7 +32,7 @@ const MaxLineSize = 4 * 1024 * 1024
 //	defer srv.Close()
 //
 // Start is non-blocking. An accept goroutine runs until Close is called or
-// the context is cancelled. The socket file is removed on Close. Only one
+// the context is canceled. The socket file is removed on Close. Only one
 // connection is handled at a time; if the client reconnects, the accept
 // loop picks up the new connection automatically.
 type Server struct {
@@ -86,11 +86,12 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Remove any stale socket file from a crashed previous run. If the
-	// path is actually in use by a live process, net.Listen will fail
-	// below and we'll surface that error.
+	// path is actually in use by a live process, Listen will fail below
+	// and we'll surface that error.
 	_ = os.Remove(s.path)
 
-	ln, err := net.Listen("unix", s.path)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "unix", s.path)
 	if err != nil {
 		return fmt.Errorf("sidecar.Server: listen %s: %w", s.path, err)
 	}

@@ -2,7 +2,10 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,11 +27,32 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/templates"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/version"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/worktree"
 	agent_pkg "github.com/Root-IO-Labs/open-agent-teams/pkg/agent"
 	backend_pkg "github.com/Root-IO-Labs/open-agent-teams/pkg/backend"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
 )
+
+// ─── Function index (approximate line numbers) ──────────────────
+//
+// Daemon struct + constructor:    ~72   (Daemon, New)
+// Start / Stop / Run:             ~246  (Start, Stop, periodicLoop)
+// PR monitoring:                  ~513  (prMonitorLoop, checkSingleWorkerPR)
+// Health checks:                  ~664  (checkAgentHealth, pruneOrphans)
+// Message routing:                ~816  (messageRouterLoop, routeMessages)
+// Wake / nudge:                   ~997  (wakeLoop, wakeAgents, nudgeIntervalFor)
+// Idle mode:                      ~1057 (idle transitions, final nudges)
+// Request handling:               ~1604 (handleRequest switch — all socket commands)
+// Worker lifecycle:               ~1970 (handleStartWorker, handleSendAgentInput)
+// Repo agent startup:             ~2875 (handleStartRepoAgents, startRegisteredAgent)
+// Agent restart / remove:         ~3313 (handleRestartAgent, handleRemoveAgent)
+// Agent definitions:              ~4558 (supervisorDefinitionBodyForMessage, sendAgentDefinitionsToSupervisor)
+// Binary resolution:              ~4702 (getAgentBinaryPath, ensureBinSymlinks)
+// Prompt assembly:                ~5173 (writePromptFileWithPrefix, writePromptFile)
+// Helpers:                        ~5500 (env vars, session names, state snapshot)
+//
+// ─────────────────────────────────────────────────────────────────
 
 // workerPostCompletionDelay is the grace period after a worker signals completion
 // before its window is cleaned up. Kept short (3s) to prevent completed agents
@@ -37,7 +61,7 @@ const workerPostCompletionDelay = 3 * time.Second
 
 // shutdownDrainTimeout bounds how long an output-watcher consumer goroutine
 // will wait to drain buffered token events after the daemon context is
-// cancelled. Prevents up-to-32-events-per-agent token spend loss on shutdown
+// canceled. Prevents up-to-32-events-per-agent token spend loss on shutdown
 // while keeping daemon stop snappy.
 const shutdownDrainTimeout = 1 * time.Second
 
@@ -45,11 +69,25 @@ const shutdownDrainTimeout = 1 * time.Second
 // the daemon stops trying to fetch for a repo (until daemon restart).
 const fetchFailureThreshold = 3
 
-// defaultModelParams is passed via --model-params to every agent to prevent
-// large tool calls (e.g. write_file with big content) from being silently
-// truncated when the model's output token limit is too low.
-// Keep this as raw JSON. Backends handle shell-quoting when constructing commands.
-const defaultModelParams = `{"max_tokens":32000}`
+// defaultMaxTokens is the fallback output-token limit passed via --model-params
+// to every agent. It prevents large tool calls (e.g. write_file with big content)
+// from being silently truncated when the model's output token limit is too low.
+// Per-model overrides come from ModelProfile.Runtime.MaxTokens, and when that
+// is zero this default is used. Profiles can tune this value independently.
+const defaultMaxTokens = 32000
+
+// modelParamsJSON returns the raw JSON string passed via --model-params for a
+// given model, honoring the per-profile MaxTokens override when non-zero.
+// Keep the JSON simple; backends handle shell quoting when constructing commands.
+func (d *Daemon) modelParamsJSON(modelID string) string {
+	maxTokens := defaultMaxTokens
+	if d.modelProfiles != nil && modelID != "" {
+		if p := d.modelProfiles.Get(modelID); p != nil && p.Runtime.MaxTokens > 0 {
+			maxTokens = p.Runtime.MaxTokens
+		}
+	}
+	return fmt.Sprintf(`{"max_tokens":%d}`, maxTokens)
+}
 
 // Daemon represents the main daemon process
 type Daemon struct {
@@ -63,8 +101,13 @@ type Daemon struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 
-	fetchFailures     map[string]int // repo name -> consecutive fetch failure count
-	fetchFailuresMu   sync.Mutex
+	fetchFailures   map[string]int // repo name -> consecutive fetch failure count
+	fetchFailuresMu sync.Mutex
+	// workspaceActivity is ONLY accessed from healthCheckLoop. It has no mutex
+	// on purpose — the loop is single-goroutine and serializes iterations. If
+	// a second goroutine ever needs to touch it, add a mutex AND restructure
+	// checkWorkspaceHealth to copy-under-lock / mutate / swap-under-lock so
+	// the struct fields stay race-free alongside the map.
 	workspaceActivity map[string]*workspaceActivity // repo name -> workspace activity tracking
 
 	coreAgentActivity   map[string]*coreAgentActivity // "repo/agent" -> core agent activity tracking
@@ -102,8 +145,26 @@ type Daemon struct {
 	restartCooldown   map[string]time.Time // "repo/agent" -> last restart attempt time
 	restartCooldownMu sync.Mutex
 
-	modelProfiles *routing.ProfileStore // loaded model capability profiles for routing
+	modelProfiles     *routing.ProfileStore    // loaded model capability profiles for routing
+	outcomeLogger     *routing.OutcomeLogger   // appends per-completion records to routing-history.jsonl
+	prBackfiller      *routing.PRBackfiller    // observes PR state at lag buckets after completion (sidecar writer)
+	oatVersion        string                   // build-time release identity, snapshotted on New() so logOutcome doesn't recompute
+	pricingSnapshotID string                   // sha-prefix of pricing registry at boot, snapshotted after pricing load
+	pricing           *routing.PricingRegistry // embedded pricing YAML for cost-aware routing (Router V1)
+
+	// V2 router corpus snapshot. Built at startup from the joined corpus
+	// (main + sidecar), refreshed every corpusIndexRefreshInterval. Atomic
+	// pointer so reads (per-spawn routing decisions) don't lock against
+	// the periodic refresher.
+	corpusIndex   *routing.CorpusIndex
+	corpusIndexMu sync.RWMutex
 }
+
+// corpusIndexRefreshInterval — how often the daemon rebuilds the V2
+// router's corpus snapshot. Routing decisions read the cached snapshot,
+// so the freshness/cost trade-off is bounded: 10 min lag at most before a
+// new merged-PR observation feeds into routing.
+const corpusIndexRefreshInterval = 10 * time.Minute
 
 func backendModeName(backend backend_pkg.ProcessBackend) string {
 	if info, ok := backend.(backend_pkg.BackendInfo); ok {
@@ -177,16 +238,112 @@ func New(paths *config.Paths) (*Daemon, error) {
 		logger.Warn("Failed to load model profiles: %v", err)
 	} else {
 		d.modelProfiles = profiles
+		// Attach the embedded context-registry BEFORE the first Reload so the
+		// initial load picks up overrides. Un-probed max_input_tokens values
+		// get filled from the registry for providers whose probe fallback
+		// doesn't work (openai/google_genai/ollama — see Phase 5 audit).
+		reg := routing.LoadEmbeddedContextRegistry()
+		profiles.SetContextRegistry(reg)
+		if reg != nil && reg.Count() > 0 {
+			logger.Info("Context-registry loaded (%d entries) — will fill missing max_input_tokens on profile reload", reg.Count())
+		}
+		// Re-run load so the registry overrides take effect on startup.
+		// Failures here are non-fatal; the already-loaded profiles remain.
+		if reloadErr := profiles.Reload(); reloadErr != nil {
+			logger.Warn("Profile reload after context-registry attach failed: %v", reloadErr)
+		}
 		if profiles.IsEmpty() {
 			logger.Warn("No model profiles loaded from %s; agents will use explicit --model or passthrough routing (run: oat model onboard <provider:model>)", paths.ModelProfilesDir)
 		}
 	}
+
+	// Routing outcome logger — appends one JSONL line per worker/review completion
+	// so the replay harness in benchmarks/routing-replay can compute counterfactual
+	// $/success. Failures in this path are logged but never block completion.
+	historyPath := routing.DefaultOutcomeHistoryPath(paths.Root)
+
+	// One-shot v1→v2 migration: lifts schema_version=1 records (or older
+	// records with no schema_version field) to v2, enriching with provider,
+	// model_canonical, task_features, and a stable record_id derived via
+	// UUIDv5 from the record's natural key. Idempotent — re-running on an
+	// already-migrated file is a no-op. Original is backed up exactly once
+	// to <path>.v1.bak.jsonl. Failures here log a warning but do not block
+	// daemon startup; corpus quality is best-effort.
+	if migStats, migErr := routing.MigrateV1ToV2(historyPath); migErr != nil {
+		logger.Warn("Routing-history v1→v2 migration failed: %v — corpus may have mixed schemas", migErr)
+	} else if migStats.V1Migrated > 0 {
+		logger.Info("Routing-history migrated %d v1 record(s) to v2 (backup: %s)", migStats.V1Migrated, migStats.BackupPath)
+	}
+
+	d.outcomeLogger = routing.NewOutcomeLogger(
+		historyPath,
+		func(format string, args ...any) { logger.Warn(format, args...) },
+	)
+
+	// PR-state backfiller (Phase 1, schema v2) — at fixed lag buckets after a
+	// worker completes (1h, 24h, 7d), observes the PR's merge state via gh
+	// and writes one append-only sidecar entry. Sidecar lives next to the
+	// main routing-history.jsonl; the main file stays strictly append-only
+	// and immutable. The Phase 2 indexer will join the two on (ts,worker,repo).
+	d.prBackfiller = routing.NewPRBackfiller(routing.PRBackfillerOptions{
+		HistoryPath: routing.DefaultOutcomeHistoryPath(paths.Root),
+		SidecarPath: routing.DefaultBackfillSidecarPath(paths.Root),
+		Warn:        func(format string, args ...any) { logger.Warn(format, args...) },
+	})
+
+	// Pricing registry — used by RouteForTask when OAT_ROUTING_V1=1, and by
+	// budget cost computation. The loader prefers a fresh LiteLLM-derived
+	// cache at $OAT_HOME/pricing-cache.json, falling back to the embedded
+	// YAML shipped in the binary. A background goroutine refreshes the
+	// cache every 24h so prices stay current without requiring a release.
+	// Disable by setting OAT_PRICING_REMOTE=0 (uses embedded YAML only).
+	pricingOpts := routing.NewPricingLoaderOptions(paths.Root)
+	pricingOpts.Log = func(format string, args ...any) { logger.Info(format, args...) }
+	if v := strings.TrimSpace(os.Getenv("OAT_PRICING_REMOTE")); v == "0" || strings.EqualFold(v, "false") {
+		pricingOpts.Disabled = true
+		logger.Info("Pricing remote refresh disabled via OAT_PRICING_REMOTE=0; using embedded YAML only")
+	}
+	d.pricing = routing.LoadPricingWithRemote(pricingOpts)
+	if d.pricing.Count() > 0 {
+		logger.Info("Pricing registry loaded (%d models) — cost-aware routing available via OAT_ROUTING_V1=1", d.pricing.Count())
+	}
+
+	// Schema v2 identity snapshot — captured once so logOutcome doesn't pay
+	// for recomputation on every completion. Both fields decorate every
+	// OutcomeRecord written by this daemon process. If pricing reloads
+	// mid-run (LiteLLM background refresh), the snapshot deliberately stays
+	// pinned to the boot value — that's the correct behavior since the
+	// records' cost basis was set at decision time, not at log time.
+	d.oatVersion = formatOATVersion(version.Current())
+	d.pricingSnapshotID = d.pricing.SnapshotID()
+
+	// V2 router corpus snapshot — built once at startup so the first
+	// routing decision after daemon start doesn't pay the full corpus
+	// scan. Refreshed periodically by Start(). Failure here is silent;
+	// V2 just falls through to no-corpus behavior, which is V1-quality.
+	d.refreshCorpusIndex()
 
 	// Create socket server with streaming support
 	sh := &streamHandler{d: d}
 	d.server = socket.NewServer(paths.DaemonSock, socket.HandlerFunc(d.handleRequest), socket.WithStreamHandler(sh))
 
 	return d, nil
+}
+
+// formatOATVersion renders version.Info into the compact "<semver> (<sha>)"
+// shape stored on every OutcomeRecord. Strips the "(date)" segment because
+// the date isn't useful for grouping and the sha already pins the build.
+func formatOATVersion(v version.Info) string {
+	if v.IsDev || v.Version == "" {
+		if v.Commit != "" && v.Commit != "none" {
+			return "dev (" + v.Commit + ")"
+		}
+		return "dev"
+	}
+	if v.Commit != "" && v.Commit != "none" {
+		return v.Version + " (" + v.Commit + ")"
+	}
+	return v.Version
 }
 
 // Start starts the daemon
@@ -239,7 +396,70 @@ func (d *Daemon) Start() error {
 	go d.wakeLoop()
 	go d.prMonitorLoop()
 
+	// Routing-history PR backfiller (schema v2). Runs on its own ticker;
+	// d.cancel() in Stop() unwinds the loop and d.wg.Wait() blocks until it
+	// returns. No-op if NewPRBackfiller returned nil (which it won't here).
+	if d.prBackfiller != nil {
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			d.prBackfiller.Run(d.ctx)
+		}()
+	}
+
+	// V2 router corpus refresher — every corpusIndexRefreshInterval, rebuild
+	// the in-memory snapshot from disk so newly-completed records and fresh
+	// PR-merge observations from the backfiller's sidecar feed into routing.
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		t := time.NewTicker(corpusIndexRefreshInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-t.C:
+				d.refreshCorpusIndex()
+			}
+		}
+	}()
+
 	return nil
+}
+
+// refreshCorpusIndex rebuilds the V2 router's corpus snapshot. Called once
+// at New() and periodically by the goroutine in Start(). Reads the joined
+// corpus (main + sidecar) so historical success rates reflect the latest
+// PR-merge observations.
+//
+// Failures are logged at debug — V2 keeps working with the previous snapshot
+// (or with nil, which falls through to no-historical-data behavior).
+func (d *Daemon) refreshCorpusIndex() {
+	historyPath := routing.DefaultOutcomeHistoryPath(d.paths.Root)
+	sidecarPath := routing.DefaultBackfillSidecarPath(d.paths.Root)
+
+	records, _, err := routing.LoadCorpusJoined(historyPath, sidecarPath)
+	if err != nil {
+		if d.logger != nil {
+			d.logger.Debug("V2 corpus refresh failed: %v (using previous snapshot)", err)
+		}
+		return
+	}
+	idx := routing.BuildCorpusIndex(records)
+
+	d.corpusIndexMu.Lock()
+	d.corpusIndex = idx
+	d.corpusIndexMu.Unlock()
+}
+
+// getCorpusIndex returns the current V2 router corpus snapshot. Lock-light
+// for the per-spawn read path. May return nil during the brief window
+// between New() and the first refresh — V2 routing handles nil gracefully.
+func (d *Daemon) getCorpusIndex() *routing.CorpusIndex {
+	d.corpusIndexMu.RLock()
+	defer d.corpusIndexMu.RUnlock()
+	return d.corpusIndex
 }
 
 // Wait waits for the daemon to shut down
@@ -905,7 +1125,7 @@ func (d *Daemon) routeMessages() {
 			// Determine if this is a permanent failure (mark as failed) or transient (leave pending for retry).
 			// Permanent: agent adopted without PTY, or agent process is confirmed dead.
 			// Transient: temporary backend hiccup — message stays pending and retries next cycle.
-			permanentFailure := err == backend_pkg.ErrAgentAdopted
+			permanentFailure := errors.Is(err, backend_pkg.ErrAgentAdopted)
 			if !permanentFailure {
 				// Check if the target agent's process is actually dead
 				agent, exists := d.state.GetAgent(del.repoName, del.agentName)
@@ -982,11 +1202,21 @@ func repoHasActiveWorkers(repo *state.Repository) bool {
 	return false
 }
 
-// Final nudge messages sent when transitioning a repo to idle mode (one per agent type).
+// Final nudge messages sent when transitioning a repo to idle mode (one per
+// agent type). These used to carry meta-commentary ("before we pause nudges",
+// "after this we'll stop status checks until new workers are created") that
+// didn't drive agent behavior; compacted in the P1 release-prep pass while
+// preserving the actionable instructions. `sleep 30` is kept literal inside
+// the merge-queue template so agents don't reinterpret it as a busy-loop hint.
 const (
-	finalNudgeSupervisor = "[daemon] Final status check before we pause nudges. Check for any pending messages or follow-up; after this we'll stop status checks until new workers are created."
-	finalNudgeMergeQueue = "[daemon] Final status check: check for any open PRs to process before we pause nudges. After this we'll stop status checks until new workers are created.\nIMPORTANT: If any PR has CI still in progress, you MUST wait for it to finish. Poll CI status every 30 seconds for up to 5 minutes (run `gh run list --branch <branch> --limit 1`, then `sleep 30`, repeat). Do not stop checking until CI completes (pass or fail) and you have merged or reported all actionable PRs."
-	finalNudgePRShepherd = "[daemon] Final status check: review PRs on upstream, check CI, and rebase if needed before we pause nudges. After this we'll stop status checks until new workers are created."
+	finalNudgeSupervisor = "[daemon] Final status check. Any pending messages or follow-up?"
+
+	finalNudgeMergeQueue = "[daemon] Final status check. Merge any open PRs with green CI. " +
+		"For in-progress CI: poll `gh run list --branch <branch> --limit 1`, `sleep 30`, " +
+		"repeat, for up to 5 min. Don't stop until CI completes (pass/fail) and all " +
+		"actionable PRs are merged or reported."
+
+	finalNudgePRShepherd = "[daemon] Final check: review upstream PRs, check CI, rebase if needed."
 )
 
 // wakeAgents sends periodic nudges to agents. When a repo has no workers (idle mode), the daemon
@@ -1022,11 +1252,12 @@ func (d *Daemon) wakeAgents() {
 		// Uses ModifyRepo to atomically re-check that no workers appeared since the snapshot.
 		if !idle && !hasActive {
 			d.sendFinalNudgeToRepo(repoName, repo, now)
-			// TODO: notifyWorkspaceIdleTransition causes races with benchmark wave
-			// control -- it fires on fresh repos that never had workers, triggering the
-			// workspace to spawn workers before the benchmark gate finishes. Disabled
-			// pending redesign; see https://github.com/Root-IO-Labs/open-agent-teams/pull/58
-			// d.notifyWorkspaceIdleTransition(repoName, repo)
+			// Historical note: a notifyWorkspaceIdleTransition helper used to fire
+			// here so the workspace would spawn next-wave workers. It was removed
+			// because it raced with benchmark wave control — fresh repos that
+			// never had workers triggered a spawn before the benchmark gate
+			// finished. See https://github.com/Root-IO-Labs/open-agent-teams/pull/58
+			// for the redesign discussion.
 			if err := d.state.ModifyRepo(repoName, func(r *state.Repository) {
 				if !repoHasActiveWorkers(r) {
 					r.IdleMode = true
@@ -1073,6 +1304,10 @@ func (d *Daemon) sendFinalNudgeToRepo(repoName string, repo *state.Repository, n
 		if !d.shouldSendFinalNudge(agent) {
 			continue
 		}
+		// Attach daemon-state snapshot for supervisor/merge-queue so the agent
+		// doesn't respond to this nudge with a status-check shell loop.
+		// Non-target agent types pass through unchanged.
+		message = d.withRepoSnapshot(repoName, agent.Type, message)
 		if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, message); err != nil {
 			d.logger.Error("Failed to send final wake message to agent %s: %v", agentName, err)
 			continue
@@ -1083,28 +1318,6 @@ func (d *Daemon) sendFinalNudgeToRepo(repoName string, repo *state.Repository, n
 			d.logger.Error("Failed to update agent %s last nudge: %v", agentName, err)
 		}
 		d.logger.Debug("Sent final nudge to agent %s in repo %s", agentName, repoName)
-	}
-}
-
-// notifyWorkspaceIdleTransition sends a message to the workspace agent when
-// the repo transitions to idle mode (all workers finished). This is critical:
-// the workspace is responsible for spawning new workers (e.g., next wave of
-// issues after a gate passes). Without this nudge, the workspace stalls
-// because it is never nudged by the regular wake loop (by design) and idle
-// mode skips the repo entirely.
-func (d *Daemon) notifyWorkspaceIdleTransition(repoName string, repo *state.Repository) {
-	for agentName, agent := range repo.Agents {
-		if agent.Type != state.AgentTypeWorkspace || agent.ReadyForCleanup {
-			continue
-		}
-		msg := "[daemon] All workers have completed. Check for any remaining open issues that need workers assigned. If there are pending issues or a next wave of work, spawn workers now."
-		msgMgr := d.getMessageManager()
-		if _, err := msgMgr.Send(repoName, "daemon", agentName, msg); err != nil {
-			d.logger.Error("Failed to notify workspace about idle transition: %v", err)
-		} else {
-			d.logger.Info("Notified workspace agent about idle transition in repo %s", repoName)
-		}
-		d.triggerRouteMessages()
 	}
 }
 
@@ -1139,6 +1352,7 @@ func (d *Daemon) scheduleDelayedMergeQueueNudge(repoName string, repo *state.Rep
 			}
 			ciSummary := d.buildMergeQueueCISummary(repoPath)
 			message := "[daemon] Follow-up status check (3 min after idle). Check for any open PRs that may now have CI results.\n" + ciSummary
+			message = d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue, message)
 			if err := d.backend.SendMessage(d.ctx, sessionName, mqWindowName, message); err != nil {
 				d.logger.Error("Failed to send delayed merge-queue nudge for repo %s: %v", repoName, err)
 			} else {
@@ -1166,6 +1380,41 @@ func (d *Daemon) shouldSendFinalNudge(agent state.Agent) bool {
 	return true
 }
 
+// nudgeIntervalFor resolves the minimum nudge interval for an agent using a
+// three-step fallback ladder:
+//
+//  1. If the agent's resolved model has a non-zero Runtime.NudgeIntervalSeconds
+//     in its ModelProfile, use it.
+//  2. Otherwise fall back to the OAT_NUDGE_INTERVAL_SECONDS env var (default 60s).
+//  3. For the direct backend supervisor we clamp to at least 10 minutes to
+//     avoid chat-spam on operator-driven workflows.
+//
+// Returning 0 is never allowed — callers rely on a positive interval to debounce.
+func (d *Daemon) nudgeIntervalFor(repo *state.Repository, agent state.Agent) time.Duration {
+	// Env-based default (shared across all models).
+	def := time.Duration(getEnvInt("OAT_NUDGE_INTERVAL_SECONDS", 60)) * time.Second
+
+	// Per-model override: walk the resolution we use everywhere else
+	// (agent.Model → repo.Model) so the value sticks for the agent's lifetime.
+	modelID := agent.Model
+	if modelID == "" && repo != nil {
+		modelID = repo.Model
+	}
+	if d.modelProfiles != nil && modelID != "" {
+		if p := d.modelProfiles.Get(modelID); p != nil && p.Runtime.NudgeIntervalSeconds > 0 {
+			def = time.Duration(p.Runtime.NudgeIntervalSeconds) * time.Second
+		}
+	}
+
+	// Direct backend operator mode is chat-driven; reduce supervisor churn.
+	if d.isDirectBackend() && agent.Type == state.AgentTypeSupervisor {
+		if def < 10*time.Minute {
+			def = 10 * time.Minute
+		}
+	}
+	return def
+}
+
 // shouldNudgeAgent returns false if the agent should be skipped (workspace, dormant, recently nudged, or process not alive).
 func (d *Daemon) shouldNudgeAgent(repo *state.Repository, agentName string, agent state.Agent, now time.Time) bool {
 	if agent.Type == state.AgentTypeWorkspace {
@@ -1177,11 +1426,7 @@ func (d *Daemon) shouldNudgeAgent(repo *state.Repository, agentName string, agen
 	if agent.ReadyForCleanup {
 		return false
 	}
-	minNudgeInterval := time.Duration(getEnvInt("OAT_NUDGE_INTERVAL_SECONDS", 60)) * time.Second
-	// Direct backend operator mode is chat-driven; reduce supervisor churn/spam.
-	if d.isDirectBackend() && agent.Type == state.AgentTypeSupervisor {
-		minNudgeInterval = 10 * time.Minute
-	}
+	minNudgeInterval := d.nudgeIntervalFor(repo, agent)
 	if !agent.LastNudge.IsZero() && now.Sub(agent.LastNudge) < minNudgeInterval {
 		return false
 	}
@@ -1236,6 +1481,45 @@ func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now 
 		default:
 			continue
 		}
+		// Supervisor/merge-queue get a daemon-state snapshot appended so they
+		// don't respond to this nudge with a `oat worker list` / `gh pr list`
+		// loop. Other agent types pass through unchanged.
+		message = d.withRepoSnapshot(repoName, agent.Type, message)
+
+		// No-change skip: if the fully-composed message (including injected
+		// snapshot) is byte-identical to the last nudge sent to this agent,
+		// the LLM would spin up a turn just to read the same state. Skip
+		// the PTY send and record the skip. After maxNudgeSkips consecutive
+		// skips we always send a heartbeat so the agent proves liveness
+		// and picks up any out-of-band change we missed.
+		if d.shouldSkipNudgeForAgent(agent.Type) {
+			hash := hashNudgeContent(message)
+			maxSkips := nudgeSkipMax()
+			if hash == agent.LastNudgeHash && agent.NudgeSkipCount < maxSkips {
+				d.logger.Debug("Skipped no-change nudge to %s/%s (skip %d/%d)",
+					repoName, agentName, agent.NudgeSkipCount+1, maxSkips)
+				if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+					a.NudgeSkipCount++
+				}); err != nil {
+					d.logger.Error("Failed to update skip count for agent %s: %v", agentName, err)
+				}
+				continue
+			}
+			if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, message); err != nil {
+				d.logger.Error("Failed to send wake message to agent %s: %v", agentName, err)
+				continue
+			}
+			if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+				a.LastNudge = now
+				a.LastNudgeHash = hash
+				a.NudgeSkipCount = 0
+			}); err != nil {
+				d.logger.Error("Failed to update agent %s last nudge: %v", agentName, err)
+			}
+			d.logger.Debug("Woke agent %s in repo %s", agentName, repoName)
+			continue
+		}
+
 		if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, message); err != nil {
 			d.logger.Error("Failed to send wake message to agent %s: %v", agentName, err)
 			continue
@@ -1249,12 +1533,35 @@ func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now 
 	}
 }
 
-// worktreeRefreshLoop is disabled. Automatic worktree sync caused message
-// flooding and rebase churn. Workers now rebase only when the daemon notifies
-// them of a merge conflict (via pr_monitor) or on manual `oat refresh`.
-// The function is retained so existing tests still compile.
-func (d *Daemon) worktreeRefreshLoop() {
-	defer d.wg.Done()
+// shouldSkipNudgeForAgent reports whether the no-change nudge-skip logic
+// applies to this agent type. Only supervisor and merge-queue receive
+// daemon-injected state snapshots, so only they are vulnerable to the
+// "identical snapshot, duplicate turn" failure mode. Other persistent
+// agents still get the pre-existing unconditional nudge.
+func (d *Daemon) shouldSkipNudgeForAgent(t state.AgentType) bool {
+	return t == state.AgentTypeSupervisor || t == state.AgentTypeMergeQueue
+}
+
+// hashNudgeContent returns a short content hash of the fully-composed
+// nudge message. sha256 + hex → deterministic and collision-safe for our
+// volume. We store the hex string in state so a snapshot can be diffed
+// across daemon restarts.
+func hashNudgeContent(msg string) string {
+	sum := sha256.Sum256([]byte(msg))
+	return hex.EncodeToString(sum[:])
+}
+
+// nudgeSkipMax returns the configured ceiling on consecutive skipped
+// nudges to a single agent. At the default 60s wake cadence, a max of 5
+// means we force a liveness nudge every ~5 minutes even when state is
+// static. Override via OAT_NUDGE_SKIP_MAX; a value of 0 disables the
+// skip path entirely.
+func nudgeSkipMax() int {
+	n := getEnvInt("OAT_NUDGE_SKIP_MAX", 5)
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // refreshWorktrees syncs worker worktrees that are behind main
@@ -1274,7 +1581,7 @@ func (d *Daemon) refreshWorktrees() {
 			continue
 		}
 
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 
 		// Get the upstream remote and default branch
 		remote, err := wt.GetUpstreamRemote()
@@ -1315,7 +1622,7 @@ func (d *Daemon) refreshWorktrees() {
 			}
 
 			// Check worktree state
-			wtState, err := worktree.GetWorktreeState(agent.WorktreePath, remote, mainBranch)
+			wtState, err := worktree.GetWorktreeState(d.ctx, agent.WorktreePath, remote, mainBranch)
 			if err != nil {
 				d.logger.Debug("Could not get worktree state for %s/%s: %v", repoName, agentName, err)
 				continue
@@ -1329,7 +1636,7 @@ func (d *Daemon) refreshWorktrees() {
 
 			// Refresh the worktree
 			d.logger.Info("Refreshing worktree for %s/%s (%d commits behind)", repoName, agentName, wtState.CommitsBehind)
-			result := worktree.RefreshWorktree(agent.WorktreePath, remote, mainBranch)
+			result := worktree.RefreshWorktree(d.ctx, agent.WorktreePath, remote, mainBranch)
 
 			if result.Error != nil {
 				if result.HasConflicts {
@@ -1400,7 +1707,7 @@ func (d *Daemon) refreshWorktreesWithOptions(targetRepo, branch string) {
 				continue
 			}
 
-			wtState, err := worktree.GetWorktreeState(agent.WorktreePath, remote, syncBranch)
+			wtState, err := worktree.GetWorktreeState(d.ctx, agent.WorktreePath, remote, syncBranch)
 			if err != nil {
 				d.logger.Debug("Could not get worktree state for %s/%s: %v", repoName, agentName, err)
 				continue
@@ -1412,7 +1719,7 @@ func (d *Daemon) refreshWorktreesWithOptions(targetRepo, branch string) {
 			}
 
 			d.logger.Info("Syncing worktree for %s/%s (%d commits behind %s)", repoName, agentName, wtState.CommitsBehind, syncBranch)
-			result := worktree.RefreshWorktree(agent.WorktreePath, remote, syncBranch)
+			result := worktree.RefreshWorktree(d.ctx, agent.WorktreePath, remote, syncBranch)
 
 			if result.Error != nil {
 				if result.HasConflicts {
@@ -1474,7 +1781,9 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 	case "stop":
 		d.safeGo("daemon-stop", func() {
 			time.Sleep(100 * time.Millisecond)
-			d.Stop()
+			if err := d.Stop(); err != nil {
+				d.logger.Error("Daemon stop returned error: %v", err)
+			}
 		})
 		return socket.SuccessResponse("Daemon stopping")
 
@@ -1947,7 +2256,7 @@ func (d *Daemon) handleSendAgentInput(req socket.Request) socket.Response {
 	}
 
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, message); err != nil {
-		if err == backend_pkg.ErrAgentAdopted {
+		if errors.Is(err, backend_pkg.ErrAgentAdopted) {
 			return socket.ErrorResponse("agent '%s' was re-adopted after daemon restart and needs to be restarted before it can accept input", agentName)
 		}
 		return socket.ErrorResponse("failed to send input to agent '%s': %v", agentName, err)
@@ -2042,6 +2351,24 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 		}
 	}
 
+	// Log the outcome BEFORE removing from state (the logger reads agent fields).
+	// Workers killed without having reached ReadyForCleanup are recorded as "removed"
+	// so the replay harness can distinguish crash/timeout from graceful completion.
+	if agentExists && (agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification) {
+		outcome := "removed"
+		if agent.ReadyForCleanup {
+			// Already logged at handleCompleteAgent — don't double-log.
+			outcome = ""
+		}
+		if outcome != "" {
+			// Reason source priority: explicit `reason` arg (supervisor /
+			// budget-cap / re-route flows pass it) → fall back to "manual"
+			// for the bare CLI `oat agent remove` path.
+			reason := getOptionalStringArg(req.Args, "reason", RemovalReasonManual)
+			d.logOutcome(repoName, agentName, agent, outcome, reason)
+		}
+	}
+
 	if err := d.state.RemoveAgent(repoName, agentName); err != nil {
 		return socket.ErrorResponse("%s", err.Error())
 	}
@@ -2130,7 +2457,7 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 			// Get current branch from worktree
 			branch := ""
 			if agent.WorktreePath != "" {
-				if b, err := worktree.GetCurrentBranch(agent.WorktreePath); err == nil {
+				if b, err := worktree.GetCurrentBranch(d.ctx, agent.WorktreePath); err == nil {
 					branch = b
 				}
 			}
@@ -2310,6 +2637,10 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 
 	d.logger.Info("Agent %s/%s marked as ready for cleanup", repoName, agentName)
 
+	// Append to routing-history.jsonl for offline replay analysis. Outcome is
+	// "completed" here; the PR merge-status backfill happens separately.
+	d.logOutcome(repoName, agentName, agent, "completed", "")
+
 	// Close associated issue when a worker self-completes without a PR.
 	// This covers the "impossible task" scenario where the worker determines
 	// the work cannot be done and calls oat agent complete directly.
@@ -2340,30 +2671,38 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 	if !alreadyNotified && (agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification) {
 		msgMgr := d.getMessageManager()
 
-		if agent.Type == state.AgentTypeWorker {
-			supervisorMessage := fmt.Sprintf("[daemon] Worker '%s' has completed and may have a PR to merge. Merge-queue has also been notified.", agentName)
+		switch agent.Type {
+		case state.AgentTypeWorker:
+			// Attach a pre-computed state snapshot so supervisor / merge-queue
+			// don't run `oat worker list` / `gh pr list` themselves. See
+			// daemon_messaging.go for the chokepoint that makes this decision.
+			supervisorMessage := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor,
+				fmt.Sprintf("[daemon] Worker '%s' has completed and may have a PR to merge. Merge-queue has also been notified.", agentName))
 			if _, err := msgMgr.Send(repoName, "daemon", "supervisor", supervisorMessage); err != nil {
 				d.logger.Error("Failed to send completion message to supervisor: %v", err)
 			} else {
 				d.logger.Info("Sent completion notification to supervisor for worker %s", agentName)
 			}
 
-			mergeQueueMessage := fmt.Sprintf("[daemon] Worker '%s' has completed and may have a PR. Check for new PRs to process.", agentName)
+			mergeQueueMessage := d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue,
+				fmt.Sprintf("[daemon] Worker '%s' has completed and may have a PR. Check for new PRs to process.", agentName))
 			if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mergeQueueMessage); err != nil {
 				d.logger.Error("Failed to send completion message to merge-queue: %v", err)
 			} else {
 				d.logger.Info("Sent completion notification to merge-queue for worker %s", agentName)
 			}
-		} else if agent.Type == state.AgentTypeReview {
-			mergeQueueMessage := fmt.Sprintf("[daemon] Review agent '%s' has completed its review. Check the review summary and decide on next steps.", agentName)
+		case state.AgentTypeReview:
+			mergeQueueMessage := d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue,
+				fmt.Sprintf("[daemon] Review agent '%s' has completed its review. Check the review summary and decide on next steps.", agentName))
 			if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mergeQueueMessage); err != nil {
 				d.logger.Error("Failed to send completion message to merge-queue: %v", err)
 			} else {
 				d.logger.Info("Sent completion notification to merge-queue for review agent %s", agentName)
 			}
-		} else if agent.Type == state.AgentTypeVerification {
+		case state.AgentTypeVerification:
 			// Notify supervisor that verification completed
-			supervisorMessage := fmt.Sprintf("[daemon] Verification agent '%s' has completed. The linked worker should have received the verdict.", agentName)
+			supervisorMessage := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor,
+				fmt.Sprintf("[daemon] Verification agent '%s' has completed. The linked worker should have received the verdict.", agentName))
 			if _, err := msgMgr.Send(repoName, "daemon", "supervisor", supervisorMessage); err != nil {
 				d.logger.Error("Failed to send completion message to supervisor: %v", err)
 			} else {
@@ -2465,6 +2804,14 @@ func (d *Daemon) handleStartVerification(req socket.Request) socket.Response {
 		return errResp
 	}
 
+	// Snapshot the remote default branch SHA so the verifier diffs against
+	// a pinned base. Without this pin, commits that land on origin/main
+	// between the worker's rebase and the verifier's diff appear as
+	// "deletions" in the verifier's view. Best-effort: failures fall back
+	// to live origin/main..HEAD on the verifier side.
+	repoPath := d.paths.RepoDir(repoName)
+	baseSHA := d.snapshotRemoteBaseSHA(repoPath)
+
 	// Atomically set all verification fields on the worker
 	err := d.state.ModifyAgent(repoName, workerName, func(a *state.Agent) {
 		a.VerificationAgent = verifierName
@@ -2473,18 +2820,91 @@ func (d *Daemon) handleStartVerification(req socket.Request) socket.Response {
 		a.VerificationReason = ""
 		a.VerificationAt = time.Time{}
 		a.LastBranchSHA = commitSHA
+		a.BaseSHA = baseSHA
 	})
 	if err != nil {
 		return socket.ErrorResponse("failed to set verification state: %v", err)
 	}
 
-	d.logger.Info("Verification started for worker %s/%s by %s (SHA: %s)", repoName, workerName, verifierName, commitSHA[:min(len(commitSHA), 8)])
+	if baseSHA != "" {
+		d.logger.Info("Verification started for worker %s/%s by %s (SHA: %s, base: %s)", repoName, workerName, verifierName, commitSHA[:min(len(commitSHA), 8)], baseSHA[:min(len(baseSHA), 8)])
+	} else {
+		d.logger.Info("Verification started for worker %s/%s by %s (SHA: %s, base: <unpinned>)", repoName, workerName, verifierName, commitSHA[:min(len(commitSHA), 8)])
+	}
 
 	// Trigger immediate wake so the verification agent gets nudged right away
 	// instead of waiting for the next polling tick (up to 60s).
 	d.triggerWake()
 
 	return socket.SuccessResponse(fmt.Sprintf("verification pending for worker '%s'", workerName))
+}
+
+// snapshotRemoteBaseSHA fetches the remote default branch and returns its
+// commit SHA. The result is meant to be persisted on the worker's state so
+// the verifier can diff against this pinned base instead of live
+// origin/main. Returns "" on any failure (caller falls back to live ref).
+//
+// Steps:
+//  1. Resolve the default branch ref (origin/HEAD → origin/<default>;
+//     fallback probe origin/main, origin/master).
+//  2. git fetch origin <branch> (best-effort; offline daemon still gets
+//     the last-fetched SHA below).
+//  3. git rev-parse <ref>.
+//
+// All sub-commands are scoped to d.ctx via exec.CommandContext (PR #85
+// noctx lint).
+func (d *Daemon) snapshotRemoteBaseSHA(repoPath string) string {
+	if repoPath == "" {
+		return ""
+	}
+
+	branchRef := d.resolveDefaultBranchRef(repoPath)
+	if branchRef == "" {
+		return ""
+	}
+
+	// branchRef is e.g. "origin/main"; the bare branch name (after the
+	// "origin/" prefix) is what `git fetch origin <branch>` expects.
+	branchName := strings.TrimPrefix(branchRef, "origin/")
+	if branchName != "" {
+		fetchCmd := exec.CommandContext(d.ctx, "git", "fetch", "origin", branchName)
+		fetchCmd.Dir = repoPath
+		if out, err := fetchCmd.CombinedOutput(); err != nil {
+			d.logger.Warn("BaseSHA snapshot: git fetch origin %s failed in %s: %v (%s); using last-fetched SHA", branchName, repoPath, err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	revParseCmd := exec.CommandContext(d.ctx, "git", "rev-parse", branchRef)
+	revParseCmd.Dir = repoPath
+	out, err := revParseCmd.Output()
+	if err != nil {
+		d.logger.Warn("BaseSHA snapshot: git rev-parse %s failed in %s: %v; verifier will fall back to live origin/main", branchRef, repoPath, err)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// resolveDefaultBranchRef returns the remote default branch as
+// "origin/<name>". Mirrors verify_helpers.go getBaseBranchRef().
+func (d *Daemon) resolveDefaultBranchRef(repoPath string) string {
+	symCmd := exec.CommandContext(d.ctx, "git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	symCmd.Dir = repoPath
+	if out, err := symCmd.Output(); err == nil {
+		refPath := strings.TrimSpace(string(out))
+		if parts := strings.SplitN(refPath, "refs/remotes/", 2); len(parts) == 2 {
+			return parts[1]
+		}
+	}
+
+	for _, branch := range []string{"origin/main", "origin/master"} {
+		probe := exec.CommandContext(d.ctx, "git", "rev-parse", "--verify", branch)
+		probe.Dir = repoPath
+		if err := probe.Run(); err == nil {
+			return branch
+		}
+	}
+
+	return ""
 }
 
 // handleStartVerificationAgent starts a verification agent process via the daemon
@@ -2692,8 +3112,8 @@ func (d *Daemon) handleVerificationVerdict(req socket.Request) socket.Response {
 
 	if worker.IsDormant() {
 		d.wakeWorker(repoName, workerName, worker, verdictMsg)
-	} else {
-		msgMgr.Send(repoName, "daemon", workerName, verdictMsg)
+	} else if _, err := msgMgr.Send(repoName, "daemon", workerName, verdictMsg); err != nil {
+		d.logger.Warn("Failed to deliver verdict message to %s/%s: %v", repoName, workerName, err)
 	}
 
 	d.logger.Info("Verification verdict for %s/%s: %s (SHA: %s)", repoName, workerName, verdict, sha[:min(len(sha), 8)])
@@ -2799,18 +3219,28 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 
 		args := []string{"--auto-approve"}
 
+		// Re-validate the model against the current profile store and repo
+		// allowlist. Without this, startRegisteredAgent restored agents with
+		// models that may since have been un-onboarded or disallowed — the
+		// "silent bypass" identified in the routing live-test audit.
+		// Validation errors are non-fatal here: the agent still starts with
+		// its historical model (operator visibility wins over refusal for
+		// restore paths), but the WARN gives the operator a trail.
 		resolvedModel := agent.Model
 		if resolvedModel == "" {
 			resolvedModel = repo.Model
 		}
 		if resolvedModel != "" {
+			if vErr := d.validateModelForAgentType(resolvedModel, agent.Type, repo.AllowedWorkerModels); vErr != nil {
+				d.logger.Warn("Model routing: %s/%s restoring with model %q despite validation error: %v — consider re-onboarding or updating allowlist", repoName, agentName, resolvedModel, vErr)
+			}
 			args = append(args, "-M", resolvedModel)
 			// Persist resolved model so TUI/CLI can display it
 			if agent.Model == "" {
 				agent.Model = resolvedModel
 			}
 		}
-		args = append(args, "--model-params", defaultModelParams)
+		args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
 
 		isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
 		logFile := d.paths.AgentLogFile(repoName, agentName, isWorker)
@@ -3000,11 +3430,13 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 
 		if !alreadyNotified {
 			msgMgr := d.getMessageManager()
-			supervisorMsg := fmt.Sprintf("[daemon] Worker '%s' auto-completed (no PR found). Merge-queue has also been notified.", agentName)
+			supervisorMsg := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor,
+				fmt.Sprintf("[daemon] Worker '%s' auto-completed (no PR found). Merge-queue has also been notified.", agentName))
 			if _, err := msgMgr.Send(repoName, "daemon", "supervisor", supervisorMsg); err != nil {
 				d.logger.Error("Failed to send auto-complete notification to supervisor: %v", err)
 			}
-			mergeQueueMsg := fmt.Sprintf("[daemon] Worker '%s' auto-completed (no PR found). Check for new PRs to process.", agentName)
+			mergeQueueMsg := d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue,
+				fmt.Sprintf("[daemon] Worker '%s' auto-completed (no PR found). Check for new PRs to process.", agentName))
 			if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mergeQueueMsg); err != nil {
 				d.logger.Error("Failed to send auto-complete notification to merge-queue: %v", err)
 			}
@@ -3046,7 +3478,8 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 
 				if !alreadyNotified {
 					msgMgr := d.getMessageManager()
-					supervisorMsg := fmt.Sprintf("[daemon] Worker '%s' auto-completed: PR #%d already %s.", agentName, agent.PRNumber, strings.ToLower(result.State))
+					supervisorMsg := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor,
+						fmt.Sprintf("[daemon] Worker '%s' auto-completed: PR #%d already %s.", agentName, agent.PRNumber, strings.ToLower(result.State)))
 					if _, err := msgMgr.Send(repoName, "daemon", "supervisor", supervisorMsg); err != nil {
 						d.logger.Error("Failed to send auto-complete notification to supervisor: %v", err)
 					}
@@ -3117,7 +3550,8 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 	// is going back to sleep for the same PR — merge-queue already knows).
 	if agent.PRNumber > 0 && !wasAlreadyWaiting {
 		msgMgr := d.getMessageManager()
-		mqMsg := fmt.Sprintf("[daemon] Worker '%s' has submitted PR #%d. Please check and merge when CI is green.", agentName, agent.PRNumber)
+		mqMsg := d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue,
+			fmt.Sprintf("[daemon] Worker '%s' has submitted PR #%d. Please check and merge when CI is green.", agentName, agent.PRNumber))
 		if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mqMsg); err != nil {
 			d.logger.Error("Failed to notify merge-queue about dormant worker %s/%s: %v", repoName, agentName, err)
 		}
@@ -3488,13 +3922,16 @@ func (d *Daemon) handleUpdateRepoConfig(req socket.Request) socket.Response {
 		}
 
 		repo, _ := d.state.GetRepo(name)
+		if repo == nil {
+			return socket.ErrorResponse("repo %s disappeared after worker model update", name)
+		}
 		d.logger.Info("Updated allowed worker models for repo %s: action=%s, models=%v", name, workerModelsAction, repo.AllowedWorkerModels)
 
 		// Drift detection: when set/remove/clear causes a model to transition
 		// from allowed → disallowed, any worker currently running on it will
 		// be rerouted on the next restart. Warn per affected worker so
 		// operators aren't surprised. add cannot narrow the allow-list.
-		if repo != nil && (workerModelsAction == "remove" || workerModelsAction == "set" || workerModelsAction == "clear") {
+		if workerModelsAction == "remove" || workerModelsAction == "set" || workerModelsAction == "clear" {
 			removedSet := computeRemovedWorkerModels(previousAllowed, repo.AllowedWorkerModels)
 			if len(removedSet) > 0 {
 				for agentName, agent := range repo.Agents {
@@ -3595,18 +4032,32 @@ func (d *Daemon) cleanupDeadAgents(deadAgents map[string][]string) []string {
 				if strings.HasPrefix(agentName, "verify-") {
 					linkedWorker := strings.TrimPrefix(agentName, "verify-")
 					if worker, wExists := d.state.GetAgent(repoName, linkedWorker); wExists && worker.VerificationStatus == "pending" && worker.VerificationAgent == agentName {
+						// Guard: if the verifier was already marked
+						// ReadyForCleanup, it cleanly delivered a verdict
+						// (handleSetVerdict sets ReadyForCleanup=true). The
+						// worker's status being "pending" at this moment
+						// means a concurrent request-review reset it, NOT
+						// that the verifier crashed. Skip the bogus crash
+						// wake-message but still clear the orphaned
+						// verifier-name pointer so the worker's state stays
+						// internally consistent.
+						verdictDelivered := agent.ReadyForCleanup
 						_ = d.state.ModifyAgent(repoName, linkedWorker, func(a *state.Agent) {
 							a.VerificationStatus = ""
 							a.VerificationAgent = ""
 						})
-						d.logger.Info("Reset pending verification status for worker %s (verifier %s cleaned up)", linkedWorker, agentName)
+						if verdictDelivered {
+							d.logger.Info("Verifier %s already delivered verdict; clearing stale worker pointer without crash wake-message", agentName)
+						} else {
+							d.logger.Info("Reset pending verification status for worker %s (verifier %s cleaned up)", linkedWorker, agentName)
 
-						// Re-read the worker after modifying to get updated state
-						if updatedWorker, ok := d.state.GetAgent(repoName, linkedWorker); ok && updatedWorker.IsDormant() {
-							wakeMsg := fmt.Sprintf("[daemon] Your verification agent '%s' crashed before delivering a verdict. "+
-								"Self-verify and create your PR: run `oat worker verify` then `oat pr create`.", agentName)
-							d.wakeWorker(repoName, linkedWorker, updatedWorker, wakeMsg)
-							d.logger.Info("Woke dormant worker %s (verifier %s crashed)", linkedWorker, agentName)
+							// Re-read the worker after modifying to get updated state
+							if updatedWorker, ok := d.state.GetAgent(repoName, linkedWorker); ok && updatedWorker.IsDormant() {
+								wakeMsg := fmt.Sprintf("[daemon] Your verification agent '%s' crashed before delivering a verdict. "+
+									"Self-verify and create your PR: run `oat worker verify` then `oat pr create`.", agentName)
+								d.wakeWorker(repoName, linkedWorker, updatedWorker, wakeMsg)
+								d.logger.Info("Woke dormant worker %s (verifier %s crashed)", linkedWorker, agentName)
+							}
 						}
 					}
 				}
@@ -3643,7 +4094,7 @@ func (d *Daemon) cleanupDeadAgents(deadAgents map[string][]string) []string {
 			// Clean up worktree if it exists and differs from the repo dir
 			repoPath := d.paths.RepoDir(repoName)
 			if agent.WorktreePath != "" && agent.WorktreePath != repoPath {
-				wt := worktree.NewManager(repoPath)
+				wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 				if err := wt.Remove(agent.WorktreePath, true); err != nil {
 					d.logger.Warn("Failed to remove worktree %s: %v", agent.WorktreePath, err)
 				} else {
@@ -3667,7 +4118,7 @@ func (d *Daemon) recordTaskHistory(repoName, agentName string, agent state.Agent
 	// Get the branch name from the worktree if it exists
 	branch := ""
 	if agent.WorktreePath != "" {
-		if b, err := worktree.GetCurrentBranch(agent.WorktreePath); err == nil {
+		if b, err := worktree.GetCurrentBranch(d.ctx, agent.WorktreePath); err == nil {
 			branch = b
 		} else {
 			// Fallback: construct expected branch name
@@ -3685,6 +4136,7 @@ func (d *Daemon) recordTaskHistory(repoName, agentName string, agent state.Agent
 		Name:          agentName,
 		Task:          agent.Task,
 		Branch:        branch,
+		PRNumber:      agent.PRNumber,
 		Status:        status, // Will be updated when displaying if a PR exists
 		Summary:       agent.Summary,
 		FailureReason: agent.FailureReason,
@@ -3817,7 +4269,7 @@ func (d *Daemon) handleSpawnAgent(req socket.Request) socket.Response {
 	repoPath := d.paths.RepoDir(repoName)
 	worktreePath := d.paths.AgentWorktree(repoName, agentName)
 
-	wt := worktree.NewManager(repoPath)
+	wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 
 	if agentClass == "persistent" {
 		// Persistent agents get their own worktree in detached HEAD mode
@@ -3863,8 +4315,12 @@ func (d *Daemon) handleSpawnAgent(req socket.Request) socket.Response {
 	}
 
 	if err := d.startAgentWithConfig(repoName, repo, cfg); err != nil {
-		d.backend.StopAgent(d.ctx, repo.SessionName, agentName)
-		wt.Remove(worktreePath, true)
+		if stopErr := d.backend.StopAgent(d.ctx, repo.SessionName, agentName); stopErr != nil {
+			d.logger.Warn("cleanup: StopAgent after failed start for %s/%s: %v", repoName, agentName, stopErr)
+		}
+		if rmErr := wt.Remove(worktreePath, true); rmErr != nil {
+			d.logger.Warn("cleanup: worktree remove after failed start for %s/%s: %v", repoName, agentName, rmErr)
+		}
 		return socket.ErrorResponse("failed to start agent: %v", err)
 	}
 
@@ -3906,7 +4362,7 @@ func (d *Daemon) cleanupOrphanedWorktrees(recentlyRemovedPaths []string) {
 			continue
 		}
 
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 
 		// Prune stale git worktree references BEFORE checking for orphans
 		// so that git worktree list returns the most accurate state possible.
@@ -3970,7 +4426,7 @@ func (d *Daemon) cleanupMergedBranches() {
 			continue
 		}
 
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 
 		// Clean up merged branches with common oat prefixes.
 		// Delete local branches first, then selectively delete remote branches
@@ -4222,7 +4678,7 @@ func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) erro
 	supervisorWtPath := d.paths.AgentWorktree(repoName, "supervisor")
 	if _, err := os.Stat(supervisorWtPath); os.IsNotExist(err) {
 		d.logger.Info("Creating supervisor worktree for %s", repoName)
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 		if err := wt.Prune(); err != nil {
 			d.logger.Warn("Failed to prune worktrees for %s: %v", repoName, err)
 		}
@@ -4327,7 +4783,7 @@ func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) erro
 		workspaceName = "default"
 		workspacePath = d.paths.AgentWorktree(repoName, workspaceName)
 		d.logger.Info("Creating workspace worktree for %s", repoName)
-		wt := worktree.NewManager(repoPath)
+		wt := worktree.NewManagerWithContext(d.ctx, repoPath)
 
 		if err := wt.Prune(); err != nil {
 			d.logger.Warn("Failed to prune worktrees for %s: %v", repoName, err)
@@ -4432,7 +4888,7 @@ func (d *Daemon) sendAgentDefinitionsToSupervisor(repoName, repoPath string, mqC
 	isForkMode := forkConfig.IsFork || forkConfig.ForceForkMode
 	if isForkMode {
 		sb.WriteString("## Fork Mode (ACTIVE)\n")
-		sb.WriteString(fmt.Sprintf("This repository is a fork of **%s/%s**.\n\n", forkConfig.UpstreamOwner, forkConfig.UpstreamRepo))
+		fmt.Fprintf(&sb, "This repository is a fork of **%s/%s**.\n\n", forkConfig.UpstreamOwner, forkConfig.UpstreamRepo)
 		sb.WriteString("**Key differences in fork mode:**\n")
 		sb.WriteString("- Use `pr-shepherd` instead of `merge-queue`\n")
 		sb.WriteString("- PRs target the upstream repository\n")
@@ -4441,7 +4897,7 @@ func (d *Daemon) sendAgentDefinitionsToSupervisor(repoName, repoPath string, mqC
 		sb.WriteString("## PR Shepherd Configuration\n")
 		if psConfig.Enabled {
 			sb.WriteString("- Enabled: yes\n")
-			sb.WriteString(fmt.Sprintf("- Track Mode: %s\n\n", psConfig.TrackMode))
+			fmt.Fprintf(&sb, "- Track Mode: %s\n\n", psConfig.TrackMode)
 		} else {
 			sb.WriteString("- Enabled: no (do NOT spawn pr-shepherd agent)\n\n")
 		}
@@ -4450,7 +4906,7 @@ func (d *Daemon) sendAgentDefinitionsToSupervisor(repoName, repoPath string, mqC
 		sb.WriteString("## Merge Queue Configuration\n")
 		if mqConfig.Enabled {
 			sb.WriteString("- Enabled: yes\n")
-			sb.WriteString(fmt.Sprintf("- Track Mode: %s\n\n", mqConfig.TrackMode))
+			fmt.Fprintf(&sb, "- Track Mode: %s\n\n", mqConfig.TrackMode)
 		} else {
 			sb.WriteString("- Enabled: no (do NOT spawn merge-queue agent)\n\n")
 		}
@@ -4466,7 +4922,7 @@ func (d *Daemon) sendAgentDefinitionsToSupervisor(repoName, repoPath string, mqC
 			continue
 		}
 
-		sb.WriteString(fmt.Sprintf("--- Agent Definition %d: %s (source: %s) ---\n", i+1, def.Name, def.Source))
+		fmt.Fprintf(&sb, "--- Agent Definition %d: %s (source: %s) ---\n", i+1, def.Name, def.Source)
 
 		// For merge-queue, prepend the tracking mode configuration if enabled
 		if def.Name == "merge-queue" && mqConfig.Enabled {
@@ -4495,19 +4951,17 @@ func (d *Daemon) sendAgentDefinitionsToSupervisor(repoName, repoPath string, mqC
 	sb.WriteString("Workers are created by the workspace agent or by users. You do not create workers proactively.\n")
 	sb.WriteString("Your role: monitor agents, nudge stuck ones, and handle escalations.\n")
 
-	// Send message to supervisor
+	// Send message to supervisor — attach an initial (likely empty) state
+	// snapshot so the supervisor's "trust the snapshot" policy has a concrete
+	// anchor from turn 1, not just in later nudges.
 	msgMgr := d.getMessageManager()
-	if _, err := msgMgr.Send(repoName, "daemon", "supervisor", sb.String()); err != nil {
+	supMsg := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor, sb.String())
+	if _, err := msgMgr.Send(repoName, "daemon", "supervisor", supMsg); err != nil {
 		return fmt.Errorf("failed to send message to supervisor: %w", err)
 	}
 
 	d.logger.Info("Sent %d agent definition(s) to supervisor for repo %s", len(definitions), repoName)
 	return nil
-}
-
-// quoteForShell returns s quoted for safe use in a shell command (handles spaces and single quotes).
-func quoteForShell(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // getAgentBinaryPath resolves the oat-agent binary path.
@@ -4590,12 +5044,92 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		d.logger.Warn("Failed to copy hooks config: %v", err)
 	}
 
-	// Resolve and validate model before anything else — needed for both
-	// state registration and CLI args, regardless of test mode.
-	resolvedModel, modelErr := d.resolveAndValidateModel(cfg.model, repo.Model, cfg.agentType, repo.AllowedWorkerModels)
-	if modelErr != nil {
-		return fmt.Errorf("model routing: %w", modelErr)
+	// Resolve and validate model. Three code paths, gated by env flags:
+	//
+	// 1. Router V2 (OAT_ROUTER_VERSION=v2): lookup-aware routing via
+	//    RouteForTaskV2. Same eligibility/floor as V1, then re-ranks
+	//    candidates by static_score × historical_factor (Wilson lower bound
+	//    on per-(model,complexity) success rate, with N>=5 threshold).
+	//    Falls through to V1 behavior on empty/sparse corpus. Beats V1 when
+	//    the corpus has signal.
+	//
+	// 2. Router V1 (OAT_ROUTING_V1=1, V2 not set): cost-aware routing via
+	//    RouteForTask. Picks cheapest model meeting the tier floor.
+	//
+	// 3. Default: resolveAndValidateModelWithSource (argmax score within
+	//    allowlist). Pre-rewrite behavior.
+	//
+	// The flags exist so A/B comparison is possible without a branch switch.
+	var resolvedModel, routingSource string
+	var routingDecisionReason string
+	var routingCandidates []string
+	var modelErr error
+
+	v2Enabled := os.Getenv("OAT_ROUTER_VERSION") == "v2"
+	v1Enabled := os.Getenv("OAT_ROUTING_V1") == "1" || v2Enabled // V2 requires the V1 stack
+	routerEligible := v1Enabled &&
+		cfg.agentType == state.AgentTypeWorker &&
+		cfg.model == "" &&
+		d.pricing != nil && d.pricing.Count() > 0 &&
+		d.modelProfiles != nil && d.modelProfiles.Count() > 0
+
+	if routerEligible {
+		// Strip the "Task: " prefix startAgentConfig adds, so the classifier
+		// sees the user's actual task description.
+		taskText := strings.TrimPrefix(cfg.initialMessage, "Task: ")
+		routeCtx := routing.RouteContext{
+			TaskText:      taskText,
+			Role:          routing.RoleWorker,
+			AllowedModels: repo.AllowedWorkerModels,
+		}
+		var decision *routing.RouteDecision
+		var routeErr error
+		if v2Enabled {
+			decision, routeErr = d.modelProfiles.RouteForTaskV2(routeCtx, d.pricing, d.getCorpusIndex())
+		} else {
+			decision, routeErr = d.modelProfiles.RouteForTask(routeCtx, d.pricing)
+		}
+		routerName := "RouterV1"
+		if v2Enabled {
+			routerName = "RouterV2"
+		}
+		if routeErr != nil {
+			d.logger.Warn("%s: %v — falling back to default router", routerName, routeErr)
+		} else {
+			d.logger.Info("%s: %s  complexity=%s  candidates=%v", routerName, decision.Reason, decision.Complexity, decision.Candidates)
+			// Validate the pick (handles status=restricted + allowlist recheck).
+			if vErr := d.validateModelForAgentType(decision.ChosenModel, cfg.agentType, repo.AllowedWorkerModels); vErr != nil {
+				d.logger.Warn("%s picked %s but validation failed: %v — falling back", routerName, decision.ChosenModel, vErr)
+			} else {
+				resolvedModel = decision.ChosenModel
+				routingSource = decision.RoutingSource
+				routingDecisionReason = decision.Reason
+				routingCandidates = decision.Candidates
+			}
+		}
 	}
+
+	// Fall through to default router if V1 was not eligible or failed.
+	if resolvedModel == "" {
+		resolvedModel, routingSource, modelErr = d.resolveAndValidateModelWithSource(cfg.model, repo.Model, cfg.agentType, repo.AllowedWorkerModels)
+		if modelErr != nil {
+			return fmt.Errorf("model routing: %w", modelErr)
+		}
+	}
+
+	// Capture prompt metadata BEFORE the backend-spawn block so test-mode
+	// agents (which skip backend) still get hashes. Reading the prompt file
+	// here is a duplicate of the read inside StartAgent below; it's cheap
+	// (small files) and the duplication is preferable to threading the
+	// content through extra plumbing. Failures are silent: prompt metadata
+	// is best-effort, never blocks spawn.
+	var spawnSystemPromptContent string
+	if cfg.promptFile != "" {
+		if data, readErr := os.ReadFile(cfg.promptFile); readErr == nil {
+			spawnSystemPromptContent = string(data)
+		}
+	}
+	taskTextForHash := strings.TrimPrefix(cfg.initialMessage, "Task: ")
 
 	var pid int
 
@@ -4622,7 +5156,7 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		if resolvedModel != "" {
 			args = append(args, "-M", resolvedModel)
 		}
-		args = append(args, "--model-params", defaultModelParams)
+		args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
 
 		// Determine log file path
 		isWorker := cfg.agentType == state.AgentTypeWorker || cfg.agentType == state.AgentTypeReview || cfg.agentType == state.AgentTypeVerification
@@ -4671,13 +5205,21 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 
 	// Register agent with state
 	agent := state.Agent{
-		Type:         cfg.agentType,
-		WorktreePath: cfg.workDir,
-		WindowName:   cfg.agentName,
-		SessionID:    sessionID,
-		PID:          pid,
-		CreatedAt:    time.Now(),
-		Model:        resolvedModel,
+		Type:                  cfg.agentType,
+		WorktreePath:          cfg.workDir,
+		WindowName:            cfg.agentName,
+		SessionID:             sessionID,
+		PID:                   pid,
+		CreatedAt:             time.Now(),
+		Model:                 resolvedModel,
+		RoutingSource:         routingSource,
+		RoutingDecisionReason: routingDecisionReason,
+		RoutingCandidates:     routingCandidates,
+		RoutingAllowlist:      append([]string(nil), repo.AllowedWorkerModels...),
+		PromptSystemHash:      routing.HashPromptText(spawnSystemPromptContent),
+		PromptSystemTokens:    routing.EstimateTokens(spawnSystemPromptContent),
+		PromptUserHash:        routing.HashPromptText(taskTextForHash),
+		PromptUserTokens:      routing.EstimateTokens(taskTextForHash),
 	}
 
 	if err := d.state.AddAgent(repoName, cfg.agentName, agent); err != nil {
@@ -4738,8 +5280,8 @@ func (d *Daemon) startOutputWatcher(repoName, agentName, logFile string) {
 		return
 	}
 
-	// Seek to end — we only want new output
-	f.Seek(0, 2)
+	// Seek to end — we only want new output; best-effort (fall back to reading from 0 on failure).
+	_, _ = f.Seek(0, 2)
 
 	watcher := agent_pkg.NewOutputWatcher(f)
 
@@ -5073,7 +5615,7 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	}
 
 	// Always regenerate prompt file on restart so code changes take effect
-	promptFile, err := d.writePromptFile(repoName, prompts.AgentType(agent.Type), agentName)
+	promptFile, err := d.writePromptFile(repoName, agent.Type, agentName)
 	if err != nil {
 		return fmt.Errorf("failed to regenerate prompt file: %w", err)
 	}
@@ -5095,16 +5637,39 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		}
 	}
 
-	// Validate model on restart (prevents switching to an ineligible model)
+	// Validate model on restart (prevents switching to an ineligible model).
+	//
+	// On validation failure we try harder than the previous "fallback to
+	// previous model" path, which silently kept the un-validatable model alive
+	// — the supervisor-on-flash bug from the Phase 5 audit. Strategy:
+	//
+	//   1. Try the agent's stored model (respects operator-set overrides).
+	//   2. If rejected, auto-select from the pool (explicitModel="" triggers
+	//      BestEligible inside resolveAndValidateModel).
+	//   3. If THAT also fails (no eligible models at all), log an error and
+	//      fall back to agent.Model just to keep the agent running — operator
+	//      has visibility via WARN and can fix the team.
 	resolvedModel, modelErr := d.resolveAndValidateModel(agent.Model, repo.Model, agent.Type, repo.AllowedWorkerModels)
 	if modelErr != nil {
-		d.logger.Warn("Model routing failed on restart for %s: %v — falling back to previous model", agentName, modelErr)
-		resolvedModel = resolveAgentModel(agent, repo)
+		d.logger.Warn("Model routing failed on restart for %s: %v — attempting auto-select from pool", agentName, modelErr)
+		autoResolved, autoErr := d.resolveAndValidateModel("", repo.Model, agent.Type, repo.AllowedWorkerModels)
+		if autoErr == nil && autoResolved != "" && autoResolved != agent.Model {
+			d.logger.Info("Model routing: %s switched from %q to %q on restart (auto-selected)", agentName, agent.Model, autoResolved)
+			resolvedModel = autoResolved
+			// Persist so next restart starts from the validated model.
+			if _, ok := d.state.GetAgent(repoName, agentName); ok {
+				agent.Model = autoResolved
+				_ = d.state.UpdateAgent(repoName, agentName, agent)
+			}
+		} else {
+			d.logger.Error("Model routing: no valid model for %s/%s after auto-select (primary err=%v, auto err=%v) — restarting with previous model %q anyway", repoName, agentName, modelErr, autoErr, agent.Model)
+			resolvedModel = resolveAgentModel(agent, repo)
+		}
 	}
 	if resolvedModel != "" {
 		args = append(args, "-M", resolvedModel)
 	}
-	args = append(args, "--model-params", defaultModelParams)
+	args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
 
 	envPrefix := buildAgentEnvPrefix(d.paths, repoName)
 	isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
@@ -5179,21 +5744,83 @@ func resolveAgentModel(agent state.Agent, repo *state.Repository) string {
 	return repo.Model
 }
 
+// validateModelForAgentType applies the same checks resolveAndValidateModel
+// does (profile eligibility + allowlist for workers), without the
+// auto-selection fallback. Returns nil if the model is safe to use; returns
+// an error the caller can log or surface.
+//
+// This exists for code paths that already have a resolved model (e.g. agent
+// restart / restore) and just need the "is this still allowed?" check. It is
+// the chokepoint closing the startRegisteredAgent bypass identified in the
+// Phase 5 audit.
+func (d *Daemon) validateModelForAgentType(model string, agentType state.AgentType, allowedModels []string) error {
+	if model == "" {
+		return nil // caller handles empty-model defaulting
+	}
+	if d.modelProfiles == nil || d.modelProfiles.Count() == 0 {
+		return nil // no profiles — can't validate, pass through
+	}
+
+	role := routing.RoleWorker
+	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace || agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd {
+		role = routing.RoleOrchestrator
+	}
+
+	if err := d.modelProfiles.Validate(model, role); err != nil {
+		return err
+	}
+
+	// Allowlist check only applies to workers (matches resolveAndValidateModel semantics).
+	if role == routing.RoleWorker && len(allowedModels) > 0 {
+		found := false
+		for _, m := range allowedModels {
+			if m == model {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", model, model)
+		}
+	}
+	return nil
+}
+
+// Routing-source labels written into state.Agent.RoutingSource and surfaced
+// in the outcome log. Labels are the single source of truth for "how did this
+// model get picked?" — the replay analysis filters on them.
+const (
+	RoutingSourceOperatorExplicit = "operator-explicit"
+	RoutingSourceRepoDefault      = "repo-default"
+	RoutingSourceRouterAuto       = "router-auto"
+	RoutingSourcePassthrough      = "passthrough" // no profiles loaded, took whatever was asked
+	RoutingSourceUnknown          = "unknown"
+)
+
 // resolveAndValidateModel resolves the model for an agent and validates it against
-// loaded profiles. If profiles are loaded, unknown or ineligible models are rejected.
-// If no model is specified and profiles exist, auto-selects the best eligible model.
-// allowedModels restricts workers to a specific set of models (empty = no restriction).
+// loaded profiles. Thin wrapper around resolveAndValidateModelWithSource that
+// discards the source label — kept for existing call sites that don't track it.
 func (d *Daemon) resolveAndValidateModel(explicitModel string, repoModel string, agentType state.AgentType, allowedModels []string) (string, error) {
+	model, _, err := d.resolveAndValidateModelWithSource(explicitModel, repoModel, agentType, allowedModels)
+	return model, err
+}
+
+// resolveAndValidateModelWithSource does the same job as resolveAndValidateModel
+// and additionally returns a RoutingSource* label describing the decision path.
+// Callers that persist routing_source (agent-create, supervisor-spawn) should
+// use this variant; the replay analysis keys on the source label to separate
+// operator decisions from router auto-selects.
+func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoModel string, agentType state.AgentType, allowedModels []string) (string, string, error) {
 	// If no profiles loaded, fall back to old behavior
 	if d.modelProfiles == nil || d.modelProfiles.Count() == 0 {
 		if explicitModel != "" {
 			d.logger.Info("Model routing: no profiles loaded, passthrough explicit=%s", explicitModel)
-			return explicitModel, nil
+			return explicitModel, RoutingSourcePassthrough, nil
 		}
 		if repoModel != "" {
 			d.logger.Info("Model routing: no profiles loaded, fallback to repo=%s", repoModel)
 		}
-		return repoModel, nil
+		return repoModel, RoutingSourcePassthrough, nil
 	}
 
 	role := routing.RoleWorker
@@ -5216,14 +5843,14 @@ func (d *Daemon) resolveAndValidateModel(explicitModel string, repoModel string,
 	if explicitModel != "" {
 		if err := d.modelProfiles.Validate(explicitModel, role); err != nil {
 			d.logger.Warn("Model routing: rejected %s for %s: %v", explicitModel, role, err)
-			return "", err
+			return "", "", err
 		}
 		if allowSet != nil && !allowSet[explicitModel] {
 			d.logger.Warn("Model routing: %s not in allowed worker models for this repo", explicitModel)
-			return "", fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", explicitModel, explicitModel)
+			return "", "", fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", explicitModel, explicitModel)
 		}
 		d.logger.Info("Model routing: validated %s for %s", explicitModel, role)
-		return explicitModel, nil
+		return explicitModel, RoutingSourceOperatorExplicit, nil
 	}
 
 	// No explicit model — try auto-select from allowed subset (or all eligible)
@@ -5233,15 +5860,15 @@ func (d *Daemon) resolveAndValidateModel(explicitModel string, repoModel string,
 			// Fallback to repo default with warning
 			if repoModel != "" {
 				d.logger.Warn("Model routing: no allowed worker models are eligible — falling back to repo default %s", repoModel)
-				return repoModel, nil
+				return repoModel, RoutingSourceRepoDefault, nil
 			}
-			return "", nil
+			return "", RoutingSourceUnknown, nil
 		}
 		// Pick best from allowed subset, preferring repoModel if it's in the set
 		var best *routing.ModelProfile
 		if repoModel != "" && allowSet[repoModel] {
 			if p := d.modelProfiles.Get(repoModel); p != nil && p.IsEligible(role) {
-				return repoModel, nil
+				return repoModel, RoutingSourceRepoDefault, nil
 			}
 		}
 		for _, p := range eligible {
@@ -5250,7 +5877,7 @@ func (d *Daemon) resolveAndValidateModel(explicitModel string, repoModel string,
 			}
 		}
 		d.logger.Info("Model routing: auto-selected %s for %s from allowed set (preferred=%s)", best.ModelID, role, repoModel)
-		return best.ModelID, nil
+		return best.ModelID, RoutingSourceRouterAuto, nil
 	}
 
 	// No allowed-list restriction — use global pool
@@ -5258,12 +5885,12 @@ func (d *Daemon) resolveAndValidateModel(explicitModel string, repoModel string,
 	if err != nil {
 		if repoModel != "" {
 			d.logger.Info("Model routing: no eligible profiles, fallback to repo=%s", repoModel)
-			return repoModel, nil
+			return repoModel, RoutingSourceRepoDefault, nil
 		}
-		return "", nil
+		return "", RoutingSourceUnknown, nil
 	}
 	d.logger.Info("Model routing: auto-selected %s for %s (preferred=%s)", best, role, repoModel)
-	return best, nil
+	return best, RoutingSourceRouterAuto, nil
 }
 
 // handleReloadModelProfiles reloads model profiles from disk.
@@ -5299,13 +5926,16 @@ func isProcessAlive(pid int) bool {
 }
 
 // isAgentProcess checks whether the given PID corresponds to the agent process (not the shell).
+// Uses a background context because this is a fast (<10ms) ps check with no
+// cancellation benefit; adding a ctx parameter would break every caller.
 // Uses the full command line (args) so we don't rely on comm, which is truncated to 16 chars on macOS.
 func isAgentProcess(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	// Use args= (full command line) so we match "oat-agent" even when binary path is long or comm is truncated
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=")
+	// Use args= (full command line) so we match "oat-agent" even when binary path is long or comm is truncated.
+	// Background ctx: fast ps check, no cancellation benefit.
+	cmd := exec.CommandContext(context.Background(), "ps", "-p", strconv.Itoa(pid), "-o", "args=") //nolint:contextcheck // see comment above
 	output, err := cmd.Output()
 	if err != nil {
 		return false
@@ -5510,7 +6140,7 @@ func (d *Daemon) rotateLogsIfNeeded() {
 
 	err := filepath.Walk(d.paths.OutputDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // Skip errors
+			return nil //nolint:nilerr // per-entry walk errors are non-fatal
 		}
 		if info.IsDir() {
 			return nil
@@ -5570,4 +6200,118 @@ func isLogFile(path string) bool {
 	base := filepath.Base(path)
 	// Only match .log files, not already-rotated files (which have timestamps)
 	return len(base) > 4 && base[len(base)-4:] == ".log"
+}
+
+// RemovalReason* values for OutcomeRecord.RemovalReason. Used only when
+// outcome="removed" to disambiguate the cause. Empty string is the default
+// for the "completed" outcome.
+const (
+	RemovalReasonFailed         = "failed"          // worker self-reported failure or supervisor judged it failed
+	RemovalReasonSuperseded     = "superseded"      // re-route replaced this worker before it finished
+	RemovalReasonManual         = "manual"          // operator ran `oat agent remove` directly
+	RemovalReasonTimeout        = "timeout"         // worker exceeded a wall-clock budget
+	RemovalReasonBudgetExceeded = "budget_exceeded" // spend cap tripped (--max-spend / --max-tokens)
+	RemovalReasonDaemonRestart  = "daemon_restart"  // daemon shutdown / cleanup, not a per-agent decision
+)
+
+// logOutcome appends a routing-history record for the given agent. Called at
+// completion (outcome="completed") and at kill/remove (outcome="removed"). Never
+// blocks the caller — all I/O errors route through the logger's warn callback.
+//
+// removalReason is empty for outcome="completed". For outcome="removed" it
+// disambiguates the cause; pass one of the RemovalReason* constants. An
+// empty string with outcome="removed" is logged as-is; downstream consumers
+// treat that as "removed for unrecorded reason" and weight accordingly.
+func (d *Daemon) logOutcome(repoName, agentName string, agent state.Agent, outcome, removalReason string) {
+	if d.outcomeLogger == nil {
+		return
+	}
+
+	completed := time.Now().UTC()
+	started := agent.CreatedAt
+	if started.IsZero() {
+		started = completed
+	}
+	wallMs := completed.Sub(started).Milliseconds()
+	if wallMs < 0 {
+		wallMs = 0
+	}
+
+	routingSource := agent.RoutingSource
+	if routingSource == "" {
+		routingSource = RoutingSourceUnknown // legacy agents created before the field was added
+	}
+
+	// Schema v2 enrichments — all additive, all best-effort. None of these
+	// mutate routing decisions; they only enrich the log line so Phase 2/3/4
+	// have richer signal. Failures here fall back to zero values, never
+	// blocking the completion path.
+	canonical, provider := routing.Canonicalize(agent.Model)
+	taskFeatures := routing.ExtractLoggedTaskFeatures(agent.Task, agent.WorktreePath)
+
+	// VerifyPassed is the daemon's own verdict — strongest immediate success
+	// signal. Tristate: nil if verification didn't run for this agent, else
+	// pointer-to-bool reflecting the verdict. Decoupled from outcome (which
+	// is "completed" even when verification failed downstream).
+	var verifyPassed *bool
+	switch agent.VerificationStatus {
+	case "approved":
+		v := true
+		verifyPassed = &v
+	case "rejected":
+		v := false
+		verifyPassed = &v
+	}
+
+	// Prompt metadata. Built here from agent fields (captured at spawn) so
+	// the daemon can reconstruct the prompt surface without re-reading the
+	// prompt file. Tool-defs / skills come from the sidecar protocol later;
+	// they're zero here today.
+	var promptMeta *routing.PromptMetadata
+	if agent.PromptSystemHash != "" || agent.PromptUserHash != "" {
+		promptMeta = &routing.PromptMetadata{
+			SystemPromptHash:   agent.PromptSystemHash,
+			SystemPromptTokens: agent.PromptSystemTokens,
+			UserMessageHash:    agent.PromptUserHash,
+			UserMessageTokens:  agent.PromptUserTokens,
+		}
+	}
+
+	rec := routing.OutcomeRecord{
+		RecordID:             routing.NewRecordID(),
+		OATVersion:           d.oatVersion,
+		PricingSnapshotID:    d.pricingSnapshotID,
+		TS:                   completed.Format(time.RFC3339),
+		Repo:                 repoName,
+		Worker:               agentName,
+		AgentType:            string(agent.Type),
+		TaskText:             agent.Task,
+		IssueNum:             agent.IssueNumber,
+		Model:                agent.Model,
+		Provider:             provider,
+		ModelCanonical:       canonical,
+		RoutingSource:        routingSource,
+		DecisionReason:       agent.RoutingDecisionReason,
+		CandidatesConsidered: agent.RoutingCandidates,
+		Allowlist:            agent.RoutingAllowlist,
+		StartedAt:            started.UTC().Format(time.RFC3339),
+		CompletedAt:          completed.Format(time.RFC3339),
+		WallMs:               wallMs,
+		TokensIn:             agent.InputTokens,
+		TokensOut:            agent.OutputTokens,
+		CacheRead:            agent.CacheReadTokens,
+		CacheWrite:           agent.CacheCreationTokens,
+		Outcome:              outcome,
+		RemovalReason:        removalReason,
+		PRNumber:             agent.PRNumber,
+		Summary:              agent.Summary,
+		FailureReason:        agent.FailureReason,
+		VerifyPassed:         verifyPassed,
+		TaskFeatures:         taskFeatures,
+		Prompt:               promptMeta,
+		// EscalationCount stays 0 here; cascade escalation in Phase 2.5 will
+		// set it based on agent.EscalatedFrom chain depth.
+	}
+
+	d.outcomeLogger.Log(rec)
 }

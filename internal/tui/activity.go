@@ -18,20 +18,21 @@ type ActivityEntry struct {
 	Action    string
 }
 
-// agentColors maps agent names to colors for consistent visual identity.
-var agentColorPalette = []lipgloss.Color{
-	"#06B6D4", // cyan
-	"#A78BFA", // purple
-	"#34D399", // emerald
-	"#FBBF24", // amber
-	"#F472B6", // pink
-	"#60A5FA", // blue
-	"#FB923C", // orange
-	"#4ADE80", // green
+// agentColorPalette maps agent names to colors for consistent visual identity.
+// Entries are AdaptiveColors so the palette stays readable on light terminals.
+var agentColorPalette = []lipgloss.TerminalColor{
+	lipgloss.AdaptiveColor{Dark: "#06B6D4", Light: "#0891B2"}, // cyan
+	lipgloss.AdaptiveColor{Dark: "#A78BFA", Light: "#6D28D9"}, // purple
+	lipgloss.AdaptiveColor{Dark: "#34D399", Light: "#047857"}, // emerald
+	lipgloss.AdaptiveColor{Dark: "#FBBF24", Light: "#B45309"}, // amber
+	lipgloss.AdaptiveColor{Dark: "#F472B6", Light: "#BE185D"}, // pink
+	lipgloss.AdaptiveColor{Dark: "#60A5FA", Light: "#1D4ED8"}, // blue
+	lipgloss.AdaptiveColor{Dark: "#FB923C", Light: "#C2410C"}, // orange
+	lipgloss.AdaptiveColor{Dark: "#4ADE80", Light: "#15803D"}, // green
 }
 
 // colorForAgent returns a consistent color for an agent name.
-func colorForAgent(name string) lipgloss.Color {
+func colorForAgent(name string) lipgloss.TerminalColor {
 	hash := 0
 	for _, c := range name {
 		hash = hash*31 + int(c)
@@ -217,6 +218,7 @@ func renderActivityLog(entries []ActivityEntry, width, height int) string {
 
 	title := lipgloss.NewStyle().
 		Foreground(colorPrimary).
+		Background(colorBgPanel).
 		Bold(true).
 		Width(width).
 		Render(" Activity")
@@ -225,6 +227,7 @@ func renderActivityLog(entries []ActivityEntry, width, height int) string {
 
 	divider := lipgloss.NewStyle().
 		Foreground(colorBorder).
+		Background(colorBgPanel).
 		Width(width).
 		Render(" " + strings.Repeat("─", width-2))
 	b.WriteString(divider)
@@ -299,7 +302,13 @@ func renderActivityLog(entries []ActivityEntry, width, height int) string {
 	}
 
 	// Constrain to exact dimensions — prevent overflow in either direction
-	return lipgloss.NewStyle().Width(width).MaxHeight(height).Render(b.String())
+	return lipgloss.NewStyle().
+		Width(width).
+		Height(height).
+		MaxHeight(height).
+		Background(colorBgPanel).
+		Foreground(colorText).
+		Render(b.String())
 }
 
 func compactActivityAction(action string) string {

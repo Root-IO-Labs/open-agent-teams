@@ -1,14 +1,14 @@
 # OAT - Open Agent Teams
 
-> Build your AI dev team. Any model. Any repo.
-
 OAT is a framework for running teams of AI coding agents that collaborate on a shared codebase. It assembles a coordinated team of AI agents — supervisor, merge queue, workers, reviewers — that plan, implement, test, and ship code while you focus on architecture and direction. Every agent gets its own process and git worktree. You coach. They deliver.
 
-Works with Anthropic, OpenAI, Google, DeepSeek, Groq, Mistral, and [17+ LLM providers](docs/SUPPORTED_LLM_PROVIDERS.md). Not locked to any single model or vendor.
+Works with 17+ LLM providers via [langchain](docs/SUPPORTED_LLM_PROVIDERS.md), including Anthropic, OpenAI, Google, OpenRouter, and local Ollama. 13 ready-to-use probe-scored profiles ship in [`model-routing/profiles/`](model-routing/profiles/) across 6 provider families. Not locked to any single model or vendor.
 
 ## Table of Contents
 
+- [AI-First Install](#ai-first-install)
 - [Getting Started](#getting-started)
+- [Troubleshooting](#troubleshooting)
 - [Try the Benchmark](#try-the-benchmark)
 - [How It Works](#how-it-works)
 - [Dashboard (`oat ui`)](#dashboard-oat-ui)
@@ -16,31 +16,57 @@ Works with Anthropic, OpenAI, Google, DeepSeek, Groq, Mistral, and [17+ LLM prov
 - [Commands](#commands)
 - [Built-in Agents](#built-in-agents)
 - [Customize Your Team](#customize-your-team)
+- [Coming Soon: Spec Builder](#coming-soon-spec-builder)
 - [Documentation](#documentation)
+- [Trust model](#trust-model)
+- [Telemetry and privacy](#telemetry-and-privacy)
 - [Public Libraries](#public-libraries)
 - [Building from Source](#building-from-source)
 - [License](#license)
 
-## Getting Started
+## AI-First Install
 
-### Option A: One-line install (recommended)
+Don't run shell commands by hand. Paste the prompt below into Cursor, Claude Code, Codex, or any agent with shell access. Provider tokens (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) are assumed to already be in the agent's environment.
 
-Pre-built binaries for macOS and Linux (x86_64 and arm64). Pulls the
-latest release from GitHub, drops the binaries into `~/.local/bin/`,
-and sets up the Python agent-runtime venv:
+```text
+Install OAT (Open Agent Teams) on this machine end-to-end.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+Repo:        https://github.com/Root-IO-Labs/open-agent-teams
+Branch:      dev
+Clone to:    ~/src/open-agent-teams
+Contract:    oats/INSTALL.md (read this AFTER cloning — it has every gate)
+
+Rules:
+- Verify each gate before moving on. Stop on the first real failure and
+  report the exact command, exit code, and last ~30 lines of output.
+- Do NOT skip steps, guess keys, edit my shell rc without asking, or run
+  destructive commands without explicit approval.
+- A provider API key is already in my environment. If none is set,
+  ask which provider I want and request the key once.
+
+Steps (full detail in oats/INSTALL.md after clone):
+  1. Check prereqs: go>=1.24.2, python3>=3.11, uv, git, gh, jq.
+  2. `gh auth status` — if not logged in, tell me to run `gh auth login`
+     and wait for me to confirm.
+  3. Clone to ~/src/open-agent-teams, `git checkout dev`.
+  4. `./scripts/install.sh` (verify "OAT installed successfully" in output).
+  5. Ensure `$GOPATH/bin` is on PATH; ask before editing my rc file.
+  6. Confirm one *_API_KEY is exported, or append to ~/.oat/.env.
+  7. `oat start` then `oat daemon status` — must be running.
+  8. `oat model list` — must show ≥1 model with status=known, worker=true.
+     If empty, check `~/.oat/model-profiles/` and report; do NOT
+     hand-write profile YAML.
+  9. Final report: what was installed, what's running, what to run next.
+
+End state to verify: `command -v oat` resolves, daemon is running, and
+`oat model list` shows at least one usable model.
 ```
 
-Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) on the
-target machine — the installer offers to install `uv` for you if it's
-missing. Pin a specific release with `OAT_VERSION=v0.1.0 curl … | bash`.
+The full step-by-step contract that the assistant follows lives in [`oats/INSTALL.md`](oats/INSTALL.md). Drop-in version without the inline summary: [`oats/INSTALL_PROMPT.txt`](oats/INSTALL_PROMPT.txt).
 
-After install, make sure `~/.local/bin` is on your `PATH`, then jump
-to step **3. Authenticate with GitHub** below.
+## Getting Started
 
-### Option B: Let your AI set it up
+### Option A: Let your AI set it up (easiest)
 
 Open **Cursor**, **Claude Code**, or your preferred AI assistant and paste this prompt:
 
@@ -53,7 +79,15 @@ Open **Cursor**, **Claude Code**, or your preferred AI assistant and paste this 
 
 [QUICKSTART.md](docs/QUICKSTART.md) contains the full setup walkthrough — prerequisites, install, API keys, first run — everything an AI (or human) needs.
 
-### Option C: Build from source
+### Option B: Install with Homebrew (macOS / Linux)
+
+```bash
+brew install Root-IO-Labs/oat/oat
+```
+
+This installs both `oat` and `oat-agent`, bundles the Python agent runtime, and runs `uv sync` automatically. You'll still need `gh auth login` and an LLM API key — see steps 3 and 4 below.
+
+### Option C: Manual setup from source
 
 #### 1. Prerequisites
 
@@ -127,15 +161,34 @@ oat ui
 
 That's it. You now have a supervisor, merge queue, and worker grinding away. Open `oat ui` to watch them all at once, or close the terminal — they keep working while you sleep.
 
+## Troubleshooting
+
+First stop: `oat doctor`. It runs seven read-only preflight checks (Go toolchain, Python runtime, `gh` auth, `oat-agent` binary, LLM API key, writable `~/.oat`, daemon liveness) and exits non-zero if anything fails, so it's safe to pipe into `&&` chains.
+
+The first-run issues that actually show up in practice:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `command not found: oat` | `$GOPATH/bin` (or `$HOME/go/bin`) not on `PATH` | Add it to your shell rc: `export PATH="$(go env GOPATH)/bin:$PATH"`, then `source ~/.zshrc` (or equivalent). |
+| `oat init` fails with "no LLM provider key found" | No `*_API_KEY` in shell or `~/.oat/.env` | Either `export ANTHROPIC_API_KEY=…` (or any other supported provider — full list in [docs/SUPPORTED_LLM_PROVIDERS.md](docs/SUPPORTED_LLM_PROVIDERS.md)), or append it to `~/.oat/.env`. |
+| `gh: ... authentication required` on `oat init` | `gh` not authenticated | `gh auth login` (choose HTTPS, login via browser). Then `gh auth status` should say "Logged in to github.com". |
+| `uv: command not found` during `./scripts/install.sh` | `uv` missing | `curl -LsSf https://astral.sh/uv/install.sh \| sh`, then open a new shell. |
+| `ripgrep not found` warning at daemon start | `rg` missing | Non-fatal, but search is faster with it: `brew install ripgrep` (macOS) or `apt install ripgrep` (Debian/Ubuntu). |
+| `Python 3.10 is below required Python 3.11` | System Python too old | Install Python 3.11+ and ensure `python3 --version` reports it. On macOS: `brew install python@3.12`. |
+| `oat ui` shows no agents after `oat init` | Daemon crashed or never started | `oat daemon status`; if not running, `oat start`; check `~/.oat/daemon.log`. |
+
+If `oat doctor` reports everything green and you're still stuck, run the offending command with `OAT_DEBUG=1` set and attach the output to a [new issue](https://github.com/Root-IO-Labs/open-agent-teams/issues/new/choose).
+
 ## Try the Benchmark
 
 OAT ships with a built-in benchmark: the **robotic barista** — a Python CLI project defined by a detailed spec, interface contracts, and 24 issues organized into dependency waves. No implementation code is provided; the model has to build the entire application from scratch, design its own acceptance test, and self-correct until it passes.
 
 ```bash
-./benchmarks/run.sh --model anthropic:claude-sonnet-4-6 --name my-bench-run
+cd benchmarks
+./scripts/run.sh --model anthropic:claude-sonnet-4-6 --repo my-bench-run
 ```
 
-This single command sets up the benchmark repo (under your authenticated GitHub account), drives OAT through all four waves, and collects results. See [benchmarks/README.md](benchmarks/README.md) for the full workflow.
+This single command sets up the benchmark repo, drives OAT through all four waves, and collects results. See [benchmarks/README.md](benchmarks/README.md) for the full workflow and [benchmarks/MODEL_COMPARISON.md](benchmarks/MODEL_COMPARISON.md) for results from previous runs across different models.
 
 ## How It Works
 
@@ -155,7 +208,7 @@ oat worker create "Refactor database layer" --model claude-opus-4-6
 
 Each worker works independently. When done, they verify their changes (via `oat worker verify` or by requesting an independent review from a verification agent), open a PR with `oat pr create`, and enter a zero-token dormant state. The daemon monitors GitHub for CI results, merge conflicts, review comments, and merges — waking the worker only when action is needed.
 
-If a worker gets stuck, a three-tier escalation kicks in automatically: gentle nudges, then supervisor intervention, then programmatic git-level diagnosis. Hard cap at ~30 minutes.
+If a worker gets stuck, a three-tier escalation kicks in automatically: gentle nudges, then supervisor intervention, then programmatic git-level diagnosis. Hard cap at ~30 minutes (configurable via `OAT_STUCK_MAX_NUDGE`).
 
 **Your workspace** is your persistent session. Chat with it, spawn workers, check status. It's always there when you come back.
 
@@ -163,7 +216,7 @@ You watch everything from `oat ui`, or close your laptop and come back to PRs.
 
 ## Dashboard (`oat ui`)
 
-Full-screen terminal dashboard built with [Bubble Tea](https://github.com/charmbracelet/bubbletea). No tmux required.
+Full-screen terminal dashboard built with [Bubble Tea](https://github.com/charmbracelet/bubbletea). Runs in any standard terminal.
 
 - **Agent sidebar** — live status for every agent (active, dormant, completed)
 - **Streaming output** — watch any agent's work in real time with syntax highlighting
@@ -176,6 +229,17 @@ oat ui --repo my-project   # specific repo
 ```
 
 See [Commands Reference](docs/COMMANDS.md#tui) for all keybindings.
+
+### Observability
+
+Live per-agent token usage, cache-hit rate, and last-update age:
+
+```bash
+oat status --tokens                             # live, in-memory snapshot
+oat tokens report --repo <name> --format json   # historical / scripted
+```
+
+See [Monitoring token usage and cache efficiency](docs/ADVANCED_USAGE.md#monitoring-token-usage-and-cache-efficiency) for the full story, including prompt-caching internals and diagnostic rules when cache hit rate drops.
 
 ## What Makes OAT Different
 
@@ -281,11 +345,18 @@ oat agents list                # see available definitions
 oat agents reset               # reset to defaults
 ```
 
+## Coming Soon: Spec Builder
+
+OAT works best with well-structured specs. We are building a companion workflow — human-in-the-loop — that generates high-efficacy implementation specs from your requirements, purpose-built for OAT agent teams. Better spec, better result.
+
 ## Documentation
+
+Human-facing docs live under [`docs/`](docs/). Agent-facing prompts and install contracts live under [`oats/`](oats/).
 
 | Doc | What it covers |
 |-----|----------------|
-| [Quick Start](docs/QUICKSTART.md) | Step-by-step setup guide (agent-readable) |
+| [First-run walkthrough](examples/first-run.md) | End-to-end: install, register a toy repo, watch a worker open and merge a PR (~10 min) |
+| [Quick Start](docs/QUICKSTART.md) | Step-by-step setup guide (works for humans and agents) |
 | [Commands Reference](docs/COMMANDS.md) | Every CLI command with examples |
 | [Agent Guide](docs/AGENTS.md) | Agent types, lifecycle, communication, internals |
 | [Workflows](docs/WORKFLOWS.md) | Usage patterns and real examples |
@@ -294,6 +365,29 @@ oat agents reset               # reset to defaults
 | [Supported Providers](docs/SUPPORTED_LLM_PROVIDERS.md) | 17+ LLM providers, model format, custom setup |
 | [Pause and Resume](docs/PAUSE_AND_RESUME.md) | Hibernate and resume workflows |
 | [Crash Recovery](docs/CRASH_RECOVERY.md) | Recovery procedures |
+| [`oats/INSTALL.md`](oats/INSTALL.md) | **Agent-targeted** install contract (every gate, every fallback) |
+| [`oats/INSTALL_PROMPT.txt`](oats/INSTALL_PROMPT.txt) | **Agent-targeted** drop-in prompt for AI assistants |
+
+## Trust model
+
+OAT is a local tool. It runs on your machine, under your user account, and does what coding agents do: read files, edit files, run shell commands, open pull requests. What you should know before you let it loose:
+
+- **Workers execute arbitrary shell commands in their worktree.** Every worker runs in an isolated git worktree under `~/.oat/wts/<repo>/<name>/` — not in your main checkout — but it still has full access to your user account. Don't point it at untrusted code you haven't skimmed.
+- **A command allow-list runs in front of destructive shells.** Shell calls that match known dangerous patterns (`rm -rf /`, `sudo`, unquoted interpolation into `curl | sh`, etc.) are blocked by the HITL guardrails in `agent-runtime/libs/cli/oat_cli/config.py` (`contains_dangerous_patterns`, `is_shell_command_allowed`). The allow-list is defense-in-depth, not a sandbox.
+- **PRs are opened against the GitHub repo you configured.** OAT uses your `gh` credentials. If `gh auth status` shows an account you don't want commits authored under, log out and back in before running `oat init`.
+- **Nothing runs as root.** The install script refuses `sudo`. Files live under `~/.oat/`.
+- **You can always kill it.** `oat stop` stops the daemon and every agent. `oat agent attach <name> --read-only` lets you observe without interfering. `rm -rf ~/.oat/` is a valid reset.
+
+## Telemetry and privacy
+
+No phone-home. No usage analytics. No crash reporting to a third party.
+
+- **Model API calls** go directly from your machine to whichever provider you've configured (Anthropic, OpenAI, OpenRouter, etc.) using the API key you exported. OAT does not proxy them.
+- **State lives locally** in `~/.oat/` — `state.json`, worktrees, logs, messages. Nothing is uploaded.
+- **Optional: LangSmith tracing.** If you export `LANGSMITH_API_KEY` the underlying agent runtime will ship traces to LangSmith. If you don't, it won't. There is no default-on telemetry.
+- **Optional: `gh` calls.** OAT uses the GitHub CLI for PR/issue operations on the repos you explicitly hand it.
+
+If you're on a regulated network and need to audit what goes out, `OAT_DEBUG=1` plus `tail -f ~/.oat/daemon.log` shows every outbound command and API call the daemon initiates.
 
 ## Public Libraries
 
@@ -313,6 +407,8 @@ go install ./cmd/oat        # Install to $GOPATH/bin
 > **Note:** `go install ./cmd/oat` only installs the `oat` binary. For a complete working system (including `oat-agent` and the Python runtime), use `./scripts/install.sh` instead.
 
 Requires: Go 1.24.2+, git, gh (authenticated)
+
+**Platform support:** macOS and Linux. Windows is not tested.
 
 ## License
 

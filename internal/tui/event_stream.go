@@ -3,6 +3,7 @@ package tui
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -118,7 +119,7 @@ func (s *EventStream) run() {
 	}
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(eventStreamIdleTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(eventStreamIdleTimeout))
 
 	scanner := bufio.NewScanner(conn)
 	// Events can carry large tool-result payloads — match the server's
@@ -134,7 +135,8 @@ func (s *EventStream) run() {
 
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
 					// Idle timeout — agent may just be thinking. Check
 					// done, extend deadline, rebuild scanner.
 					select {
@@ -142,7 +144,7 @@ func (s *EventStream) run() {
 						return
 					default:
 					}
-					conn.SetReadDeadline(time.Now().Add(eventStreamIdleTimeout))
+					_ = conn.SetReadDeadline(time.Now().Add(eventStreamIdleTimeout))
 					scanner = bufio.NewScanner(conn)
 					scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 					continue
@@ -151,7 +153,7 @@ func (s *EventStream) run() {
 			return
 		}
 
-		conn.SetReadDeadline(time.Now().Add(eventStreamIdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(eventStreamIdleTimeout))
 
 		var msg streamEventLine
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {

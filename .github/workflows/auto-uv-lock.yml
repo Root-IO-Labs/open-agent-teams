@@ -1,0 +1,59 @@
+name: Auto uv lock
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - "agent-runtime/libs/**/pyproject.toml"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh-uv-lock:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Determine which pyproject.toml files changed
+        id: changed
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- 'agent-runtime/libs/**/pyproject.toml' | sort -u)
+          dirs=$(printf '%s\n' $changed | xargs -I{} dirname {} | sort -u | tr '\n' ' ')
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+          echo "Changed dirs: $dirs"
+
+      - name: Refresh uv.lock in each changed directory
+        if: steps.changed.outputs.dirs != ''
+        run: |
+          set -e
+          for d in ${{ steps.changed.outputs.dirs }}; do
+            echo "=== uv lock in $d ==="
+            (cd "$d" && uv lock)
+          done
+
+      - name: Commit and push any lock-file updates
+        if: steps.changed.outputs.dirs != ''
+        run: |
+          git config user.name "dependabot[bot]"
+          git config user.email "49699333+dependabot[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- '**/uv.lock'; then
+            git add '**/uv.lock'
+            git commit -m "chore(deps): refresh uv.lock to match dependabot pyproject bump"
+            git push origin HEAD:${{ github.head_ref }}
+          else
+            echo "No uv.lock changes to commit."
+          fi

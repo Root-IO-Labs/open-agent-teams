@@ -57,7 +57,7 @@ from typing import Any
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 _AGENT_RUNTIME = os.path.join(_REPO_ROOT, "agent-runtime")
-for subdir in ("libs/cli", "libs/deepagents", "libs/acp"):
+for subdir in ("libs/cli", "libs/oat_sdk"):
     path = os.path.join(_AGENT_RUNTIME, subdir)
     if path not in sys.path:
         sys.path.insert(0, path)
@@ -89,13 +89,14 @@ class ModelReport:
     # init_chat_model() because the former raised. Surfaced in YAML so
     # operators can see the model wasn't resolved via the canonical path.
     resolution_fallback: bool = False
+    retries_needed: int = 0
 
 
 def _resolve_model(model_string: str, no_fallback: bool = False) -> tuple[Any, bool]:
     """Resolve model using OAT's exact resolution path.
 
     Returns ``(model, used_fallback)``. ``used_fallback`` is ``True`` when the
-    primary path (``deepagents_cli.config.create_model``) raised and we had to
+    primary path (``oat_cli.config.create_model``) raised and we had to
     fall back to ``langchain.chat_models.init_chat_model``.
 
     The primary path reads ``~/.oat/config.toml`` and supports custom providers
@@ -115,11 +116,11 @@ def _resolve_model(model_string: str, no_fallback: bool = False) -> tuple[Any, b
     first_exc: Exception | None = None
 
     try:
-        from deepagents_cli.config import create_model
+        from oat_cli.config import create_model
     except ImportError as exc:
         # Only WARN once — this is the common case when running the probe
         # outside an OAT checkout. Fallback is expected.
-        print(f"WARN: deepagents_cli.config unavailable ({type(exc).__name__}): {exc}",
+        print(f"WARN: oat_cli.config unavailable ({type(exc).__name__}): {exc}",
               file=sys.stderr)
         first_exc = exc
     else:
@@ -1526,6 +1527,13 @@ def _generate_recommendations(report: ModelReport) -> None:
     if mt and mt.passed and mt.score < 60:
         report.warnings.append("Multi-turn works but weak cross-turn state tracking — poor supervisor candidate")
 
+    # Transient failure reliability
+    if report.retries_needed >= 3:
+        report.warnings.append(
+            f"High transient failure rate ({report.retries_needed} retries across "
+            f"{len(report.probes)} probes) — model provider may be unreliable for sustained agent work"
+        )
+
     # OAT compatibility verdict
     core_probes = ["basic_inference", "tool_calling", "streaming",
                    "shell_roundtrip", "file_write_via_tool"]
@@ -1703,6 +1711,8 @@ async def run_probes(
     if allowed is not None:
         all_probes = [(n, fn) for n, fn in all_probes if n in allowed]
 
+    retries_needed = 0
+
     for name, probe_fn in all_probes:
         print(f"  Running {name}...", file=sys.stderr, end="", flush=True)
         try:
@@ -1710,29 +1720,38 @@ async def run_probes(
             report.probes.append(result)
             status = "✓" if result.passed else "✗"
             print(f" {status} ({result.score}/100)", file=sys.stderr)
-        except asyncio.TimeoutError:
-            # Per-probe timeout (PR #2 P0-A). Record as a failed probe with
-            # score=0 and continue to the next probe so one hung API call
-            # doesn't block the whole run. See _invoke_probe_with_timeout for
-            # the thread-leak caveat.
-            print(f" TIMEOUT", file=sys.stderr)
-            print(f"[PROBE] {name} TIMEOUT after {per_probe_timeout}s", file=sys.stderr)
-            report.probes.append(ProbeResult(
-                name=name, passed=False, score=0,
-                error=f"timeout after {per_probe_timeout}s",
-            ))
-        except Exception:
-            print(f" ERROR", file=sys.stderr)
-            report.probes.append(ProbeResult(
-                name=name, passed=False, score=0,
-                error=f"Probe crashed: {traceback.format_exc()[-200:]}",
-            ))
+        except (asyncio.TimeoutError, Exception) as first_err:
+            is_timeout = isinstance(first_err, asyncio.TimeoutError)
+            print(f" {'TIMEOUT' if is_timeout else 'ERROR'} (retrying in 5s...)", file=sys.stderr)
+            retries_needed += 1
+            await asyncio.sleep(5)
+            print(f"  Retrying {name}...", file=sys.stderr, end="", flush=True)
+            try:
+                result = await _invoke_probe_with_timeout(probe_fn, per_probe_timeout)
+                report.probes.append(result)
+                status = "✓" if result.passed else "✗"
+                print(f" {status} ({result.score}/100)", file=sys.stderr)
+            except asyncio.TimeoutError:
+                print(f" TIMEOUT", file=sys.stderr)
+                print(f"[PROBE] {name} TIMEOUT after {per_probe_timeout}s (retry also failed)", file=sys.stderr)
+                report.probes.append(ProbeResult(
+                    name=name, passed=False, score=0,
+                    error=f"timeout after {per_probe_timeout}s (retried)",
+                ))
+            except Exception:
+                print(f" ERROR", file=sys.stderr)
+                report.probes.append(ProbeResult(
+                    name=name, passed=False, score=0,
+                    error=f"Probe crashed (retried): {traceback.format_exc()[-200:]}",
+                ))
 
         # If basic inference fails (including timeout), skip remaining probes.
         # Consistent with Q3 — treat timeout as failure for the gate check.
         if name == "basic_inference" and not report.probes[-1].passed:
             print("  Skipping remaining probes (basic inference failed)", file=sys.stderr)
             break
+
+    report.retries_needed = retries_needed
 
     # Weighted scoring
     if report.probes:
@@ -1760,11 +1779,20 @@ def _generate_yaml_profile(report: ModelReport) -> str:
         p = probe_map.get(name)
         return round(p.score / 100.0, 2) if p else 0.0
 
-    def _score_or_default(name: str, default: float = 1.0) -> float:
-        """Return probe score if tested, or a safe default if not tested."""
+    def _score_or_null(name: str) -> str:
+        """Return probe score as a string if tested, or 'null' if not tested.
+
+        Returns a string (for direct YAML emission) rather than a float so the
+        "not tested" case is distinct from a genuine 0.0 score. Downstream
+        routing reads `null` as "unknown" — which the router treats as an
+        excluded dimension, not a failed one.
+
+        This replaces the pre-2026-04-23 `_score_or_default(..., default=1.0)`
+        behavior, which silently reported un-probed capabilities as perfect.
+        """
         if _probed(name):
-            return _score(name)
-        return default
+            return f"{_score(name)}"
+        return "null"
 
     # Derive context class from profile
     ctx = probe_map.get("context_profile", ProbeResult("", False, 0))
@@ -1798,14 +1826,23 @@ def _generate_yaml_profile(report: ModelReport) -> str:
     else:
         autonomy_tier = "restricted"
 
-    # Worker/orchestrator eligibility
+    # Worker/orchestrator eligibility.
+    #
+    # Pre-2026-04-23 behavior: "probe didn't run" was silently waived via
+    # `or not _probed(X)`. That let a --probe-set minimum run promote a model
+    # to orchestrator_eligible without ever testing shell-recovery/multi-turn/
+    # routing-decision. Removed because it's a lie — see docs/routing/REWRITE_PLAN.md.
+    #
+    # New rule: orchestrator_eligible requires probes to have RUN and PASSED
+    # the threshold. An un-probed dimension fails the check. Operators who
+    # want orchestrator eligibility must run `--probe-set default`.
     worker_eligible = report.oat_compatible
     routing_score = _score("routing_decision")
     orchestrator_eligible = (
         report.oat_compatible
-        and (_score("shell_failure_recovery") >= 0.7 or not _probed("shell_failure_recovery"))
-        and (_score("multi_turn") >= 0.7 or not _probed("multi_turn"))
-        and (_score("routing_decision") >= 0.5 or not _probed("routing_decision"))
+        and _probed("shell_failure_recovery") and _score("shell_failure_recovery") >= 0.6
+        and _probed("multi_turn") and _score("multi_turn") >= 0.7
+        and _probed("routing_decision") and _score("routing_decision") >= 0.5
         and score >= 80
     )
 
@@ -1847,12 +1884,12 @@ def _generate_yaml_profile(report: ModelReport) -> str:
         f"capabilities:",
         f"  tool_reliability: {_score('tool_calling')}",
         f"  shell_roundtrip: {_score('shell_roundtrip')}",
-        f"  shell_recovery: {_score_or_default('shell_failure_recovery')}",
+        f"  shell_recovery: {_score_or_null('shell_failure_recovery')}",
         f"  file_write_reliability: {_score('file_write_via_tool')}",
         f"  token_reporting: {_score('token_reporting')}",
-        f"  streaming: {_score_or_default('streaming')}",
-        f"  multi_turn: {_score_or_default('multi_turn')}",
-        f"  large_output: {_score_or_default('large_output')}",
+        f"  streaming: {_score_or_null('streaming')}",
+        f"  multi_turn: {_score_or_null('multi_turn')}",
+        f"  large_output: {_score_or_null('large_output')}",
         f"  effective_context_class: {context_class}",
         f"  max_input_tokens: {max_input if max_input else 'unknown'}",
         f"  reasoning_controls: \"{reasoning_controls}\"",
@@ -1885,6 +1922,7 @@ def _generate_yaml_profile(report: ModelReport) -> str:
         f"  probes_run: {len(report.probes)}",
         f"  probes_passed: {sum(1 for p in report.probes if p.passed)}",
         f"  resolution_fallback: {str(report.resolution_fallback).lower()}",
+        f"  retries_needed: {report.retries_needed}",
     ])
 
     if probes_skipped:

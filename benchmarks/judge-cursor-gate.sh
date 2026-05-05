@@ -47,7 +47,7 @@ echo "    $(wc -l < "$RESULTS_DIR/gate-generated-test.sh" | tr -d ' ') lines"
 
 echo ""
 echo "==> Running judge..."
-"${SCRIPT_DIR}/judge-blackbox.sh" \
+"${SCRIPT_DIR}/scripts/judge-blackbox.sh" \
     --generated "$RESULTS_DIR/gate-generated-test.sh" \
     --reference "${SCRIPT_DIR}/acceptance-test.sh" \
     --output "$RESULTS_DIR/gate.json"

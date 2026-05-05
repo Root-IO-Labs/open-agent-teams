@@ -32,18 +32,6 @@ go.work
 .DS_Store
 Thumbs.db
 
-# Environment files (never commit local credentials)
-.env
-.env.local
-.env.*
-!.env.example
-
-# Log files
-*.log
-
-# Node (defensive — no JS shipped today)
-node_modules/
-
 # oat runtime (but allow config files)
 .oat/*
 !.oat/*.md
@@ -53,10 +41,16 @@ node_modules/
 
 # Benchmark results (generated per-run)
 benchmarks/results/
+benchmarks/routing-test-repo/results/
 
 # Python cache
 __pycache__/
 *.pyc
+
+# Python tooling caches
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
 
 # Python coverage
 .coverage
@@ -69,8 +63,8 @@ __pycache__
 
 # Generated coverage
 coverage.out
-# Claude Code settings
-.claude/settings.local.json
+# Claude Code local settings / caches (per-developer, never tracked)
+.claude/
 
 # Debug files
 debug*.go
@@ -99,16 +93,14 @@ build/
 # intended to be tracked in git).
 model-routing/profiles/*.yaml.bak
 
-# GoReleaser output
-dist/
-
 # Audit artifacts (generated, not source)
 AUDIT_PLAN.md
 PUBLIC_REPO_AUDIT.md
 CODE_HYGIENE_REPORT.md
 
-# Blog drafts (publish separately)
-blog/
-
 # Local Bedrock benchmarking notes (not for the public repo)
 docs/bedrock-benchmarking.md
+
+# GoReleaser output and staging
+/dist/
+/.release-stage/

@@ -89,10 +89,8 @@ func (c *Collector) Collect(description string, verbose bool) (*Report, error) {
 	// Check daemon status
 	report.DaemonRunning, report.DaemonPID = c.checkDaemonStatus()
 
-	// Load state and count agents
-	if err := c.collectAgentStats(report); err != nil {
-		// Non-fatal: continue with zero counts
-	}
+	// Load state and count agents. Non-fatal: continue with zero counts on error.
+	_ = c.collectAgentStats(report)
 
 	// Collect daemon log tail
 	report.DaemonLogTail = c.collectDaemonLog()

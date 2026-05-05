@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from deepagents_cli.input import (
+from oat_cli.input import (
     extract_leading_pasted_file_path,
     normalize_pasted_path,
     parse_file_mentions,
@@ -66,7 +66,7 @@ def test_parse_file_mentions_warns_for_nonexistent_file(
 ) -> None:
     """Ensure non-existent files are excluded and warning is printed."""
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     _, files = parse_file_mentions("@nonexistent.py")
 
@@ -82,7 +82,7 @@ def test_parse_file_mentions_ignores_directories(
     dir_path = tmp_path / "mydir"
     dir_path.mkdir()
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     _, files = parse_file_mentions("@mydir")
 
@@ -151,7 +151,7 @@ def test_parse_file_mentions_adjacent_looks_like_email(
     first.write_text("1")
     second.write_text("2")
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     _, files = parse_file_mentions("@a.py@b.py")
 
@@ -165,7 +165,7 @@ def test_parse_file_mentions_handles_oserror(
 ) -> None:
     """Ensure `OSError` during path resolution is handled gracefully."""
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
     mocker.patch("pathlib.Path.resolve", side_effect=OSError("Permission denied"))
 
     _, files = parse_file_mentions("@somefile.py")
@@ -186,7 +186,7 @@ def test_parse_file_mentions_skips_email_addresses(
     because the `@` is preceded by email-like characters.
     """
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     _, files = parse_file_mentions("contact me at user@example.com")
 
@@ -200,7 +200,7 @@ def test_parse_file_mentions_skips_various_email_formats(
 ) -> None:
     """Ensure various email formats are all skipped."""
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     emails = [
         "test@domain.com",
@@ -224,7 +224,7 @@ def test_parse_file_mentions_works_after_cjk_text(
     file_path = tmp_path / "test.py"
     file_path.write_text("content")
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     # CJK character before @ is not email-like, so this should parse
     _, files = parse_file_mentions("查看@test.py")
@@ -242,7 +242,7 @@ def test_parse_file_mentions_handles_bad_tilde_user(
     exist. This must be caught gracefully rather than propagating up.
     """
     monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_cli.input.console")
+    mock_console = mocker.patch("oat_cli.input.console")
 
     _, files = parse_file_mentions("@~nonexistentuser12345/file.py")
 

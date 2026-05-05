@@ -12,6 +12,8 @@ The benchmark evaluates a model's ability to:
 - Self-correct via a convergence loop when the blackbox test fails
 - Coordinate multiple workers, resolve merge conflicts, and pass CI
 
+For results from previous benchmark runs, see [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
+
 ## Table of Contents
 
 - [Quickstart](#quickstart)
@@ -140,7 +142,7 @@ flowchart TD
 
 Because the model both generates the blackbox test and builds the application, the benchmark is designed to prevent the model from gaming its own test to make a broken app pass:
 
-- The test is run by deterministic benchmark software (`run.sh` / `run-blackbox.sh`), not by agents
+- The test is run by deterministic benchmark software (`run.sh` / `scripts/run-blackbox.sh`), not by agents
 - Agents never see test output -- only the benchmark script sees results
 - Fix-wave workers can only modify test modules via PRs that pass CI
 - The human-written `acceptance-test.sh` (the ground truth) is never accessible to agents
@@ -149,7 +151,7 @@ Because the model both generates the blackbox test and builds the application, t
 
 ### Gate Scoring Rubric
 
-The LLM judge (`judge-blackbox.sh`) compares the model-generated test against the human-written reference `acceptance-test.sh` using a structured rubric. The judge scores across four dimensions, each worth 0-25 points (total 0-100):
+The LLM judge (`scripts/judge-blackbox.sh`) compares the model-generated test against the human-written reference `acceptance-test.sh` using a structured rubric. The judge scores across four dimensions, each worth 0-25 points (total 0-100):
 
 | Dimension | Points | What It Measures |
 |-----------|--------|------------------|
@@ -241,14 +243,14 @@ For more control, you can run each step separately:
 ./benchmarks/setup.sh --model claude-sonnet-4-6 --name sonnet46-baseline --setup-only
 ```
 
-Check the created repo at `https://github.com/<your-org>/oat-robotic-barista-sonnet46-baseline`.
+Check the created repo at `https://github.com/Root-IO-Labs/oat-robotic-barista-sonnet46-baseline`.
 
 #### 2. Initialize OAT
 
 If your default `GH_TOKEN` doesn't have access to the benchmark repo owner, set it explicitly:
 
 ```bash
-GH_TOKEN=$GH_TOKEN oat init https://github.com/<your-org>/oat-robotic-barista-sonnet46-baseline --model claude-sonnet-4-6
+GH_TOKEN=$GH_TOKEN oat init https://github.com/Root-IO-Labs/oat-robotic-barista-sonnet46-baseline --model claude-sonnet-4-6
 ```
 
 Alternatively, skip `--setup-only` in step 1 to have `setup.sh` run `oat init` for you automatically.
@@ -371,7 +373,7 @@ Automates the entire benchmark lifecycle: setup, wave progression, results colle
 | `--available-worker-models <m1,m2>` | No | Comma-separated list of models the workspace can assign to workers (requires `--routing-mode`). Does not affect orchestrator agents. Alias: `--available-models` |
 
 **How the benchmark flow works:**
-1. **Blackbox gate** (unless `--skip-gate`): spawns parallel workers for all wave:0 issues (#1-#4), each writing a modular test module to `scripts/blackbox-tests/`. After all close, the modules are assembled into a single script and scored by an LLM judge against the reference `acceptance-test.sh`. If below threshold, the run stops early. If the gate passes, an execution smoke test runs the assembled script via `run-blackbox.sh --smoke` to catch runtime errors (unbound variables, syntax issues, bash version incompatibilities) before investing time in waves
+1. **Blackbox gate** (unless `--skip-gate`): spawns parallel workers for all wave:0 issues (#1-#4), each writing a modular test module to `scripts/blackbox-tests/`. After all close, the modules are assembled into a single script and scored by an LLM judge against the reference `acceptance-test.sh`. If below threshold, the run stops early. If the gate passes, an execution smoke test runs the assembled script via `scripts/run-blackbox.sh --smoke` to catch runtime errors (unbound variables, syntax issues, bash version incompatibilities) before investing time in waves
 2. Sends one message to the workspace agent explaining the wave system and asking it to create workers for wave 1
 3. The wave message includes instructions for the workspace to verify workers are on track via output logs
 4. Silently polls `gh issue list` every 2 minutes (no agent messages, zero token cost)
@@ -382,6 +384,25 @@ Automates the entire benchmark lifecycle: setup, wave progression, results colle
 9. After convergence, runs `collect.sh`, `acceptance-test.sh`, and `summarize.sh`
 
 **Token budget:** Maximum 8 wave messages (4 instructions + up to 4 nudges), plus up to 4 convergence messages. All polling is external.
+
+**Resilience to GitHub indexing degradation:**
+
+`run.sh` and `collect.sh` treat [`benchmarks/issues.json`](issues.json) as the static source of truth for wave composition (waves 0-4) and use the live `gh issue list` only as a sanity check. When GitHub's Issues/search index is degraded -- as during the Apr 27 2026 ElasticSearch incident, where `gh issue list --label wave:0` returned only `#4` for ~14 minutes despite `#1`/`#2`/`#3` being live and reachable via per-issue endpoints -- the gate phase, per-wave kickoff, `wait_for_wave` completion arithmetic, and post-run analysis collection all transparently fall back to the JSON-derived expected list rather than under-spawning workers, false-positive-completing waves, or producing silently-wrong analysis numbers.
+
+You'll see one of these one-line signals on stderr when degradation is detected:
+
+- `WARNING: gh issue list lagging for wave:N -- live=X expected=Y missing=#a #b -- using JSON fallback (likely GitHub indexing degradation, see https://www.githubstatus.com/)` -- transient indexing lag; the script falls back to `issues.json` and continues. The kickoff log line for that wave gets an inline `(live=X expected=Y indexed)` annotation so the operator can see the disparity at a glance.
+- `ERROR:   gh issue #N missing from repo (per-issue probe returned 404 -- setup may have silently failed) -- excluded from fallback list` -- the issue genuinely doesn't exist; the script excludes it from the worker spawn list rather than trying an impossible spawn.
+
+Tunables (env vars):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OAT_INDEX_POLL_TIMEOUT` | `120` | Seconds to poll the live `gh issue list` against the JSON-expected count before giving up and falling back |
+| `OAT_INDEX_POLL_INTERVAL` | `10` | Seconds between polls |
+| `ISSUES_JSON_PATH` | `benchmarks/issues.json` | Override the source-of-truth JSON (e.g. for custom benchmarks) |
+
+Healthy-path overhead is ~0.5s per benchmark run -- the polling loops only engage when the live list comes back short. To make degraded runs bail faster, set `OAT_INDEX_POLL_TIMEOUT=30`; to disable the JSON-as-source-of-truth behavior entirely (e.g. for a custom benchmark), point `ISSUES_JSON_PATH` at a missing file and the helpers gracefully no-op.
 
 ### `setup.sh` -- Create benchmark repo and start OAT
 
@@ -408,7 +429,7 @@ Automates the entire benchmark lifecycle: setup, wave progression, results colle
 | `--name <suffix>` | No | Repo name suffix (default: Unix timestamp) |
 | `--setup-only` | No | Only create repo + issues, skip OAT init |
 
-Repos are created as `<your-org>/oat-robotic-barista-<suffix>`.
+Repos are created as `Root-IO-Labs/oat-robotic-barista-<suffix>`.
 
 The bundled source in `benchmarks/robotic-barista/` already includes all spec clarifications (required flags, data file path, `BARISTA_DATA_DIR` env var, recipe output format, entry point packaging, development environment setup, etc.). No patching is needed at setup time.
 
@@ -506,6 +527,7 @@ ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY ./benchmarks/summarize.sh \
 - Worker log signals: errors, merge conflicts, CI failures, daemon interventions, stuck patterns
 - System agent logs: supervisor/merge-queue/workspace decisions and anomalies
 - Daemon log: nudges, force removals, idle mode transitions, PR monitor events
+- **Per-agent token usage and cost** via `oat tokens report` (table + per-wave breakdown). The summary appends a "Total cost (priced agents only)" line in USD pulled from the embedded pricing table at `internal/routing/pricing.yaml`. Agents whose model isn't in pricing.yaml show `—` in the cost column and are excluded from the total; add the model + verified prices to the YAML and rebuild to fix.
 
 **Output:** A structured markdown report covering executive summary, scorecard, what went well/wrong, token efficiency concerns, per-wave breakdown, acceptance test analysis, blackbox gate analysis, dual-run comparison, and recommendations.
 
@@ -536,7 +558,7 @@ Use `cleanup.sh` to remove all local state from a failed or completed benchmark 
 ./benchmarks/cleanup.sh --repo oat-robotic-barista-sonnet46-auto --delete-remote
 ```
 
-If `--delete-remote` fails due to token permissions, delete the GitHub repo manually at `https://github.com/<your-org>/oat-robotic-barista-<name>/settings` (Danger Zone > Delete).
+If `--delete-remote` fails due to token permissions, delete the GitHub repo manually at `https://github.com/Root-IO-Labs/oat-robotic-barista-<name>/settings` (Danger Zone > Delete).
 
 Alternatively, skip cleanup entirely by using a different `--name` for each run.
 
@@ -560,9 +582,9 @@ cd agent-runtime/libs/cli && uv pip install langchain-ollama
 
 `oat-agent` uses a `uv`-managed venv inside `agent-runtime/libs/cli/.venv/` -- installing `langchain-ollama` via system `pip` won't work. The venv doesn't include `pip`, so you must use `uv` to install into it.
 
-4. **Onboard the model:** `oat model onboard ollama:gemma4 --save`
+4. **Onboard the model:** `oat model onboard ollama:gemma4` (add `--verbose` for full probe output)
 
-**Multiple Ollama models:** If using more than one Ollama model simultaneously, set `OLLAMA_MAX_LOADED_MODELS` to the number of models before starting Ollama.
+**Multiple Ollama models:** If using more than one Ollama model simultaneously, set `OLLAMA_MAX_LOADED_MODELS` to the number of models before starting Ollama. See [known issues](../docs/known-issues.md) for platform-specific instructions.
 
 **Orchestrator vs worker:** Ollama models are best suited as **worker** models via `--available-worker-models`. The orchestrator (`--model`) should be a capable hosted model (e.g., `anthropic:claude-sonnet-4-6`) since it handles complex multi-step coordination that small local models struggle with.
 
@@ -582,12 +604,13 @@ If you see raw terminal formatting (colored text, status-bar fragments like `[oa
 |------|---------|
 | `run.sh` | Fully automated benchmark runner (gate + setup + wave progression + collection) |
 | `setup.sh` | Create benchmark repo, populate issues, start OAT |
-| `judge-blackbox.sh` | LLM judge comparing model-generated test vs reference |
-| `run-blackbox.sh` | Shim wrapper: run model-generated test, produce JSON results (`--smoke` for stub CLI at gate time) |
+| `scripts/judge-blackbox.sh` | LLM judge comparing model-generated test vs reference |
+| `scripts/run-blackbox.sh` | Shim wrapper: run model-generated test, produce JSON results (`--smoke` for stub CLI at gate time) |
 | `collect.sh` | Collect results from a completed benchmark run |
 | `acceptance-test.sh` | Functional smoke test of the barista CLI (reference test) |
 | `summarize.sh` | Extract log signals and generate LLM-powered summary |
 | `cleanup.sh` | Clean up local and remote state from a benchmark run |
 | `blackbox-testing.md` | General CLI blackbox testing methodology guide (copied into target repo during setup) |
 | `issues.json` | Pre-captured issue data (24 issues with titles, bodies, labels) |
+| `MODEL_COMPARISON.md` | Cross-model benchmark comparison (scores, strengths, weaknesses) |
 | `results/` | Output directory for timestamped result folders (gitignored) |

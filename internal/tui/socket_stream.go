@@ -3,13 +3,62 @@ package tui
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 )
+
+// streamDebugLogger writes one-line traces of stream events to a debug log
+// when OAT_STREAM_DEBUG=1 is set. Logging is opt-in to avoid disk churn
+// during normal use; when enabled it captures each hop in the message-
+// delivery path so we can pinpoint where lines are dropped.
+//
+// File: $HOME/.oat/logs/tui-stream.log (created on first write).
+var (
+	streamDebugInit sync.Once
+	streamDebugFile *os.File
+	streamDebugMu   sync.Mutex
+)
+
+func streamDebugEnabled() bool {
+	return os.Getenv("OAT_STREAM_DEBUG") == "1"
+}
+
+func streamDebugf(format string, args ...interface{}) {
+	if !streamDebugEnabled() {
+		return
+	}
+	streamDebugInit.Do(func() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		dir := filepath.Join(home, ".oat", "logs")
+		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+			return
+		}
+		path := filepath.Join(dir, "tui-stream.log")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return
+		}
+		streamDebugFile = f
+	})
+	streamDebugMu.Lock()
+	defer streamDebugMu.Unlock()
+	if streamDebugFile == nil {
+		return
+	}
+	fmt.Fprintf(streamDebugFile, "%s "+format+"\n",
+		append([]interface{}{time.Now().Format("15:04:05.000")}, args...)...)
+}
 
 // streamIdleTimeout is how long the SocketStream waits for data before
 // checking if it should close. This catches silent connection drops (daemon
@@ -33,6 +82,12 @@ type SocketStream struct {
 	done       chan struct{}
 	once       sync.Once
 	closed     atomic.Bool
+
+	// Diagnostic counters. Exposed via Stats() for the debug log.
+	received    atomic.Uint64 // lines pulled off the daemon socket
+	delivered   atomic.Uint64 // lines delivered to the TUI typed channel
+	plainDrops  atomic.Uint64 // plain channel sends dropped (TUI ignores it for sockets)
+	filterDrops atomic.Uint64 // filtered out by OutputFilter
 }
 
 // streamOutputLine matches the daemon's streaming protocol.
@@ -104,7 +159,7 @@ func (s *SocketStream) run() {
 
 	// Set initial read deadline so we detect silent connection drops
 	// (daemon crash, network flap) instead of blocking forever on Scan().
-	conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
+	_ = conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 
 	// Read JSON lines from the stream
 	scanner := bufio.NewScanner(conn)
@@ -121,7 +176,8 @@ func (s *SocketStream) run() {
 		if !scanner.Scan() {
 			// Distinguish timeout (idle stream) from real close/error.
 			if err := scanner.Err(); err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
 					// Deadline fired — check if TUI wants to stop
 					select {
 					case <-s.done:
@@ -129,7 +185,7 @@ func (s *SocketStream) run() {
 					default:
 					}
 					// Agent may just be thinking with no output. Extend deadline and continue.
-					conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
+					_ = conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 					// Re-create scanner since the underlying reader hit an error
 					scanner = bufio.NewScanner(conn)
 					scanner.Buffer(make([]byte, 64*1024), 256*1024)
@@ -140,7 +196,7 @@ func (s *SocketStream) run() {
 		}
 
 		// Got data — reset the idle deadline
-		conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
+		_ = conn.SetReadDeadline(time.Now().Add(streamIdleTimeout))
 
 		var msg streamOutputLine
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
@@ -151,20 +207,69 @@ func (s *SocketStream) run() {
 			return
 		}
 
+		s.received.Add(1)
+
 		// Apply category filter
 		if s.filter != nil && !s.filter.FilterLine(msg.Line) {
+			s.filterDrops.Add(1)
+			streamDebugf("agent=%s filter-drop line=%q", s.agentName, truncateForLog(msg.Line))
 			continue
 		}
 
 		tl := TypedLine{Text: msg.Line, LineType: msg.LineType}
+
+		// FIX (Apr 2026): the agent-response-disappears bug.
+		//
+		// Previously this site did:
+		//   select { case s.typedLines <- tl: default: }      // drop on full
+		//   select { case s.lines <- msg.Line: case <-s.done: } // BLOCKING
+		//
+		// The TUI's readStream() prefers TypedLines() and never reads
+		// Lines() once a SocketStream is active (see app.go:readStream —
+		// `if typedCh != nil` short-circuits the plain channel). With both
+		// channels sized 256, the plain channel filled and the goroutine
+		// blocked permanently on `s.lines <-`. Subsequent agent output
+		// arrived from the daemon but never reached the UI — the chat
+		// stream simply went silent, even though the agent was producing
+		// a response and the daemon was streaming it. Symptom: user sends
+		// a message, the agent replies, the reply never appears.
+		//
+		// Fix: make the typed-channel send block (it IS consumed) and the
+		// plain-channel send non-blocking (no consumer for socket streams,
+		// drop is harmless). Both sends honor s.done so Stop() works.
 		select {
 		case s.typedLines <- tl:
-		default:
+			s.delivered.Add(1)
+		case <-s.done:
+			return
 		}
 		select {
 		case s.lines <- msg.Line:
 		case <-s.done:
 			return
+		default:
+			s.plainDrops.Add(1)
+		}
+
+		if d := s.delivered.Load(); d > 0 && d%500 == 0 {
+			streamDebugf("agent=%s delivered=%d received=%d filter-drops=%d plain-drops=%d typed-buf=%d/%d",
+				s.agentName, d, s.received.Load(), s.filterDrops.Load(),
+				s.plainDrops.Load(), len(s.typedLines), cap(s.typedLines))
 		}
 	}
+}
+
+// truncateForLog clips a line to a short prefix for debug logs.
+func truncateForLog(s string) string {
+	const maxLen = 120
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
+}
+
+// Stats returns counters for diagnostics. Useful from tests and from the
+// debug log to confirm where lines are being dropped along the pipeline.
+func (s *SocketStream) Stats() (received, delivered, filterDrops, plainDrops uint64) {
+	return s.received.Load(), s.delivered.Load(), s.filterDrops.Load(), s.plainDrops.Load()
 }

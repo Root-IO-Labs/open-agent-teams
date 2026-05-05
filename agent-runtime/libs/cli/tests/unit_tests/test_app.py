@@ -1,4 +1,4 @@
-"""Unit tests for DeepAgentsApp."""
+"""Unit tests for OatSdksApp."""
 
 import io
 import os
@@ -15,16 +15,16 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from deepagents_cli.app import (
+from oat_cli.app import (
     _ITERM_CURSOR_GUIDE_OFF,
     _ITERM_CURSOR_GUIDE_ON,
-    DeepAgentsApp,
+    OatSdksApp,
     QueuedMessage,
     TextualSessionState,
     _write_iterm_escape,
 )
-from deepagents_cli.widgets.chat_input import ChatInput
-from deepagents_cli.widgets.messages import (
+from oat_cli.widgets.chat_input import ChatInput
+from oat_cli.widgets.messages import (
     AppMessage,
     ErrorMessage,
     QueuedUserMessage,
@@ -38,7 +38,7 @@ class TestInitialPromptOnMount:
     async def test_initial_prompt_triggers_handle_user_message(self) -> None:
         """When initial_prompt is set, the prompt should be auto-submitted."""
         mock_agent = MagicMock()
-        app = DeepAgentsApp(
+        app = OatSdksApp(
             agent=mock_agent,
             thread_id="new-thread-123",
             initial_prompt="hello world",
@@ -68,7 +68,7 @@ class TestAppCSSValidation:
         This test catches invalid CSS properties like 'overflow: visible'
         which are only validated at runtime when styles are applied.
         """
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             # Give the app time to render and apply CSS
             await pilot.pause()
@@ -81,12 +81,12 @@ class TestThreadCachePrewarm:
 
     async def test_prewarm_uses_current_thread_limit(self) -> None:
         """Prewarm helper should pass the resolved thread limit through."""
-        app = DeepAgentsApp(agent=MagicMock(), thread_id="thread-123")
+        app = OatSdksApp(agent=MagicMock(), thread_id="thread-123")
 
         with (
-            patch("deepagents_cli.sessions.get_thread_limit", return_value=7),
+            patch("oat_cli.sessions.get_thread_limit", return_value=7),
             patch(
-                "deepagents_cli.sessions.prewarm_thread_message_counts",
+                "oat_cli.sessions.prewarm_thread_message_counts",
                 new_callable=AsyncMock,
             ) as mock_prewarm,
         ):
@@ -104,17 +104,17 @@ class TestThreadCachePrewarm:
                 "message_count": 2,
             }
         ]
-        app = DeepAgentsApp()
+        app = OatSdksApp()
 
         async with app.run_test() as pilot:
             await pilot.pause()
             with (
-                patch("deepagents_cli.sessions.get_thread_limit", return_value=9),
+                patch("oat_cli.sessions.get_thread_limit", return_value=9),
                 patch(
-                    "deepagents_cli.sessions.get_cached_threads",
+                    "oat_cli.sessions.get_cached_threads",
                     return_value=cached_threads,
                 ),
-                patch("deepagents_cli.app.ThreadSelectorScreen") as mock_screen_cls,
+                patch("oat_cli.app.ThreadSelectorScreen") as mock_screen_cls,
                 patch.object(app, "push_screen") as mock_push_screen,
             ):
                 mock_screen = MagicMock()
@@ -135,7 +135,7 @@ class TestAppBindings:
 
     def test_toggle_tool_output_has_ctrl_e_binding(self) -> None:
         """Ctrl+E should be bound to toggle_tool_output with priority."""
-        bindings = [b for b in DeepAgentsApp.BINDINGS if isinstance(b, Binding)]
+        bindings = [b for b in OatSdksApp.BINDINGS if isinstance(b, Binding)]
         bindings_by_key = {b.key: b for b in bindings}
         ctrl_e = bindings_by_key.get("ctrl+e")
 
@@ -145,7 +145,7 @@ class TestAppBindings:
 
     def test_ctrl_o_not_bound_to_toggle_tool_output(self) -> None:
         """Ctrl+O should not exist (replaced by Ctrl+E)."""
-        bindings = [b for b in DeepAgentsApp.BINDINGS if isinstance(b, Binding)]
+        bindings = [b for b in OatSdksApp.BINDINGS if isinstance(b, Binding)]
         bindings_by_key = {b.key: b for b in bindings}
         assert "ctrl+o" not in bindings_by_key
 
@@ -170,7 +170,7 @@ class TestITerm2CursorGuide:
         """_write_iterm_escape should no-op when _IS_ITERM is False."""
         mock_stderr = MagicMock()
         with (
-            patch("deepagents_cli.app._IS_ITERM", False),
+            patch("oat_cli.app._IS_ITERM", False),
             patch("sys.__stderr__", mock_stderr),
         ):
             _write_iterm_escape(_ITERM_CURSOR_GUIDE_ON)
@@ -180,7 +180,7 @@ class TestITerm2CursorGuide:
         """_write_iterm_escape should write sequence when in iTerm2."""
         mock_stderr = io.StringIO()
         with (
-            patch("deepagents_cli.app._IS_ITERM", True),
+            patch("oat_cli.app._IS_ITERM", True),
             patch("sys.__stderr__", mock_stderr),
         ):
             _write_iterm_escape(_ITERM_CURSOR_GUIDE_ON)
@@ -191,7 +191,7 @@ class TestITerm2CursorGuide:
         mock_stderr = MagicMock()
         mock_stderr.write.side_effect = OSError("Broken pipe")
         with (
-            patch("deepagents_cli.app._IS_ITERM", True),
+            patch("oat_cli.app._IS_ITERM", True),
             patch("sys.__stderr__", mock_stderr),
         ):
             _write_iterm_escape(_ITERM_CURSOR_GUIDE_ON)
@@ -199,7 +199,7 @@ class TestITerm2CursorGuide:
     def test_write_iterm_escape_handles_none_stderr(self) -> None:
         """_write_iterm_escape should handle None __stderr__ gracefully."""
         with (
-            patch("deepagents_cli.app._IS_ITERM", True),
+            patch("oat_cli.app._IS_ITERM", True),
             patch("sys.__stderr__", None),
         ):
             _write_iterm_escape(_ITERM_CURSOR_GUIDE_ON)
@@ -336,7 +336,7 @@ class TestMountMessageNoMatches:
 
     async def test_mount_message_no_crash_when_messages_missing(self) -> None:
         """_mount_message should not raise NoMatches when #messages is absent."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
@@ -364,7 +364,7 @@ class TestMountMessageNoMatches:
         in the CancelledError handler, _run_agent_task's except clause also
         calls _mount_message(ErrorMessage(...)), which fails the same way.
         """
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
@@ -392,11 +392,11 @@ class TestQueuedMessage:
 
 
 class TestMessageQueue:
-    """Test message queue behavior in DeepAgentsApp."""
+    """Test message queue behavior in OatSdksApp."""
 
     async def test_message_queued_when_agent_running(self) -> None:
         """Messages should be queued when agent is running."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -410,7 +410,7 @@ class TestMessageQueue:
 
     async def test_message_blocked_while_thread_switching(self) -> None:
         """Submissions should be ignored while thread switching is in-flight."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._thread_switching = True
@@ -429,7 +429,7 @@ class TestMessageQueue:
 
     async def test_queued_widget_mounted(self) -> None:
         """Queued messages should produce a QueuedUserMessage widget."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -443,7 +443,7 @@ class TestMessageQueue:
 
     async def test_immediate_processing_when_agent_idle(self) -> None:
         """Messages should process immediately when agent is not running."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             assert not app._agent_running
@@ -459,7 +459,7 @@ class TestMessageQueue:
 
     async def test_fifo_order(self) -> None:
         """Queued messages should process in FIFO order."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -475,7 +475,7 @@ class TestMessageQueue:
 
     async def test_queue_cleared_on_interrupt(self) -> None:
         """Interrupt should clear the message queue."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -499,7 +499,7 @@ class TestMessageQueue:
 
     async def test_interrupt_dismisses_completion_without_stopping_agent(self) -> None:
         """Esc should dismiss completion popup without interrupting the agent."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -523,7 +523,7 @@ class TestMessageQueue:
 
     async def test_interrupt_falls_through_when_no_completion(self) -> None:
         """Esc should interrupt the agent when completion is not active."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -541,7 +541,7 @@ class TestMessageQueue:
 
     async def test_queue_cleared_on_ctrl_c(self) -> None:
         """Ctrl+C should clear the message queue."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._agent_running = True
@@ -558,7 +558,7 @@ class TestMessageQueue:
 
     async def test_process_next_from_queue_removes_widget(self) -> None:
         """Processing a queued message should remove its ephemeral widget."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
@@ -576,7 +576,7 @@ class TestMessageQueue:
 
     async def test_bash_command_continues_chain(self) -> None:
         """Bash/command messages should not break the queue processing chain."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
@@ -601,17 +601,17 @@ class TestTraceCommand:
 
     async def test_trace_opens_browser_when_configured(self) -> None:
         """Should open the LangSmith thread URL in the browser."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._session_state = TextualSessionState(thread_id="test-thread-123")
 
             with (
                 patch(
-                    "deepagents_cli.app.build_langsmith_thread_url",
+                    "oat_cli.app.build_langsmith_thread_url",
                     return_value="https://smith.langchain.com/o/org/projects/p/proj/t/test-thread-123",
                 ),
-                patch("deepagents_cli.app.webbrowser.open") as mock_open,
+                patch("oat_cli.app.webbrowser.open") as mock_open,
             ):
                 await app._handle_trace_command("/trace")
                 await pilot.pause()
@@ -628,13 +628,13 @@ class TestTraceCommand:
 
     async def test_trace_shows_error_when_not_configured(self) -> None:
         """Should show configuration hint when LangSmith is not set up."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._session_state = TextualSessionState()
 
             with patch(
-                "deepagents_cli.app.build_langsmith_thread_url",
+                "oat_cli.app.build_langsmith_thread_url",
                 return_value=None,
             ):
                 await app._handle_trace_command("/trace")
@@ -645,7 +645,7 @@ class TestTraceCommand:
 
     async def test_trace_shows_error_when_no_session(self) -> None:
         """Should show error when there is no active session."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._session_state = None
@@ -658,18 +658,18 @@ class TestTraceCommand:
 
     async def test_trace_shows_link_when_browser_fails(self) -> None:
         """Should still display the URL link even if the browser cannot open."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._session_state = TextualSessionState(thread_id="test-thread-123")
 
             with (
                 patch(
-                    "deepagents_cli.app.build_langsmith_thread_url",
+                    "oat_cli.app.build_langsmith_thread_url",
                     return_value="https://smith.langchain.com/t/test-thread-123",
                 ),
                 patch(
-                    "deepagents_cli.app.webbrowser.open",
+                    "oat_cli.app.webbrowser.open",
                     side_effect=webbrowser.Error("no browser"),
                 ),
             ):
@@ -684,13 +684,13 @@ class TestTraceCommand:
 
     async def test_trace_shows_error_when_url_build_raises(self) -> None:
         """Should show error message when build_langsmith_thread_url raises."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._session_state = TextualSessionState(thread_id="test-thread-123")
 
             with patch(
-                "deepagents_cli.app.build_langsmith_thread_url",
+                "oat_cli.app.build_langsmith_thread_url",
                 side_effect=RuntimeError("SDK error"),
             ):
                 await app._handle_trace_command("/trace")
@@ -701,7 +701,7 @@ class TestTraceCommand:
 
     async def test_trace_routed_from_handle_command(self) -> None:
         """'/trace' should be correctly routed through _handle_command."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             app._session_state = None
@@ -718,13 +718,13 @@ class TestRunAgentTaskImageTracker:
 
     async def test_run_agent_task_passes_image_tracker(self) -> None:
         """`_run_agent_task` should forward the shared image tracker."""
-        app = DeepAgentsApp(agent=MagicMock())
+        app = OatSdksApp(agent=MagicMock())
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._ui_adapter is not None
 
             with patch(
-                "deepagents_cli.app.execute_task_textual", new_callable=AsyncMock
+                "oat_cli.app.execute_task_textual", new_callable=AsyncMock
             ) as mock_execute:
                 await app._run_agent_task("hello")
 
@@ -734,7 +734,7 @@ class TestRunAgentTaskImageTracker:
 
     async def test_run_agent_task_finalizes_pending_tools_on_error(self) -> None:
         """Unexpected agent errors should stop/clear in-flight tool widgets."""
-        app = DeepAgentsApp(agent=MagicMock())
+        app = OatSdksApp(agent=MagicMock())
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._ui_adapter is not None
@@ -743,7 +743,7 @@ class TestRunAgentTaskImageTracker:
             app._ui_adapter._current_tool_messages = {"tool-1": pending_tool}
 
             with patch(
-                "deepagents_cli.app.execute_task_textual",
+                "oat_cli.app.execute_task_textual",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("boom"),
             ):
@@ -762,7 +762,7 @@ class TestAppFocusRestoresChatInput:
 
     async def test_app_focus_restores_chat_input(self) -> None:
         """Regaining terminal focus should re-focus the chat input."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._chat_input is not None
@@ -780,12 +780,12 @@ class TestAppFocusRestoresChatInput:
 
     async def test_app_focus_skips_when_modal_open(self) -> None:
         """Regaining focus should not steal focus from an open modal."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
             # Push a modal screen
-            from deepagents_cli.widgets.thread_selector import ThreadSelectorScreen
+            from oat_cli.widgets.thread_selector import ThreadSelectorScreen
 
             screen = ThreadSelectorScreen(current_thread=None)
             app.push_screen(screen)
@@ -801,7 +801,7 @@ class TestAppFocusRestoresChatInput:
 
     async def test_app_focus_skips_when_approval_pending(self) -> None:
         """Regaining focus should not steal focus from the approval widget."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._chat_input is not None
@@ -820,7 +820,7 @@ class TestPasteRouting:
 
     async def test_on_paste_routes_unfocused_event_to_chat_input(self) -> None:
         """Unfocused paste events should be forwarded to chat input handler."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._chat_input is not None
@@ -842,7 +842,7 @@ class TestPasteRouting:
 
     async def test_on_paste_does_not_route_when_input_already_focused(self) -> None:
         """Focused input should keep normal TextArea paste handling path."""
-        app = DeepAgentsApp()
+        app = OatSdksApp()
         async with app.run_test() as pilot:
             await pilot.pause()
             assert app._chat_input is not None

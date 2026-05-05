@@ -104,10 +104,10 @@ func (d *Daemon) recoverMissedMessages(repoName, agentName string, stalePoint ti
 	var sb strings.Builder
 	sb.WriteString("\nMissed messages while you were thinking:\n")
 	if omitted > 0 {
-		sb.WriteString(fmt.Sprintf("  (%d earlier messages omitted)\n", omitted))
+		fmt.Fprintf(&sb, "  (%d earlier messages omitted)\n", omitted)
 	}
 	for _, m := range missed {
-		sb.WriteString(fmt.Sprintf("  [%s] %s\n", m.From, m.Body))
+		fmt.Fprintf(&sb, "  [%s] %s\n", m.From, m.Body)
 	}
 	return sb.String()
 }

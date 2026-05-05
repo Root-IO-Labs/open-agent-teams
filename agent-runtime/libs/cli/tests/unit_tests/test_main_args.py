@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from deepagents_cli.config import parse_shell_allow_list
-from deepagents_cli.main import apply_stdin_pipe, parse_args
+from oat_cli.config import parse_shell_allow_list
+from oat_cli.main import apply_stdin_pipe, parse_args
 
 MockArgvType = Callable[..., AbstractContextManager[object]]
 
@@ -21,7 +21,7 @@ def mock_argv() -> MockArgvType:
     """Factory fixture to mock sys.argv with given arguments."""
 
     def _mock_argv(*args: str) -> AbstractContextManager[object]:
-        return patch.object(sys, "argv", ["deepagents", *args])
+        return patch.object(sys, "argv", ["oat_sdk", *args])
 
     return _mock_argv
 
@@ -150,12 +150,12 @@ class TestNoStreamArgument:
 
     def test_requires_non_interactive(self) -> None:
         """Test --no-stream without -n or piped stdin exits with code 2."""
-        from deepagents_cli.main import cli_main
+        from oat_cli.main import cli_main
 
         mock_stdin = MagicMock()
         mock_stdin.isatty.return_value = True
         with (
-            patch.object(sys, "argv", ["deepagents", "--no-stream"]),
+            patch.object(sys, "argv", ["oat_sdk", "--no-stream"]),
             patch.object(sys, "stdin", mock_stdin),
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -168,12 +168,12 @@ class TestQuietRequiresNonInteractive:
 
     def test_quiet_without_non_interactive_exits(self) -> None:
         """Test --quiet without -n or piped stdin exits with code 2."""
-        from deepagents_cli.main import cli_main
+        from oat_cli.main import cli_main
 
         mock_stdin = MagicMock()
         mock_stdin.isatty.return_value = True
         with (
-            patch.object(sys, "argv", ["deepagents", "-q"]),
+            patch.object(sys, "argv", ["oat_sdk", "-q"]),
             patch.object(sys, "stdin", mock_stdin),
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -238,12 +238,12 @@ class TestProfileOverrideArgument:
 
     def test_invalid_json_exits(self) -> None:
         """--profile-override with invalid JSON exits with code 1."""
-        from deepagents_cli.main import cli_main
+        from oat_cli.main import cli_main
 
         mock_stdin = MagicMock()
         mock_stdin.isatty.return_value = True
         with (
-            patch.object(sys, "argv", ["deepagents", "--profile-override", "{bad"]),
+            patch.object(sys, "argv", ["oat_sdk", "--profile-override", "{bad"]),
             patch.object(sys, "stdin", mock_stdin),
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -252,12 +252,12 @@ class TestProfileOverrideArgument:
 
     def test_non_dict_json_exits(self) -> None:
         """--profile-override with JSON array exits with code 1."""
-        from deepagents_cli.main import cli_main
+        from oat_cli.main import cli_main
 
         mock_stdin = MagicMock()
         mock_stdin.isatty.return_value = True
         with (
-            patch.object(sys, "argv", ["deepagents", "--profile-override", "[1,2]"]),
+            patch.object(sys, "argv", ["oat_sdk", "--profile-override", "[1,2]"]),
             patch.object(sys, "stdin", mock_stdin),
             pytest.raises(SystemExit) as exc_info,
         ):

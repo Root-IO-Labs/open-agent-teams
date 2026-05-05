@@ -125,6 +125,8 @@ const (
 	TaskStatusNoPR TaskStatus = "no-pr"
 	// TaskStatusFailed means the task failed without creating a PR
 	TaskStatusFailed TaskStatus = "failed"
+	// TaskStatusRecovered means the worker failed but its PR was eventually merged
+	TaskStatusRecovered TaskStatus = "recovered"
 	// TaskStatusUnknown means the status couldn't be determined
 	TaskStatusUnknown TaskStatus = "unknown"
 )
@@ -167,6 +169,15 @@ type Agent struct {
 	NudgeResetUsed              bool      `json:"nudge_reset_used,omitempty"`               // Whether supervisor has used their one-time nudge reset
 	LastBranchSHA               string    `json:"last_branch_sha,omitempty"`                // Last known commit SHA on the worker's branch
 	Model                       string    `json:"model,omitempty"`                          // LLM model override (agent-level; takes precedence over repo default)
+	RoutingSource               string    `json:"routing_source,omitempty"`                 // How Model was chosen: operator-explicit | repo-default | router-auto | restart-fallback | unknown
+	RoutingDecisionReason       string    `json:"routing_decision_reason,omitempty"`        // human-readable reason from the router (e.g. "complexity=complex floor=9 chose haiku")
+	RoutingCandidates           []string  `json:"routing_candidates,omitempty"`             // ranked candidate model IDs at decision time, first = the pick — needed for counterfactual replay
+	RoutingAllowlist            []string  `json:"routing_allowlist,omitempty"`              // snapshot of repo's AllowedWorkerModels at decision time
+	PromptSystemHash            string    `json:"prompt_system_hash,omitempty"`             // sha256 of system prompt at spawn — feeds OutcomeRecord.Prompt
+	PromptSystemTokens          int       `json:"prompt_system_tokens,omitempty"`           // estimated token count of system prompt
+	PromptUserHash              string    `json:"prompt_user_hash,omitempty"`               // sha256 of user task message at spawn
+	PromptUserTokens            int       `json:"prompt_user_tokens,omitempty"`             // estimated token count of user task message
+	BaseSHA                     string    `json:"base_sha,omitempty"`                       // Pinned remote base commit (e.g. origin/main HEAD at request-review time); used as the verifier's diff base so concurrently-landed commits don't appear as deletions
 	InputTokens                 int64     `json:"input_tokens,omitempty"`                   // Cumulative input tokens from LLM API
 	OutputTokens                int64     `json:"output_tokens,omitempty"`                  // Cumulative output tokens from LLM API
 	TotalTokens                 int64     `json:"total_tokens,omitempty"`                   // InputTokens + OutputTokens
@@ -190,6 +201,14 @@ type Agent struct {
 	WokenForMergedPRAt   time.Time `json:"woken_for_merged_pr_at,omitempty"` // When the worker was woken because its PR was merged (fast-track auto-complete)
 	LastNudgeTier        int       `json:"last_nudge_tier,omitempty"`        // Tier of the last nudge sent (for de-duplication)
 	SuppressedNudgeCount int       `json:"suppressed_nudge_count,omitempty"` // Number of consecutive suppressed nudges at the same tier
+	// Supervisor/merge-queue "no-change" nudge skip tracking. The daemon
+	// hashes every nudge message post-snapshot-injection and skips the
+	// actual PTY send when the hash matches LastNudgeHash. NudgeSkipCount
+	// tracks consecutive skips so a forced refresh eventually fires even
+	// when state is truly static. Workers are not affected — they have
+	// their own tier-based dedup in stuck_worker.go.
+	LastNudgeHash  string `json:"last_nudge_hash,omitempty"`
+	NudgeSkipCount int    `json:"nudge_skip_count,omitempty"`
 }
 
 // IsDormant returns true if the agent is in any dormancy state (waiting for
@@ -217,7 +236,7 @@ type Repository struct {
 	ForkConfig              ForkConfig         `json:"fork_config,omitempty"`
 	TargetBranch            string             `json:"target_branch,omitempty"`             // Default branch for PRs (usually "main")
 	IdleMode                bool               `json:"idle_mode,omitempty"`                 // True when daemon has paused nudges for this repo (no workers)
-	Model                   string             `json:"model,omitempty"`                     // Default LLM model for agents in this repo (e.g., "claude-sonnet-4-6")
+	Model                   string             `json:"model,omitempty"`                     // Default LLM model for agents in this repo (e.g., "claude-sonnet-4-5")
 	AllowedWorkerModels     []string           `json:"allowed_worker_models,omitempty"`     // Restrict which models can be used for workers (empty = no restriction)
 	WorkspaceStuckDetection bool               `json:"workspace_stuck_detection,omitempty"` // Enable workspace stuck-thinking detection (off by default)
 }

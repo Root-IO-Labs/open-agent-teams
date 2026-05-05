@@ -449,53 +449,6 @@ func TestExtractTestFailures(t *testing.T) {
 	}
 }
 
-func TestCollectSimpleVerifyFiles(t *testing.T) {
-	dir := t.TempDir()
-	for _, name := range []string{"test.py", "script.sh", "main.go", "notes.txt"} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte("test"), 0644); err != nil {
-			t.Fatalf("WriteFile(%q) error = %v", name, err)
-		}
-	}
-
-	oldCwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd() error = %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("Chdir(%q) error = %v", dir, err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(oldCwd); err != nil {
-			t.Fatalf("restoring cwd failed: %v", err)
-		}
-	})
-
-	got, err := collectSimpleVerifyFiles()
-	if err != nil {
-		t.Fatalf("collectSimpleVerifyFiles() error = %v", err)
-	}
-
-	want := []string{"test.py", "main.go", "script.sh"}
-	for _, file := range want {
-		found := false
-		for _, gotFile := range got {
-			if gotFile == file {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("collectSimpleVerifyFiles() missing %q in %v", file, got)
-		}
-	}
-
-	for _, gotFile := range got {
-		if gotFile == "notes.txt" {
-			t.Fatalf("collectSimpleVerifyFiles() unexpectedly included %q", gotFile)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // removeDuplicateBlocks - file-level test
 // ---------------------------------------------------------------------------
@@ -1020,5 +973,223 @@ func TestVerifyWorkerAllowedWhenVerifierGone(t *testing.T) {
 	err := cli.verifyWorker(nil)
 	if err != nil && strings.Contains(err.Error(), "self-verify blocked") {
 		t.Fatal("verifyWorker() should NOT block when verifier is gone from state")
+	}
+}
+
+// TestGatherVerificationContextUsesPinnedBaseSHA verifies that
+// gatherVerificationContext reads the worker's pinned BaseSHA from state
+// and uses it as the diff base. The git diff sub-commands themselves
+// fail (no real repo), but BaseRef must still reflect what the verifier
+// would diff against.
+func TestGatherVerificationContextUsesPinnedBaseSHA(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+	paths := &config.Paths{
+		Root:         tmpDir,
+		WorktreesDir: filepath.Join(tmpDir, "wts"),
+		ReposDir:     filepath.Join(tmpDir, "repos"),
+		StateFile:    filepath.Join(tmpDir, "state.json"),
+	}
+	cli := &CLI{paths: paths}
+
+	pinnedSHA := "abcdef0123456789abcdef0123456789abcdef01"
+	st := map[string]interface{}{
+		"repos": map[string]interface{}{
+			"test-repo": map[string]interface{}{
+				"github_url":   "https://github.com/test/repo",
+				"session_name": "test-session",
+				"agents": map[string]interface{}{
+					"my-worker": map[string]interface{}{
+						"type":        "worker",
+						"window_name": "my-worker",
+						"created_at":  time.Now().Format(time.RFC3339),
+						"base_sha":    pinnedSHA,
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(st, "", "  ")
+	if err := os.WriteFile(paths.StateFile, data, 0644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	vctx := cli.gatherVerificationContext("test-repo", "my-worker")
+	if vctx.BaseRef != pinnedSHA {
+		t.Errorf("BaseRef = %q, want pinned SHA %q", vctx.BaseRef, pinnedSHA)
+	}
+}
+
+// TestGatherVerificationContextFallbackToOriginMain verifies that when no
+// BaseSHA is set on the worker (upgrade path or daemon-side snapshot
+// failure), gatherVerificationContext falls back to literal "origin/main".
+func TestGatherVerificationContextFallbackToOriginMain(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+	paths := &config.Paths{
+		Root:         tmpDir,
+		WorktreesDir: filepath.Join(tmpDir, "wts"),
+		ReposDir:     filepath.Join(tmpDir, "repos"),
+		StateFile:    filepath.Join(tmpDir, "state.json"),
+	}
+	cli := &CLI{paths: paths}
+
+	st := map[string]interface{}{
+		"repos": map[string]interface{}{
+			"test-repo": map[string]interface{}{
+				"github_url":   "https://github.com/test/repo",
+				"session_name": "test-session",
+				"agents": map[string]interface{}{
+					"my-worker": map[string]interface{}{
+						"type":        "worker",
+						"window_name": "my-worker",
+						"created_at":  time.Now().Format(time.RFC3339),
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(st, "", "  ")
+	if err := os.WriteFile(paths.StateFile, data, 0644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	vctx := cli.gatherVerificationContext("test-repo", "my-worker")
+	if vctx.BaseRef != "origin/main" {
+		t.Errorf("BaseRef = %q, want %q (fallback)", vctx.BaseRef, "origin/main")
+	}
+}
+
+// TestGetDiffBaseRefUsesPinnedBaseSHA verifies that self-verify
+// (getImplementationSummary, getModifiedFiles via getDiffBaseRef) reads
+// the worker's pinned BaseSHA from state when the CLI is run inside the
+// worker's worktree -- ensuring self-verify and the verifier diff
+// against the same base.
+func TestGetDiffBaseRefUsesPinnedBaseSHA(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+	paths := &config.Paths{
+		Root:         tmpDir,
+		WorktreesDir: filepath.Join(tmpDir, "wts"),
+		ReposDir:     filepath.Join(tmpDir, "repos"),
+		StateFile:    filepath.Join(tmpDir, "state.json"),
+	}
+	cli := &CLI{paths: paths}
+
+	pinnedSHA := "deadbeef0123456789deadbeef0123456789dead"
+	st := map[string]interface{}{
+		"repos": map[string]interface{}{
+			"test-repo": map[string]interface{}{
+				"github_url":   "https://github.com/test/repo",
+				"session_name": "test-session",
+				"agents": map[string]interface{}{
+					"my-worker": map[string]interface{}{
+						"type":        "worker",
+						"window_name": "my-worker",
+						"created_at":  time.Now().Format(time.RFC3339),
+						"base_sha":    pinnedSHA,
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(st, "", "  ")
+	if err := os.WriteFile(paths.StateFile, data, 0644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	workerDir := filepath.Join(paths.WorktreesDir, "test-repo", "my-worker")
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		t.Fatalf("mkdir worker: %v", err)
+	}
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(workerDir); err != nil {
+		t.Fatalf("chdir worker: %v", err)
+	}
+	defer os.Chdir(origDir)
+
+	if got := cli.getDiffBaseRef(); got != pinnedSHA {
+		t.Errorf("getDiffBaseRef() = %q, want pinned SHA %q", got, pinnedSHA)
+	}
+}
+
+// TestGetDiffBaseRefFallsBackWithoutPinnedSHA verifies that when the
+// worker has no BaseSHA on its state, getDiffBaseRef falls through to
+// the live getBaseBranchRef() (which returns "" without a real git
+// repo). This is the documented happy path for self-verify run
+// BEFORE any request-review.
+func TestGetDiffBaseRefFallsBackWithoutPinnedSHA(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+	paths := &config.Paths{
+		Root:         tmpDir,
+		WorktreesDir: filepath.Join(tmpDir, "wts"),
+		ReposDir:     filepath.Join(tmpDir, "repos"),
+		StateFile:    filepath.Join(tmpDir, "state.json"),
+	}
+	cli := &CLI{paths: paths}
+
+	st := map[string]interface{}{
+		"repos": map[string]interface{}{
+			"test-repo": map[string]interface{}{
+				"github_url":   "https://github.com/test/repo",
+				"session_name": "test-session",
+				"agents": map[string]interface{}{
+					"my-worker": map[string]interface{}{
+						"type":        "worker",
+						"window_name": "my-worker",
+						"created_at":  time.Now().Format(time.RFC3339),
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(st, "", "  ")
+	if err := os.WriteFile(paths.StateFile, data, 0644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	workerDir := filepath.Join(paths.WorktreesDir, "test-repo", "my-worker")
+	if err := os.MkdirAll(workerDir, 0755); err != nil {
+		t.Fatalf("mkdir worker: %v", err)
+	}
+
+	origDir, _ := os.Getwd()
+	if err := os.Chdir(workerDir); err != nil {
+		t.Fatalf("chdir worker: %v", err)
+	}
+	defer os.Chdir(origDir)
+
+	// No pinned BaseSHA, no real git repo in cwd -> live fallback returns "".
+	got := cli.getDiffBaseRef()
+	if got == "deadbeef0123456789deadbeef0123456789dead" {
+		t.Errorf("getDiffBaseRef() should not return pinned SHA when state has no base_sha; got %q", got)
+	}
+	// Don't assert on the exact fallback value: getBaseBranchRef may
+	// resolve via the OUTER repo's .git if the test runs from inside
+	// open-agent-teams. The contract under test is just "did NOT use a
+	// stale or fabricated SHA"; the fallback string is verified by the
+	// gatherVerificationContext tests above.
+}
+
+// TestGatherVerificationContextNoStateFallback verifies that when state
+// can't be loaded at all (no state file), the function still returns a
+// usable context with BaseRef defaulting to origin/main rather than
+// crashing.
+func TestGatherVerificationContextNoStateFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+	paths := &config.Paths{
+		Root:         tmpDir,
+		WorktreesDir: filepath.Join(tmpDir, "wts"),
+		ReposDir:     filepath.Join(tmpDir, "repos"),
+		StateFile:    filepath.Join(tmpDir, "no-such-state.json"),
+	}
+	cli := &CLI{paths: paths}
+
+	vctx := cli.gatherVerificationContext("test-repo", "my-worker")
+	if vctx.BaseRef != "origin/main" {
+		t.Errorf("BaseRef = %q, want %q (fallback when no state)", vctx.BaseRef, "origin/main")
 	}
 }

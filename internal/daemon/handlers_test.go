@@ -3356,6 +3356,71 @@ func TestCleanupDeadVerifierWakesDormantWorker(t *testing.T) {
 	}
 }
 
+// TestCleanupDeliveredVerifierDoesNotClaimCrash covers the race where a
+// verifier cleanly delivered a verdict (ReadyForCleanup=true) but a
+// concurrent `oat worker request-review` reset the worker's
+// VerificationStatus back to "pending" before the cleanup loop ran. The
+// guard added to cleanupDeadAgents must NOT emit the bogus
+// "crashed before delivering a verdict" wake-message in this case.
+func TestCleanupDeliveredVerifierDoesNotClaimCrash(t *testing.T) {
+	d, cleanup := setupTestDaemonWithState(t, func(s *state.State) {
+		s.AddRepo("test-repo", &state.Repository{
+			GithubURL:   "https://github.com/test/repo",
+			SessionName: "test-session",
+			Agents:      make(map[string]state.Agent),
+		})
+		s.AddAgent("test-repo", "my-worker", state.Agent{
+			Type:              state.AgentTypeWorker,
+			WindowName:        "my-worker",
+			Task:              "Implement feature Y",
+			CreatedAt:         time.Now(),
+			WaitingForPR:      true,
+			WaitingForPRSince: time.Now().Add(-3 * time.Minute),
+			// Status is "pending" because a concurrent re-request-review
+			// reset it after the verifier already delivered its verdict.
+			VerificationStatus: "pending",
+			VerificationAgent:  "verify-my-worker",
+		})
+		s.AddAgent("test-repo", "verify-my-worker", state.Agent{
+			Type:            state.AgentTypeVerification,
+			WindowName:      "verify-my-worker",
+			CreatedAt:       time.Now(),
+			ReadyForCleanup: true, // verdict was successfully delivered
+		})
+	})
+	defer cleanup()
+
+	deadAgents := map[string][]string{
+		"test-repo": {"verify-my-worker"},
+	}
+	d.cleanupDeadAgents(deadAgents)
+
+	// Verifier should still be removed (cleanup runs as normal)
+	_, vExists := d.state.GetAgent("test-repo", "verify-my-worker")
+	if vExists {
+		t.Error("Verifier should have been removed")
+	}
+
+	worker, wExists := d.state.GetAgent("test-repo", "my-worker")
+	if !wExists {
+		t.Fatal("Worker should still exist")
+	}
+
+	// The orphaned worker pointers must still get cleared so state stays
+	// internally consistent; only the bogus crash wake-message is suppressed.
+	if worker.VerificationStatus != "" {
+		t.Errorf("VerificationStatus should be cleared, got %q", worker.VerificationStatus)
+	}
+	if worker.VerificationAgent != "" {
+		t.Errorf("VerificationAgent should be cleared, got %q", worker.VerificationAgent)
+	}
+
+	// The wake-message must NOT claim a crash.
+	if strings.Contains(worker.LastWakeReason, "crashed before delivering a verdict") {
+		t.Errorf("LastWakeReason should NOT claim crash for a verifier that delivered a verdict; got: %s", worker.LastWakeReason)
+	}
+}
+
 func TestHandleAgentWaitingNoPRClosesAssociatedIssue(t *testing.T) {
 	d, cleanup := setupTestDaemonWithState(t, func(s *state.State) {
 		s.AddRepo("test-repo", &state.Repository{

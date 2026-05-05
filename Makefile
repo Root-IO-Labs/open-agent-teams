@@ -3,7 +3,8 @@
 
 .PHONY: help build test unit-tests e2e-tests verify-docs coverage check-all pre-commit clean \
 	dev-install dev-clean-bin dev-restart dev-status dev-clean-sockets dev-full-reset \
-	dev-verify dev-nuke sidecar-test
+	dev-verify dev-nuke sidecar-test \
+	release-snapshot release-check stage-runtime
 
 # Default target
 help:
@@ -38,11 +39,28 @@ help:
 	@echo "  make dev-nuke          - EMERGENCY: kill every OAT process, clean all state"
 	@echo "  make sidecar-test      - Run sidecar-related unit + integration tests"
 
+# ---------------------------------------------------------------------------
+# Release metadata injected at build time
+#
+# VERSION resolves to the nearest `v*` tag if available, otherwise the
+# short commit SHA with a `-dev` suffix so local builds stay identifiable.
+# COMMIT / DATE carry the usual git/UTC-timestamp shape. All three are
+# propagated via -ldflags "-X internal/version.*" so the resulting binary
+# can report a precise build identity without reading /proc or .git at runtime.
+# goreleaser re-exports the same three variables on tag builds.
+# ---------------------------------------------------------------------------
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0-dev")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Version=$(VERSION) \
+           -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Commit=$(COMMIT) \
+           -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Date=$(DATE)
+
 # Build - matches CI build job
 build:
 	@echo "==> Building all packages..."
-	@go build -v ./...
-	@echo "✓ Build successful"
+	@go build -ldflags "$(LDFLAGS)" -v ./...
+	@echo "✓ Build successful ($(VERSION) $(COMMIT))"
 
 # Unit tests - matches CI unit-tests job
 unit-tests:
@@ -152,7 +170,7 @@ OAT_AGENT_BIN := $(GOBIN)/oat-agent
 # `oat stop && oat start` yourself, or use `make dev-restart`.
 dev-install:
 	@echo "==> Installing oat + oat-agent from $(shell pwd)..."
-	@go install ./cmd/...
+	@go install -ldflags "$(LDFLAGS)" ./cmd/...
 	@if [ -x "$(OAT_BIN)" ]; then \
 		echo "  ✓ oat        → $(OAT_BIN) ($$(stat -f %Sm $(OAT_BIN) 2>/dev/null || stat -c %y $(OAT_BIN)))"; \
 	else \
@@ -330,7 +348,7 @@ sidecar-test:
 # What it kills:
 #   - oat daemon _run          (the daemon itself)
 #   - oat-agent                (Go bridge for each agent)
-#   - deepagents_cli           (Python LangGraph runtime per agent)
+#   - oat_cli                  (Python LangGraph runtime per agent)
 #
 # What it cleans:
 #   - /tmp/oat-sdcr-*.sock     (sidecar sockets)
@@ -341,7 +359,7 @@ sidecar-test:
 # `oat repair` or manually clear ~/.oat/state.json.
 dev-nuke:
 	@echo "==> Counting runaway processes..."
-	@echo "    deepagents Python: $$(pgrep -f 'deepagents_cli' | wc -l | tr -d ' ')"
+	@echo "    oat_cli Python: $$(pgrep -f 'oat_cli' | wc -l | tr -d ' ')"
 	@echo "    oat-agent:         $$(pgrep -f 'oat-agent' | wc -l | tr -d ' ')"
 	@echo "    oat daemon:        $$(pgrep -f 'oat daemon _run' | wc -l | tr -d ' ')"
 	@echo "    sidecar sockets:   $$(ls /tmp/oat-sdcr-*.sock 2>/dev/null | wc -l | tr -d ' ')"
@@ -350,12 +368,12 @@ dev-nuke:
 	@-$(OAT_BIN) stop 2>/dev/null || true
 	@sleep 2
 	@echo "==> Sending SIGTERM to every OAT process..."
-	@-pkill -TERM -f "deepagents_cli" 2>/dev/null || true
+	@-pkill -TERM -f "oat_cli" 2>/dev/null || true
 	@-pkill -TERM -f "oat-agent" 2>/dev/null || true
 	@-pkill -TERM -f "oat daemon _run" 2>/dev/null || true
 	@sleep 3
 	@echo "==> Escalating to SIGKILL for stragglers..."
-	@-pkill -KILL -f "deepagents_cli" 2>/dev/null || true
+	@-pkill -KILL -f "oat_cli" 2>/dev/null || true
 	@-pkill -KILL -f "oat-agent" 2>/dev/null || true
 	@-pkill -KILL -f "oat daemon _run" 2>/dev/null || true
 	@sleep 1
@@ -364,9 +382,25 @@ dev-nuke:
 	@rm -f "$$HOME/.oat/daemon.pid" 2>/dev/null || true
 	@echo ""
 	@echo "==> Final state:"
-	@echo "    deepagents Python: $$(pgrep -f 'deepagents_cli' | wc -l | tr -d ' ')"
+	@echo "    oat_cli Python: $$(pgrep -f 'oat_cli' | wc -l | tr -d ' ')"
 	@echo "    oat-agent:         $$(pgrep -f 'oat-agent' | wc -l | tr -d ' ')"
 	@echo "    oat daemon:        $$(pgrep -f 'oat daemon _run' | wc -l | tr -d ' ')"
 	@echo "    sidecar sockets:   $$(ls /tmp/oat-sdcr-*.sock 2>/dev/null | wc -l | tr -d ' ')"
 	@echo ""
 	@echo "✓ OAT fully nuked. Start fresh with: make dev-restart"
+
+# Release: stage agent-runtime/ for packaging (excludes venvs and caches)
+stage-runtime:
+	@bash scripts/stage-agent-runtime.sh
+
+# Release: validate .goreleaser.yaml syntax
+release-check:
+	@command -v goreleaser >/dev/null 2>&1 || { echo "goreleaser not found. Install with: brew install goreleaser"; exit 1; }
+	@goreleaser check
+
+# Release: build a local snapshot (no publish, no tag required) for dry-run testing
+release-snapshot:
+	@command -v goreleaser >/dev/null 2>&1 || { echo "goreleaser not found. Install with: brew install goreleaser"; exit 1; }
+	@goreleaser release --snapshot --clean --skip=publish
+	@echo ""
+	@echo "✓ Snapshot artifacts in dist/"

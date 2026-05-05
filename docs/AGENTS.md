@@ -175,14 +175,14 @@ The daemon is **not an AI agent**. It is a deterministic Go process (`internal/d
 
 ### Daemon Loops
 
-The daemon runs four periodic loops (`time.NewTicker`):
+The daemon runs four periodic loops, all on 2-minute intervals (`time.NewTicker`):
 
-| Loop | Function | Interval | What it does |
-|------|----------|----------|-------------|
-| Health check | `checkAgentHealth()` | 2 min | Verifies agent sessions exist via the backend; self-heals by restarting sessions if missing; cleans up agents marked `ReadyForCleanup`; prunes orphaned worktrees and message directories |
-| Message routing | `routeMessages()` | 60 s | Delivers pending messages from `~/.oat/messages/` to agents via `backend.SendMessage`; serialized with a mutex to prevent concurrent delivery |
-| Wake/Nudge | `wakeAgents()` | 60 s | Sends periodic status-check nudges to active agents; manages idle mode transitions; skips agents nudged within the last cycle |
-| PR monitoring | `prMonitorLoop()` | 60 s | Checks the status of PRs from dormant workers; wakes workers on CI failure, merge conflicts, new comments, or PR merge/close; at dormancy cap, force-merges green PRs or times out the worker |
+| Loop | Function | What it does |
+|------|----------|-------------|
+| Health check | `checkAgentHealth()` | Verifies agent sessions exist via the backend; self-heals by restarting sessions if missing; cleans up agents marked `ReadyForCleanup`; prunes orphaned worktrees and message directories |
+| Message routing | `routeMessages()` | Delivers pending messages from `~/.oat/messages/` to agents via `backend.SendMessage`; serialized with a mutex to prevent concurrent delivery |
+| Wake/Nudge | `wakeAgents()` | Sends periodic status-check nudges to active agents; manages idle mode transitions; skips agents nudged within the last 2 minutes |
+| PR monitoring | `prMonitorLoop()` | Checks the status of PRs from dormant workers; wakes workers on CI failure, merge conflicts, new comments, or PR merge/close; at dormancy cap, force-merges green PRs or times out the worker |
 
 ### Worker Lifecycle Management
 
@@ -197,7 +197,7 @@ active ──(oat agent waiting)──────────────> dorm
   │                                               ├──(PR closed, not merged)──> auto-completed (issue closed) ──> ready-for-cleanup
   │                                               ├──(no PR found)──> auto-completed (issue closed) ──> ready-for-cleanup
   │                                               ├──(CI failure/conflict)──> woken, back to active
-  │                                               └──(15 min cap)──> timed out ──> ready-for-cleanup
+  │                                               └──(30 min cap)──> timed out ──> ready-for-cleanup
   │
   ├──(oat agent complete)──> complete ──> ready-for-cleanup ──(health check)──> removed
   │
@@ -206,7 +206,7 @@ active ──(oat agent waiting)──────────────> dorm
 
 When a worker is auto-completed via `handleAgentWaiting` and its PR was not merged (or no PR exists), the daemon closes the worker's associated GitHub issue via `closeAssociatedIssue`. This prevents stale issues from blocking wave completion. Note: `autoCompleteWorker` (force-remove, daemon takeover) does NOT close issues — those scenarios may involve incomplete work, and the supervisor is notified to handle them.
 
-When a worker enters `ready-for-cleanup`, the next health check (within 2 minutes) stops the agent process, removes the worktree, and prunes messages.
+When a worker enters `ready-for-cleanup`, the health check loop (next 2-minute cycle) stops the agent process, removes the worktree, and prunes messages.
 
 ### Stuck Worker Escalation
 
@@ -214,14 +214,14 @@ When the daemon detects a worker that isn't making progress (not completing, not
 
 | Nudge count | Action | Constant |
 |-------------|--------|----------|
-| < 10 | Normal status nudge | — |
-| >= 10 | Alert supervisor + directive nudge | `stuckSupervisorNudge` (env: `OAT_STUCK_SUPERVISOR_NUDGE`) |
-| >= 16 | Daemon takeover: programmatic git checks, possible auto-complete | `stuckDaemonNudge` (env: `OAT_STUCK_DAEMON_NUDGE`) |
-| >= 30 | Force-remove worker and notify supervisor | `stuckMaxNudge` (env: `OAT_STUCK_MAX_NUDGE`) |
+| < 5 | Normal status nudge | — |
+| >= 5 | Alert supervisor + directive nudge | `stuckSupervisorNudge` (env: `OAT_STUCK_SUPERVISOR_NUDGE`) |
+| >= 8 | Daemon takeover: programmatic git checks, possible auto-complete | `stuckDaemonNudge` (env: `OAT_STUCK_DAEMON_NUDGE`) |
+| >= 20 | Force-remove worker and notify supervisor | `stuckMaxNudge` (env: `OAT_STUCK_MAX_NUDGE`) |
 
 The escalation to the supervisor at nudge 5 is important: the supervisor is an AI agent that can actually investigate whether the worker is genuinely stuck or just thinking through a complex problem. The daemon cannot make this distinction -- it only knows the nudge count.
 
-**Merged-PR fast-track:** Workers whose PR has been merged get fast-tracked — the daemon escalates to auto-complete after 3 nudges (~3 minutes) instead of 16. These workers only need to run `oat agent complete`, and if they can't (worktree deleted, model ignoring), waiting longer is wasteful.
+**Merged-PR fast-track:** Workers whose PR has been merged get fast-tracked — the daemon escalates to auto-complete after 3 nudges (6 minutes) instead of 8 (16 minutes). These workers only need to run `oat agent complete`, and if they can't (worktree deleted, model ignoring), waiting 16 minutes is wasteful.
 
 **Supervisor nudge reset:** If the supervisor determines a worker is actively working (e.g., running a long test suite) and not actually stuck, it can run `oat worker reset-nudge <worker-name>` to reset the nudge count to zero. This gives the worker another full escalation cycle. The reset can only be used **once per worker** -- if the worker still hasn't completed after a second round of nudges, the daemon proceeds with its escalation. The `NudgeResetUsed` flag resets when a worker enters dormancy (starting a fresh active cycle).
 
@@ -330,7 +330,7 @@ Messages are JSON files in `~/.oat/messages/<repo>/<agent>/<msg-id>.json`:
 }
 ```
 
-The daemon routes messages every 60 seconds via `backend.SendMessage()`, which writes messages directly to the agent's PTY. See `pkg/backend/backend.go` for the `ProcessBackend` interface.
+The daemon routes messages every 2 minutes via `backend.SendMessage()`, which writes messages directly to the agent's PTY. See `pkg/backend/backend.go` for the `ProcessBackend` interface.
 
 ### Issue Creation
 
@@ -445,7 +445,7 @@ Repositories can customize agent behavior by creating markdown files in `.oat/ag
 |------------|-----------------|
 | worker | `.oat/agents/worker.md` |
 | merge-queue | `.oat/agents/merge-queue.md` |
-| reviewer | `.oat/agents/reviewer.md` |
+| review | `.oat/agents/review.md` |
 
 **Precedence order:**
 1. `<repo>/.oat/agents/<agent>.md` (checked into repo, highest priority)

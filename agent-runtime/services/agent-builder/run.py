@@ -99,7 +99,7 @@ async def _stream_turn(runtime, messages: list[dict], thread_id: str) -> str:
 
 _BANNER = f"""
 {_c(BOLD + CYAN, '╔══════════════════════════════════════╗')}
-{_c(BOLD + CYAN, '║')}  {_c(BOLD, 'OAT Agent Builder')}  {_c(DIM, '— deepagents')}  {_c(BOLD + CYAN, '║')}
+{_c(BOLD + CYAN, '║')}  {_c(BOLD, 'OAT Agent Builder')}  {_c(BOLD + CYAN, '║')}
 {_c(BOLD + CYAN, '╚══════════════════════════════════════╝')}
 {_c(DIM, "Describe the agent service you want to build.")}
 {_c(DIM, "Type 'exit' or press Ctrl-C to quit.")}

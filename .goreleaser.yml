@@ -1,0 +1,138 @@
+# goreleaser config for open-agent-teams.
+#
+# Triggered by `git tag v*` + a push of the tag. Builds oat (and oat-agent)
+# for Linux/macOS on amd64+arm64, stamps internal/version with the tag /
+# commit / RFC-3339 build date, and publishes a GitHub Release with tar.gz
+# archives + SHA256 checksums.
+#
+# The Homebrew tap block is intentionally left commented out until
+# Root-IO-Labs/homebrew-oat is flipped public AND the HOMEBREW_TAP_GITHUB_TOKEN
+# secret is provisioned on this repo. Both steps happen right before the
+# first v* tag; until then a goreleaser run that can't push to the tap
+# would fail the whole release workflow, so keep the block off by default.
+
+version: 2
+
+project_name: oat
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: oat
+    main: ./cmd/oat
+    binary: oat
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Version={{.Version}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Date={{.Date}}
+
+  - id: oat-agent
+    main: ./cmd/oat-agent
+    binary: oat-agent
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Version={{.Version}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    ids: [oat, oat-agent]
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - CONTRIBUTING.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: Root-IO-Labs
+    name: open-agent-teams
+  draft: false
+  prerelease: auto
+  name_template: "{{ .ProjectName }} {{ .Tag }}"
+  header: |
+    ## Installation
+
+    ### Homebrew (recommended, once the tap lands)
+
+    ```bash
+    brew tap Root-IO-Labs/oat
+    brew install oat
+    ```
+
+    ### Direct download
+
+    Pick the archive for your OS/arch below, then `tar -xzf` it and move
+    `oat` (and optionally `oat-agent`) onto your `$PATH`.
+
+    ### From source
+
+    ```bash
+    go install github.com/Root-IO-Labs/open-agent-teams/cmd/oat@{{ .Tag }}
+    ```
+
+# Homebrew tap publication. Enable once Root-IO-Labs/homebrew-oat is
+# public and HOMEBREW_TAP_GITHUB_TOKEN is in the repo secrets. Leaving
+# commented here (and in Section 7c of the release-prep plan) so the
+# first v* tag still ships binaries even if the tap isn't flipped yet.
+#
+# brews:
+#   - name: oat
+#     ids: [oat]
+#     repository:
+#       owner: Root-IO-Labs
+#       name: homebrew-oat
+#       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+#     commit_author:
+#       name: oat-releaser
+#       email: releases@root.io
+#     directory: Formula
+#     homepage: https://github.com/Root-IO-Labs/open-agent-teams
+#     description: Orchestrate parallel coding agents on GitHub repos.
+#     license: MIT
+#     test: |
+#       system "#{bin}/oat", "version"
+#     install: |
+#       bin.install "oat"
+#       bin.install "oat-agent"

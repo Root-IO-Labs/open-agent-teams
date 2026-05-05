@@ -117,7 +117,6 @@ type App struct {
 	daemonOK  bool
 	lastPoll  time.Time
 	statusMsg string
-	err       error
 }
 
 // NewApp creates a new TUI application.
@@ -160,7 +159,6 @@ type streamTickMsg time.Time // stream read tick (every 50ms)
 type pollResultMsg struct {
 	agents   []AgentInfo
 	daemonOK bool
-	repoName string
 }
 
 type sendResultMsg struct {
@@ -633,20 +631,20 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.ScrollUp):
 		a.autoScroll[a.activeAgent] = false
-		a.viewport.LineUp(1)
+		a.viewport.ScrollUp(1)
 		return a, nil
 	case key.Matches(msg, keys.ScrollDown):
-		a.viewport.LineDown(1)
+		a.viewport.ScrollDown(1)
 		if a.viewport.AtBottom() {
 			a.autoScroll[a.activeAgent] = true
 		}
 		return a, nil
 	case key.Matches(msg, keys.PageUp):
 		a.autoScroll[a.activeAgent] = false
-		a.viewport.HalfViewUp()
+		a.viewport.HalfPageUp()
 		return a, nil
 	case key.Matches(msg, keys.PageDown):
-		a.viewport.HalfViewDown()
+		a.viewport.HalfPageDown()
 		if a.viewport.AtBottom() {
 			a.autoScroll[a.activeAgent] = true
 		}
@@ -704,10 +702,19 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (a *App) View() string {
 	if !a.ready {
-		return "\n" +
+		w := a.width
+		if w <= 0 {
+			w = 40
+		}
+		h := a.height
+		if h <= 0 {
+			h = 8
+		}
+		body := "\n" +
 			styleBrandTag.Render(" OAT ") + "\n" +
 			styleStatusAgent.Render("  Open Agent Teams") + "\n\n" +
 			styleHelp.Render("  Loading...")
+		return styleViewport.Width(w).Height(h).Render(body)
 	}
 
 	var sections []string
@@ -721,7 +728,11 @@ func (a *App) View() string {
 	showList := a.layoutShowAgentList
 	showActivity := a.layoutShowActivity
 
-	vpView := a.viewport.View()
+	// Wrap the viewport in the dark-bg style so blank lines below the
+	// content fill with the forced-dark background instead of the
+	// terminal's native bg (light terminals would otherwise show white
+	// gaps with our light-on-dark palette — see styles.go init()).
+	vpView := styleViewport.Width(vpWidth).Height(vpHeight).Render(a.viewport.View())
 
 	if showList || showActivity {
 		divLines := make([]string, vpHeight)
@@ -732,6 +743,7 @@ func (a *App) View() string {
 			Width(1).
 			Height(vpHeight).
 			Foreground(colorBorder).
+			Background(colorBg).
 			Render(strings.Join(divLines, "\n"))
 
 		var panels []string
@@ -741,13 +753,13 @@ func (a *App) View() string {
 			panels = append(panels, divider)
 		}
 
-		panels = append(panels, lipgloss.NewStyle().MaxWidth(vpWidth).Render(vpView))
+		panels = append(panels, vpView)
 
 		if showActivity {
 			actWidth := a.activityPanelWidth()
 			actView := renderActivityLog(a.activityLog, actWidth, vpHeight)
 			panels = append(panels, divider)
-			panels = append(panels, lipgloss.NewStyle().MaxWidth(actWidth).Render(actView))
+			panels = append(panels, styleViewport.Width(actWidth).Height(vpHeight).Render(actView))
 		}
 
 		sections = append(sections, lipgloss.JoinHorizontal(lipgloss.Top, panels...))
@@ -818,10 +830,8 @@ func (a *App) renderStatusBar() string {
 		center += " " + styleStatusWarn.Render(fmt.Sprintf("[%d msg]", totalPendingMsgs))
 	}
 
-	// Status message (error/info) — append to right, truncated to fit
-	if a.statusMsg != "" {
-		// Will be added after we know remaining space
-	}
+	// Status message (error/info) is appended later once remaining space is
+	// known, after left/right/center have been sized below.
 
 	// Fit everything within terminal width. Priority: left > right > center.
 	leftW := lipgloss.Width(left)
@@ -999,7 +1009,13 @@ func (a *App) renderAgentList(width, height int) string {
 		b.WriteString("\n")
 	}
 
-	return lipgloss.NewStyle().Width(width).MaxHeight(height).Render(b.String())
+	return lipgloss.NewStyle().
+		Width(width).
+		Height(height).
+		MaxHeight(height).
+		Background(colorBgPanel).
+		Foreground(colorText).
+		Render(b.String())
 }
 
 func (a *App) renderTokenBar() string {
@@ -1076,25 +1092,29 @@ func (a *App) renderInputBar() string {
 
 	prompt := styleInputPrompt.Render("> ")
 	a.input.Width = a.width - 4
-	return prompt + a.input.View()
+	// Force-dark background on the entire input row so the bubbletea
+	// textinput, which inherits the terminal bg, doesn't render a light
+	// strip on light terminals.
+	return styleInputBar.Width(a.width).Render(prompt + a.input.View())
 }
 
 func (a *App) renderHelp() string {
 	// Full and short variants for narrow terminals
 	var help string
-	if a.mode == ViewAgentList {
+	switch a.mode {
+	case ViewAgentList:
 		if a.width < 50 {
 			help = "↑↓:nav  enter:sel  esc:back  ^c:quit"
 		} else {
 			help = "↑↓:nav  enter:select  esc:back  ^o:log  ^c:quit"
 		}
-	} else if a.mode == ViewAgent {
+	case ViewAgent:
 		if a.width < 70 {
 			help = "tab:agents  esc:back  ^e:expand  ^r:input  ^c:quit"
 		} else {
 			help = "tab:agents  esc:workspace  ^o:log  ^e:expand  ^r:input  ^f:filter  ^c:quit"
 		}
-	} else {
+	default:
 		if a.width < 70 {
 			help = "tab:agents  esc:back  ^e:expand  ^f:filter  ^c:quit"
 		} else {

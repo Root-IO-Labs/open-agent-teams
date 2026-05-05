@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from deepagents_cli.sidecar_events import (
+from oat_cli.sidecar_events import (
     KIND_ASSISTANT_MESSAGE,
     KIND_INTERRUPT,
     KIND_TOKEN_USAGE,

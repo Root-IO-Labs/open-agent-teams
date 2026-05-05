@@ -34,6 +34,14 @@ func (r AgentRole) String() string {
 	}
 }
 
+// RuntimeConfig holds per-model runtime parameters that the daemon passes to
+// agent backends. Zero values mean "fall back to the daemon default", so
+// profiles can override specific knobs without enumerating every field.
+type RuntimeConfig struct {
+	MaxTokens            int // 0 = fall back to daemon default
+	NudgeIntervalSeconds int // 0 = fall back to daemon default
+}
+
 // ModelProfile holds the parsed capability data from a YAML profile.
 type ModelProfile struct {
 	ModelID  string
@@ -49,6 +57,20 @@ type ModelProfile struct {
 	Streaming            float64
 	MultiTurn            float64
 	LargeOutput          float64
+
+	// UnprobedCapabilities records which capability fields were emitted as
+	// `null` in the YAML (probe skipped, score unknown). Consumers that need
+	// to distinguish "unprobed" from "probed and scored 0" read this map.
+	// Keys are the YAML field names (e.g. "shell_recovery", "multi_turn").
+	// The corresponding float64 fields stay at their zero value — check here
+	// before treating 0 as "failed."
+	//
+	// Rationale (Phase-5 audit): pre-2026-04-23 the probe script emitted
+	// `1.0` for un-probed capabilities, which silently promoted fast-gate
+	// models to parity with fully-probed ones. The probe now emits `null`
+	// and this map tracks it so the router can exclude-from-consideration
+	// rather than penalize or reward.
+	UnprobedCapabilities map[string]bool
 
 	// Context
 	EffectiveContextClass string // "large", "medium", "small", "unknown"
@@ -78,6 +100,11 @@ type ModelProfile struct {
 
 	// Warnings
 	Warnings []string
+
+	// Runtime holds per-model overrides for daemon defaults such as
+	// max_tokens and nudge_interval_seconds. Zero values fall back to the
+	// daemon default. See model-routing/profiles/README.md for the YAML schema.
+	Runtime RuntimeConfig
 }
 
 // IsEligible checks whether this profile is eligible for the given role.
@@ -112,10 +139,24 @@ func (p *ModelProfile) IsFullyProbed() bool {
 
 // ProfileStore loads and caches model profiles from disk.
 type ProfileStore struct {
-	mu       sync.RWMutex
-	profiles map[string]*ModelProfile // keyed by model_id
-	dir      string                   // path to profiles directory
-	logger   Logger                   // diagnostic logger; never nil (defaults to noopLogger)
+	mu              sync.RWMutex
+	profiles        map[string]*ModelProfile // keyed by model_id
+	dir             string                   // path to profiles directory
+	logger          Logger                   // diagnostic logger; never nil (defaults to noopLogger)
+	contextRegistry *ContextRegistry         // optional hand-curated max_input_tokens overrides
+}
+
+// SetContextRegistry wires in a context-registry. When set, each profile
+// loaded from disk gets its missing MaxInputTokens / EffectiveContextClass
+// filled from the registry (the probe script can't reliably discover these
+// for openai/google_genai/ollama). Safe to call multiple times; takes effect
+// on the next Reload.
+//
+// Pass nil to disable registry overrides.
+func (ps *ProfileStore) SetContextRegistry(reg *ContextRegistry) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.contextRegistry = reg
 }
 
 // NewProfileStore creates a store and loads profiles from the given directory.
@@ -235,7 +276,7 @@ func (ps *ProfileStore) BestEligible(role AgentRole, preferredModel string) (str
 		}
 	}
 
-	// effectiveScore penalises minimum-set profiles so BestEligible prefers
+	// effectiveScore penalizes minimum-set profiles so BestEligible prefers
 	// fully-probed ones when overall scores are close. See minimumProbeSetPenalty
 	// comment for rationale.
 	effectiveScore := func(p *ModelProfile) int {
@@ -342,6 +383,26 @@ func (ps *ProfileStore) load() error {
 		loaded[p.ModelID] = p
 	}
 
+	// Apply context-registry overrides BEFORE swapping the store map. Profiles
+	// with missing/unknown windows get filled from the hand-curated registry.
+	// Operators see per-profile INFO lines so drift is visible.
+	ps.mu.RLock()
+	reg := ps.contextRegistry
+	ps.mu.RUnlock()
+	if reg != nil && reg.Count() > 0 {
+		applied := 0
+		for _, p := range loaded {
+			if reg.ApplyToProfile(p) {
+				applied++
+				logger.Infof("context-registry override applied to %s: max_input_tokens=%d, class=%s",
+					p.ModelID, p.MaxInputTokens, p.EffectiveContextClass)
+			}
+		}
+		if applied > 0 {
+			logger.Infof("context-registry applied %d override(s) during profile load", applied)
+		}
+	}
+
 	ps.mu.Lock()
 	ps.profiles = loaded
 	ps.mu.Unlock()
@@ -418,6 +479,20 @@ func parseProfile(content string) *ModelProfile {
 		}
 	}
 
+	// Track capabilities emitted as `null` in the YAML — the probe-script
+	// signal for "not probed." Stored so router code can distinguish
+	// "unprobed" from "probed and failed."
+	unprobed := map[string]bool{}
+	for _, cap := range []string{
+		"tool_reliability", "shell_roundtrip", "shell_recovery",
+		"file_write_reliability", "token_reporting", "streaming",
+		"multi_turn", "large_output",
+	} {
+		if v, ok := fields[cap]; ok && strings.EqualFold(v, "null") {
+			unprobed[cap] = true
+		}
+	}
+
 	return &ModelProfile{
 		ModelID:                 fields["model_id"],
 		Status:                  fields["status"],
@@ -430,6 +505,7 @@ func parseProfile(content string) *ModelProfile {
 		Streaming:               parseFloat(fields["streaming"]),
 		MultiTurn:               parseFloat(fields["multi_turn"]),
 		LargeOutput:             parseFloat(fields["large_output"]),
+		UnprobedCapabilities:    unprobed,
 		EffectiveContextClass:   fields["effective_context_class"],
 		MaxInputTokens:          parseInt64(fields["max_input_tokens"]),
 		ReasoningControls:       fields["reasoning_controls"],
@@ -445,7 +521,23 @@ func parseProfile(content string) *ModelProfile {
 		ProbesRun:               parseInt(fields["probes_run"]),
 		ProbesPassed:            parseInt(fields["probes_passed"]),
 		Warnings:                warnings,
+		Runtime: RuntimeConfig{
+			MaxTokens:            parseInt(fields["max_tokens"]),
+			NudgeIntervalSeconds: parseInt(fields["nudge_interval_seconds"]),
+		},
 	}
+}
+
+// IsProbed reports whether the given capability field was scored during
+// onboarding. Un-probed capabilities have a 0 value in their float64 field;
+// callers that need to distinguish "unknown" from "failed" must consult
+// this helper. Returns true for unknown capability names (conservative:
+// if we don't know about it, don't flag it as unprobed).
+func (p *ModelProfile) IsProbed(capName string) bool {
+	if p == nil || p.UnprobedCapabilities == nil {
+		return true
+	}
+	return !p.UnprobedCapabilities[capName]
 }
 
 func parseFloat(s string) float64 {

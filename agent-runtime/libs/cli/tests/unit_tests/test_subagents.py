@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from deepagents_cli.subagents import (
+from oat_cli.subagents import (
     _load_subagents_from_dir,
     _parse_subagent_file,
     list_subagents,

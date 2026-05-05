@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -180,7 +181,7 @@ func TestRefreshWorktree_DetachedHead(t *testing.T) {
 	}
 
 	// RefreshWorktree should skip detached HEAD
-	result := RefreshWorktree(wtPath, "origin", "main")
+	result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 	if !result.Skipped {
 		t.Error("Expected RefreshWorktree to skip detached HEAD")
 	}
@@ -194,7 +195,7 @@ func TestRefreshWorktree_OnMainBranch(t *testing.T) {
 	defer cleanup()
 
 	// RefreshWorktree should skip if on main branch
-	result := RefreshWorktree(repoPath, "origin", "main")
+	result := RefreshWorktree(context.Background(), repoPath, "origin", "main")
 	if !result.Skipped {
 		t.Error("Expected RefreshWorktree to skip main branch")
 	}
@@ -227,7 +228,7 @@ func TestRefreshWorktree_MidRebase(t *testing.T) {
 	}
 
 	// RefreshWorktree should skip mid-rebase
-	result := RefreshWorktree(wtPath, "origin", "main")
+	result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 	if !result.Skipped {
 		t.Error("Expected RefreshWorktree to skip mid-rebase state")
 	}
@@ -260,7 +261,7 @@ func TestRefreshWorktree_MidMerge(t *testing.T) {
 	}
 
 	// RefreshWorktree should skip mid-merge
-	result := RefreshWorktree(wtPath, "origin", "main")
+	result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 	if !result.Skipped {
 		t.Error("Expected RefreshWorktree to skip mid-merge state")
 	}
@@ -271,7 +272,7 @@ func TestRefreshWorktree_MidMerge(t *testing.T) {
 
 func TestRefreshWorktree_NonExistentPath(t *testing.T) {
 	// RefreshWorktree should return error for non-existent path
-	result := RefreshWorktree("/nonexistent/path", "origin", "main")
+	result := RefreshWorktree(context.Background(), "/nonexistent/path", "origin", "main")
 	if result.Error == nil {
 		t.Error("Expected error for non-existent path")
 	}
@@ -290,7 +291,7 @@ func TestGetWorktreeState_UpToDate(t *testing.T) {
 	}
 
 	// Get worktree state
-	state, err := GetWorktreeState(wtPath, "origin", "main")
+	state, err := GetWorktreeState(context.Background(), wtPath, "origin", "main")
 	if err != nil {
 		t.Fatalf("GetWorktreeState() failed: %v", err)
 	}
@@ -324,7 +325,7 @@ func TestGetWorktreeState_DetachedHead(t *testing.T) {
 	}
 
 	// GetWorktreeState should indicate can't refresh
-	state, err := GetWorktreeState(wtPath, "origin", "main")
+	state, err := GetWorktreeState(context.Background(), wtPath, "origin", "main")
 	if err != nil {
 		t.Fatalf("GetWorktreeState() failed: %v", err)
 	}
@@ -342,7 +343,7 @@ func TestGetWorktreeState_OnMainBranch(t *testing.T) {
 	defer cleanup()
 
 	// GetWorktreeState for main branch
-	state, err := GetWorktreeState(repoPath, "origin", "main")
+	state, err := GetWorktreeState(context.Background(), repoPath, "origin", "main")
 	if err != nil {
 		t.Fatalf("GetWorktreeState() failed: %v", err)
 	}
@@ -451,7 +452,7 @@ func TestIsBehindMain_UpToDate(t *testing.T) {
 	}
 
 	// Should not be behind initially
-	behind, count, err := IsBehindMain(wtPath, "origin", "main")
+	behind, count, err := IsBehindMain(context.Background(), wtPath, "origin", "main")
 	if err != nil {
 		t.Fatalf("IsBehindMain() failed: %v", err)
 	}
@@ -486,7 +487,7 @@ func TestIsBehindMain_ActuallyBehind(t *testing.T) {
 	}
 
 	// Now the worktree should be behind main
-	behind, count, err := IsBehindMain(wtPath, "origin", "main")
+	behind, count, err := IsBehindMain(context.Background(), wtPath, "origin", "main")
 	if err != nil {
 		t.Fatalf("IsBehindMain() failed: %v", err)
 	}
@@ -536,7 +537,7 @@ func TestRefreshWorktree_WithUncommittedChanges(t *testing.T) {
 	}
 
 	// RefreshWorktree should handle uncommitted changes (stash and restore)
-	result := RefreshWorktree(wtPath, "origin", "main")
+	result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 	// Since there's nothing new on main, this might skip or succeed
 	// The key is it shouldn't lose the uncommitted changes
 	if result.Error != nil && !strings.Contains(result.Error.Error(), "fetch") {
@@ -605,7 +606,7 @@ func TestGetWorktreeState_WithMidRebaseApply(t *testing.T) {
 	}
 
 	// GetWorktreeState should detect mid-rebase
-	state, err := GetWorktreeState(wtPath, "origin", "main")
+	state, err := GetWorktreeState(context.Background(), wtPath, "origin", "main")
 	if err != nil {
 		t.Fatalf("GetWorktreeState() failed: %v", err)
 	}

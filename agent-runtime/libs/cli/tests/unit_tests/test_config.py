@@ -7,8 +7,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from deepagents_cli import model_config
-from deepagents_cli.config import (
+from oat_cli import model_config
+from oat_cli.config import (
     RECOMMENDED_SAFE_SHELL_COMMANDS,
     ModelResult,
     Settings,
@@ -24,8 +24,8 @@ from deepagents_cli.config import (
     settings,
     validate_model_capabilities,
 )
-from deepagents_cli.model_config import ModelConfigError, clear_caches
-from deepagents_cli.project_utils import (
+from oat_cli.model_config import ModelConfigError, clear_caches
+from oat_cli.project_utils import (
     find_project_agent_md as _find_project_agent_md,
     find_project_root as _find_project_root,
 )
@@ -78,15 +78,15 @@ class TestProjectRootDetection:
 class TestProjectAgentMdFinding:
     """Test finding project-specific AGENTS.md files."""
 
-    def test_find_agent_md_in_deepagents_dir(self, tmp_path: Path) -> None:
-        """Test finding AGENTS.md in .deepagents/ directory."""
+    def test_find_agent_md_in_oat_sdk_dir(self, tmp_path: Path) -> None:
+        """Test finding AGENTS.md in .oat_sdk/ directory."""
         project_root = tmp_path / "project"
         project_root.mkdir()
 
-        # Create .deepagents/AGENTS.md
-        deepagents_dir = project_root / ".deepagents"
-        deepagents_dir.mkdir()
-        agent_md = deepagents_dir / "AGENTS.md"
+        # Create .oat_sdk/AGENTS.md
+        oat_sdk_dir = project_root / ".oat_sdk"
+        oat_sdk_dir.mkdir()
+        agent_md = oat_sdk_dir / "AGENTS.md"
         agent_md.write_text("Project instructions")
 
         result = _find_project_agent_md(project_root)
@@ -98,7 +98,7 @@ class TestProjectAgentMdFinding:
         project_root = tmp_path / "project"
         project_root.mkdir()
 
-        # Create root-level AGENTS.md (no .deepagents/)
+        # Create root-level AGENTS.md (no .oat_sdk/)
         agent_md = project_root / "AGENTS.md"
         agent_md.write_text("Project instructions")
 
@@ -112,18 +112,18 @@ class TestProjectAgentMdFinding:
         project_root.mkdir()
 
         # Create both locations
-        deepagents_dir = project_root / ".deepagents"
-        deepagents_dir.mkdir()
-        deepagents_md = deepagents_dir / "AGENTS.md"
-        deepagents_md.write_text("In .deepagents/")
+        oat_sdk_dir = project_root / ".oat_sdk"
+        oat_sdk_dir.mkdir()
+        oat_sdk_md = oat_sdk_dir / "AGENTS.md"
+        oat_sdk_md.write_text("In .oat_sdk/")
 
         root_md = project_root / "AGENTS.md"
         root_md.write_text("In root")
 
-        # Should return both, with .deepagents/ first
+        # Should return both, with .oat_sdk/ first
         result = _find_project_agent_md(project_root)
         assert len(result) == 2
-        assert result[0] == deepagents_md
+        assert result[0] == oat_sdk_md
         assert result[1] == root_md
 
     def test_find_agent_md_not_found(self, tmp_path: Path) -> None:
@@ -145,7 +145,7 @@ class TestProjectAgentMdFinding:
         original_exists = Path.exists
 
         def patched_exists(self: Path) -> bool:
-            if self.name == "AGENTS.md" and ".deepagents" in str(self):
+            if self.name == "AGENTS.md" and ".oat_sdk" in str(self):
                 msg = "Permission denied"
                 raise PermissionError(msg)
             return original_exists(self)
@@ -168,10 +168,10 @@ class TestSettingsGetProjectAgentMdPath:
 
     def test_returns_existing_paths(self, tmp_path: Path) -> None:
         """Should return existing AGENTS.md paths from project root."""
-        deepagents_dir = tmp_path / ".deepagents"
-        deepagents_dir.mkdir()
-        deepagents_md = deepagents_dir / "AGENTS.md"
-        deepagents_md.write_text("inner")
+        oat_sdk_dir = tmp_path / ".oat_sdk"
+        oat_sdk_dir.mkdir()
+        oat_sdk_md = oat_sdk_dir / "AGENTS.md"
+        oat_sdk_md.write_text("inner")
 
         root_md = tmp_path / "AGENTS.md"
         root_md.write_text("root")
@@ -180,7 +180,7 @@ class TestSettingsGetProjectAgentMdPath:
         s.project_root = tmp_path
 
         result = s.get_project_agent_md_path()
-        assert result == [deepagents_md, root_md]
+        assert result == [oat_sdk_md, root_md]
 
     def test_returns_empty_when_no_agents_md_files(self, tmp_path: Path) -> None:
         """Should return [] when project exists but has no AGENTS.md."""
@@ -192,7 +192,7 @@ class TestSettingsGetProjectAgentMdPath:
 class TestValidateModelCapabilities:
     """Tests for model capability validation."""
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_without_profile_attribute_warns(self, mock_console: Mock) -> None:
         """Test that models without profile attribute trigger a warning."""
         model = Mock(spec=[])  # No profile attribute
@@ -203,7 +203,7 @@ class TestValidateModelCapabilities:
         assert "No capability profile" in call_args
         assert "test-model" in call_args
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_none_profile_warns(self, mock_console: Mock) -> None:
         """Test that models with `profile=None` trigger a warning."""
         model = Mock()
@@ -215,7 +215,7 @@ class TestValidateModelCapabilities:
         call_args = mock_console.print.call_args[0][0]
         assert "No capability profile" in call_args
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_tool_calling_false_exits(self, mock_console: Mock) -> None:
         """Test that models with `tool_calling=False` cause `sys.exit(1)`."""
         model = Mock()
@@ -231,7 +231,7 @@ class TestValidateModelCapabilities:
         assert "does not support tool calling" in error_call
         assert "no-tools-model" in error_call
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_tool_calling_true_passes(self, mock_console: Mock) -> None:
         """Test that models with `tool_calling=True` pass without messages."""
         model = Mock()
@@ -241,7 +241,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_tool_calling_none_passes(self, mock_console: Mock) -> None:
         """Test that models with `tool_calling=None` (missing) pass."""
         model = Mock()
@@ -251,7 +251,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_limited_context_warns(self, mock_console: Mock) -> None:
         """Test that models with <8000 token context trigger a warning."""
         model = Mock()
@@ -265,7 +265,7 @@ class TestValidateModelCapabilities:
         assert "4,096" in call_args
         assert "small-context-model" in call_args
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_adequate_context_passes(self, mock_console: Mock) -> None:
         """Confirm that models with >=8000 token context pass silently."""
         model = Mock()
@@ -275,7 +275,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_without_max_input_tokens_passes(self, mock_console: Mock) -> None:
         """Test that models without `max_input_tokens` key pass silently."""
         model = Mock()
@@ -285,7 +285,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_zero_max_input_tokens_passes(self, mock_console: Mock) -> None:
         """Test that models with `max_input_tokens=0` pass (falsy value check)."""
         model = Mock()
@@ -296,7 +296,7 @@ class TestValidateModelCapabilities:
         # Should pass because 0 is falsy, so the condition `if max_input_tokens` fails
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_cli.config.console")
+    @patch("oat_cli.config.console")
     def test_model_with_empty_profile_passes(self, mock_console: Mock) -> None:
         """Test that models with empty profile dict pass silently."""
         model = Mock()
@@ -561,7 +561,7 @@ max_input_tokens = 4096
         clear_caches()
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            caplog.at_level(logging.WARNING, logger="deepagents_cli.config"),
+            caplog.at_level(logging.WARNING, logger="oat_cli.config"),
         ):
             result = create_model("anthropic:claude-sonnet-4-5")
 
@@ -784,7 +784,7 @@ class TestGetLangsmithProjectName:
             assert get_langsmith_project_name() is None
 
     def test_returns_project_from_settings(self) -> None:
-        """Should prefer settings.deepagents_langchain_project."""
+        """Should prefer settings.oat_sdk_langchain_project."""
         env = {
             "LANGSMITH_API_KEY": "lsv2_test",
             "LANGSMITH_TRACING": "true",
@@ -792,9 +792,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_cli.config.settings") as mock_settings,
+            patch("oat_cli.config.settings") as mock_settings,
         ):
-            mock_settings.deepagents_langchain_project = "settings-project"
+            mock_settings.oat_sdk_langchain_project = "settings-project"
             assert get_langsmith_project_name() == "settings-project"
 
     def test_falls_back_to_env_project(self) -> None:
@@ -806,9 +806,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_cli.config.settings") as mock_settings,
+            patch("oat_cli.config.settings") as mock_settings,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_settings.oat_sdk_langchain_project = None
             assert get_langsmith_project_name() == "env-project"
 
     def test_falls_back_to_default(self) -> None:
@@ -819,9 +819,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_cli.config.settings") as mock_settings,
+            patch("oat_cli.config.settings") as mock_settings,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_settings.oat_sdk_langchain_project = None
             assert get_langsmith_project_name() == "default"
 
     def test_accepts_langchain_api_key(self) -> None:
@@ -833,9 +833,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_cli.config.settings") as mock_settings,
+            patch("oat_cli.config.settings") as mock_settings,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_settings.oat_sdk_langchain_project = None
             assert get_langsmith_project_name() == "default"
 
 
@@ -892,7 +892,7 @@ class TestFetchLangsmithProjectUrl:
         """Should return None when LangSmith lookup exceeds timeout."""
         with (
             patch(
-                "deepagents_cli.config._LANGSMITH_URL_LOOKUP_TIMEOUT_SECONDS",
+                "oat_cli.config._LANGSMITH_URL_LOOKUP_TIMEOUT_SECONDS",
                 0.01,
             ),
             patch("langsmith.Client") as mock_client_cls,
@@ -994,7 +994,7 @@ class TestBuildLangsmithThreadUrl:
 
         with (
             patch(
-                "deepagents_cli.config.get_langsmith_project_name",
+                "oat_cli.config.get_langsmith_project_name",
                 return_value="my-project",
             ),
             patch("langsmith.Client") as mock_client_cls,
@@ -1004,7 +1004,7 @@ class TestBuildLangsmithThreadUrl:
 
         assert (
             result
-            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=deepagents-cli"
+            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=oat_sdk-cli"
         )
 
     def test_strips_trailing_slash(self) -> None:
@@ -1015,7 +1015,7 @@ class TestBuildLangsmithThreadUrl:
 
         with (
             patch(
-                "deepagents_cli.config.get_langsmith_project_name",
+                "oat_cli.config.get_langsmith_project_name",
                 return_value="my-project",
             ),
             patch("langsmith.Client") as mock_client_cls,
@@ -1025,13 +1025,13 @@ class TestBuildLangsmithThreadUrl:
 
         assert (
             result
-            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=deepagents-cli"
+            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=oat_sdk-cli"
         )
 
     def test_returns_none_when_no_project_name(self) -> None:
         """Should return None when LangSmith project name is not configured."""
         with patch(
-            "deepagents_cli.config.get_langsmith_project_name",
+            "oat_cli.config.get_langsmith_project_name",
             return_value=None,
         ):
             result = build_langsmith_thread_url("thread-123")
@@ -1042,7 +1042,7 @@ class TestBuildLangsmithThreadUrl:
         """Should return None when the project URL cannot be resolved."""
         with (
             patch(
-                "deepagents_cli.config.get_langsmith_project_name",
+                "oat_cli.config.get_langsmith_project_name",
                 return_value="my-project",
             ),
             patch("langsmith.Client") as mock_client_cls,
@@ -1224,7 +1224,7 @@ class TestOpenRouterHeaders:
         assert kwargs["default_headers"]["HTTP-Referer"] == (
             "https://github.com/Root-IO-Labs/open-agent-teams"
         )
-        assert kwargs["default_headers"]["X-Title"] == "OAT"
+        assert kwargs["default_headers"]["X-Title"] == "OAT Agents CLI"
 
     def test_per_model_headers_override_defaults(self, tmp_path: Path) -> None:
         """Per-model default_headers override built-in defaults."""
@@ -1244,7 +1244,7 @@ default_headers = {X-Title = "My Custom App"}
         assert kwargs["default_headers"]["X-Title"] == "My Custom App"
         # Built-in HTTP-Referer should still be present
         assert kwargs["default_headers"]["HTTP-Referer"] == (
-            "https://github.com/langchain-ai/deepagents"
+            "https://github.com/Root-IO-Labs/open-agent-teams"
         )
 
     def test_no_headers_for_other_providers(self) -> None:
@@ -1258,14 +1258,14 @@ class TestCreateModelFromClass:
 
     def test_raises_on_invalid_class_path_format(self) -> None:
         """Raises ModelConfigError when class_path lacks colon."""
-        from deepagents_cli.model_config import ModelConfigError
+        from oat_cli.model_config import ModelConfigError
 
         with pytest.raises(ModelConfigError, match="Invalid class_path"):
             _create_model_from_class("my_package.MyChatModel", "model", "provider", {})
 
     def test_raises_on_import_error(self) -> None:
         """Raises ModelConfigError when module cannot be imported."""
-        from deepagents_cli.model_config import ModelConfigError
+        from oat_cli.model_config import ModelConfigError
 
         with pytest.raises(ModelConfigError, match="Could not import module"):
             _create_model_from_class(
@@ -1274,14 +1274,14 @@ class TestCreateModelFromClass:
 
     def test_raises_when_class_not_found_in_module(self) -> None:
         """Raises ModelConfigError when class doesn't exist in module."""
-        from deepagents_cli.model_config import ModelConfigError
+        from oat_cli.model_config import ModelConfigError
 
         with pytest.raises(ModelConfigError, match="not found in module"):
             _create_model_from_class("os.path:NonExistentClass", "m", "p", {})
 
     def test_raises_when_not_base_chat_model_subclass(self) -> None:
         """Raises ModelConfigError when class is not a BaseChatModel."""
-        from deepagents_cli.model_config import ModelConfigError
+        from oat_cli.model_config import ModelConfigError
 
         # os.path:join is a function, not a BaseChatModel subclass
         with pytest.raises(ModelConfigError, match="not a BaseChatModel subclass"):
@@ -1338,7 +1338,7 @@ class TestCreateModelFromClass:
 
         from langchain_core.language_models import BaseChatModel
 
-        from deepagents_cli.model_config import ModelConfigError
+        from oat_cli.model_config import ModelConfigError
 
         class BadModel(BaseChatModel):
             def __init__(self, **kwargs: object) -> None:
@@ -1384,7 +1384,7 @@ temperature = 0
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch(
-                "deepagents_cli.config._create_model_from_class",
+                "oat_cli.config._create_model_from_class",
                 return_value=mock_instance,
             ) as mock_factory,
         ):
@@ -1421,7 +1421,7 @@ api_key_env = "FIREWORKS_API_KEY"
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch.dict("os.environ", {"FIREWORKS_API_KEY": "key"}, clear=False),
             patch(
-                "deepagents_cli.config._create_model_via_init",
+                "oat_cli.config._create_model_via_init",
                 return_value=mock_instance,
             ) as mock_init,
         ):
@@ -1524,7 +1524,7 @@ class TestCreateModelEdgeCaseParsing:
         with pytest.raises(ModelConfigError, match="model name is required"):
             create_model("anthropic:")
 
-    @patch("deepagents_cli.config._get_default_model_spec")
+    @patch("oat_cli.config._get_default_model_spec")
     @patch("langchain.chat_models.init_chat_model")
     def test_empty_string_uses_default(
         self, mock_init_chat_model: Mock, mock_default: Mock

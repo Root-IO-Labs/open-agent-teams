@@ -11,10 +11,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
 import pytest
-from deepagents.backends.protocol import SandboxBackendProtocol
-from deepagents.backends.sandbox import BaseSandbox
+from oat_sdk.backends.protocol import SandboxBackendProtocol
+from oat_sdk.backends.sandbox import BaseSandbox
 
-from deepagents_cli.integrations.sandbox_factory import create_sandbox
+from oat_cli.integrations.sandbox_factory import create_sandbox
 
 
 class BaseSandboxIntegrationTest(ABC):

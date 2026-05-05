@@ -530,7 +530,7 @@ class TestYAMLGeneration(unittest.TestCase):
         self.assertIn("status: known", yaml_out)
         self.assertIn("probe_version: 2", yaml_out)
         self.assertIn("probe_set: default", yaml_out)
-        self.assertIn("supervisor_eligible: true", yaml_out)
+        self.assertIn("orchestrator_eligible: true", yaml_out)
         self.assertIn("worker_eligible: true", yaml_out)
         self.assertIn('reasoning_controls: "low, high"', yaml_out)
         self.assertIn("ttft_ms: 800", yaml_out)
@@ -539,7 +539,7 @@ class TestYAMLGeneration(unittest.TestCase):
         self.assertNotIn("probes_skipped", yaml_out)
 
     def test_minimum_probe_set_defaults(self):
-        """Minimum probe set should use defaults for untested probes."""
+        """Minimum probe set should use null for untested probes."""
         probes = [
             pm.ProbeResult("basic_inference", True, 100, duration_ms=500),
             pm.ProbeResult("tool_calling", True, 100, duration_ms=600),
@@ -551,18 +551,18 @@ class TestYAMLGeneration(unittest.TestCase):
         report = self._make_report(probes, 95, probe_set="minimum")
         yaml_out = pm._generate_yaml_profile(report)
 
-        # Untested probes should default to 1.0, not 0.0
-        self.assertIn("shell_recovery: 1.0", yaml_out)
-        self.assertIn("multi_turn: 1.0", yaml_out)
-        self.assertIn("streaming: 1.0", yaml_out)
-        self.assertIn("large_output: 1.0", yaml_out)
+        # Untested probes should show null (not 0.0 or 1.0)
+        self.assertIn("shell_recovery: null", yaml_out)
+        self.assertIn("multi_turn: null", yaml_out)
+        self.assertIn("streaming: null", yaml_out)
+        self.assertIn("large_output: null", yaml_out)
         # Reasoning should be not_tested
         self.assertIn('reasoning_controls: "not_tested"', yaml_out)
         # Should have probes_skipped
         self.assertIn("probes_skipped:", yaml_out)
         self.assertIn("probe_set: minimum", yaml_out)
-        # Supervisor eligible should be true (untested probes don't penalize)
-        self.assertIn("supervisor_eligible: true", yaml_out)
+        # Orchestrator ineligible — required probes not run
+        self.assertIn("orchestrator_eligible: false", yaml_out)
 
     def test_supervisor_ineligible_low_multi_turn(self):
         """Low multi_turn score should block supervisor."""
@@ -583,7 +583,60 @@ class TestYAMLGeneration(unittest.TestCase):
         ]
         report = self._make_report(probes, 88)
         yaml_out = pm._generate_yaml_profile(report)
-        self.assertIn("supervisor_eligible: false", yaml_out)
+        self.assertIn("orchestrator_eligible: false", yaml_out)
+
+    def test_supervisor_eligible_shell_recovery_at_66(self):
+        """shell_failure_recovery score of 66 (>= 0.6 threshold) should pass."""
+        probes = [
+            pm.ProbeResult("basic_inference", True, 100),
+            pm.ProbeResult("tool_calling", True, 100),
+            pm.ProbeResult("streaming", True, 100),
+            pm.ProbeResult("shell_roundtrip", True, 80),
+            pm.ProbeResult("shell_failure_recovery", True, 66),
+            pm.ProbeResult("file_write_via_tool", True, 100),
+            pm.ProbeResult("multi_turn", True, 85),
+            pm.ProbeResult("large_output", True, 90),
+            pm.ProbeResult("token_reporting", True, 95),
+            pm.ProbeResult("reasoning_effort", True, 100, details={"supported": ["low"]}),
+            pm.ProbeResult("routing_decision", True, 70),
+            pm.ProbeResult("context_profile", True, 90, details={"max_input_tokens": 200000}),
+            pm.ProbeResult("streaming_tokens", True, 100),
+        ]
+        report = self._make_report(probes, 88)
+        yaml_out = pm._generate_yaml_profile(report)
+        self.assertIn("orchestrator_eligible: true", yaml_out)
+
+    def test_supervisor_ineligible_shell_recovery_below_60(self):
+        """shell_failure_recovery score of 55 (< 0.6 threshold) should fail."""
+        probes = [
+            pm.ProbeResult("basic_inference", True, 100),
+            pm.ProbeResult("tool_calling", True, 100),
+            pm.ProbeResult("streaming", True, 100),
+            pm.ProbeResult("shell_roundtrip", True, 80),
+            pm.ProbeResult("shell_failure_recovery", True, 55),
+            pm.ProbeResult("file_write_via_tool", True, 100),
+            pm.ProbeResult("multi_turn", True, 85),
+            pm.ProbeResult("large_output", True, 90),
+            pm.ProbeResult("token_reporting", True, 95),
+            pm.ProbeResult("reasoning_effort", True, 100, details={"supported": ["low"]}),
+            pm.ProbeResult("routing_decision", True, 70),
+            pm.ProbeResult("context_profile", True, 90, details={"max_input_tokens": 200000}),
+            pm.ProbeResult("streaming_tokens", True, 100),
+        ]
+        report = self._make_report(probes, 88)
+        yaml_out = pm._generate_yaml_profile(report)
+        self.assertIn("orchestrator_eligible: false", yaml_out)
+
+    def test_retries_needed_in_yaml(self):
+        """retries_needed should appear in YAML evidence section."""
+        probes = [
+            pm.ProbeResult("basic_inference", True, 100, duration_ms=500),
+            pm.ProbeResult("tool_calling", True, 100, duration_ms=600),
+        ]
+        report = self._make_report(probes, 90)
+        report.retries_needed = 2
+        yaml_out = pm._generate_yaml_profile(report)
+        self.assertIn("retries_needed: 2", yaml_out)
 
     def test_not_oat_compatible(self):
         """Failed core probes should produce restricted status."""
@@ -596,7 +649,7 @@ class TestYAMLGeneration(unittest.TestCase):
         yaml_out = pm._generate_yaml_profile(report)
         self.assertIn("status: restricted", yaml_out)
         self.assertIn("worker_eligible: false", yaml_out)
-        self.assertIn("supervisor_eligible: false", yaml_out)
+        self.assertIn("orchestrator_eligible: false", yaml_out)
 
     def test_probe_set_from_report_not_count(self):
         """probe_set_name should come from report.probe_set, not probe count."""
@@ -708,6 +761,31 @@ class TestRecommendations(unittest.TestCase):
         ]
         pm._generate_recommendations(report)
         self.assertTrue(any("BLOCKER" in r for r in report.recommendations))
+
+    def test_high_retry_warning(self):
+        """High retries_needed should produce a reliability warning."""
+        report = pm.ModelReport("t:m", "t", "m", "2026-01-01")
+        report.retries_needed = 4
+        report.probes = [
+            pm.ProbeResult("basic_inference", True, 100),
+            pm.ProbeResult("tool_calling", True, 100),
+            pm.ProbeResult("streaming", True, 100),
+            pm.ProbeResult("shell_roundtrip", True, 80),
+            pm.ProbeResult("file_write_via_tool", True, 100),
+        ]
+        pm._generate_recommendations(report)
+        self.assertTrue(any("unreliable" in w for w in report.warnings))
+
+    def test_low_retry_no_warning(self):
+        """Low retries_needed should not produce a warning."""
+        report = pm.ModelReport("t:m", "t", "m", "2026-01-01")
+        report.retries_needed = 1
+        report.probes = [
+            pm.ProbeResult("basic_inference", True, 100),
+            pm.ProbeResult("tool_calling", True, 100),
+        ]
+        pm._generate_recommendations(report)
+        self.assertFalse(any("unreliable" in w for w in report.warnings))
 
 
 # ---------------------------------------------------------------------------
@@ -926,20 +1004,20 @@ class TestPerProbeTimeout(unittest.TestCase):
 class TestResolveModel(unittest.TestCase):
     def test_returns_tuple(self):
         """_resolve_model must return a (model, used_fallback) tuple."""
-        # The live deepagents_cli.config.create_model may or may not be
+        # The live oat_cli.config.create_model may or may not be
         # importable in the test env. Patch both paths to determine result.
         fake_model = MockModel()
 
         # Happy path: primary succeeds → used_fallback=False.
         # Patch at the import level by injecting a fake module.
         import types
-        fake_mod = types.ModuleType("deepagents_cli.config")
+        fake_mod = types.ModuleType("oat_cli.config")
 
         class _Fake:
             def __init__(self, m):
                 self.model = m
         fake_mod.create_model = lambda s: _Fake(fake_model)
-        with patch.dict(sys.modules, {"deepagents_cli.config": fake_mod}):
+        with patch.dict(sys.modules, {"oat_cli.config": fake_mod}):
             result, used_fallback = pm._resolve_model("test:model")
         self.assertIs(result, fake_model)
         self.assertFalse(used_fallback)
@@ -948,7 +1026,7 @@ class TestResolveModel(unittest.TestCase):
         """When create_model raises, a WARN line should be printed to stderr
         before attempting the fallback path."""
         import types, io, contextlib
-        fake_mod = types.ModuleType("deepagents_cli.config")
+        fake_mod = types.ModuleType("oat_cli.config")
 
         def _raise(s):
             raise ValueError("bad config")
@@ -959,7 +1037,7 @@ class TestResolveModel(unittest.TestCase):
 
         buf = io.StringIO()
         with patch.dict(sys.modules, {
-            "deepagents_cli.config": fake_mod,
+            "oat_cli.config": fake_mod,
             "langchain.chat_models": fake_chat_mod,
         }), contextlib.redirect_stderr(buf):
             model, used_fallback = pm._resolve_model("test:model")
@@ -974,7 +1052,7 @@ class TestResolveModel(unittest.TestCase):
         """When both resolution paths fail, the FIRST exception should be
         re-raised (the create_model one, not the init_chat_model one)."""
         import types, io, contextlib
-        fake_mod = types.ModuleType("deepagents_cli.config")
+        fake_mod = types.ModuleType("oat_cli.config")
 
         def _raise_first(s):
             raise ValueError("config.toml typo here")
@@ -988,7 +1066,7 @@ class TestResolveModel(unittest.TestCase):
 
         buf = io.StringIO()
         with patch.dict(sys.modules, {
-            "deepagents_cli.config": fake_mod,
+            "oat_cli.config": fake_mod,
             "langchain.chat_models": fake_chat_mod,
         }), contextlib.redirect_stderr(buf):
             with self.assertRaises(ValueError) as ctx:
@@ -1000,7 +1078,7 @@ class TestResolveModel(unittest.TestCase):
         """--no-fallback should skip init_chat_model entirely and re-raise
         the original create_model exception."""
         import types, io, contextlib
-        fake_mod = types.ModuleType("deepagents_cli.config")
+        fake_mod = types.ModuleType("oat_cli.config")
         call_counter = {"fallback": 0}
 
         def _raise(s):
@@ -1016,7 +1094,7 @@ class TestResolveModel(unittest.TestCase):
 
         buf = io.StringIO()
         with patch.dict(sys.modules, {
-            "deepagents_cli.config": fake_mod,
+            "oat_cli.config": fake_mod,
             "langchain.chat_models": fake_chat_mod,
         }), contextlib.redirect_stderr(buf):
             with self.assertRaises(ValueError) as ctx:

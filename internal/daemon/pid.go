@@ -66,13 +66,13 @@ func (p *PIDFile) IsRunning() (bool, int, error) {
 	// Check if process exists by sending signal 0
 	process, err := os.FindProcess(pid)
 	if err != nil {
-		return false, 0, nil
+		return false, 0, nil //nolint:nilerr // FindProcess failure -> treat as "not running"
 	}
 
 	err = process.Signal(syscall.Signal(0))
 	if err != nil {
 		// Process doesn't exist or we don't have permission
-		return false, 0, nil
+		return false, 0, nil //nolint:nilerr // Signal failure -> treat as "not running"
 	}
 
 	return true, pid, nil

@@ -9,10 +9,10 @@ OAT consists of several components that can fail independently:
 | Component | Description | Persistence |
 |-----------|-------------|-------------|
 | **Daemon** | Central coordinator process | `daemon.pid`, `state.json` |
-| **Supervisor** | LLM agent managing workers | in-memory session, no special state |
-| **Merge-Queue** | LLM agent processing PRs | in-memory session, no special state |
-| **Workers** | LLM agents executing tasks | in-memory sessions, git worktrees, branches |
-| **Workspace** | User's interactive LLM agent | in-memory session, git worktree |
+| **Supervisor** | agent agent managing workers | in-memory session, no special state |
+| **Merge-Queue** | agent agent processing PRs | in-memory session, no special state |
+| **Workers** | agent agents executing tasks | in-memory sessions, git worktrees, branches |
+| **Workspace** | User's interactive agent agent | in-memory session, git worktree |
 | **Backend Session** | Container for all agents in a repo | daemon process memory |
 | **Git Worktrees** | Isolated working directories | filesystem + git metadata |
 
@@ -77,8 +77,8 @@ oat daemon status
 # Check supervisor window
 oat agent attach supervisor
 
-# Restart the supervisor (auto-resumes the existing session)
-oat agent restart supervisor
+# Use the oat agent command to restart (auto-detects context and resumes)
+oat agent
 ```
 
 **Impact:**
@@ -128,6 +128,30 @@ oat agent restart supervisor
 - Health check detects agent process is dead
 - If `ReadyForCleanup` is not set, worker is preserved
 - Changes are NOT automatically committed or pushed
+
+### 4b. Verifier Crash
+
+**What happens:**
+- A `verify-<worker>` agent spawned by `oat worker request-review`
+  exits before delivering an `approved`/`rejected` verdict.
+
+**What gets orphaned:**
+- The worker is still dormant with `WaitingForVerification: true`,
+  pointing at a `VerificationAgent` that no longer has a process.
+
+**Automatic recovery:**
+- `cleanupDeadAgents` detects the dead verifier, clears
+  `worker.VerificationStatus` and `worker.VerificationAgent`, and wakes
+  the worker with the message: "your verification agent crashed before
+  delivering a verdict — self-verify (`oat worker verify`) and create
+  your PR (`oat pr create`)".
+- The crash wake-message is **gated on `!verifier.ReadyForCleanup`**.
+  A verifier that successfully delivered its verdict via
+  `verification_verdict` sets `ReadyForCleanup=true`; the cleanup pass
+  for that verifier therefore clears the stale worker pointer **without**
+  emitting the bogus crash message. This prevents a race where another
+  worker's concurrent `request-review` resets a still-pending status
+  field and looks like a crash to the cleanup loop.
 
 **Manual recovery:**
 ```bash
@@ -394,7 +418,7 @@ oat start
 tail -f ~/.oat/daemon.log   # look for "Woke agent" or "skipping wake"
 ```
 
-Task messages from the supervisor are delivered by the **message router** (every 60 seconds) and do not depend on the PID check; only the periodic nudge does.
+Task messages from the supervisor are delivered by the **message router** (every 2 minutes) and do not depend on the PID check; only the periodic nudge does.
 
 ### Workers: messages appear in prompt but are not processed
 
@@ -419,7 +443,7 @@ If text sent to agents (nudges, task messages, or manual `oat agent tell`) appea
 ### System Configuration
 
 1. **Process supervisor** - Use systemd/launchd to auto-restart daemon
-2. **Log rotation** - Daemon log can grow large
+3. **Log rotation** - Daemon log can grow large
 
 ---
 
@@ -449,7 +473,7 @@ The state file is written atomically (write to temp file, then rename) because:
 
 ## Future Improvements
 
-Potential enhancements (track via GitHub issues):
+See GitHub issue #23 for tracking. Potential enhancements:
 
 1. **State backup** - Periodic backups of state.json
 2. **Process monitoring** - Detect dead agent processes, not just missing windows

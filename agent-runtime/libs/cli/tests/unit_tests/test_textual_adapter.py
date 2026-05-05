@@ -11,14 +11,14 @@ from unittest.mock import MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from deepagents_cli.textual_adapter import (
+from oat_cli.textual_adapter import (
     TextualUIAdapter,
     _build_interrupted_ai_message,
     _build_stream_config,
     _is_summarization_chunk,
     execute_task_textual,
 )
-from deepagents_cli.widgets.messages import SummarizationMessage
+from oat_cli.widgets.messages import SummarizationMessage
 
 
 async def _mock_mount(widget: object) -> None:

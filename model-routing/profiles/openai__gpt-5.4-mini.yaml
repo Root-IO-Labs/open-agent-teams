@@ -5,7 +5,7 @@
 model_id: "openai:gpt-5.4-mini"
 status: known
 source: onboarded
-onboarded_at: "2026-04-21"
+onboarded_at: "2026-04-24"
 
 provider:
   name: openai
@@ -13,10 +13,10 @@ provider:
 capabilities:
   tool_reliability: 1.0
   shell_roundtrip: 1.0
-  shell_recovery: 0.55
+  shell_recovery: 0.44
   file_write_reliability: 1.0
   token_reporting: 1.0
-  streaming: 1.0
+  streaming: 0.75
   multi_turn: 1.0
   large_output: 0.9
   effective_context_class: unknown
@@ -24,23 +24,23 @@ capabilities:
   reasoning_controls: "low, medium, high"
 
 latency:
-  ttft_ms: 941
-  basic_inference_ms: 1922
-  tool_calling_ms: 724
-  token_reporting_ms: 679
-  streaming_ms: 944
-  streaming_tokens_ms: 1496
-  shell_roundtrip_ms: 2464
-  shell_failure_recovery_ms: 3984
-  file_write_via_tool_ms: 841
-  multi_turn_ms: 3761
-  large_output_ms: 5603
-  routing_decision_ms: 1376
-  avg_ms: 2163
+  ttft_ms: 1348
+  basic_inference_ms: 1993
+  tool_calling_ms: 2868
+  token_reporting_ms: 1357
+  streaming_ms: 1595
+  streaming_tokens_ms: 1702
+  shell_roundtrip_ms: 1915
+  shell_failure_recovery_ms: 5541
+  file_write_via_tool_ms: 830
+  multi_turn_ms: 4988
+  large_output_ms: 6657
+  routing_decision_ms: 1703
+  avg_ms: 2831
 
 routing:
-  autonomy_tier: full
-  overall_score: 90
+  autonomy_tier: standard
+  overall_score: 87
 
 contract:
   onboarding_passed: true
@@ -51,5 +51,8 @@ evidence:
   probe_version: 2
   probe_set: default
   probes_run: 13
-  probes_passed: 13
-  resolution_fallback: false
+  probes_passed: 12
+  resolution_fallback: true
+
+warnings:
+  - "Model does not recover from shell failures — may get stuck on errors"

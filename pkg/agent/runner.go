@@ -17,17 +17,16 @@
 //	    "github.com/Root-IO-Labs/open-agent-teams/pkg/backend"
 //	)
 //
-//	// Create a ProcessBackend and adapt it to the TerminalRunner interface.
-//	b := backend.NewBackend("", "")
-//	adapter := backend.NewTerminalAdapter(b)
-//	runner := agent.NewRunner(agent.WithTerminal(adapter))
+//	// Create a backend client and agent runner
+//	client := backend.NewClient()
+//	runner := agent.NewRunner(agent.WithTerminal(client))
 //
-//	// Create a session, then start an agent inside it.
+//	// Start an agent in a session
 //	ctx := context.Background()
-//	if err := b.CreateSession(ctx, "my-session"); err != nil { /* ... */ }
-//	result, err := runner.Start(ctx, "my-session", "agent-window", agent.Config{
+//	config := agent.Config{
 //	    WorkDir: "/path/to/workspace",
-//	})
+//	}
+//	result, err := runner.Start(ctx, "my-session", "agent-window", config)
 //
 // # Sending Messages
 //
@@ -211,7 +210,7 @@ type Config struct {
 	// Used so core agents started by the daemon inherit user environment (GH_TOKEN, etc.). Never logged.
 	EnvPrefix string
 
-	// Model is the LLM model spec (e.g., "claude-sonnet-4-6"). Passed via --model to the agent CLI.
+	// Model is the LLM model spec (e.g., "claude-sonnet-4-5"). Passed via --model to the agent CLI.
 	// If empty, the agent CLI auto-detects from available API keys.
 	Model string
 
@@ -258,12 +257,10 @@ func (r *Runner) Start(ctx context.Context, session, window string, cfg Config) 
 		}
 	}
 
-	// Print MOTD before starting the agent if configured
+	// Print MOTD before starting the agent if configured. Non-fatal on error.
 	if cfg.MOTD != "" {
 		motd := fmt.Sprintf("echo %q", cfg.MOTD)
-		if err := r.Terminal.SendKeys(ctx, session, window, motd); err != nil {
-			// Non-fatal - just continue
-		}
+		_ = r.Terminal.SendKeys(ctx, session, window, motd)
 	}
 
 	// Send the command to start the agent
@@ -443,7 +440,7 @@ func findAgentChild(parentPID int) (int, error) {
 		}
 		pidStr, ppidStr := fields[0], fields[1]
 		args := strings.ToLower(strings.Join(fields[2:], " "))
-		if !strings.Contains(args, "oat-agent") && !strings.Contains(args, "oatagent") && !strings.Contains(args, "deepagents") {
+		if !strings.Contains(args, "oat-agent") && !strings.Contains(args, "oatagent") && !strings.Contains(args, "oat_sdk") {
 			continue
 		}
 		if ppidStr != parentStr && !childPIDs[ppidStr] {

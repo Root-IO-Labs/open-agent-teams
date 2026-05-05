@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 from rich.style import Style
 from rich.text import Text
 
-from deepagents_cli.widgets.welcome import WelcomeBanner
+from oat_cli.widgets.welcome import WelcomeBanner
 
 
 def _extract_links(banner: Text, text_start: int, text_end: int) -> list[str]:
@@ -83,7 +83,7 @@ class TestBuildBannerThreadLink:
         thread_id_end = thread_id_start + len("99999")
         links = _extract_links(banner, thread_id_start, thread_id_end)
         assert links, "Expected a link style on the thread ID text"
-        assert links[0] == f"{project_url}/t/99999?utm_source=deepagents-cli"
+        assert links[0] == f"{project_url}/t/99999?utm_source=oat_sdk-cli"
 
     def test_no_thread_line_when_thread_id_is_none(self) -> None:
         """Banner should not contain a thread line when `thread_id` is `None`."""
@@ -126,7 +126,7 @@ class TestBuildBannerThreadLink:
         thread_id_end = thread_id_start + len("77777")
         links = _extract_links(banner, thread_id_start, thread_id_end)
         assert links
-        assert links[0] == f"{project_url}/t/77777?utm_source=deepagents-cli"
+        assert links[0] == f"{project_url}/t/77777?utm_source=oat_sdk-cli"
 
 
 class TestUpdateThreadId:
@@ -162,7 +162,7 @@ class TestUpdateThreadId:
         thread_end = thread_start + len("new_id")
         links = _extract_links(banner, thread_start, thread_end)
         assert links
-        assert links[0] == f"{project_url}/t/new_id?utm_source=deepagents-cli"
+        assert links[0] == f"{project_url}/t/new_id?utm_source=oat_sdk-cli"
 
 
 class TestBuildBannerReturnType:
@@ -183,7 +183,7 @@ class TestAutoLinksDisabled:
         assert WelcomeBanner.auto_links is False
 
 
-_WEBBROWSER_OPEN = "deepagents_cli.widgets._links.webbrowser.open"
+_WEBBROWSER_OPEN = "oat_cli.widgets._links.webbrowser.open"
 
 
 class TestOnClickOpensLink:

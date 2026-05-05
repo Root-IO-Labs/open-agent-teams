@@ -3,12 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "deepagents-cli"
+name = "oat-cli"
 version = "0.0.26"
-description = "Terminal interface for Deep Agents - interactive AI agent with file operations, shell access, and sub-agent capabilities."
+description = "Terminal interface for OAT (Open Agent Teams) - interactive AI agent with file operations, shell access, and sub-agent capabilities."
 license = { text = "MIT" }
 requires-python = ">=3.11,<4.0"
-keywords = ["agents", "ai", "cli", "terminal", "llm", "langgraph", "langchain", "deep-agent"]
+keywords = ["agents", "ai", "cli", "terminal", "llm", "langgraph", "langchain", "oat", "open-agent-teams"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -25,7 +25,7 @@ classifiers = [
 ]
 dependencies = [
     # Framework
-    "deepagents==0.4.5",
+    "oat_sdk==0.4.5",
     "langchain>=1.2.10,<2.0.0",
     "langgraph-checkpoint-sqlite>=3.0.0,<4.0.0",
 
@@ -80,20 +80,18 @@ perplexity = ["langchain-perplexity>=1.0.0,<2.0.0"]
 vertexai = ["langchain-google-vertexai>=3.0.0,<4.0.0"]
 xai = ["langchain-xai>=1.0.0,<2.0.0"]
 all-providers = [
-    "deepagents-cli[anthropic,bedrock,cohere,deepseek,fireworks,google-genai,groq,huggingface,ibm,mistralai,nvidia,ollama,openai,openrouter,perplexity,vertexai,xai]",
+    "oat-cli[anthropic,bedrock,cohere,deepseek,fireworks,google-genai,groq,huggingface,ibm,mistralai,nvidia,ollama,openai,openrouter,perplexity,vertexai,xai]",
 ]
 
 [project.scripts]
-deepagents = "deepagents_cli:cli_main"
-deepagents-cli = "deepagents_cli:cli_main"
+oat-runtime = "oat_cli:cli_main"
 
 [project.urls]
-Homepage = "https://docs.langchain.com/oss/python/deepagents/overview"
-Documentation = "https://reference.langchain.com/python/deepagents/"
-Repository = "https://github.com/langchain-ai/deepagents"
-Issues = "https://github.com/langchain-ai/deepagents/issues"
-Changelog = "https://github.com/langchain-ai/deepagents/blob/main/libs/cli/CHANGELOG.md"
-Twitter = "https://x.com/LangChain"
+Homepage = "https://github.com/Root-IO-Labs/open-agent-teams"
+Documentation = "https://github.com/Root-IO-Labs/open-agent-teams/tree/main/docs"
+Repository = "https://github.com/Root-IO-Labs/open-agent-teams"
+Issues = "https://github.com/Root-IO-Labs/open-agent-teams/issues"
+Changelog = "https://github.com/Root-IO-Labs/open-agent-teams/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 test = [
@@ -113,18 +111,18 @@ test = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["deepagents_cli"]
+packages = ["oat_cli"]
 
 [tool.hatch.build.targets.wheel.shared-data]
-"deepagents_cli/default_agent_prompt.md" = "deepagents_cli/default_agent_prompt.md"
-"deepagents_cli/*.tcss" = "deepagents_cli/"
+"oat_cli/default_agent_prompt.md" = "oat_cli/default_agent_prompt.md"
+"oat_cli/*.tcss" = "oat_cli/"
 
 [tool.uv.sources]
-deepagents = { path = "../deepagents", editable = true }
+oat_sdk = { path = "../oat_sdk", editable = true }
 
 [tool.ty.environment]
 python-version = "3.11"
-extra-paths = ["../deepagents"]
+extra-paths = ["../oat_sdk"]
 
 [tool.ty.rules]
 # https://docs.astral.sh/ty/rules/
@@ -164,7 +162,7 @@ ban-relative-imports = "all"
 [tool.ruff.lint.isort]
 force-single-line = false
 combine-as-imports = true
-known-first-party = ["deepagents_cli"]
+known-first-party = ["oat_cli"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -205,7 +203,7 @@ ignore-var-parameters = true
     "T201",     # `print` found — examples use print for output
     "TRY300",   # Consider moving to `else` block — examples prioritize readability
 ]
-"deepagents_cli/built_in_skills/**/scripts/**" = [
+"oat_cli/built_in_skills/**/scripts/**" = [
     "ANN001",   # Missing type annotation for function argument — standalone scripts
     "ANN201",   # Missing return type annotation — standalone scripts
     "BLE001",   # Blind exception catch — resilience in standalone scripts

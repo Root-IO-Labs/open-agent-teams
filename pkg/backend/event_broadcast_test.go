@@ -129,7 +129,7 @@ func TestEventBroadcaster_MultipleSubscribersFanOut(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(nSubs)
 	for i := 0; i < nSubs; i++ {
-		i := i
+
 		go func() {
 			defer wg.Done()
 			deadline := time.After(2 * time.Second)

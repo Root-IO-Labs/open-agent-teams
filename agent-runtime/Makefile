@@ -1,8 +1,7 @@
-PACKAGE_DIRS := $(sort $(patsubst %/,%,$(dir $(wildcard libs/*/Makefile libs/partners/*/Makefile))))
+PACKAGE_DIRS := $(sort $(patsubst %/,%,$(dir $(wildcard libs/*/Makefile))))
 
-# Map package dirs to their required Python version
-# acp requires 3.14, everything else uses 3.12
-python_version = $(if $(filter libs/acp,$1),3.14,3.12)
+# Python version for all packages
+python_version = 3.12
 
 .PHONY: help lock lock-check lint format
 

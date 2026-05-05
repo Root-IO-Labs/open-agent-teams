@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from langchain.messages import ToolCall
     from langgraph.runtime import Runtime
 
-from deepagents_cli.agent import (
+from oat_cli.agent import (
     DEFAULT_AGENT_NAME,
     _format_edit_file_description,
     _format_execute_description,
@@ -24,7 +24,7 @@ from deepagents_cli.agent import (
     get_system_prompt,
     list_agents,
 )
-from deepagents_cli.config import Settings, get_glyphs
+from oat_cli.config import Settings, get_glyphs
 
 
 def _make_fake_chat_model() -> GenericFakeChatModel:
@@ -305,7 +305,7 @@ class TestGetSystemPromptModelIdentity:
         mock_settings.model_provider = "anthropic"
         mock_settings.model_context_limit = 200000
 
-        with patch("deepagents_cli.agent.settings", mock_settings):
+        with patch("oat_cli.agent.settings", mock_settings):
             prompt = get_system_prompt("test-agent")
 
         assert "### Model Identity" in prompt
@@ -320,7 +320,7 @@ class TestGetSystemPromptModelIdentity:
         mock_settings.model_provider = "anthropic"
         mock_settings.model_context_limit = 200000
 
-        with patch("deepagents_cli.agent.settings", mock_settings):
+        with patch("oat_cli.agent.settings", mock_settings):
             prompt = get_system_prompt("test-agent")
 
         assert "### Model Identity" not in prompt
@@ -332,7 +332,7 @@ class TestGetSystemPromptModelIdentity:
         mock_settings.model_provider = None
         mock_settings.model_context_limit = 128000
 
-        with patch("deepagents_cli.agent.settings", mock_settings):
+        with patch("oat_cli.agent.settings", mock_settings):
             prompt = get_system_prompt("test-agent")
 
         assert "### Model Identity" in prompt
@@ -347,7 +347,7 @@ class TestGetSystemPromptModelIdentity:
         mock_settings.model_provider = "google"
         mock_settings.model_context_limit = None
 
-        with patch("deepagents_cli.agent.settings", mock_settings):
+        with patch("oat_cli.agent.settings", mock_settings):
             prompt = get_system_prompt("test-agent")
 
         assert "### Model Identity" in prompt
@@ -362,7 +362,7 @@ class TestGetSystemPromptModelIdentity:
         mock_settings.model_provider = None
         mock_settings.model_context_limit = None
 
-        with patch("deepagents_cli.agent.settings", mock_settings):
+        with patch("oat_cli.agent.settings", mock_settings):
             prompt = get_system_prompt("test-agent")
 
         assert "### Model Identity" in prompt
@@ -378,7 +378,7 @@ class TestDefaultAgentName:
         """Guard against accidental renames of the default agent identifier.
 
         Other modules (main.py, commands.py) rely on this value matching
-        the directory name under `~/.deepagents/`.
+        the directory name under `~/.oat_sdk/`.
         """
         assert DEFAULT_AGENT_NAME == "agent"
 
@@ -402,7 +402,7 @@ class TestListAgents:
         (other_dir / "AGENTS.md").touch()
 
         mock_settings = Mock()
-        mock_settings.user_deepagents_dir = agents_dir
+        mock_settings.user_oat_sdk_dir = agents_dir
 
         output: list[str] = []
 
@@ -410,8 +410,8 @@ class TestListAgents:
             output.append(" ".join(str(a) for a in args))
 
         with (
-            patch("deepagents_cli.agent.settings", mock_settings),
-            patch("deepagents_cli.agent.console") as mock_console,
+            patch("oat_cli.agent.settings", mock_settings),
+            patch("oat_cli.agent.console") as mock_console,
         ):
             mock_console.print = capture_print
             list_agents()
@@ -439,7 +439,7 @@ class TestListAgents:
         (custom_dir / "AGENTS.md").touch()
 
         mock_settings = Mock()
-        mock_settings.user_deepagents_dir = agents_dir
+        mock_settings.user_oat_sdk_dir = agents_dir
 
         output: list[str] = []
 
@@ -447,8 +447,8 @@ class TestListAgents:
             output.append(" ".join(str(a) for a in args))
 
         with (
-            patch("deepagents_cli.agent.settings", mock_settings),
-            patch("deepagents_cli.agent.console") as mock_console,
+            patch("oat_cli.agent.settings", mock_settings),
+            patch("oat_cli.agent.console") as mock_console,
         ):
             mock_console.print = capture_print
             list_agents()
@@ -509,12 +509,12 @@ class TestCreateCliAgentSkillsSources:
 
         fake_model = _make_fake_chat_model()
         with (
-            patch("deepagents_cli.agent.settings", mock_settings),
-            patch("deepagents_cli.agent.SkillsMiddleware", FakeSkillsMiddleware),
-            patch("deepagents_cli.agent.MemoryMiddleware"),
-            patch("deepagents_cli.agent.create_deep_agent", return_value=mock_agent),
+            patch("oat_cli.agent.settings", mock_settings),
+            patch("oat_cli.agent.SkillsMiddleware", FakeSkillsMiddleware),
+            patch("oat_cli.agent.MemoryMiddleware"),
+            patch("oat_cli.agent.create_oat_agent", return_value=mock_agent),
             patch(
-                "deepagents.graph.init_chat_model",
+                "oat_sdk.graph.init_chat_model",
                 return_value=fake_model,
             ),
         ):
@@ -547,7 +547,7 @@ class TestCreateCliAgentMemorySources:
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
 
-        project_inner = tmp_path / ".deepagents" / "AGENTS.md"
+        project_inner = tmp_path / ".oat_sdk" / "AGENTS.md"
         project_root = tmp_path / "AGENTS.md"
 
         mock_settings = Mock()
@@ -582,16 +582,16 @@ class TestCreateCliAgentMemorySources:
 
         fake_model = _make_fake_chat_model()
         with (
-            patch("deepagents_cli.agent.settings", mock_settings),
-            patch("deepagents_cli.agent.SkillsMiddleware"),
-            patch("deepagents_cli.agent.MemoryMiddleware", FakeMemoryMiddleware),
-            patch("deepagents_cli.agent.FilesystemBackend"),
+            patch("oat_cli.agent.settings", mock_settings),
+            patch("oat_cli.agent.SkillsMiddleware"),
+            patch("oat_cli.agent.MemoryMiddleware", FakeMemoryMiddleware),
+            patch("oat_cli.agent.FilesystemBackend"),
             patch(
-                "deepagents_cli.agent.create_deep_agent",
+                "oat_cli.agent.create_oat_agent",
                 return_value=mock_agent,
             ),
             patch(
-                "deepagents.graph.init_chat_model",
+                "oat_sdk.graph.init_chat_model",
                 return_value=fake_model,
             ),
         ):
@@ -648,16 +648,16 @@ class TestCreateCliAgentMemorySources:
 
         fake_model = _make_fake_chat_model()
         with (
-            patch("deepagents_cli.agent.settings", mock_settings),
-            patch("deepagents_cli.agent.SkillsMiddleware"),
-            patch("deepagents_cli.agent.MemoryMiddleware", FakeMemoryMiddleware),
-            patch("deepagents_cli.agent.FilesystemBackend"),
+            patch("oat_cli.agent.settings", mock_settings),
+            patch("oat_cli.agent.SkillsMiddleware"),
+            patch("oat_cli.agent.MemoryMiddleware", FakeMemoryMiddleware),
+            patch("oat_cli.agent.FilesystemBackend"),
             patch(
-                "deepagents_cli.agent.create_deep_agent",
+                "oat_cli.agent.create_oat_agent",
                 return_value=mock_agent,
             ),
             patch(
-                "deepagents.graph.init_chat_model",
+                "oat_sdk.graph.init_chat_model",
                 return_value=fake_model,
             ),
         ):
@@ -676,7 +676,7 @@ class TestCreateCliAgentMemorySources:
 
 
 class TestMiddlewareStackConformance:
-    """Verify all middleware passed to create_deep_agent inherits AgentMiddleware."""
+    """Verify all middleware passed to create_oat_agent inherits AgentMiddleware."""
 
     def test_all_middleware_inherit_agent_middleware(self, tmp_path: Path) -> None:
         """Every middleware in the stack must be an AgentMiddleware subclass.
@@ -717,13 +717,13 @@ class TestMiddlewareStackConformance:
 
         fake_model = _make_fake_chat_model()
         with (
-            patch("deepagents_cli.agent.settings", mock_settings),
+            patch("oat_cli.agent.settings", mock_settings),
             patch(
-                "deepagents_cli.agent.create_deep_agent",
+                "oat_cli.agent.create_oat_agent",
                 side_effect=capture_create_agent,
             ),
             patch(
-                "deepagents.graph.init_chat_model",
+                "oat_sdk.graph.init_chat_model",
                 return_value=fake_model,
             ),
         ):

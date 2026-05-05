@@ -1,6 +1,6 @@
 # Testing Strategy: Robotic Barista CLI
 
-This document defines the comprehensive testing philosophy and methodology for the Robotic Barista CLI project, following the multiclaude agentic workflow testing strategy.
+This document defines the comprehensive testing philosophy and methodology for the Robotic Barista CLI project, following the OAT multi-agent workflow testing strategy.
 
 ## Core Principles
 

@@ -53,7 +53,12 @@ func setupTestDaemon(t *testing.T) (*Daemon, func()) {
 		t.Fatalf("Failed to create daemon: %v", err)
 	}
 
+	// Cleanup stops the daemon (canceling its ctx so any goroutines started
+	// by the test — OutputWatchers, message-router, etc — can unwind via
+	// d.wg.Wait) before removing the tmpdir. goleak in leak_test.go catches
+	// tests that bypass this helper.
 	cleanup := func() {
+		_ = d.Stop()
 		os.RemoveAll(tmpDir)
 	}
 

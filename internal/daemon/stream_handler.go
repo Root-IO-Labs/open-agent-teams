@@ -61,9 +61,9 @@ func classifyLine(line string) string {
 }
 
 // streamWriteTimeout is the maximum time to wait for a single write to the
-// streaming client. If the client is hung or the network is broken, we give
-// up after this duration to avoid leaking the goroutine.
-const streamWriteTimeout = 30 * time.Second
+// streaming client. Kept short so zombie oat-ui processes (still running but
+// not reading) are ejected quickly and don't block daemon event delivery.
+const streamWriteTimeout = 5 * time.Second
 
 // HandleStream dispatches streaming commands.
 func (sh *streamHandler) HandleStream(req socket.Request, conn net.Conn) {
@@ -211,9 +211,9 @@ func (sh *streamHandler) handleStreamEvents(req socket.Request, conn net.Conn) {
 		return
 	}
 
-	// Backend must implement SidecarSubscriber. Non-sidecar backends
-	// (e.g., a future tmux backend) return a clean error rather than
-	// silently producing an empty stream, which would confuse the TUI.
+	// Backend must implement SidecarSubscriber. Backends without
+	// sidecar support return a clean error rather than silently
+	// producing an empty stream, which would confuse the TUI.
 	subscriber, ok := sh.d.backend.(backend_pkg.SidecarSubscriber)
 	if !ok {
 		enc.Encode(socket.Response{Success: false, Error: "event streaming not supported for this backend"}) //nolint:errcheck

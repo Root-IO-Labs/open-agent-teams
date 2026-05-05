@@ -31,8 +31,8 @@ func GenerateModelRoster(ps *ProfileStore, allowedModels []string) string {
 		context := formatContext(p)
 		latency := formatLatency(p)
 		coverage := formatCoverage(p)
-		b.WriteString(fmt.Sprintf("| `%s` | %d | %s | %s | %s | %s | %s |\n",
-			p.ModelID, p.OverallScore, coverage, context, latency, strengths, weaknesses))
+		fmt.Fprintf(&b, "| `%s` | %d | %s | %s | %s | %s | %s |\n",
+			p.ModelID, p.OverallScore, coverage, context, latency, strengths, weaknesses)
 	}
 
 	b.WriteString("\n### Model Selection Guidelines\n\n")
@@ -69,8 +69,8 @@ func GenerateOrchestratorModelRoster(ps *ProfileStore) string {
 
 	for _, p := range eligible {
 		context := formatContext(p)
-		b.WriteString(fmt.Sprintf("| `%s` | %d | %s | %.0f%% | %.0f%% |\n",
-			p.ModelID, p.OverallScore, context, p.MultiTurn*100, p.ToolReliability*100))
+		fmt.Fprintf(&b, "| `%s` | %d | %s | %.0f%% | %.0f%% |\n",
+			p.ModelID, p.OverallScore, context, p.MultiTurn*100, p.ToolReliability*100)
 	}
 
 	return b.String()

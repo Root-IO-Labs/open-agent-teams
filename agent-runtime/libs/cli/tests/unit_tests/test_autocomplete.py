@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from deepagents_cli.widgets.autocomplete import (
+from oat_cli.widgets.autocomplete import (
     SLASH_COMMANDS,
     CompletionController,
     FuzzyFileController,

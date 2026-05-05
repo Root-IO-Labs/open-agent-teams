@@ -22,7 +22,7 @@ var workerDormancyCap = time.Duration(getEnvInt("OAT_WORKER_DORMANCY_CAP_MINUTES
 // bypassing the merge-queue entirely. The merge-queue still runs for
 // escalation (CI failures, conflicts) — this only affects the happy path.
 // Configurable via OAT_FAST_MERGE (default true). Set to "false" or "0" to disable.
-var fastMergeEnabled = !(os.Getenv("OAT_FAST_MERGE") == "false" || os.Getenv("OAT_FAST_MERGE") == "0")
+var fastMergeEnabled = os.Getenv("OAT_FAST_MERGE") != "false" && os.Getenv("OAT_FAST_MERGE") != "0"
 
 // prWakeThreshold is the number of conflict/CI wakes before the daemon stops
 // waking the worker and escalates to the supervisor instead. 5 retries gives
@@ -112,6 +112,49 @@ func (d *Daemon) checkWorkerPRs() {
 	if !workersWoken {
 		d.checkActiveWorkerPRIssues()
 	}
+
+	d.backfillRecoveredTasks()
+}
+
+// backfillRecoveredTasks checks task history entries marked "failed" that have
+// a PR number. If the PR has since been merged, the entry is updated to
+// "recovered" — distinguishing workers that failed but whose work landed anyway.
+func (d *Daemon) backfillRecoveredTasks() {
+	repoNames := d.state.ListRepos()
+	for _, repoName := range repoNames {
+		repo, exists := d.state.GetRepo(repoName)
+		if !exists || repo == nil {
+			continue
+		}
+
+		repoPath := d.paths.RepoDir(repoName)
+
+		history, err := d.state.GetTaskHistory(repoName, 50)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range history {
+			if entry.Status != state.TaskStatusFailed || entry.PRNumber == 0 {
+				continue
+			}
+
+			prNum := strconv.Itoa(entry.PRNumber)
+			result, ok := d.queryPRStatus(repoPath, prNum, repoName, entry.Name)
+			if !ok {
+				continue
+			}
+
+			if result.State == "MERGED" {
+				prURL := fmt.Sprintf("%s/pull/%d", repo.GithubURL, entry.PRNumber)
+				if err := d.state.UpdateTaskHistoryStatus(repoName, entry.Name, state.TaskStatusRecovered, prURL, entry.PRNumber); err != nil {
+					d.logger.Warn("Failed to backfill recovered status for %s: %v", entry.Name, err)
+				} else {
+					d.logger.Info("Backfilled task %s/%s to 'recovered' (PR #%d merged)", repoName, entry.Name, entry.PRNumber)
+				}
+			}
+		}
+	}
 }
 
 // checkActiveWorkerPRIssues checks for merge conflicts and CI failures on PRs
@@ -189,6 +232,7 @@ func (d *Daemon) checkActiveWorkerPRIssues() {
 	}
 }
 
+// checkSingleWorkerPR checks a single worker's PR status and wakes the worker if needed.
 // checkSingleWorkerPR checks a dormant worker's PR status and wakes it if action is needed.
 // Returns true if the worker was woken.
 func (d *Daemon) checkSingleWorkerPR(repoName, repoPath, agentName string, agent state.Agent) bool {
@@ -204,9 +248,11 @@ func (d *Daemon) checkSingleWorkerPR(repoName, repoPath, agentName string, agent
 		d.resetPRWakeCount(repoName, agentName)
 		d.wakeWorker(repoName, agentName, agent,
 			fmt.Sprintf("[daemon] Your PR #%d has been merged. Run `oat agent complete` now.", agent.PRNumber))
-		d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+		if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
 			a.WokenForMergedPRAt = time.Now()
-		})
+		}); err != nil {
+			d.logger.Warn("Failed to record WokenForMergedPRAt for %s/%s: %v", repoName, agentName, err)
+		}
 		mergedPR := agent.PRNumber
 		d.safeGo("post-merge-ci-check", func() {
 			time.Sleep(90 * time.Second)
@@ -339,7 +385,7 @@ func (d *Daemon) escalatePRWakeToSupervisor(repoName, agentName string, prNumber
 // is inaccessible due to token permissions.
 func (d *Daemon) queryPRStatus(repoPath, prNum, repoName, agentName string) (prViewResult, bool) {
 	// Try with statusCheckRollup first
-	cmd := exec.Command("gh", "pr", "view", prNum,
+	cmd := exec.CommandContext(d.ctx, "gh", "pr", "view", prNum,
 		"--json", "mergeable,state,statusCheckRollup")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -351,7 +397,7 @@ func (d *Daemon) queryPRStatus(repoPath, prNum, repoName, agentName string) (prV
 	}
 
 	// Fallback: query without statusCheckRollup (works with limited token scopes)
-	cmd = exec.Command("gh", "pr", "view", prNum,
+	cmd = exec.CommandContext(d.ctx, "gh", "pr", "view", prNum,
 		"--json", "mergeable,state")
 	cmd.Dir = repoPath
 	output, err = cmd.Output()
@@ -372,7 +418,7 @@ func (d *Daemon) queryPRStatus(repoPath, prNum, repoName, agentName string) (prV
 // hasCIFailuresFallback checks CI status via `gh run list` when statusCheckRollup is unavailable.
 func (d *Daemon) hasCIFailuresFallback(repoPath, agentName string, prNumber int) bool {
 	branch := "work/" + agentName
-	cmd := exec.Command("gh", "run", "list",
+	cmd := exec.CommandContext(d.ctx, "gh", "run", "list",
 		"--branch", branch, "--limit", "1", "--json", "conclusion,status")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -390,14 +436,14 @@ func (d *Daemon) hasCIFailuresFallback(repoPath, agentName string, prNumber int)
 
 	run := runs[0]
 	return run.Status == "completed" &&
-		(run.Conclusion == "failure" || run.Conclusion == "cancelled" || run.Conclusion == "timed_out")
+		(run.Conclusion == "failure" || run.Conclusion == "canceled" || run.Conclusion == "timed_out")
 }
 
 // hasFailedChecks returns true if any status check has failed.
 func hasFailedChecks(checks []prCheckResult) bool {
 	for _, check := range checks {
 		if check.Conclusion == "FAILURE" || check.Conclusion == "ERROR" ||
-			check.Conclusion == "CANCELLED" || check.Conclusion == "TIMED_OUT" ||
+			check.Conclusion == "CANCELED" || check.Conclusion == "TIMED_OUT" ||
 			check.State == "FAILURE" || check.State == "ERROR" {
 			return true
 		}
@@ -421,7 +467,7 @@ func allChecksPassed(checks []prCheckResult) bool {
 // hasCIPassedFallback checks if CI passed via `gh run list` when statusCheckRollup is unavailable.
 func (d *Daemon) hasCIPassedFallback(repoPath, agentName string) bool {
 	branch := "work/" + agentName
-	cmd := exec.Command("gh", "run", "list",
+	cmd := exec.CommandContext(d.ctx, "gh", "run", "list",
 		"--branch", branch, "--limit", "1", "--json", "conclusion,status")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -477,7 +523,7 @@ func (d *Daemon) notifyMergeQueueAboutPR(repoName, agentName string, agent state
 // buildMergeQueueCISummary builds a multi-line summary of open PR CI statuses for a repo.
 // Used to include CI status in periodic nudge messages to the merge-queue.
 func (d *Daemon) buildMergeQueueCISummary(repoPath string) string {
-	cmd := exec.Command("gh", "pr", "list", "--state", "open", "--json", "number,headRefName", "--limit", "50")
+	cmd := exec.CommandContext(d.ctx, "gh", "pr", "list", "--state", "open", "--json", "number,headRefName", "--limit", "50")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -502,7 +548,7 @@ func (d *Daemon) buildMergeQueueCISummary(repoPath string) string {
 
 // getBranchCIStatus returns a human-readable CI status for a branch.
 func (d *Daemon) getBranchCIStatus(repoPath, branch string) string {
-	cmd := exec.Command("gh", "run", "list", "--branch", branch, "--limit", "1", "--json", "conclusion,status")
+	cmd := exec.CommandContext(d.ctx, "gh", "run", "list", "--branch", branch, "--limit", "1", "--json", "conclusion,status")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -535,7 +581,7 @@ func (d *Daemon) getBranchCIStatus(repoPath, branch string) string {
 func (d *Daemon) checkPRActivity(repoName, repoPath, agentName string, agent state.Agent) {
 	prNum := strconv.Itoa(agent.PRNumber)
 
-	cmd := exec.Command("gh", "pr", "view", prNum, "--json", "comments")
+	cmd := exec.CommandContext(d.ctx, "gh", "pr", "view", prNum, "--json", "comments")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -643,7 +689,7 @@ func allChecksPass(checks []prCheckResult) bool {
 // OAT_FAST_MERGE is enabled. Falls back to notifyMergeQueueAboutPR on failure.
 func (d *Daemon) fastMergeWorkerPR(repoName, repoPath, agentName string, agent state.Agent) {
 	prNum := strconv.Itoa(agent.PRNumber)
-	cmd := exec.Command("gh", "pr", "merge", prNum, "--squash")
+	cmd := exec.CommandContext(d.ctx, "gh", "pr", "merge", prNum, "--squash")
 	cmd.Dir = repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -676,7 +722,7 @@ func (d *Daemon) fastMergeWorkerPR(repoName, repoPath, agentName string, agent s
 // when the merge-queue fails to process a ready PR within the dormancy cap.
 func (d *Daemon) forceMergeWorkerPR(repoName, repoPath, agentName string, agent state.Agent) {
 	prNum := strconv.Itoa(agent.PRNumber)
-	cmd := exec.Command("gh", "pr", "merge", prNum, "--squash")
+	cmd := exec.CommandContext(d.ctx, "gh", "pr", "merge", prNum, "--squash")
 	cmd.Dir = repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -797,7 +843,7 @@ func (d *Daemon) checkMainCIAfterMerge(repoName string, prNumber int) {
 // queryMainCIStatus runs `gh run list --branch main --limit 1` and returns
 // (conclusion, status). Returns ("", "") on error.
 func (d *Daemon) queryMainCIStatus(repoPath string) (conclusion, status string) {
-	cmd := exec.Command("gh", "run", "list", "--branch", "main", "--limit", "1", "--json", "status,conclusion")
+	cmd := exec.CommandContext(d.ctx, "gh", "run", "list", "--branch", "main", "--limit", "1", "--json", "status,conclusion")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {

@@ -5,27 +5,42 @@
 model_id: "openai:gpt-5.4-nano"
 status: known
 source: onboarded
-onboarded_at: "2026-04-17"
+onboarded_at: "2026-04-24"
 
 provider:
   name: openai
 
 capabilities:
   tool_reliability: 1.0
-  shell_reliability: 1.0
-  shell_recovery: 0.0
+  shell_roundtrip: 0.8
+  shell_recovery: 0.55
   file_write_reliability: 1.0
   token_reporting: 1.0
-  streaming: 0.0
-  multi_turn: 0.0
-  large_output: 0.0
+  streaming: 1.0
+  multi_turn: 1.0
+  large_output: 0.9
   effective_context_class: unknown
   max_input_tokens: unknown
-  reasoning_controls: "none"
+  reasoning_controls: "low, medium, high"
+
+latency:
+  ttft_ms: 615
+  basic_inference_ms: 916
+  tool_calling_ms: 776
+  token_reporting_ms: 706
+  streaming_ms: 1024
+  streaming_tokens_ms: 932
+  shell_roundtrip_ms: 1814
+  shell_failure_recovery_ms: 4473
+  file_write_via_tool_ms: 981
+  multi_turn_ms: 5056
+  large_output_ms: 9661
+  routing_decision_ms: 919
+  avg_ms: 2478
 
 routing:
-  autonomy_tier: full
-  overall_score: 95
+  autonomy_tier: standard
+  overall_score: 88
 
 contract:
   onboarding_passed: true
@@ -33,6 +48,8 @@ contract:
   orchestrator_eligible: false
 
 evidence:
-  probe_version: 1
-  probes_run: 6
-  probes_passed: 6
+  probe_version: 2
+  probe_set: default
+  probes_run: 13
+  probes_passed: 13
+  resolution_fallback: true

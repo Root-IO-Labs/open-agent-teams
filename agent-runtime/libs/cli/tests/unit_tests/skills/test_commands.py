@@ -7,11 +7,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from deepagents.middleware.skills import SkillMetadata, _parse_skill_metadata
+from oat_sdk.middleware.skills import SkillMetadata, _parse_skill_metadata
 from rich.console import Console
 
-from deepagents_cli.main import parse_args
-from deepagents_cli.skills.commands import (
+from oat_cli.main import parse_args
+from oat_cli.skills.commands import (
     _delete,
     _format_info_fields,
     _generate_template,
@@ -444,10 +444,10 @@ class TestFormatInfoFields:
 
 
 class TestSkillsHelpFlag:
-    """Test that `deepagents skills -h` shows skills-specific help."""
+    """Test that `oat_sdk skills -h` shows skills-specific help."""
 
     def test_skills_help_shows_subcommands(self) -> None:
-        """Running `deepagents skills -h` should show skills subcommands.
+        """Running `oat_sdk skills -h` should show skills subcommands.
 
         Regression: -h on the skills subcommand was falling through to the
         global help screen, showing top-level options (--sandbox, --model, etc.)
@@ -457,8 +457,8 @@ class TestSkillsHelpFlag:
         test_console = Console(file=buf, highlight=False, width=120)
 
         with (
-            patch("sys.argv", ["deepagents", "skills", "-h"]),
-            patch("deepagents_cli.ui.console", test_console),
+            patch("sys.argv", ["oat_sdk", "skills", "-h"]),
+            patch("oat_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -478,13 +478,13 @@ class TestSkillsHelpFlag:
         assert "--model" not in output
 
     def test_skills_list_help_shows_list_options(self) -> None:
-        """Running `deepagents skills list -h` should show list-specific options."""
+        """Running `oat_sdk skills list -h` should show list-specific options."""
         buf = io.StringIO()
         test_console = Console(file=buf, highlight=False, width=120)
 
         with (
-            patch("sys.argv", ["deepagents", "skills", "list", "-h"]),
-            patch("deepagents_cli.ui.console", test_console),
+            patch("sys.argv", ["oat_sdk", "skills", "list", "-h"]),
+            patch("oat_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -502,10 +502,10 @@ class TestSkillsHelpFlag:
 
 
 class TestThreadsHelpFlag:
-    """Test that `deepagents threads -h` shows threads-specific help."""
+    """Test that `oat_sdk threads -h` shows threads-specific help."""
 
     def test_threads_help_shows_threads_content(self) -> None:
-        """Running `deepagents threads -h` should show threads subcommands.
+        """Running `oat_sdk threads -h` should show threads subcommands.
 
         Regression: same pattern as skills -- -h on the threads subcommand
         should show threads-specific help, not the global help screen.
@@ -514,8 +514,8 @@ class TestThreadsHelpFlag:
         test_console = Console(file=buf, highlight=False, width=120)
 
         with (
-            patch("sys.argv", ["deepagents", "threads", "-h"]),
-            patch("deepagents_cli.ui.console", test_console),
+            patch("sys.argv", ["oat_sdk", "threads", "-h"]),
+            patch("oat_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -534,36 +534,36 @@ class TestThreadsHelpFlag:
 
 
 class TestThreadsListAlias:
-    """Test that `deepagents threads ls` is parsed as a `list` alias."""
+    """Test that `oat_sdk threads ls` is parsed as a `list` alias."""
 
     def test_threads_ls_alias_parsed(self) -> None:
         """Verify `threads ls` sets threads_command to 'ls'."""
-        with patch("sys.argv", ["deepagents", "threads", "ls"]):
+        with patch("sys.argv", ["oat_sdk", "threads", "ls"]):
             args = parse_args()
         assert args.command == "threads"
         assert args.threads_command == "ls"
 
     def test_threads_list_still_works(self) -> None:
         """Verify `threads list` still works after alias addition."""
-        with patch("sys.argv", ["deepagents", "threads", "list"]):
+        with patch("sys.argv", ["oat_sdk", "threads", "list"]):
             args = parse_args()
         assert args.command == "threads"
         assert args.threads_command == "list"
 
 
 class TestSkillsListAlias:
-    """Test that `deepagents skills ls` is parsed as a `list` alias."""
+    """Test that `oat_sdk skills ls` is parsed as a `list` alias."""
 
     def test_skills_ls_alias_parsed(self) -> None:
         """Verify `skills ls` sets skills_command to 'ls'."""
-        with patch("sys.argv", ["deepagents", "skills", "ls"]):
+        with patch("sys.argv", ["oat_sdk", "skills", "ls"]):
             args = parse_args()
         assert args.command == "skills"
         assert args.skills_command == "ls"
 
     def test_skills_list_still_works(self) -> None:
         """Verify `skills list` still works after alias addition."""
-        with patch("sys.argv", ["deepagents", "skills", "list"]):
+        with patch("sys.argv", ["oat_sdk", "skills", "list"]):
             args = parse_args()
         assert args.command == "skills"
         assert args.skills_command == "list"
@@ -596,7 +596,7 @@ class TestInfoShadowWarning:
         self._make_skill_dir(project_dir, "web-research", "Project version")
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -617,7 +617,7 @@ class TestInfoShadowWarning:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             _info("web-research", agent="agent")
@@ -632,7 +632,7 @@ class TestInfoShadowWarning:
         self._make_skill_dir(user_dir, "web-research", "User only skill")
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -653,7 +653,7 @@ class TestInfoShadowWarning:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             _info("web-research", agent="agent")
@@ -686,7 +686,7 @@ class TestInfoBuiltInSkill:
         self._make_skill_dir(built_in_dir, "test-builtin", "A built-in skill")
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -707,7 +707,7 @@ class TestInfoBuiltInSkill:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             _info("test-builtin", agent="agent")
@@ -724,7 +724,7 @@ class TestInfoBuiltInSkill:
         self._make_skill_dir(user_dir, "shared-skill", "User version")
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -745,7 +745,7 @@ class TestInfoBuiltInSkill:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             # User overrides built-in; info shows user version, no shadow note
@@ -773,7 +773,7 @@ class TestListBuiltInSkillsDisplay:
         self._make_skill_dir(built_in_dir, "test-builtin", "A built-in skill")
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -794,7 +794,7 @@ class TestListBuiltInSkillsDisplay:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             _list(agent="agent")
@@ -809,7 +809,7 @@ class TestListBuiltInSkillsDisplay:
         self._make_skill_dir(built_in_dir, "test-builtin", "A built-in skill")
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -830,7 +830,7 @@ class TestListBuiltInSkillsDisplay:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             _list(agent="agent")
@@ -849,7 +849,7 @@ class TestSkillsLsDispatch:
         built_in_dir.mkdir()
 
         mock_settings = patch(
-            "deepagents_cli.skills.commands.Settings.from_environment",
+            "oat_cli.skills.commands.Settings.from_environment",
             return_value=type(
                 "FakeSettings",
                 (),
@@ -872,7 +872,7 @@ class TestSkillsLsDispatch:
 
         with (
             mock_settings,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_console.print = capture_print
             execute_skills_command(args)
@@ -914,7 +914,7 @@ class TestDeleteSkill:
 
     def test_delete_existing_skill_with_force(self, tmp_path: Path) -> None:
         """Test deleting an existing skill with --force flag."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -924,7 +924,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             _delete("test-skill", agent="agent", project=False, force=True)
 
@@ -932,7 +932,7 @@ class TestDeleteSkill:
 
     def test_delete_nonexistent_skill(self, tmp_path: Path) -> None:
         """Test deleting a skill that doesn't exist shows error."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         user_skills_dir.mkdir(parents=True)
 
         mock_settings = MagicMock()
@@ -947,8 +947,8 @@ class TestDeleteSkill:
             output.append(" ".join(str(a) for a in args))
 
         with (
-            patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.Settings") as mock_settings_cls,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_settings_cls.from_environment.return_value = mock_settings
             mock_console.print = capture_print
@@ -962,7 +962,7 @@ class TestDeleteSkill:
         self, tmp_path: Path, response: str
     ) -> None:
         """Test deleting a skill with user confirmation (y/yes)."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -972,7 +972,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             with patch("builtins.input", return_value=response):
                 _delete("test-skill", agent="agent", project=False, force=False)
@@ -981,7 +981,7 @@ class TestDeleteSkill:
 
     def test_delete_with_confirmation_no(self, tmp_path: Path) -> None:
         """Test canceling skill deletion with user confirmation (no)."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -991,7 +991,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             with patch("builtins.input", return_value="n"):
                 _delete("test-skill", agent="agent", project=False, force=False)
@@ -1000,7 +1000,7 @@ class TestDeleteSkill:
 
     def test_delete_with_confirmation_empty_input(self, tmp_path: Path) -> None:
         """Test canceling skill deletion with empty input (default: no)."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -1010,7 +1010,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             with patch("builtins.input", return_value=""):
                 _delete("test-skill", agent="agent", project=False, force=False)
@@ -1019,7 +1019,7 @@ class TestDeleteSkill:
 
     def test_delete_with_keyboard_interrupt(self, tmp_path: Path) -> None:
         """Test canceling skill deletion with Ctrl+C."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -1029,7 +1029,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             with patch("builtins.input", side_effect=KeyboardInterrupt):
                 _delete("test-skill", agent="agent", project=False, force=False)
@@ -1038,7 +1038,7 @@ class TestDeleteSkill:
 
     def test_delete_with_eof_error(self, tmp_path: Path) -> None:
         """Test canceling skill deletion with EOF (piped stdin)."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -1048,7 +1048,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             with patch("builtins.input", side_effect=EOFError):
                 _delete("test-skill", agent="agent", project=False, force=False)
@@ -1057,7 +1057,7 @@ class TestDeleteSkill:
 
     def test_delete_invalid_skill_name(self, tmp_path: Path) -> None:
         """Test deleting with an invalid skill name shows error."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         user_skills_dir.mkdir(parents=True)
 
         mock_settings = MagicMock()
@@ -1080,8 +1080,8 @@ class TestDeleteSkill:
             output.clear()
 
             with (
-                patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls,
-                patch("deepagents_cli.skills.commands.console") as mock_console,
+                patch("oat_cli.skills.commands.Settings") as mock_settings_cls,
+                patch("oat_cli.skills.commands.console") as mock_console,
             ):
                 mock_settings_cls.from_environment.return_value = mock_settings
                 mock_console.print = capture_print
@@ -1094,18 +1094,18 @@ class TestDeleteSkill:
 
     def test_delete_project_skill(self, tmp_path: Path) -> None:
         """Test deleting a project-level skill."""
-        project_skills_dir = tmp_path / "project" / ".deepagents" / "skills"
+        project_skills_dir = tmp_path / "project" / ".oat_sdk" / "skills"
         skill_dir = self._create_test_skill(project_skills_dir, "project-skill")
         assert skill_dir.exists()
 
         mock_settings = MagicMock()
-        user_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         mock_settings.get_user_skills_dir.return_value = user_dir
         mock_settings.get_project_skills_dir.return_value = project_skills_dir
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             _delete("project-skill", agent="agent", project=True, force=True)
 
@@ -1114,7 +1114,7 @@ class TestDeleteSkill:
     def test_delete_project_skill_not_in_project(self, tmp_path: Path) -> None:
         """Test deleting a project skill when not in a project directory."""
         mock_settings = MagicMock()
-        user_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         mock_settings.get_user_skills_dir.return_value = user_dir
         mock_settings.get_project_skills_dir.return_value = None
 
@@ -1124,8 +1124,8 @@ class TestDeleteSkill:
             output.append(" ".join(str(a) for a in args))
 
         with (
-            patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.Settings") as mock_settings_cls,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_settings_cls.from_environment.return_value = mock_settings
             mock_console.print = capture_print
@@ -1136,7 +1136,7 @@ class TestDeleteSkill:
 
     def test_delete_skill_with_supporting_files(self, tmp_path: Path) -> None:
         """Test deleting a skill that contains multiple supporting files."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "complex-skill")
 
         (skill_dir / "helper.py").write_text("# Helper script")
@@ -1154,7 +1154,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             _delete("complex-skill", agent="agent", project=False, force=True)
 
@@ -1162,8 +1162,8 @@ class TestDeleteSkill:
 
     def test_delete_skill_for_specific_agent(self, tmp_path: Path) -> None:
         """Test deleting a skill for a specific agent."""
-        agent1_skills_dir = tmp_path / ".deepagents" / "agent1" / "skills"
-        agent2_skills_dir = tmp_path / ".deepagents" / "agent2" / "skills"
+        agent1_skills_dir = tmp_path / ".oat_sdk" / "agent1" / "skills"
+        agent2_skills_dir = tmp_path / ".oat_sdk" / "agent2" / "skills"
 
         skill_dir_agent1 = self._create_test_skill(agent1_skills_dir, "shared-skill")
         skill_dir_agent2 = self._create_test_skill(agent2_skills_dir, "shared-skill")
@@ -1177,7 +1177,7 @@ class TestDeleteSkill:
         mock_settings.get_user_agent_skills_dir.return_value = None
         mock_settings.get_project_agent_skills_dir.return_value = None
 
-        with patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls:
+        with patch("oat_cli.skills.commands.Settings") as mock_settings_cls:
             mock_settings_cls.from_environment.return_value = mock_settings
             _delete("shared-skill", agent="agent1", project=False, force=True)
 
@@ -1186,7 +1186,7 @@ class TestDeleteSkill:
 
     def test_delete_rmtree_os_error(self, tmp_path: Path) -> None:
         """Test that OSError during shutil.rmtree exits with code 1."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         skill_dir = self._create_test_skill(user_skills_dir, "test-skill")
         assert skill_dir.exists()
 
@@ -1202,8 +1202,8 @@ class TestDeleteSkill:
             output.append(" ".join(str(a) for a in args))
 
         with (
-            patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.Settings") as mock_settings_cls,
+            patch("oat_cli.skills.commands.console") as mock_console,
             patch("shutil.rmtree", side_effect=OSError("Permission denied")),
         ):
             mock_settings_cls.from_environment.return_value = mock_settings
@@ -1235,8 +1235,8 @@ class TestDeleteSkill:
             output.append(" ".join(str(a) for a in args))
 
         with (
-            patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.Settings") as mock_settings_cls,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_settings_cls.from_environment.return_value = mock_settings
             mock_console.print = capture_print
@@ -1249,13 +1249,13 @@ class TestDeleteSkill:
 
 
 class TestDeleteArgparsing:
-    """Test argparse wiring for `deepagents skills delete`."""
+    """Test argparse wiring for `oat_sdk skills delete`."""
 
     def test_delete_args_parsed(self) -> None:
         """Verify `skills delete my-skill --force --project` parses correctly."""
         with patch(
             "sys.argv",
-            ["deepagents", "skills", "delete", "my-skill", "--force", "--project"],
+            ["oat_sdk", "skills", "delete", "my-skill", "--force", "--project"],
         ):
             args = parse_args()
         assert args.command == "skills"
@@ -1266,20 +1266,20 @@ class TestDeleteArgparsing:
 
     def test_delete_args_defaults(self) -> None:
         """Verify default values for optional delete arguments."""
-        with patch("sys.argv", ["deepagents", "skills", "delete", "my-skill"]):
+        with patch("sys.argv", ["oat_sdk", "skills", "delete", "my-skill"]):
             args = parse_args()
         assert args.force is False
         assert args.project is False
         assert args.agent == "agent"
 
     def test_delete_help_shows_delete_options(self) -> None:
-        """Running `deepagents skills delete -h` should show delete options."""
+        """Running `oat_sdk skills delete -h` should show delete options."""
         buf = io.StringIO()
         test_console = Console(file=buf, highlight=False, width=120)
 
         with (
-            patch("sys.argv", ["deepagents", "skills", "delete", "-h"]),
-            patch("deepagents_cli.ui.console", test_console),
+            patch("sys.argv", ["oat_sdk", "skills", "delete", "-h"]),
+            patch("oat_cli.ui.console", test_console),
             pytest.raises(SystemExit) as exc_info,
         ):
             parse_args()
@@ -1291,7 +1291,7 @@ class TestDeleteArgparsing:
 
     def test_execute_skills_command_dispatches_delete(self, tmp_path: Path) -> None:
         """Verify `execute_skills_command` routes 'delete' to `_delete()`."""
-        user_skills_dir = tmp_path / ".deepagents" / "agent" / "skills"
+        user_skills_dir = tmp_path / ".oat_sdk" / "agent" / "skills"
         user_skills_dir.mkdir(parents=True)
 
         mock_settings = MagicMock()
@@ -1314,8 +1314,8 @@ class TestDeleteArgparsing:
             output.append(" ".join(str(a) for a in args_p))
 
         with (
-            patch("deepagents_cli.skills.commands.Settings") as mock_settings_cls,
-            patch("deepagents_cli.skills.commands.console") as mock_console,
+            patch("oat_cli.skills.commands.Settings") as mock_settings_cls,
+            patch("oat_cli.skills.commands.console") as mock_console,
         ):
             mock_settings_cls.from_environment.return_value = mock_settings
             mock_console.print = capture_print

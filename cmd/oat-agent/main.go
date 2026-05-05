@@ -5,11 +5,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
+// Version is set at build time via -ldflags "-X main.Version=...".
+var Version = "dev"
+
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version", "-v", "version":
+			fmt.Println(Version)
+			return
+		}
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -117,8 +126,8 @@ func findAgentRuntimeDir() (string, error) {
 func isAgentRuntimeDir(dir string) bool {
 	// Check for key files/directories that should exist in agent-runtime
 	keyPaths := []string{
-		"libs/cli/deepagents_cli",
-		"libs/deepagents",
+		"libs/cli/oat_cli",
+		"libs/oat_sdk",
 	}
 
 	for _, keyPath := range keyPaths {
@@ -215,10 +224,19 @@ func hasRequiredPackages(pythonPath string) bool {
 	return true
 }
 
-// buildPythonCommand constructs the command to run the Python CLI
+// buildPythonCommand constructs the command to run the Python CLI.
+//
+// Uses `python -m oat_cli` (invoking the package via its `__main__.py`)
+// rather than `python -m oat_cli.main`. Running the submodule directly
+// causes CPython to emit a `RuntimeWarning: 'oat_cli.main' found in
+// sys.modules after import of package 'oat_cli', but prior to execution
+// of 'oat_cli.main'; this may result in unpredictable behavior` on
+// every invocation — including trivial ones like `oat-agent --help` — because
+// the package's `__init__.py` imports `oat_cli.main` eagerly. Invoking
+// the package instead lets the runtime handle double-registration cleanly.
 func buildPythonCommand(pythonExe, agentRuntimeDir string, args []string) *exec.Cmd {
-	// The command will be: python -m deepagents_cli.main [args...]
-	cmdArgs := []string{"-m", "deepagents_cli.main"}
+	// The command will be: python -m oat_cli [args...]
+	cmdArgs := []string{"-m", "oat_cli"}
 	cmdArgs = append(cmdArgs, args...)
 
 	cmd := exec.Command(pythonExe, cmdArgs...)
@@ -237,9 +255,7 @@ func buildPythonCommand(pythonExe, agentRuntimeDir string, args []string) *exec.
 	// Add libs directories to PYTHONPATH for proper module resolution
 	libsDirs := []string{
 		filepath.Join(agentRuntimeDir, "libs", "cli"),
-		filepath.Join(agentRuntimeDir, "libs", "deepagents"),
-		filepath.Join(agentRuntimeDir, "libs", "harbor"),
-		filepath.Join(agentRuntimeDir, "libs", "acp"),
+		filepath.Join(agentRuntimeDir, "libs", "oat_sdk"),
 	}
 
 	for _, libDir := range libsDirs {
@@ -263,18 +279,4 @@ func buildPythonCommand(pythonExe, agentRuntimeDir string, args []string) *exec.
 	cmd.Env = env
 
 	return cmd
-}
-
-// getOSInfo returns OS-specific information for error messages
-func getOSInfo() string {
-	switch runtime.GOOS {
-	case "windows":
-		return "Windows"
-	case "darwin":
-		return "macOS"
-	case "linux":
-		return "Linux"
-	default:
-		return runtime.GOOS
-	}
 }

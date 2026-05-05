@@ -120,11 +120,11 @@ func generateDirectoryStructure() string {
 		if doc.Type == "directory" {
 			typeEmoji = "📁"
 		}
-		buf.WriteString(fmt.Sprintf("### %s `%s`\n\n", typeEmoji, doc.Path))
-		buf.WriteString(fmt.Sprintf("**Type**: %s\n\n", doc.Type))
-		buf.WriteString(fmt.Sprintf("%s\n\n", doc.Description))
+		fmt.Fprintf(&buf, "### %s `%s`\n\n", typeEmoji, doc.Path)
+		fmt.Fprintf(&buf, "**Type**: %s\n\n", doc.Type)
+		fmt.Fprintf(&buf, "%s\n\n", doc.Description)
 		if doc.Notes != "" {
-			buf.WriteString(fmt.Sprintf("**Notes**: %s\n\n", doc.Notes))
+			fmt.Fprintf(&buf, "**Notes**: %s\n\n", doc.Notes)
 		}
 	}
 
@@ -162,7 +162,7 @@ func generateDirectoryStructure() string {
 	buf.WriteString("| Field | Type | Description |\n")
 	buf.WriteString("|-------|------|-------------|\n")
 	for _, doc := range config.StateDocs() {
-		buf.WriteString(fmt.Sprintf("| `%s` | `%s` | %s |\n", doc.Field, doc.Type, doc.Description))
+		fmt.Fprintf(&buf, "| `%s` | `%s` | %s |\n", doc.Field, doc.Type, doc.Description)
 	}
 	buf.WriteString("\n")
 
@@ -188,7 +188,7 @@ func generateDirectoryStructure() string {
 	buf.WriteString("| Field | Type | Description |\n")
 	buf.WriteString("|-------|------|-------------|\n")
 	for _, doc := range config.MessageDocs() {
-		buf.WriteString(fmt.Sprintf("| `%s` | `%s` | %s |\n", doc.Field, doc.Type, doc.Description))
+		fmt.Fprintf(&buf, "| `%s` | `%s` | %s |\n", doc.Field, doc.Type, doc.Description)
 	}
 	buf.WriteString("\n")
 

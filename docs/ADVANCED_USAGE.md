@@ -30,7 +30,7 @@ Use conventional commit messages (feat:, fix:, chore:).
 EOF
 ```
 
-Valid filenames: `worker.md`, `merge-queue.md`, `reviewer.md`, `pr-shepherd.md`.
+Valid filenames: `worker.md`, `merge-queue.md`, `review.md`, `pr-shepherd.md`.
 
 ### Spawn a fully custom agent
 
@@ -77,6 +77,8 @@ When multiple models are onboarded, OAT can distribute workers across them based
 # 1. Onboard models to generate capability profiles
 oat model onboard anthropic:claude-sonnet-4-6
 oat model onboard openrouter:deepseek/deepseek-v3.2:nitro
+# Use --verbose to see full probe output (JSON report + YAML profile)
+# oat model onboard anthropic:claude-sonnet-4-6 --verbose
 
 # 2. Restrict which models this repo can use for workers
 oat config my-repo worker-models set "anthropic:claude-sonnet-4-6,openrouter:deepseek/deepseek-v3.2:nitro"
@@ -161,7 +163,7 @@ This folder is version-controlled, so the whole team shares the same worker cont
 
 ## Dormancy and PR Monitoring
 
-After a worker creates a PR, it enters a **dormant state** with zero token consumption. The daemon's PR monitor loop (every 60 seconds) watches the PR and wakes the worker when action is needed.
+After a worker creates a PR, it enters a **dormant state** with zero token consumption. The daemon's PR monitor loop (every 2 minutes) watches the PR and wakes the worker when action is needed.
 
 ### Wake triggers
 
@@ -207,20 +209,22 @@ When no workers are active in a repo, the daemon enters **idle mode** and stops 
 
 ## Stuck Worker Recovery
 
-The daemon runs a three-tier escalation for agents that stop making progress. Nudge counts reset whenever new git activity (commits, pushes) is detected.
+The daemon runs a three-tier escalation for agents that stop making progress. Nudge counts reset whenever new git activity (commits, pushes) is detected. The wake loop runs every 60s (configurable via `OAT_WAKE_INTERVAL_SECONDS`), so nudge counts are roughly equal to elapsed minutes.
 
 | Time window | Action | Cost |
 |-------------|--------|------|
-| 0-9 min | Status nudges every 60 s | Normal token use |
+| 0-9 min | Status nudges every minute | Normal token use |
 | 10-15 min | Daemon alerts supervisor, who inspects logs and intervenes. Supervisor can call `oat worker reset-nudge` once to buy another round. | Supervisor tokens |
 | 16-29 min | Daemon takeover: checks git state, auto-completes workers with open PRs, sends directives. **No LLM calls.** | Zero tokens |
 | ~30 min | Hard removal: worker is terminated, resources freed | Zero tokens |
 
-The key insight: recovery past the 16-minute mark uses shell commands and git state checks, not LLM conversations. This prevents recovery from compounding costs.
+The key insight: recovery at the 16-minute mark uses shell commands and git state checks, not LLM conversations. This prevents recovery from compounding costs.
 
 ---
 
 ## Verification System
+
+> **Note:** Available in the `feature/integrate-verification` branch (PR #45). Not yet on main.
 
 Workers must pass verification before creating a PR. Three options, in order of rigor:
 
@@ -279,6 +283,57 @@ The verification agent **never modifies the worker's branch**. It operates read-
 | `OAT_TEST_MODE` | (unset) | Skip real agent spawning (for tests) |
 
 ---
+
+## Monitoring Token Usage and Cache Efficiency
+
+OAT routes every agent turn through Anthropic's [prompt caching
+middleware](https://github.com/langchain-ai/langchain-anthropic), so
+the bulk of a long-running agent's input tokens are served from cache
+at roughly 10% of fresh-input pricing. The middleware is wired at
+three layers — the workspace, individual workers, and sub-agents —
+with `unsupported_model_behavior="ignore"` so non-Anthropic models
+silently no-op rather than erroring. Cache TTL defaults to Anthropic's
+5-minute behavior today; longer-TTL + independent-breakpoint work is
+in flight (see the OATS gameplan "caching optimization" row).
+
+Two surfaces make this observable.
+
+**Live:** `oat status --tokens` reads the daemon's in-memory counters
+off `state.json` and prints a per-agent table with INPUT, OUTPUT,
+CACHE_READ, CACHE_CREATE, HIT%, and COST_USD columns. `HIT%` is the
+share of input tokens served from cache (high is good); `COST_USD`
+is the dollar cost computed from the embedded
+[`internal/routing/pricing.yaml`](../internal/routing/pricing.yaml)
+table. A `—` in `COST_USD` means the agent's model has no entry in
+`pricing.yaml` (or the agent has no `Model` set in state) — add the
+model + verified prices to the YAML and rebuild to fix.
+
+**Historical:** `oat tokens report --repo <n> [--wave N] [--format
+json]` parses the `[OAT_TOKENS]` lines already emitted to each
+agent's log file and groups them by wave. Use for post-hoc benchmark
+breakdowns or any scripted aggregation — the live snapshot can't tell
+you wave boundaries. Same `cost_usd` column (and a `totals.cost_usd`
+field in the JSON output) computed from the same pricing table.
+
+Diagnostic heuristics when HIT% drops:
+
+- **HIT% < 50% on a long-running agent** — usually cache-preamble
+  churn. Something the agent re-reads each turn (a giant tool list,
+  changing timestamps in the prompt, a huge state dump) is
+  invalidating the cached prefix. Check whether a recent prompt edit
+  reshuffled headers.
+- **Near-zero `cache_read` on a supposedly-warm agent** — either the
+  model isn't Anthropic (the middleware silently disables) or the
+  TTL expired between turns (agent idled > 5 min). Harmless if
+  intermittent, worth investigating if persistent.
+- **`cache_creation` dwarfing `cache_read`** — first turn of a new
+  agent is always high; if it persists turn-to-turn, the prefix isn't
+  stable and caching is buying nothing. Treat as a bug.
+
+When Raj's caching optimization fixes land (60m TTL, independent
+breakpoints for tools vs system, `PromptAssembly` layer), expect the
+`HIT%` numbers to shift further upward; the diagnostic rules above
+will still hold.
 
 ## Socket API
 

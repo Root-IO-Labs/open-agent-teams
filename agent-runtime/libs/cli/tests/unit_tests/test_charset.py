@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from deepagents_cli.config import (
+from oat_cli.config import (
     _ASCII_BANNER,
     _UNICODE_BANNER,
     ASCII_GLYPHS,
@@ -325,21 +325,21 @@ class TestGetBanner:
     @patch.dict("os.environ", {"UI_CHARSET_MODE": "unicode"}, clear=False)
     def test_get_banner_returns_unicode_for_unicode_mode(self) -> None:
         """Test get_banner returns Unicode banner for unicode mode."""
-        with patch("deepagents_cli.config._is_editable_install", return_value=False):
+        with patch("oat_cli.config._is_editable_install", return_value=False):
             banner = get_banner()
         assert banner is _UNICODE_BANNER
 
     @patch.dict("os.environ", {"UI_CHARSET_MODE": "ascii"}, clear=False)
     def test_get_banner_returns_ascii_for_ascii_mode(self) -> None:
         """Test get_banner returns ASCII banner for ascii mode."""
-        with patch("deepagents_cli.config._is_editable_install", return_value=False):
+        with patch("oat_cli.config._is_editable_install", return_value=False):
             banner = get_banner()
         assert banner is _ASCII_BANNER
 
     @patch.dict("os.environ", {"UI_CHARSET_MODE": "unicode"}, clear=False)
     def test_get_banner_adds_local_install_suffix_for_editable(self) -> None:
         """Test get_banner adds (local) suffix for editable installs."""
-        with patch("deepagents_cli.config._is_editable_install", return_value=True):
+        with patch("oat_cli.config._is_editable_install", return_value=True):
             banner = get_banner()
         assert "(local)" in banner
         assert f"v{__version__} (local)" in banner
@@ -347,7 +347,7 @@ class TestGetBanner:
     @patch.dict("os.environ", {"UI_CHARSET_MODE": "ascii"}, clear=False)
     def test_get_banner_adds_local_install_suffix_for_editable_ascii(self) -> None:
         """Test get_banner adds (local) suffix in ASCII mode."""
-        with patch("deepagents_cli.config._is_editable_install", return_value=True):
+        with patch("oat_cli.config._is_editable_install", return_value=True):
             banner = get_banner()
         assert "(local)" in banner
         assert f"v{__version__} (local)" in banner

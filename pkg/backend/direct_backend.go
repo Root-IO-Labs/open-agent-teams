@@ -234,10 +234,7 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 	cmd.Dir = cfg.WorkDir
 
 	// Set up environment
-	cmd.Env = os.Environ()
-	for _, env := range cfg.Env {
-		cmd.Env = append(cmd.Env, env)
-	}
+	cmd.Env = append(os.Environ(), cfg.Env...)
 
 	// Allocate the event broadcaster unconditionally — it's cheap (a
 	// struct + ~256-slot ring) and having it always present simplifies
@@ -306,8 +303,8 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 		proc.broadcaster.SeedPromptContent(cfg.InitialPrompt)
 	}
 
-	// Skip cleanLogWriter file capture when OAT_TOOL_LOG is set -- the deepagents
-	// CLI writes a full-content conversation log directly to the same path.
+	// Skip cleanLogWriter file capture when OAT_TOOL_LOG is set -- the oat_cli
+	// writes a full-content conversation log directly to the same path.
 	hasToolLog := false
 	for _, env := range cfg.Env {
 		if strings.HasPrefix(env, "OAT_TOOL_LOG=") {
@@ -349,10 +346,10 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 			if n > 0 {
 				chunk := buf[:n]
 				if writer != nil {
-					writer.Write(chunk)
+					_, _ = writer.Write(chunk) // log tee; missed writes acceptable
 				}
 				if proc.broadcaster != nil {
-					proc.broadcaster.Write(chunk)
+					_, _ = proc.broadcaster.Write(chunk) // fanout; subscribers handle drops
 				}
 			}
 			if err != nil {
@@ -464,7 +461,7 @@ func (b *DirectBackend) killProcess(proc *managedProcess) error {
 	proc.mu.Unlock()
 
 	if proc.logFile != nil {
-		proc.logFile.Sync()
+		_ = proc.logFile.Sync() // fsync best-effort; Close below still flushes buffered data
 		proc.logFile.Close()
 	}
 
@@ -710,7 +707,7 @@ func (b *DirectBackend) Attach(ctx context.Context, session, agentName string, r
 	if err != nil {
 		return fmt.Errorf("failed to set terminal raw mode: %w", err)
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }() // cleanup on detach; failure here is unavoidable
 
 	// Use a pipe to proxy stdin so we can close it on detach,
 	// preventing goroutine leaks.
@@ -723,21 +720,21 @@ func (b *DirectBackend) Attach(ctx context.Context, session, agentName string, r
 
 	// Copy real stdin → pipe writer (stops when stdinW is closed)
 	go func() {
-		io.Copy(stdinW, os.Stdin)
+		_, _ = io.Copy(stdinW, os.Stdin) // terminates on stdinW close / stdin EOF
 	}()
 
 	// Copy ptmx → stdout
 	outputDone := make(chan struct{})
 	go func() {
 		defer close(outputDone)
-		io.Copy(os.Stdout, proc.ptmx)
+		_, _ = io.Copy(os.Stdout, proc.ptmx) // terminates on ptmx close
 	}()
 
 	// Copy pipe reader → ptmx (stops when stdinR is closed)
 	inputDone := make(chan struct{})
 	go func() {
 		defer close(inputDone)
-		io.Copy(proc.ptmx, stdinR)
+		_, _ = io.Copy(proc.ptmx, stdinR) // terminates on stdinR close
 	}()
 
 	// Wait for process to exit, ptmx to close, or context cancellation.
@@ -754,7 +751,7 @@ func (b *DirectBackend) Attach(ctx context.Context, session, agentName string, r
 
 // tailLogFile shows the agent's log file output.
 // If follow is true, keeps reading new data (like tail -f) until the
-// context is cancelled or the agent process exits.  If follow is false,
+// context is canceled or the agent process exits.  If follow is false,
 // prints the last 8KB and exits.
 func (b *DirectBackend) tailLogFile(ctx context.Context, session, agentName string, follow bool) error {
 	// Extract only the values we need under the lock.  The done channel is
@@ -783,7 +780,7 @@ func (b *DirectBackend) tailLogFile(ctx context.Context, session, agentName stri
 
 	// Show recent context — seek near the end
 	if info, statErr := f.Stat(); statErr == nil && info.Size() > 8192 {
-		f.Seek(-8192, io.SeekEnd)
+		_, _ = f.Seek(-8192, io.SeekEnd) // best-effort; fall back to full read
 		// Skip the first (likely partial) line
 		scanner := bufio.NewScanner(f)
 		scanner.Scan()
@@ -1116,8 +1113,9 @@ func shellQuote(s string) string {
 	// If it looks safe, return as-is
 	safe := true
 	for _, c := range s {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == '=' || c == ',') {
+		isAlnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		isSpecialSafe := c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == '=' || c == ','
+		if !isAlnum && !isSpecialSafe {
 			safe = false
 			break
 		}

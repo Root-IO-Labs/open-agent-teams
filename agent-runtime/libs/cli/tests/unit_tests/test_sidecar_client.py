@@ -14,11 +14,11 @@ import time
 
 import pytest
 
-from deepagents_cli.sidecar_client import (
+from oat_cli.sidecar_client import (
     DEFAULT_QUEUE_SIZE,
     SidecarClient,
 )
-from deepagents_cli.sidecar_events import (
+from oat_cli.sidecar_events import (
     Event,
     assistant_delta,
     turn_start,

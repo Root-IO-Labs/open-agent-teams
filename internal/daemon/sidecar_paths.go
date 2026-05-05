@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"net"
@@ -80,7 +81,10 @@ func cleanStaleSidecarSockets() int {
 // momentarily-loaded daemon, short enough that a batch cleanup of
 // dozens of stale sockets finishes in under a second.
 func isLiveSocket(path string) bool {
-	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
 		return false
 	}

@@ -7,28 +7,30 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Line rendering styles for different content categories.
+// Line rendering styles for different content categories. Most colors come
+// from the shared adaptive palette in styles.go so dark/light terminals both
+// render legibly.
 var (
 	styleToolCallLine = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#06B6D4")). // cyan
+				Foreground(colorSecondary).
 				Bold(true)
 
 	styleToolOutputLine = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#D1D5DB")) // brighter gray for dark terminals
+				Foreground(lipgloss.AdaptiveColor{Dark: "#D1D5DB", Light: "#374151"})
 
 	styleThinkingLine = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#A78BFA")). // lighter purple
+				Foreground(lipgloss.AdaptiveColor{Dark: "#A78BFA", Light: "#6D28D9"}).
 				Italic(true)
 
 	styleSystemLine = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FBBF24")) // amber
+			Foreground(lipgloss.AdaptiveColor{Dark: "#FBBF24", Light: "#B45309"})
 
 	styleUserInputLine = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#34D399")). // emerald
+				Foreground(lipgloss.AdaptiveColor{Dark: "#34D399", Light: "#047857"}).
 				Bold(true)
 
 	styleHeading = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#E5E7EB")).
+			Foreground(colorText).
 			Bold(true).
 			Underline(true)
 
@@ -36,46 +38,46 @@ var (
 			Bold(true)
 
 	styleCode = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#A78BFA")) // light purple for inline code
+			Foreground(colorBrand) // adaptive purple for inline code
 
 	// Code block lines get a dim background and monospace-friendly color
 	styleCodeBlock = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#D1D5DB")). // light gray text
-			Background(lipgloss.Color("#1F2937"))  // dark background
+			Foreground(lipgloss.AdaptiveColor{Dark: "#D1D5DB", Light: "#1F2937"}).
+			Background(lipgloss.AdaptiveColor{Dark: "#1F2937", Light: "#F3F4F6"})
 
 	// Code block fence line (``` or ```python)
 	styleCodeFence = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#6B7280")) // muted fence markers
+			Foreground(colorMuted)
 
 	styleBullet = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#06B6D4")) // cyan bullet
+			Foreground(colorSecondary) // adaptive cyan bullet
 
 	styleCheckDone = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#22C55E")) // green check
+			Foreground(colorSuccess)
 
-	// Agent text gets a soft warm white — distinct from raw terminal default,
-	// giving text responses a consistent, readable look alongside colored categories.
+	// Agent text gets a soft warm white on dark terminals and a deep slate on
+	// light, keeping text responses readable and distinct from colored categories.
 	styleAgentText = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#E2E8F0")) // slate-200: warm off-white
+			Foreground(lipgloss.AdaptiveColor{Dark: "#E2E8F0", Light: "#1F2937"})
 
 	// Divider between user input and agent response
 	styleDivider = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#374151")) // border gray
+			Foreground(colorBorder)
 
 	// Blockquote lines (> text) — left bar + dimmed text
 	styleBlockquote = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#9CA3AF")) // gray-400
+			Foreground(lipgloss.AdaptiveColor{Dark: "#9CA3AF", Light: "#4B5563"})
 
 	styleBlockquoteBar = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#4B5563")) // gray-600
+				Foreground(lipgloss.AdaptiveColor{Dark: "#4B5563", Light: "#9CA3AF"})
 
 	// Horizontal rule (--- or ***)
 	styleHRule = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#374151")) // border gray
+			Foreground(colorBorder)
 
 	// Strikethrough
 	styleStrikethrough = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#6B7280")). // muted
+				Foreground(colorMuted).
 				Strikethrough(true)
 )
 
@@ -91,7 +93,53 @@ var (
 	reHRule         = regexp.MustCompile(`^[-*_]{3,}\s*$`)
 	reStrikethrough = regexp.MustCompile(`~~(.+?)~~`)
 	reBlockquote    = regexp.MustCompile(`^>\s?(.*)`)
+
+	// Role header from the Python conversation log:
+	//   [13:28:56] USER:
+	//   [13:28:56] ASSISTANT:
+	//   [13:28:56] TOOL: execute
+	//   [13:28:56] RESULT: execute (error)
+	reRoleHeader = regexp.MustCompile(`^\[(\d{2}:\d{2}:\d{2})\] (USER|ASSISTANT|TOOL|RESULT)(?::\s*(.*))?$`)
 )
+
+// Role header styles
+var (
+	styleRoleTimestamp = lipgloss.NewStyle().Foreground(colorMuted)
+	styleRoleUser      = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true)
+	styleRoleAssistant = lipgloss.NewStyle().Foreground(colorBrand).Bold(true)
+	styleRoleTool      = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true)
+	styleRoleResult    = lipgloss.NewStyle().Foreground(colorMuted).Bold(true)
+	styleRoleDetail    = lipgloss.NewStyle().Foreground(colorText)
+)
+
+// renderRoleHeader renders a conversation-log role header:
+//
+//	[13:28:56] ASSISTANT:        →  ● Assistant · 13:28:56
+//	[13:28:56] TOOL: execute     →  ▶ Tool · execute · 13:28:56
+func renderRoleHeader(ts, role, detail string) string {
+	var glyph, label string
+	var labelStyle lipgloss.Style
+	switch role {
+	case "USER":
+		glyph, label, labelStyle = "●", "You", styleRoleUser
+	case "ASSISTANT":
+		glyph, label, labelStyle = "●", "Assistant", styleRoleAssistant
+	case "TOOL":
+		glyph, label, labelStyle = "▶", "Tool", styleRoleTool
+	case "RESULT":
+		glyph, label, labelStyle = "▷", "Result", styleRoleResult
+	default:
+		glyph, label, labelStyle = "●", role, styleRoleAssistant
+	}
+
+	parts := labelStyle.Render(glyph+" "+label) + " " + styleRoleTimestamp.Render("· "+ts)
+	detail = strings.TrimSpace(detail)
+	if detail != "" {
+		parts += " " + styleRoleTimestamp.Render("·") + " " + styleRoleDetail.Render(detail)
+	}
+	// Leading newline gives each role block breathing room above it.
+	return "\n" + parts
+}
 
 // LineRenderer formats agent output lines for display in the TUI.
 // It caches rendered output so only new lines need rendering.
@@ -272,6 +320,15 @@ func lineTypeToCategory(lt string) LineCategory {
 // renderLine formats a single line with category-based styling and markdown rendering.
 // lineType is the daemon-provided classification (empty string = use regex fallback).
 func (r *LineRenderer) renderLine(agent string, line string, lineType ...string) string {
+	// Conversation-log role headers ("[HH:MM:SS] ASSISTANT:" etc.) — render as a
+	// styled role badge instead of raw text. Checked before code fences so a role
+	// header never gets swallowed by an open code block on a prior line.
+	if !r.inCodeBlock[agent] {
+		if m := reRoleHeader.FindStringSubmatch(line); m != nil {
+			return renderRoleHeader(m[1], m[2], m[3])
+		}
+	}
+
 	// Code block fence detection (``` or ```lang) — toggle state
 	if reCodeFence.MatchString(line) {
 		if r.inCodeBlock[agent] {

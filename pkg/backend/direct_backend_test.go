@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -435,7 +436,7 @@ func TestDirectBackend_SessionPersistence(t *testing.T) {
 
 	// SendMessage should return ErrAgentAdopted
 	sendErr := b2.SendMessage(ctx, "sess", "worker", "test")
-	if sendErr != ErrAgentAdopted {
+	if !errors.Is(sendErr, ErrAgentAdopted) {
 		t.Fatalf("SendMessage should return ErrAgentAdopted, got: %v", sendErr)
 	}
 

@@ -244,7 +244,7 @@ func (d *Daemon) alertSupervisorAboutWorker(repoName, agentName string, nudgeCou
 
 // getBranchSHA returns the remote SHA for a branch, or empty string if not pushed.
 func (d *Daemon) getBranchSHA(repoPath, branchName string) string {
-	cmd := exec.Command("git", "ls-remote", "--heads", "origin", branchName)
+	cmd := exec.CommandContext(d.ctx, "git", "ls-remote", "--heads", "origin", branchName)
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -265,7 +265,7 @@ type workerPRInfo struct {
 
 // getWorkerPR checks if an open PR exists for the worker's branch.
 func (d *Daemon) getWorkerPR(repoPath, branchName string) *workerPRInfo {
-	cmd := exec.Command("gh", "pr", "list", "--head", branchName, "--state", "open", "--json", "number,title")
+	cmd := exec.CommandContext(d.ctx, "gh", "pr", "list", "--head", branchName, "--state", "open", "--json", "number,title")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -368,7 +368,7 @@ func (d *Daemon) checkWorkerProgress(repoName, repoPath, agentName string, agent
 
 	// No branch pushed — check worktree for uncommitted changes
 	if agent.WorktreePath != "" {
-		cmd := exec.Command("git", "status", "--porcelain")
+		cmd := exec.CommandContext(d.ctx, "git", "status", "--porcelain")
 		cmd.Dir = agent.WorktreePath
 		output, err := cmd.Output()
 		if err == nil && len(strings.TrimSpace(string(output))) > 0 {

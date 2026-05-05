@@ -3,9 +3,9 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from deepagents_cli._version import __version__ as _cli_version
-from deepagents_cli.config import Settings
-from deepagents_cli.skills.load import list_skills
+from oat_cli._version import __version__ as _cli_version
+from oat_cli.config import Settings
+from oat_cli.skills.load import list_skills
 
 
 def _create_skill(skill_dir: Path, name: str, description: str) -> None:
@@ -316,15 +316,15 @@ class TestListSkillsAliasDirectories:
     """Test `list_skills` with `.agents` alias directories."""
 
     def test_user_agent_skills_dir_precedence(self, tmp_path: Path) -> None:
-        """Test that `~/.agents/skills` overrides `~/.deepagents/agent/skills`."""
-        user_deepagents_dir = tmp_path / "user_deepagents_skills"
+        """Test that `~/.agents/skills` overrides `~/.oat_sdk/agent/skills`."""
+        user_oat_sdk_dir = tmp_path / "user_oat_sdk_skills"
         user_agent_dir = tmp_path / "user_agent_skills"
 
         # Create same skill in both directories
         _create_skill(
-            user_deepagents_dir / "shared-skill",
+            user_oat_sdk_dir / "shared-skill",
             "shared-skill",
-            "From deepagents user dir",
+            "From oat_sdk user dir",
         )
         _create_skill(
             user_agent_dir / "shared-skill",
@@ -333,7 +333,7 @@ class TestListSkillsAliasDirectories:
         )
 
         skills = list_skills(
-            user_skills_dir=user_deepagents_dir,
+            user_skills_dir=user_oat_sdk_dir,
             project_skills_dir=None,
             user_agent_skills_dir=user_agent_dir,
             project_agent_skills_dir=None,
@@ -345,15 +345,15 @@ class TestListSkillsAliasDirectories:
         assert skills[0]["source"] == "user"
 
     def test_project_agent_skills_dir_precedence(self, tmp_path: Path) -> None:
-        """Test that `.agents/skills` overrides `.deepagents/skills`."""
-        project_deepagents_dir = tmp_path / "project_deepagents_skills"
+        """Test that `.agents/skills` overrides `.oat_sdk/skills`."""
+        project_oat_sdk_dir = tmp_path / "project_oat_sdk_skills"
         project_agent_dir = tmp_path / "project_agent_skills"
 
         # Create same skill in both directories
         _create_skill(
-            project_deepagents_dir / "shared-skill",
+            project_oat_sdk_dir / "shared-skill",
             "shared-skill",
-            "From deepagents project dir",
+            "From oat_sdk project dir",
         )
         _create_skill(
             project_agent_dir / "shared-skill",
@@ -363,7 +363,7 @@ class TestListSkillsAliasDirectories:
 
         skills = list_skills(
             user_skills_dir=None,
-            project_skills_dir=project_deepagents_dir,
+            project_skills_dir=project_oat_sdk_dir,
             user_agent_skills_dir=None,
             project_agent_skills_dir=project_agent_dir,
         )
@@ -375,16 +375,16 @@ class TestListSkillsAliasDirectories:
 
     def test_full_precedence_chain(self, tmp_path: Path) -> None:
         """Test full precedence: `.agents/skills` (project) wins over all."""
-        user_deepagents_dir = tmp_path / "user_deepagents_skills"
+        user_oat_sdk_dir = tmp_path / "user_oat_sdk_skills"
         user_agent_dir = tmp_path / "user_agent_skills"
-        project_deepagents_dir = tmp_path / "project_deepagents_skills"
+        project_oat_sdk_dir = tmp_path / "project_oat_sdk_skills"
         project_agent_dir = tmp_path / "project_agent_skills"
 
         # Create same skill in all 4 directories
         _create_skill(
-            user_deepagents_dir / "shared-skill",
+            user_oat_sdk_dir / "shared-skill",
             "shared-skill",
-            "From deepagents user dir (lowest)",
+            "From oat_sdk user dir (lowest)",
         )
         _create_skill(
             user_agent_dir / "shared-skill",
@@ -392,9 +392,9 @@ class TestListSkillsAliasDirectories:
             "From agents user dir",
         )
         _create_skill(
-            project_deepagents_dir / "shared-skill",
+            project_oat_sdk_dir / "shared-skill",
             "shared-skill",
-            "From deepagents project dir",
+            "From oat_sdk project dir",
         )
         _create_skill(
             project_agent_dir / "shared-skill",
@@ -403,8 +403,8 @@ class TestListSkillsAliasDirectories:
         )
 
         skills = list_skills(
-            user_skills_dir=user_deepagents_dir,
-            project_skills_dir=project_deepagents_dir,
+            user_skills_dir=user_oat_sdk_dir,
+            project_skills_dir=project_oat_sdk_dir,
             user_agent_skills_dir=user_agent_dir,
             project_agent_skills_dir=project_agent_dir,
         )
@@ -416,16 +416,16 @@ class TestListSkillsAliasDirectories:
 
     def test_mixed_sources_with_aliases(self, tmp_path: Path) -> None:
         """Test different skills from different directories are all discovered."""
-        user_deepagents_dir = tmp_path / "user_deepagents_skills"
+        user_oat_sdk_dir = tmp_path / "user_oat_sdk_skills"
         user_agent_dir = tmp_path / "user_agent_skills"
-        project_deepagents_dir = tmp_path / "project_deepagents_skills"
+        project_oat_sdk_dir = tmp_path / "project_oat_sdk_skills"
         project_agent_dir = tmp_path / "project_agent_skills"
 
         # Create different skills in each directory
         _create_skill(
-            user_deepagents_dir / "skill-a",
+            user_oat_sdk_dir / "skill-a",
             "skill-a",
-            "Skill A from deepagents user",
+            "Skill A from oat_sdk user",
         )
         _create_skill(
             user_agent_dir / "skill-b",
@@ -433,9 +433,9 @@ class TestListSkillsAliasDirectories:
             "Skill B from agents user",
         )
         _create_skill(
-            project_deepagents_dir / "skill-c",
+            project_oat_sdk_dir / "skill-c",
             "skill-c",
-            "Skill C from deepagents project",
+            "Skill C from oat_sdk project",
         )
         _create_skill(
             project_agent_dir / "skill-d",
@@ -444,8 +444,8 @@ class TestListSkillsAliasDirectories:
         )
 
         skills = list_skills(
-            user_skills_dir=user_deepagents_dir,
-            project_skills_dir=project_deepagents_dir,
+            user_skills_dir=user_oat_sdk_dir,
+            project_skills_dir=project_oat_sdk_dir,
             user_agent_skills_dir=user_agent_dir,
             project_agent_skills_dir=project_agent_dir,
         )
@@ -652,9 +652,9 @@ class TestListSkillsBuiltIn:
         assert creator["source"] == "built-in"
         assert len(creator["description"]) > 0
         assert creator["license"] == "MIT"
-        assert creator["compatibility"] == "designed for deepagents-cli"
-        assert "deepagents-cli-version" in creator["metadata"]
-        assert creator["metadata"]["deepagents-cli-version"] == _cli_version
+        assert creator["compatibility"] == "designed for oat_sdk-cli"
+        assert "oat_sdk-cli-version" in creator["metadata"]
+        assert creator["metadata"]["oat_sdk-cli-version"] == _cli_version
 
     def test_oserror_in_one_source_does_not_break_others(self, tmp_path: Path) -> None:
         """An OSError in one source should not prevent other sources from loading.
@@ -672,7 +672,7 @@ class TestListSkillsBuiltIn:
         built_in_dir.mkdir()
 
         original_list = __import__(
-            "deepagents.middleware.skills", fromlist=["_list_skills"]
+            "oat_sdk.middleware.skills", fromlist=["_list_skills"]
         )._list_skills
 
         call_count = 0
@@ -686,7 +686,7 @@ class TestListSkillsBuiltIn:
                 raise OSError(msg)
             return original_list(backend=backend, source_path=source_path)
 
-        with patch("deepagents_cli.skills.load.list_skills_from_backend", patched_list):
+        with patch("oat_cli.skills.load.list_skills_from_backend", patched_list):
             skills = list_skills(
                 built_in_skills_dir=built_in_dir,
                 user_skills_dir=user_dir,

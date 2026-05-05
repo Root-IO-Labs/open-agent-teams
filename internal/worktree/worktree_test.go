@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -160,7 +161,7 @@ func TestCreateWorktreeNewBranch(t *testing.T) {
 	}
 
 	// Verify correct branch is checked out
-	currentBranch, err := GetCurrentBranch(wtPath)
+	currentBranch, err := GetCurrentBranch(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to get current branch: %v", err)
 	}
@@ -407,7 +408,7 @@ func TestHasUncommittedChanges(t *testing.T) {
 	}
 
 	// Should have no uncommitted changes initially
-	hasChanges, err := HasUncommittedChanges(wtPath)
+	hasChanges, err := HasUncommittedChanges(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check uncommitted changes: %v", err)
 	}
@@ -422,7 +423,7 @@ func TestHasUncommittedChanges(t *testing.T) {
 	}
 
 	// Should now have uncommitted changes
-	hasChanges, err = HasUncommittedChanges(wtPath)
+	hasChanges, err = HasUncommittedChanges(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check uncommitted changes: %v", err)
 	}
@@ -438,7 +439,7 @@ func TestHasUncommittedChanges(t *testing.T) {
 	}
 
 	// Should still have uncommitted changes (staged but not committed)
-	hasChanges, err = HasUncommittedChanges(wtPath)
+	hasChanges, err = HasUncommittedChanges(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check uncommitted changes: %v", err)
 	}
@@ -454,7 +455,7 @@ func TestHasUncommittedChanges(t *testing.T) {
 	}
 
 	// Should have no uncommitted changes after commit
-	hasChanges, err = HasUncommittedChanges(wtPath)
+	hasChanges, err = HasUncommittedChanges(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check uncommitted changes: %v", err)
 	}
@@ -484,7 +485,7 @@ func TestHasUncommittedChanges_OatDirExcluded(t *testing.T) {
 	}
 
 	// .oat/ files alone should NOT count as uncommitted changes
-	hasChanges, err := HasUncommittedChanges(wtPath)
+	hasChanges, err := HasUncommittedChanges(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check uncommitted changes: %v", err)
 	}
@@ -497,7 +498,7 @@ func TestHasUncommittedChanges_OatDirExcluded(t *testing.T) {
 		t.Fatalf("Failed to create real file: %v", err)
 	}
 
-	hasChanges, err = HasUncommittedChanges(wtPath)
+	hasChanges, err = HasUncommittedChanges(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check uncommitted changes: %v", err)
 	}
@@ -519,7 +520,7 @@ func TestHasUnpushedCommits(t *testing.T) {
 	}
 
 	// No tracking branch, so no unpushed commits
-	hasUnpushed, err := HasUnpushedCommits(wtPath)
+	hasUnpushed, err := HasUnpushedCommits(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check unpushed commits: %v", err)
 	}
@@ -546,7 +547,7 @@ func TestHasUnpushedCommits(t *testing.T) {
 	}
 
 	// Still no tracking branch
-	hasUnpushed, err = HasUnpushedCommits(wtPath)
+	hasUnpushed, err = HasUnpushedCommits(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to check unpushed commits: %v", err)
 	}
@@ -562,7 +563,7 @@ func TestGetCurrentBranch(t *testing.T) {
 	manager := NewManager(repoPath)
 
 	// Test current branch of main repo
-	branch, err := GetCurrentBranch(repoPath)
+	branch, err := GetCurrentBranch(context.Background(), repoPath)
 	if err != nil {
 		t.Fatalf("Failed to get current branch of main repo: %v", err)
 	}
@@ -576,7 +577,7 @@ func TestGetCurrentBranch(t *testing.T) {
 		t.Fatalf("Failed to create worktree: %v", err)
 	}
 
-	branch, err = GetCurrentBranch(wt2Path)
+	branch, err = GetCurrentBranch(context.Background(), wt2Path)
 	if err != nil {
 		t.Fatalf("Failed to get current branch: %v", err)
 	}
@@ -742,7 +743,7 @@ func TestWorktreeWithExistingBranch(t *testing.T) {
 	}
 
 	// Verify correct branch is checked out
-	currentBranch, err := GetCurrentBranch(wtPath)
+	currentBranch, err := GetCurrentBranch(context.Background(), wtPath)
 	if err != nil {
 		t.Fatalf("Failed to get current branch: %v", err)
 	}
@@ -770,7 +771,7 @@ func TestConcurrentWorktreeOperations(t *testing.T) {
 	// transient git race conditions (e.g., "failed to read .git/worktrees/*/commondir")
 	done := make(chan error, numWorktrees)
 	for i := 0; i < numWorktrees; i++ {
-		i := i // capture loop variable
+		// capture loop variable
 		go func() {
 			wtPath := filepath.Join(repoPath, fmt.Sprintf("wt-%d", i))
 			branchName := fmt.Sprintf("branch-%d", i)
@@ -1688,14 +1689,14 @@ func TestHasUncommittedChangesErrorHandling(t *testing.T) {
 		}
 		defer os.RemoveAll(tmpDir)
 
-		_, err = HasUncommittedChanges(tmpDir)
+		_, err = HasUncommittedChanges(context.Background(), tmpDir)
 		if err == nil {
 			t.Error("Expected error for non-git directory")
 		}
 	})
 
 	t.Run("returns error for non-existent path", func(t *testing.T) {
-		_, err := HasUncommittedChanges("/nonexistent/path")
+		_, err := HasUncommittedChanges(context.Background(), "/nonexistent/path")
 		if err == nil {
 			t.Error("Expected error for non-existent path")
 		}
@@ -1710,14 +1711,14 @@ func TestGetCurrentBranchErrorHandling(t *testing.T) {
 		}
 		defer os.RemoveAll(tmpDir)
 
-		_, err = GetCurrentBranch(tmpDir)
+		_, err = GetCurrentBranch(context.Background(), tmpDir)
 		if err == nil {
 			t.Error("Expected error for non-git directory")
 		}
 	})
 
 	t.Run("returns error for non-existent path", func(t *testing.T) {
-		_, err := GetCurrentBranch("/nonexistent/path")
+		_, err := GetCurrentBranch(context.Background(), "/nonexistent/path")
 		if err == nil {
 			t.Error("Expected error for non-existent path")
 		}
@@ -1736,7 +1737,7 @@ func TestHasUnpushedCommitsErrorHandling(t *testing.T) {
 		// For a non-git dir, git rev-parse will fail but the function returns false, nil
 		// because it interprets the error as "no tracking branch"
 		// Let's verify this behavior
-		hasUnpushed, err := HasUnpushedCommits(tmpDir)
+		hasUnpushed, err := HasUnpushedCommits(context.Background(), tmpDir)
 		// The function returns false, nil when there's no tracking branch
 		// So even for non-git dirs, it might return false, nil
 		if hasUnpushed {
@@ -1933,7 +1934,7 @@ func TestRefreshWorktree(t *testing.T) {
 		cmd.Run()
 
 		// Refresh the worktree
-		result := RefreshWorktree(wtPath, "origin", "main")
+		result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 
 		if result.Error != nil {
 			t.Errorf("Unexpected error: %v", result.Error)
@@ -1954,7 +1955,7 @@ func TestRefreshWorktree(t *testing.T) {
 		defer cleanup()
 
 		// Test refreshing the main repo (which is on main branch)
-		result := RefreshWorktree(repoPath, "origin", "main")
+		result := RefreshWorktree(context.Background(), repoPath, "origin", "main")
 
 		if !result.Skipped {
 			t.Error("Should have skipped refresh for main branch")
@@ -1993,7 +1994,7 @@ func TestRefreshWorktree(t *testing.T) {
 		}
 
 		// Refresh the worktree
-		result := RefreshWorktree(wtPath, "origin", "main")
+		result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 
 		if result.Error != nil {
 			t.Errorf("Unexpected error: %v", result.Error)
@@ -2025,7 +2026,7 @@ func TestRefreshWorktree(t *testing.T) {
 		defer manager.Remove(wtPath, true)
 
 		// Try to refresh with non-existent remote
-		result := RefreshWorktree(wtPath, "nonexistent", "main")
+		result := RefreshWorktree(context.Background(), wtPath, "nonexistent", "main")
 
 		if result.Error == nil {
 			t.Error("Expected error for non-existent remote")
@@ -2112,7 +2113,7 @@ func TestGetWorktreeState(t *testing.T) {
 		}
 		defer manager.Remove(wtPath, true)
 
-		state, err := GetWorktreeState(wtPath, "origin", "main")
+		state, err := GetWorktreeState(context.Background(), wtPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2142,7 +2143,7 @@ func TestGetWorktreeState(t *testing.T) {
 			t.Fatalf("Failed to detach HEAD: %v", err)
 		}
 
-		state, err := GetWorktreeState(repoPath, "origin", "main")
+		state, err := GetWorktreeState(context.Background(), repoPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2200,7 +2201,7 @@ func TestGetWorktreeState(t *testing.T) {
 		cmd.Dir = wtPath
 		cmd.Run() // Will fail, leaving us mid-rebase
 
-		state, err := GetWorktreeState(wtPath, "origin", "main")
+		state, err := GetWorktreeState(context.Background(), wtPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2234,7 +2235,7 @@ func TestGetWorktreeState(t *testing.T) {
 		cmd.Dir = repoPath
 		cmd.Run()
 
-		state, err := GetWorktreeState(repoPath, "origin", "main")
+		state, err := GetWorktreeState(context.Background(), repoPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2289,7 +2290,7 @@ func TestGetWorktreeState(t *testing.T) {
 		cmd.Dir = wtPath
 		cmd.Run()
 
-		state, err := GetWorktreeState(wtPath, "origin", "main")
+		state, err := GetWorktreeState(context.Background(), wtPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2315,7 +2316,7 @@ func TestRefreshWorktreeEdgeCases(t *testing.T) {
 			t.Fatalf("Failed to detach HEAD: %v", err)
 		}
 
-		result := RefreshWorktree(repoPath, "origin", "main")
+		result := RefreshWorktree(context.Background(), repoPath, "origin", "main")
 
 		if !result.Skipped {
 			t.Error("Should have skipped refresh for detached HEAD")
@@ -2367,7 +2368,7 @@ func TestRefreshWorktreeEdgeCases(t *testing.T) {
 		cmd.Dir = wtPath
 		cmd.Run() // Will fail, leaving us mid-rebase
 
-		result := RefreshWorktree(wtPath, "origin", "main")
+		result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 
 		if !result.Skipped {
 			t.Error("Should have skipped refresh for mid-rebase")
@@ -2424,7 +2425,7 @@ func TestRefreshWorktreeEdgeCases(t *testing.T) {
 		cmd.Dir = wtPath
 		cmd.Run() // Will fail, leaving us mid-merge
 
-		result := RefreshWorktree(wtPath, "origin", "main")
+		result := RefreshWorktree(context.Background(), wtPath, "origin", "main")
 
 		if !result.Skipped {
 			t.Error("Should have skipped refresh for mid-merge")
@@ -2480,7 +2481,7 @@ func TestIsBehindMain(t *testing.T) {
 		cmd.Dir = wtPath
 		cmd.Run()
 
-		isBehind, count, err := IsBehindMain(wtPath, "origin", "main")
+		isBehind, count, err := IsBehindMain(context.Background(), wtPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2515,7 +2516,7 @@ func TestIsBehindMain(t *testing.T) {
 		}
 		defer manager.Remove(wtPath, true)
 
-		isBehind, count, err := IsBehindMain(wtPath, "origin", "main")
+		isBehind, count, err := IsBehindMain(context.Background(), wtPath, "origin", "main")
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -2538,7 +2539,7 @@ func TestHasUnpushedCommitsNonGitDirectory(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// HasUnpushedCommits should return an error for non-git directories
-	_, err = HasUnpushedCommits(tmpDir)
+	_, err = HasUnpushedCommits(context.Background(), tmpDir)
 	if err == nil {
 		t.Error("HasUnpushedCommits should return error for non-git directory")
 	}
@@ -2548,7 +2549,7 @@ func TestHasUnpushedCommitsNonGitDirectory(t *testing.T) {
 }
 
 func TestHasUnpushedCommitsNonExistentPath(t *testing.T) {
-	_, err := HasUnpushedCommits("/nonexistent/path/12345")
+	_, err := HasUnpushedCommits(context.Background(), "/nonexistent/path/12345")
 	if err == nil {
 		t.Error("HasUnpushedCommits should return error for non-existent path")
 	}
@@ -2603,7 +2604,7 @@ func TestHasUnpushedCommitsWithTrackingBranch(t *testing.T) {
 		}
 
 		// Should have no unpushed commits yet
-		hasUnpushed, err := HasUnpushedCommits(wtPath)
+		hasUnpushed, err := HasUnpushedCommits(context.Background(), wtPath)
 		if err != nil {
 			t.Fatalf("Failed to check unpushed commits: %v", err)
 		}
@@ -2630,7 +2631,7 @@ func TestHasUnpushedCommitsWithTrackingBranch(t *testing.T) {
 		}
 
 		// Now should detect unpushed commits
-		hasUnpushed, err = HasUnpushedCommits(wtPath)
+		hasUnpushed, err = HasUnpushedCommits(context.Background(), wtPath)
 		if err != nil {
 			t.Fatalf("Failed to check unpushed commits: %v", err)
 		}
@@ -2646,7 +2647,7 @@ func TestHasUnpushedCommitsWithTrackingBranch(t *testing.T) {
 		}
 
 		// Should have no unpushed commits after push
-		hasUnpushed, err = HasUnpushedCommits(wtPath)
+		hasUnpushed, err = HasUnpushedCommits(context.Background(), wtPath)
 		if err != nil {
 			t.Fatalf("Failed to check unpushed commits: %v", err)
 		}
@@ -2721,7 +2722,7 @@ func TestHasUnpushedCommitsWithTrackingBranch(t *testing.T) {
 		}
 
 		// Should detect unpushed commits
-		hasUnpushed, err := HasUnpushedCommits(wtPath)
+		hasUnpushed, err := HasUnpushedCommits(context.Background(), wtPath)
 		if err != nil {
 			t.Fatalf("Failed to check unpushed commits: %v", err)
 		}

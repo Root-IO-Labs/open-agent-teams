@@ -3,13 +3,13 @@
 import pytest
 from textual.widgets import Static
 
-from deepagents_cli.widgets.message_store import (
+from oat_cli.widgets.message_store import (
     MessageData,
     MessageStore,
     MessageType,
     ToolStatus,
 )
-from deepagents_cli.widgets.messages import (
+from oat_cli.widgets.messages import (
     AppMessage,
     AssistantMessage,
     DiffMessage,
