@@ -104,6 +104,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`benchmarks/setup.sh` no longer silently swallows `gh label create`
+  failures.** GitHub's secondary rate limit can throttle the burst of 28
+  label creates against a fresh repo, leaving a subset of labels uncreated.
+  The script previously redirected those errors to `/dev/null` and
+  continued, so the failure surfaced ~30s later as a confusing
+  `gh issue create` rejection mid-loop (and `set -euo pipefail` then killed
+  the run, tripping `run.sh`'s cleanup trap). Now: each `gh label create`
+  and `gh issue create` is wrapped in a bounded retry-with-exponential-
+  backoff helper (`gh_with_retry`), the bursts are paced
+  (200ms / 300ms between calls), and any final failure exits with a clear
+  diagnostic listing the offending labels/issue and pointing at
+  `gh label list --repo <repo>` for inspection.
 - Duplicate `.github/workflows/main.yml` removed (byte-equivalent to the
   `check-source` job in `ci.yml`).
 - **Verifier no longer rejects work on a stale-base race.** The daemon now

@@ -136,6 +136,52 @@ echo "    Pushed initial commit to ${REPO_URL}"
 cd "${SCRIPT_DIR}"
 
 # --- Step 3: Create labels ---
+#
+# GitHub enforces a (silent, undocumented) "secondary rate limit" on bursts
+# of content creation. A fresh repo + 28 label creates + 24 issue creates
+# can trip it, leaving labels half-created. The original script piped
+# `gh label create` errors to /dev/null and continued, so the failure only
+# surfaced later when `gh issue create` rejected an issue whose required
+# labels did not exist. We now retry transient failures, pace the burst
+# slightly, and fail loud with a useful diagnostic if any label is missing.
+
+# Run a `gh` invocation with bounded retries + exponential backoff. On
+# success, command stdout is left in $GH_RETRY_STDOUT and the function
+# returns 0. On final failure, captured stderr is left in $GH_RETRY_STDERR
+# and the function returns 1.
+GH_RETRY_STDOUT=""
+GH_RETRY_STDERR=""
+gh_with_retry() {
+    local attempts=3
+    local delay=2
+    local i out="" err="" err_file
+    GH_RETRY_STDOUT=""
+    GH_RETRY_STDERR=""
+    for ((i = 1; i <= attempts; i++)); do
+        # Capture stdout and stderr separately so the success path returns a
+        # clean URL/output string and the failure path returns a useful error.
+        # NOTE: bash resets $? to 0 after an `if` whose condition fails, so we
+        # cannot read the inner command's exit code on the failure branch.
+        # We just record that *this attempt* failed and try again.
+        err_file=$(mktemp)
+        if out=$("$@" 2>"$err_file"); then
+            err=$(cat "$err_file")
+            rm -f "$err_file"
+            GH_RETRY_STDOUT="$out"
+            GH_RETRY_STDERR="$err"
+            return 0
+        fi
+        err=$(cat "$err_file")
+        rm -f "$err_file"
+        if [[ $i -lt $attempts ]]; then
+            sleep "$delay"
+            delay=$((delay * 2))
+        fi
+    done
+    GH_RETRY_STDOUT="$out"
+    GH_RETRY_STDERR="$err"
+    return 1
+}
 
 echo "==> Creating labels..."
 
@@ -152,9 +198,27 @@ LABELS=(
     "oat"
 )
 
+LABELS_FAILED=()
 for label in "${LABELS[@]}"; do
-    gh label create "$label" --repo "${REPO_FULL}" --color "ededed" --force 2>/dev/null || true
+    if ! gh_with_retry gh label create "$label" --repo "${REPO_FULL}" --color "ededed" --force; then
+        LABELS_FAILED+=("$label")
+        echo "    WARNING: failed to create label '${label}': ${GH_RETRY_STDERR}"
+    fi
+    # Pace the burst to stay under GitHub's secondary rate limit.
+    sleep 0.2
 done
+
+if (( ${#LABELS_FAILED[@]} > 0 )); then
+    echo ""
+    echo "Error: ${#LABELS_FAILED[@]} of ${#LABELS[@]} labels failed to create after retries:"
+    for L in "${LABELS_FAILED[@]}"; do
+        echo "    - $L"
+    done
+    echo ""
+    echo "  Likely cause: GitHub secondary rate limit (try again in ~60s)."
+    echo "  Inspect current state: gh label list --repo ${REPO_FULL}"
+    exit 1
+fi
 echo "    Created ${#LABELS[@]} labels"
 
 # --- Step 4: Create issues ---
@@ -173,18 +237,26 @@ for i in $(seq 0 $((ISSUE_COUNT - 1))); do
     BODY=$(jq -r ".[$i].body" "$ISSUES_FILE")
     EXPECTED_NUM=$(jq -r ".[$i].number" "$ISSUES_FILE")
 
-    LABEL_ARGS=""
-    LABEL_LIST=$(jq -r ".[$i].labels[]" "$ISSUES_FILE")
-    for label in $LABEL_LIST; do
-        LABEL_ARGS="${LABEL_ARGS} --label ${label}"
-    done
+    LABEL_ARGS=()
+    while IFS= read -r label; do
+        [[ -z "$label" ]] && continue
+        LABEL_ARGS+=(--label "$label")
+    done < <(jq -r ".[$i].labels[]" "$ISSUES_FILE")
 
-    CREATED_URL=$(gh issue create \
+    if ! gh_with_retry gh issue create \
         --repo "${REPO_FULL}" \
         --title "${TITLE}" \
         --body "${BODY}" \
-        ${LABEL_ARGS} 2>&1)
+        "${LABEL_ARGS[@]}"; then
+        echo ""
+        echo "Error: failed to create issue '${TITLE}' after retries."
+        echo "  Likely cause: GitHub secondary rate limit (try again in ~60s)."
+        echo "  Last error from gh:"
+        echo "${GH_RETRY_STDERR}" | sed 's/^/    /'
+        exit 1
+    fi
 
+    CREATED_URL="$GH_RETRY_STDOUT"
     CREATED_NUM=$(echo "$CREATED_URL" | grep -o '[0-9]*$')
     if [[ "$CREATED_NUM" != "$EXPECTED_NUM" ]]; then
         echo "    WARNING: Issue '${TITLE}' created as #${CREATED_NUM}, expected #${EXPECTED_NUM}"
@@ -192,6 +264,8 @@ for i in $(seq 0 $((ISSUE_COUNT - 1))); do
     fi
 
     echo "    #${CREATED_NUM}: ${TITLE}"
+    # Pace the issue burst too — same secondary rate limit applies.
+    sleep 0.3
 done
 
 echo "    Created ${ISSUE_COUNT} issues"
