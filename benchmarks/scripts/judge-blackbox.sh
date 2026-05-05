@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     cat <<'EOF'
-Usage: ./benchmarks/judge-blackbox.sh --generated <path> --reference <path> --output <path> [options]
+Usage: ./benchmarks/scripts/judge-blackbox.sh --generated <path> --reference <path> --output <path> [options]
 
 Use an LLM judge to structurally compare a model-generated blackbox test
 against the human-written reference acceptance-test.sh.
@@ -16,12 +16,29 @@ Required:
   --output <path>           Path to write gate.json results
 
 Options:
-  --judge-model <model>     Claude model for judging (default: claude-sonnet-4-6)
+  --judge-model <provider:model>
+                            Judge model. Resolution order:
+                              1. --judge-model flag (this option)
+                              2. OAT_BENCH_LLM_MODEL env var
+                              3. anthropic:claude-sonnet-4-6 (hard fallback)
+                            run.sh passes the orchestrator --model here so
+                            the gate uses the same provider you're testing
+                            (no surprise charges from a different provider).
+                            Accepts any provider:model string OAT supports.
+                            Note: LLM judges differ in strictness — pin
+                            --judge-model when comparing scores across
+                            orchestrators.
   --threshold <score>       Pass/fail threshold 0-100 (default: 70)
   --help                    Show this help message
 
 Environment:
-  ANTHROPIC_API_KEY         Required for the LLM judge
+  OAT_BENCH_LLM_MODEL       Optional fallback model used when --judge-model
+                            is absent.
+  <PROVIDER>_API_KEY        API key for whichever provider the resolved
+                            judge model uses (ANTHROPIC_API_KEY /
+                            OPENAI_API_KEY / GOOGLE_API_KEY /
+                            OPENROUTER_API_KEY / etc.). Local providers
+                            (ollama:) need no key.
 EOF
     exit 0
 }
@@ -29,7 +46,7 @@ EOF
 GENERATED=""
 REFERENCE=""
 OUTPUT=""
-JUDGE_MODEL="claude-sonnet-4-6"
+JUDGE_MODEL=""
 THRESHOLD=70
 
 while [[ $# -gt 0 ]]; do
@@ -49,9 +66,16 @@ if [[ -z "$GENERATED" || -z "$REFERENCE" || -z "$OUTPUT" ]]; then
     exit 1
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "Error: ANTHROPIC_API_KEY is not set"
-    exit 1
+# Resolve the judge model. Provider key checking happens inside llm_call.py
+# so we don't need an upfront ANTHROPIC_API_KEY hard-fail here — the helper
+# emits a clear, provider-aware "missing FOO_API_KEY" error.
+RESOLVED_JUDGE_MODEL=""
+if [[ -n "$JUDGE_MODEL" ]]; then
+    RESOLVED_JUDGE_MODEL="$JUDGE_MODEL"
+elif [[ -n "${OAT_BENCH_LLM_MODEL:-}" ]]; then
+    RESOLVED_JUDGE_MODEL="$OAT_BENCH_LLM_MODEL"
+else
+    RESOLVED_JUDGE_MODEL="anthropic:claude-sonnet-4-6"
 fi
 
 if [[ ! -f "$GENERATED" ]]; then
@@ -71,7 +95,7 @@ log() {
 log "Judging model-generated test against reference"
 log "Generated: ${GENERATED} ($(wc -l < "$GENERATED" | tr -d ' ') lines)"
 log "Reference: ${REFERENCE} ($(wc -l < "$REFERENCE" | tr -d ' ') lines)"
-log "Judge model: ${JUDGE_MODEL}"
+log "Judge model: ${RESOLVED_JUDGE_MODEL}"
 log "Threshold: ${THRESHOLD}/100"
 
 GENERATED_CONTENT=$(cat "$GENERATED")
@@ -140,63 +164,58 @@ ${GENERATED_CONTENT}
 
 Score the model-generated test according to the rubric. Respond with ONLY the JSON object."
 
-# Build the API payload
-PAYLOAD=$(jq -n \
-    --arg model "$JUDGE_MODEL" \
+# Build the helper payload. llm_call.py wraps any langchain provider so the
+# judge works with the orchestrator's model regardless of vendor.
+PAYLOAD_FILE=$(mktemp)
+trap "rm -f '$PAYLOAD_FILE'" EXIT
+
+jq -n \
     --arg system "$RUBRIC" \
     --arg user "$USER_PROMPT" \
     '{
-        model: $model,
-        max_tokens: 4096,
         system: $system,
-        messages: [{role: "user", content: $user}]
-    }')
+        messages: [{role: "user", content: $user}],
+        max_tokens: 4096
+    }' > "$PAYLOAD_FILE"
 
-log "Calling Claude API..."
+log "Calling LLM judge via llm_call.py..."
 
-RESPONSE=""
-CURL_EXIT=0
-MAX_ATTEMPTS=3
-ATTEMPT=1
-BACKOFF=5
+HELPER_RESPONSE=""
+HELPER_EXIT=0
+# llm_call.py lives one level up at benchmarks/llm_call.py;
+# this script lives in benchmarks/scripts/.
+HELPER_RESPONSE=$(python3 "${SCRIPT_DIR}/../llm_call.py" \
+    --model "$RESOLVED_JUDGE_MODEL" \
+    --payload "$PAYLOAD_FILE") || HELPER_EXIT=$?
 
-while [[ $ATTEMPT -le $MAX_ATTEMPTS ]]; do
-    RESPONSE=$(curl -sS --max-time 120 \
-        https://api.anthropic.com/v1/messages \
-        -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-        -H "anthropic-version: 2023-06-01" \
-        -H "content-type: application/json" \
-        -d "$PAYLOAD" 2>&1) && CURL_EXIT=0 || CURL_EXIT=$?
-
-    if [[ $CURL_EXIT -eq 0 && -n "$RESPONSE" ]]; then
-        break
-    fi
-    if [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; then
-        log "Attempt ${ATTEMPT}/${MAX_ATTEMPTS} failed. Retrying in ${BACKOFF}s..."
-        sleep "$BACKOFF"
-        BACKOFF=$((BACKOFF * 2))
-    fi
-    ATTEMPT=$((ATTEMPT + 1))
-done
-
-if [[ $CURL_EXIT -ne 0 ]]; then
-    log "Error: Claude API call failed after ${MAX_ATTEMPTS} attempts"
+if [[ $HELPER_EXIT -ne 0 ]]; then
+    case $HELPER_EXIT in
+        2) log "Error: LLM helper missing API key for the judge provider. See stderr above." ;;
+        3) log "Error: LLM helper provider call failed after retries. See stderr above." ;;
+        4) log "Error: LLM helper failed to resolve judge model. See stderr above." ;;
+        *) log "Error: LLM helper exited with code ${HELPER_EXIT}. See stderr above." ;;
+    esac
     exit 1
 fi
 
-# Check for API errors
-ERROR_TYPE=$(echo "$RESPONSE" | jq -r '.error.type // empty' 2>/dev/null || true)
-if [[ -n "$ERROR_TYPE" ]]; then
-    ERROR_MSG=$(echo "$RESPONSE" | jq -r '.error.message // "unknown"' 2>/dev/null || true)
-    log "Error: Claude API error: ${ERROR_TYPE}: ${ERROR_MSG}"
+if [[ -z "$HELPER_RESPONSE" ]]; then
+    log "Error: LLM helper returned no JSON output"
     exit 1
 fi
 
-# Extract the judge's response
-JUDGE_TEXT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty' 2>/dev/null || true)
+# Extract the judge's response text and the resolved provider:model string
+# (used below in gate.json so a bare 'claude-sonnet-4-6' is recorded as
+# 'anthropic:claude-sonnet-4-6').
+JUDGE_TEXT=$(echo "$HELPER_RESPONSE" | jq -r '.text // empty')
+RESOLVED_FROM_HELPER=$(echo "$HELPER_RESPONSE" | jq -r '.model // empty')
+if [[ -n "$RESOLVED_FROM_HELPER" ]]; then
+    RESOLVED_JUDGE_MODEL="$RESOLVED_FROM_HELPER"
+fi
+INPUT_TOKENS=$(echo "$HELPER_RESPONSE" | jq -r '.input_tokens // 0')
+OUTPUT_TOKENS=$(echo "$HELPER_RESPONSE" | jq -r '.output_tokens // 0')
 
 if [[ -z "$JUDGE_TEXT" ]]; then
-    log "Error: Empty response from Claude API"
+    log "Error: Empty text from LLM helper"
     exit 1
 fi
 
@@ -266,9 +285,11 @@ else
     PROCEEDED=false
 fi
 
-# Build gate.json
+# Build gate.json — record the resolved provider:model string so future
+# readers can tell exactly which model produced the verdict (a bare
+# 'claude-sonnet-4-6' becomes 'anthropic:claude-sonnet-4-6').
 jq -n \
-    --arg model "$JUDGE_MODEL" \
+    --arg model "$RESOLVED_JUDGE_MODEL" \
     --arg verdict "$VERDICT" \
     --argjson score "$SCORE" \
     --argjson threshold "$THRESHOLD" \
@@ -312,8 +333,6 @@ echo "=========================================="
 echo ""
 log "Results saved to: ${OUTPUT}"
 
-INPUT_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.input_tokens // "?"' 2>/dev/null || true)
-OUTPUT_TOKENS=$(echo "$RESPONSE" | jq -r '.usage.output_tokens // "?"' 2>/dev/null || true)
 log "API tokens: ${INPUT_TOKENS} input, ${OUTPUT_TOKENS} output"
 
 exit 0
