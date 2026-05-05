@@ -18,6 +18,10 @@ project_name: oat
 before:
   hooks:
     - go mod tidy
+    # Stage agent-runtime/ (excluding venvs / pycache / partners / examples)
+    # into .release-stage/ so each archive ships the Python runtime alongside
+    # the Go binaries. The bundled install.sh runs `uv sync` on this tree.
+    - bash scripts/stage-agent-runtime.sh
 
 builds:
   - id: oat
@@ -66,6 +70,16 @@ archives:
       - README.md
       - CHANGELOG.md
       - CONTRIBUTING.md
+      - SECURITY.md
+      # Bundled post-extract installer (symlinks binaries into ~/.local/bin
+      # and runs `uv sync` on the staged agent-runtime). Renamed to install.sh
+      # so users can extract and run `./install.sh` directly.
+      - src: scripts/install-from-release.sh
+        dst: install.sh
+      # Staged Python runtime (excludes venvs, pycache, examples, partners).
+      # See scripts/stage-agent-runtime.sh for the exact filter.
+      - src: .release-stage/agent-runtime/**/*
+        dst: agent-runtime
 
 checksum:
   name_template: "checksums.txt"
@@ -94,7 +108,18 @@ release:
   header: |
     ## Installation
 
-    ### Homebrew (recommended, once the tap lands)
+    ### One-line install (recommended)
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+    ```
+
+    Detects your OS/arch, downloads the matching archive below, and runs
+    the bundled installer (symlinks `oat` + `oat-agent` into `~/.local/bin`,
+    sets up the Python agent-runtime via `uv sync`). Pin a version with
+    `OAT_VERSION={{ .Tag }} curl … | bash`.
+
+    ### Homebrew (once the tap lands)
 
     ```bash
     brew tap Root-IO-Labs/oat
@@ -103,8 +128,8 @@ release:
 
     ### Direct download
 
-    Pick the archive for your OS/arch below, then `tar -xzf` it and move
-    `oat` (and optionally `oat-agent`) onto your `$PATH`.
+    Pick the archive for your OS/arch below, `tar -xzf` it, then run
+    `./install.sh` from the extracted directory.
 
     ### From source
 

@@ -15,23 +15,27 @@ bundled Python `agent-runtime/` source tree, attached to a GitHub Release.
 
 ## What gets built
 
-`.goreleaser.yaml` defines two builds:
+`.goreleaser.yml` defines two builds:
 
 | Build | Source | Notes |
 |-------|--------|-------|
-| `oat` | `cmd/oat` | Version stamped via `-ldflags '-X .../internal/cli.Version=<tag>'` |
-| `oat-agent` | `cmd/oat-agent` | Static (CGO disabled) |
+| `oat` | `cmd/oat` | Version + Commit + Date stamped via `-ldflags '-X .../internal/version.{Version,Commit,Date}=<…>'` |
+| `oat-agent` | `cmd/oat-agent` | Same ldflags stamping; static build (CGO disabled) |
 
-Each archive is named `oat_<version>_<os>_<arch>.tar.gz` and contains:
+Each archive is named `oat_<version>_<Os>_<arch>.tar.gz` (capitalized OS to match goreleaser's `{{ title .Os }}` template — e.g. `oat_0.1.0_Darwin_arm64.tar.gz`) and contains:
 
 ```
-oat_<version>_<os>_<arch>/
-├── oat                    # Go binary
-├── oat-agent              # Go binary
+oat_<version>_<Os>_<arch>/
+├── oat                    # Go binary (version-stamped)
+├── oat-agent              # Go binary (version-stamped)
 ├── agent-runtime/         # Python source for the agent runtime
+│                          # (staged via scripts/stage-agent-runtime.sh —
+│                          #  excludes venvs, pycache, examples, partners)
 ├── install.sh             # bundled installer (= scripts/install-from-release.sh)
 ├── LICENSE
 ├── README.md
+├── CHANGELOG.md
+├── CONTRIBUTING.md
 └── SECURITY.md
 ```
 
@@ -67,7 +71,7 @@ validating the config or inspecting an archive before tagging.
 brew install goreleaser            # one-time, macOS
 goreleaser release --snapshot --clean
 ls dist/                            # archives, checksums, metadata
-tar -tzf dist/oat_*_darwin_arm64.tar.gz | head -20
+tar -tzf dist/oat_*_Darwin_arm64.tar.gz | head -20
 ```
 
 `--snapshot` skips git tag validation and builds with a synthetic
@@ -95,7 +99,7 @@ The workflow will:
    - assembles each archive (binaries + agent-runtime + install.sh + license),
    - creates a GitHub Release with the archives and `checksums.txt`,
    - generates release notes from commit messages (see
-     `.goreleaser.yaml#changelog` for the grouping rules).
+     `.goreleaser.yml#changelog` for the grouping rules).
 
 ### 5. Verify the release
 
@@ -106,7 +110,7 @@ gh release view v0.1.0
 gh release view v0.1.0 --json assets --jq '.assets[].name'
 ```
 
-You should see four `oat_<version>_<os>_<arch>.tar.gz` files plus
+You should see four `oat_<version>_<Os>_<arch>.tar.gz` files plus
 `checksums.txt`.
 
 Test the install end-to-end on a clean machine (or at least a fresh
@@ -138,11 +142,11 @@ OAT_VERSION=v0.1.0 \
   commit, broken `go mod tidy`, or a build that fails on one of the
   cross-compiled platforms (run `goreleaser release --snapshot --clean`
   locally to reproduce).
-- **Archive missing files**: edit `archives.files` in `.goreleaser.yaml`.
+- **Archive missing files**: edit `archives.files` in `.goreleaser.yml`.
   Globs are evaluated relative to the repo root.
-- **Version not stamped**: confirm the `-ldflags` path in
-  `.goreleaser.yaml` matches the package path of `Version` in
-  `internal/cli/cli.go`.
+- **Version not stamped**: confirm the `-ldflags` paths in
+  `.goreleaser.yml` match the package path of `Version` / `Commit` /
+  `Date` in `internal/version/version.go`.
 - **Re-cutting a tag**: GitHub Releases reject duplicate tag pushes.
   Delete the tag locally and remotely, fix, then re-tag with the
   same name.

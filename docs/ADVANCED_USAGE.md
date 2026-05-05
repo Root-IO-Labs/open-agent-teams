@@ -163,7 +163,7 @@ This folder is version-controlled, so the whole team shares the same worker cont
 
 ## Dormancy and PR Monitoring
 
-After a worker creates a PR, it enters a **dormant state** with zero token consumption. The daemon's PR monitor loop (every 2 minutes) watches the PR and wakes the worker when action is needed.
+After a worker creates a PR, it enters a **dormant state** with zero token consumption. The daemon's PR monitor loop (every 60 seconds) watches the PR and wakes the worker when action is needed.
 
 ### Wake triggers
 
@@ -223,8 +223,6 @@ The key insight: recovery at the 16-minute mark uses shell commands and git stat
 ---
 
 ## Verification System
-
-> **Note:** Available in the `feature/integrate-verification` branch (PR #45). Not yet on main.
 
 Workers must pass verification before creating a PR. Three options, in order of rigor:
 

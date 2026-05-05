@@ -66,7 +66,24 @@ The full step-by-step contract that the assistant follows lives in [`oats/INSTAL
 
 ## Getting Started
 
-### Option A: Let your AI set it up (easiest)
+### Option A: One-line install (recommended)
+
+Pre-built binaries for macOS and Linux (x86_64 and arm64). Pulls the
+latest release from GitHub, drops `oat` and `oat-agent` into
+`~/.local/bin/`, and sets up the Python agent-runtime venv:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+```
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) — the
+installer offers to install `uv` for you if it's missing. Pin a
+specific release with `OAT_VERSION=v0.1.0 curl … | bash`.
+
+After install, ensure `~/.local/bin` is on your `$PATH`, then jump to
+**3. Authenticate with GitHub** below.
+
+### Option B: Let your AI set it up
 
 Open **Cursor**, **Claude Code**, or your preferred AI assistant and paste this prompt:
 
@@ -79,7 +96,7 @@ Open **Cursor**, **Claude Code**, or your preferred AI assistant and paste this 
 
 [QUICKSTART.md](docs/QUICKSTART.md) contains the full setup walkthrough — prerequisites, install, API keys, first run — everything an AI (or human) needs.
 
-### Option B: Install with Homebrew (macOS / Linux)
+### Option C: Install with Homebrew (macOS / Linux)
 
 ```bash
 brew install Root-IO-Labs/oat/oat
@@ -87,7 +104,7 @@ brew install Root-IO-Labs/oat/oat
 
 This installs both `oat` and `oat-agent`, bundles the Python agent runtime, and runs `uv sync` automatically. You'll still need `gh auth login` and an LLM API key — see steps 3 and 4 below.
 
-### Option C: Manual setup from source
+### Option D: Manual setup from source
 
 #### 1. Prerequisites
 

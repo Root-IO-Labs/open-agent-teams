@@ -175,7 +175,7 @@ The daemon is **not an AI agent**. It is a deterministic Go process (`internal/d
 
 ### Daemon Loops
 
-The daemon runs four periodic loops, all on 2-minute intervals (`time.NewTicker`):
+The daemon runs four periodic loops (`time.NewTicker`). The health check fires every 2 minutes; the message router, wake/nudge, and PR monitor each fire every 60 seconds.
 
 | Loop | Function | What it does |
 |------|----------|-------------|
@@ -197,7 +197,7 @@ active ──(oat agent waiting)──────────────> dorm
   │                                               ├──(PR closed, not merged)──> auto-completed (issue closed) ──> ready-for-cleanup
   │                                               ├──(no PR found)──> auto-completed (issue closed) ──> ready-for-cleanup
   │                                               ├──(CI failure/conflict)──> woken, back to active
-  │                                               └──(30 min cap)──> timed out ──> ready-for-cleanup
+  │                                               └──(15 min cap)──> timed out ──> ready-for-cleanup
   │
   ├──(oat agent complete)──> complete ──> ready-for-cleanup ──(health check)──> removed
   │
@@ -231,7 +231,7 @@ The escalation to the supervisor at nudge 5 is important: the supervisor is an A
 
 ### PR Monitoring
 
-When a worker enters dormancy via `oat agent waiting`, the daemon monitors the PR every 2 minutes:
+When a worker enters dormancy via `oat agent waiting`, the daemon monitors the PR every 60 seconds:
 
 | PR condition | Daemon action |
 |-------------|---------------|
@@ -330,7 +330,7 @@ Messages are JSON files in `~/.oat/messages/<repo>/<agent>/<msg-id>.json`:
 }
 ```
 
-The daemon routes messages every 2 minutes via `backend.SendMessage()`, which writes messages directly to the agent's PTY. See `pkg/backend/backend.go` for the `ProcessBackend` interface.
+The daemon routes messages every 60 seconds via `backend.SendMessage()`, which writes messages directly to the agent's PTY. See `pkg/backend/backend.go` for the `ProcessBackend` interface.
 
 ### Issue Creation
 
@@ -445,7 +445,7 @@ Repositories can customize agent behavior by creating markdown files in `.oat/ag
 |------------|-----------------|
 | worker | `.oat/agents/worker.md` |
 | merge-queue | `.oat/agents/merge-queue.md` |
-| review | `.oat/agents/review.md` |
+| reviewer | `.oat/agents/reviewer.md` |
 
 **Precedence order:**
 1. `<repo>/.oat/agents/<agent>.md` (checked into repo, highest priority)
@@ -614,7 +614,7 @@ The daemon periodically "nudges" agents to keep them active:
 | review | "Status check: Update on your review progress?" |
 | workspace | **Not nudged** (user-driven only) |
 
-Nudges are sent every 2 minutes, but agents are skipped if nudged within the last 2 minutes.
+Nudges are sent every 60 seconds, but agents are skipped if nudged within the last cycle.
 
 **Idle mode:** For a given repo, when it is in **idle mode** (no workers or review agents, or all are ready for cleanup), the daemon does **not** nudge the supervisor, merge-queue, or PR shepherd for that repo until workers (or review agents) appear again. On transition to idle, the daemon sends one final nudge to those agents so they can do a last check, then schedules a delayed follow-up nudge to the merge-queue ~3 minutes later to catch PRs whose CI was still in-progress during the final nudge. After that, nudges pause. When at least one worker or review agent is present again, the repo returns to **active mode** and normal nudges resume.
 

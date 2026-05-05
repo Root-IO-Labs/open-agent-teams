@@ -363,7 +363,7 @@ class OATClient {
   "data": {
     "merge_queue_enabled": true,
     "merge_queue_track_mode": "all",
-    "model": "claude-sonnet-4-5",
+    "model": "claude-sonnet-4-6",
     "allowed_worker_models": ["anthropic:claude-sonnet-4-6", "openrouter:deepseek/deepseek-v3.2:nitro"]
   }
 }
@@ -727,7 +727,7 @@ class OATClient {
 
 #### route_messages
 
-**Description:** Trigger immediate message routing (normally runs every 2 minutes)
+**Description:** Trigger immediate message routing (normally runs every 60 seconds)
 
 **Request:**
 ```json

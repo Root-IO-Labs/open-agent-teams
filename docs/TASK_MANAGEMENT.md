@@ -163,6 +163,5 @@ oat diagnostics --json | jq '.capabilities.task_management'
 
 ## Related Documentation
 
-- [agent Agent SDK - Todo Tracking](https://platform.agent.com/docs/en/agent-sdk/todo-tracking) - Official documentation
 - [AGENTS.md](AGENTS.md) - oat agent architecture
 - [AGENTS.md](AGENTS.md) - Development guide for oat itself

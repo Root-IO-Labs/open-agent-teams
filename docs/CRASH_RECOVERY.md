@@ -9,10 +9,10 @@ OAT consists of several components that can fail independently:
 | Component | Description | Persistence |
 |-----------|-------------|-------------|
 | **Daemon** | Central coordinator process | `daemon.pid`, `state.json` |
-| **Supervisor** | agent agent managing workers | in-memory session, no special state |
-| **Merge-Queue** | agent agent processing PRs | in-memory session, no special state |
-| **Workers** | agent agents executing tasks | in-memory sessions, git worktrees, branches |
-| **Workspace** | User's interactive agent agent | in-memory session, git worktree |
+| **Supervisor** | LLM agent managing workers | in-memory session, no special state |
+| **Merge-Queue** | LLM agent processing PRs | in-memory session, no special state |
+| **Workers** | LLM agents executing tasks | in-memory sessions, git worktrees, branches |
+| **Workspace** | User's interactive LLM agent | in-memory session, git worktree |
 | **Backend Session** | Container for all agents in a repo | daemon process memory |
 | **Git Worktrees** | Isolated working directories | filesystem + git metadata |
 
@@ -418,7 +418,7 @@ oat start
 tail -f ~/.oat/daemon.log   # look for "Woke agent" or "skipping wake"
 ```
 
-Task messages from the supervisor are delivered by the **message router** (every 2 minutes) and do not depend on the PID check; only the periodic nudge does.
+Task messages from the supervisor are delivered by the **message router** (every 60 seconds) and do not depend on the PID check; only the periodic nudge does.
 
 ### Workers: messages appear in prompt but are not processed
 

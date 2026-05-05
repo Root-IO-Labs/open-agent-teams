@@ -157,8 +157,9 @@ type Daemon struct {
 |------|----------|---------|
 | `serverLoop` | Continuous | Handle incoming socket requests |
 | `healthCheckLoop` | 2 min | Verify agents are alive, cleanup dead ones |
-| `messageRouterLoop` | 2 min | Deliver pending messages to agents |
-| `wakeLoop` | 2 min | Nudge idle agents with status checks |
+| `messageRouterLoop` | 60 s | Deliver pending messages to agents |
+| `wakeLoop` | 60 s | Nudge idle agents with status checks |
+| `prMonitorLoop` | 60 s | Watch dormant workers' PRs for CI/merge events |
 
 ### State Management (`internal/state/state.go`)
 
@@ -300,7 +301,7 @@ Prompts are written to `.oat/AGENTS.md` in each agent's worktree before launch. 
 Repositories can customize agent behavior with files in `.oat/agents/`:
 - `.oat/agents/worker.md` — Worker agent definition
 - `.oat/agents/merge-queue.md` — Merge-queue agent definition
-- `.oat/agents/review.md` — Review agent definition
+- `.oat/agents/reviewer.md` — Reviewer agent definition
 
 ### CLI (`internal/cli/cli.go`)
 
@@ -406,7 +407,7 @@ When launching an agent, the model is resolved in priority order:
 3. **Auto-detect** — if neither is set, the OAT - Open Agent Teams CLI picks a model based on available API keys
 
 The resolved model is passed as `--model <spec>` to the OAT - Open Agent Teams CLI. The spec can be a bare model
-name (e.g., `claude-sonnet-4-5`) or provider-prefixed (e.g., `anthropic:claude-sonnet-4-5`).
+name (e.g., `claude-sonnet-4-6`) or provider-prefixed (e.g., `anthropic:claude-sonnet-4-6`).
 
 All agent launch paths (daemon `startAgentWithConfig`, daemon `restartAgent`)
 use `resolveAgentModel()` to apply this resolution.
@@ -498,7 +499,7 @@ CLI                          Daemon                       System
 
 ## The Nudge
 
-Agents can get stuck. The daemon pokes them every 2 minutes, per repo. When a repo is in **idle mode** (no workers or review agents), the daemon stops nudging the supervisor, merge-queue, and PR shepherd until workers appear again — saving tokens.
+Agents can get stuck. The daemon pokes them every 60 seconds, per repo. When a repo is in **idle mode** (no workers or review agents), the daemon stops nudging the supervisor, merge-queue, and PR shepherd until workers appear again — saving tokens.
 
 | Agent | Nudge |
 |-------|-------|

@@ -34,11 +34,13 @@ info() { echo -e "${BLUE}→${NC} $*"; }
 # ---------- platform detection ----------
 
 detect_os() {
+    # Match goreleaser's `{{ title .Os }}` template: capitalized first letter
+    # (e.g. "Darwin", "Linux"). Keep this in sync with .goreleaser.yml.
     local os
     os="$(uname -s)"
     case "$os" in
-        Darwin) echo "darwin" ;;
-        Linux)  echo "linux" ;;
+        Darwin) echo "Darwin" ;;
+        Linux)  echo "Linux" ;;
         *)
             err "Unsupported OS: $os"
             err "OAT currently ships pre-built binaries for macOS and Linux only."
@@ -95,8 +97,9 @@ download_and_extract() {
     local os="$2"
     local arch="$3"
 
-    # Goreleaser archive name template:
-    # oat_<version-without-v>_<os>_<arch>.tar.gz
+    # Goreleaser archive name template (see .goreleaser.yml#archives):
+    # oat_<version-without-v>_<title-os>_<arch>.tar.gz
+    # e.g. oat_0.1.0_Darwin_arm64.tar.gz
     local version_no_v="${version#v}"
     local archive="oat_${version_no_v}_${os}_${arch}.tar.gz"
     local url="${REPO_URL}/releases/download/${version}/${archive}"

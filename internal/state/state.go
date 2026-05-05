@@ -236,7 +236,7 @@ type Repository struct {
 	ForkConfig              ForkConfig         `json:"fork_config,omitempty"`
 	TargetBranch            string             `json:"target_branch,omitempty"`             // Default branch for PRs (usually "main")
 	IdleMode                bool               `json:"idle_mode,omitempty"`                 // True when daemon has paused nudges for this repo (no workers)
-	Model                   string             `json:"model,omitempty"`                     // Default LLM model for agents in this repo (e.g., "claude-sonnet-4-5")
+	Model                   string             `json:"model,omitempty"`                     // Default LLM model for agents in this repo (e.g., "claude-sonnet-4-6")
 	AllowedWorkerModels     []string           `json:"allowed_worker_models,omitempty"`     // Restrict which models can be used for workers (empty = no restriction)
 	WorkspaceStuckDetection bool               `json:"workspace_stuck_detection,omitempty"` // Enable workspace stuck-thinking detection (off by default)
 }

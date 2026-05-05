@@ -512,7 +512,7 @@ func (c *CLI) registerCommands() {
 	repoCmd.Subcommands["init"] = &Command{
 		Name:        "init",
 		Description: "Initialize a repository for OAT agents",
-		Usage:       "oat repo init <github-url> [name] [--model=<model>]\n\nExample:\n  oat init https://github.com/myorg/myproject\n  oat init https://github.com/myorg/myproject --model claude-sonnet-4-5",
+		Usage:       "oat repo init <github-url> [name] [--model=<model>]\n\nExample:\n  oat init https://github.com/myorg/myproject\n  oat init https://github.com/myorg/myproject --model claude-sonnet-4-6",
 		Run:         c.initRepo,
 	}
 
