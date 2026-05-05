@@ -112,6 +112,38 @@ jobs:
             tests/unit_tests/test_token_tracking.py \
             tests/unit_tests/test_token_emission_stress.py
 
+  # Benchmark Python helpers — fully mocked, so this job needs zero
+  # secrets and runs in seconds. Covers:
+  #   - test_probe_model.py: probe-model.py is invoked by `oat model
+  #     onboard` (internal/cli/cli.go), so a regression there silently
+  #     breaks user-facing onboarding. CI gating closes that gap.
+  #   - test_llm_call.py: the shell-facing contract that summarize.sh and
+  #     judge-blackbox.sh depend on. Shell-contract bugs are silent
+  #     otherwise.
+  # Do NOT add ANTHROPIC_API_KEY (or any provider key) to this job —
+  # both test files mock LangChain entirely. A real key would just slow
+  # the job down and risk accidental network calls.
+  benchmark-helpers-tests:
+    name: Benchmark Helpers Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: pip install uv
+      - name: Sync oat-cli dependencies
+        working-directory: agent-runtime/libs/cli
+        run: uv sync --frozen --group test
+      - name: Run benchmark helper tests (mocked, no API keys)
+        working-directory: agent-runtime/libs/cli
+        run: |
+          uv run --group test pytest -v --timeout=30 \
+            ../../../benchmarks/test_probe_model.py \
+            ../../../benchmarks/test_llm_call.py
+
   secret-scan:
     name: Secret Scanning
     runs-on: ubuntu-latest

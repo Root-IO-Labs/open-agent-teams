@@ -81,7 +81,7 @@ installer offers to install `uv` for you if it's missing. Pin a
 specific release with `OAT_VERSION=v0.1.0 curl … | bash`.
 
 After install, ensure `~/.local/bin` is on your `$PATH`, then jump to
-**3. Authenticate with GitHub** below.
+[**3. Authenticate with GitHub**](#3-authenticate-with-github) below.
 
 ### Option B: Let your AI set it up
 
