@@ -2804,13 +2804,14 @@ func (d *Daemon) handleStartVerification(req socket.Request) socket.Response {
 		return errResp
 	}
 
-	// Snapshot the remote default branch SHA so the verifier diffs against
-	// a pinned base. Without this pin, commits that land on origin/main
-	// between the worker's rebase and the verifier's diff appear as
-	// "deletions" in the verifier's view. Best-effort: failures fall back
-	// to live origin/main..HEAD on the verifier side.
-	repoPath := d.paths.RepoDir(repoName)
-	baseSHA := d.snapshotRemoteBaseSHA(repoPath)
+	// Use CLI-provided base SHA (snapped from the worker's worktree, which is
+	// fresher than the daemon's repo clone). Fall back to daemon-side snapshot
+	// for backward compatibility with older CLIs that don't send base_sha.
+	baseSHA := getOptionalStringArg(req.Args, "base_sha", "")
+	if baseSHA == "" {
+		repoPath := d.paths.RepoDir(repoName)
+		baseSHA = d.snapshotRemoteBaseSHA(repoPath)
+	}
 
 	// Atomically set all verification fields on the worker
 	err := d.state.ModifyAgent(repoName, workerName, func(a *state.Agent) {
@@ -3071,12 +3072,17 @@ func (d *Daemon) handleVerificationVerdict(req socket.Request) socket.Response {
 		return socket.SuccessResponse(fmt.Sprintf("SHA mismatch (verdict=%s, branch=%s); worker has moved on — verdict noted", sha[:min(len(sha), 8)], worker.LastBranchSHA[:min(len(worker.LastBranchSHA), 8)]))
 	}
 
-	// Apply verdict atomically
+	// Apply verdict atomically (increment RejectionCount on rejection)
+	var newRejectionCount int
 	err := d.state.ModifyAgent(repoName, workerName, func(a *state.Agent) {
 		a.VerificationStatus = verdict
 		a.VerifiedCommitSHA = sha
 		a.VerificationReason = reason
 		a.VerificationAt = time.Now()
+		if verdict == "rejected" {
+			a.RejectionCount++
+			newRejectionCount = a.RejectionCount
+		}
 	})
 	if err != nil {
 		return socket.ErrorResponse("failed to set verdict: %v", err)
@@ -3094,6 +3100,13 @@ func (d *Daemon) handleVerificationVerdict(req socket.Request) socket.Response {
 		}
 	}
 
+	// On rejection: check if the worker has hit the rejection cap
+	if verdict == "rejected" && maxRejections > 0 && newRejectionCount >= maxRejections {
+		d.logger.Warn("Worker %s/%s reached rejection cap (%d/%d), escalating", repoName, workerName, newRejectionCount, maxRejections)
+		d.rejectionCapReached(repoName, workerName, worker, newRejectionCount, reason)
+		return socket.SuccessResponse(fmt.Sprintf("verdict 'rejected' recorded for worker '%s' (rejection cap reached — worker auto-completed)", workerName))
+	}
+
 	// Send message to worker and wake them if dormant
 	msgMgr := d.getMessageManager()
 	var verdictMsg string
@@ -3103,7 +3116,7 @@ func (d *Daemon) handleVerificationVerdict(req socket.Request) socket.Response {
 			verdictMsg += fmt.Sprintf(" Reason: %s", reason)
 		}
 	} else {
-		verdictMsg = fmt.Sprintf("[daemon] [REJECTED] Verification agent rejected your work (SHA: %s).", sha[:min(len(sha), 8)])
+		verdictMsg = fmt.Sprintf("[daemon] [REJECTED] Verification agent rejected your work (SHA: %s, attempt %d/%d).", sha[:min(len(sha), 8)], newRejectionCount, maxRejections)
 		if reason != "" {
 			verdictMsg += fmt.Sprintf(" Reason: %s", reason)
 		}

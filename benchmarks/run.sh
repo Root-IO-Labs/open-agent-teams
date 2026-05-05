@@ -465,7 +465,7 @@ count_open_issues() {
     local repo_full="$1"
     local wave_num="$2"
     local result
-    result=$(gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state open --json number --jq 'length' 2>/dev/null) || true
+    result=$(timeout 30 gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state open --json number --jq 'length' 2>/dev/null) || true
     if [[ -z "$result" || ! "$result" =~ ^[0-9]+$ ]]; then
         echo "-1"
     else
@@ -479,7 +479,7 @@ count_total_wave_issues() {
     # Live count via gh issue list. May be silently undercounted during a
     # GitHub indexing/search degradation (see Apr 27 2026 incident).
     local live
-    live=$(gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state all --json number --jq 'length' 2>/dev/null || echo "0")
+    live=$(timeout 30 gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state all --json number --jq 'length' 2>/dev/null || echo "0")
     if [[ -z "$live" || ! "$live" =~ ^[0-9]+$ ]]; then
         live=0
     fi
@@ -558,6 +558,9 @@ wait_for_wave() {
             fi
         fi
 
+        # Refresh elapsed after API calls (which can hang for minutes)
+        elapsed=$(( $(date +%s) - wave_start ))
+
         # Soft nudge after nudge timeout (once per wave)
         if [[ $elapsed -ge $nudge_secs && "$nudge_sent" == false ]]; then
             nudge_sent=true
@@ -565,7 +568,7 @@ wait_for_wave() {
             send_to_workspace "$repo_name" "[automated benchmark script] Some wave ${wave_num} issues are still open. Please check if any workers are stuck. If a worker needs help, send it a message via oat message send. Do NOT make code changes or fix issues yourself -- only delegate to workers."
         fi
 
-        # Hard timeout
+        # Hard timeout (checked with fresh elapsed to catch API call hangs)
         if [[ $elapsed -ge $timeout_secs ]]; then
             log "    Wave ${wave_num} timed out (${open_count} issues still open)"
             return 1
@@ -1449,14 +1452,14 @@ Focus on one specific failure per issue. Then spawn a worker for each issue with
             # Issues close when workers call oat agent complete, but the merge-queue
             # may not have merged their PR yet. Without this, the next convergence
             # iteration tests main without the fix, producing identical results.
-            EXPECTED_PRS=$(gh issue list --repo "$REPO_FULL" --label "$FIX_LABEL" --state all --json number --jq 'length' 2>/dev/null || echo "0")
+            EXPECTED_PRS=$(timeout 30 gh issue list --repo "$REPO_FULL" --label "$FIX_LABEL" --state all --json number --jq 'length' 2>/dev/null || echo "0")
             if [[ "$EXPECTED_PRS" -gt 0 ]]; then
                 log "    Waiting for ${FIX_LABEL} PRs to merge (expecting ~${EXPECTED_PRS})..."
                 MERGE_WAIT_START=$(date +%s)
                 MERGE_WAIT_TIMEOUT=180
                 LAST_PRINT_TIME=0
                 while true; do
-                    MERGED_COUNT=$(gh pr list --repo "$REPO_FULL" --state merged --label "$FIX_LABEL" --json number --jq 'length' 2>/dev/null || echo "0")
+                    MERGED_COUNT=$(timeout 30 gh pr list --repo "$REPO_FULL" --state merged --label "$FIX_LABEL" --json number --jq 'length' 2>/dev/null || echo "0")
                     MERGE_ELAPSED=$(( $(date +%s) - MERGE_WAIT_START ))
                     NOW=$(date +%s)
                     if [[ "$MERGED_COUNT" -ge "$EXPECTED_PRS" ]]; then
