@@ -34,7 +34,7 @@ jobs:
 
       - name: Run golangci-lint
         # v7+ is required for golangci-lint v2.x; v6 only supports v1.x.
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.11.4
           args: --timeout 5m
