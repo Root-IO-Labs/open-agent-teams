@@ -181,10 +181,18 @@ print_summary() {
     echo "  Python venv: $INSTALL_DIR/agent-runtime/libs/cli/.venv"
     echo ""
     if [[ "$on_path" != "yes" ]]; then
+        # Render the PATH hint with $HOME collapsed if BIN_DIR is under it,
+        # so users see the more familiar `$HOME/.local/bin` form by default
+        # but custom OAT_BIN_DIR overrides still get a literal path that
+        # actually works.
+        local path_hint="$BIN_DIR"
+        if [[ "$BIN_DIR" == "$HOME/"* ]]; then
+            path_hint="\$HOME/${BIN_DIR#$HOME/}"
+        fi
         echo -e "  ${YELLOW}${BIN_DIR} is not on your PATH.${NC}"
         echo "  Add this to your shell profile (~/.zshrc or ~/.bashrc):"
         echo ""
-        echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "      export PATH=\"${path_hint}:\$PATH\""
         echo ""
         echo "  Then reload:  source ~/.zshrc   (or restart your terminal)"
         echo ""
