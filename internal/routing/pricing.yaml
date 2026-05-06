@@ -1,0 +1,138 @@
+# Model pricing table — USD per million tokens.
+#
+# Each entry: {input_per_mtok, output_per_mtok, cache_read_per_mtok,
+#              cache_creation_per_mtok, source, last_verified}
+# - `input_per_mtok`: non-cached input price in USD per 1M tokens
+# - `output_per_mtok`: output price in USD per 1M tokens
+# - `cache_read_per_mtok`: price for cache-read tokens (often ~10% of input; omit if not supported)
+# - `cache_creation_per_mtok`: price for cache-write tokens (omit to use the
+#   per-provider default in CacheCreationPriceFor: anthropic 1.25× input,
+#   openai 0, google 1.0× input, others 1.0× input)
+# - `source`: URL where the price was sourced
+# - `last_verified`: YYYY-MM-DD date someone confirmed this
+# - `notes`: anything worth calling out (e.g., reasoning-token billing caveats)
+#
+# ⚠ THESE VALUES ARE BEST-EFFORT ESTIMATES AS OF 2026-04-23.
+# Verify against each provider's pricing page before relying on the replay output.
+# The replay harness multiplies these prices by actual logged token counts.
+# Wrong prices → wrong cost estimates → wrong routing decisions.
+
+version: 1
+last_updated: 2026-04-23
+default_unknown: &unknown
+  input_per_mtok: null
+  output_per_mtok: null
+  cache_read_per_mtok: null
+  source: "unverified"
+  last_verified: null
+
+models:
+  # ── Anthropic ──────────────────────────────────────────────────────────
+  "anthropic:claude-sonnet-4-6":
+    input_per_mtok: 3.00
+    output_per_mtok: 15.00
+    cache_read_per_mtok: 0.30
+    cache_creation_per_mtok: 3.75
+    source: "https://www.anthropic.com/pricing"
+    last_verified: 2026-04-23
+    notes: "estimate — verify; cache write is 1.25x input (5-min TTL)"
+
+  "anthropic:claude-haiku-4-5":
+    input_per_mtok: 1.00
+    output_per_mtok: 5.00
+    cache_read_per_mtok: 0.10
+    cache_creation_per_mtok: 1.25
+    source: "https://www.anthropic.com/pricing"
+    last_verified: 2026-04-23
+    notes: "estimate — verify; cache write is 1.25x input (5-min TTL)"
+
+  # ── OpenAI ────────────────────────────────────────────────────────────
+  "openai:o4-mini":
+    input_per_mtok: 1.100
+    output_per_mtok: 4.400
+    cache_read_per_mtok: 0.275
+    source: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    last_verified: 2026-04-24
+    notes: "Corrected 2026-04-24 from LiteLLM; was $2.20/$8.80 (2× too high)."
+
+  "openai:gpt-5.4-mini":
+    input_per_mtok: 0.750
+    output_per_mtok: 4.500
+    cache_read_per_mtok: 0.075
+    source: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    last_verified: 2026-04-24
+    notes: "Corrected 2026-04-24: was $0.40/$1.60 — output was 2.8× too low. This invalidates earlier cost-savings reports."
+
+  "openai:gpt-5.4-nano":
+    input_per_mtok: 0.200
+    output_per_mtok: 1.250
+    cache_read_per_mtok: 0.020
+    source: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    last_verified: 2026-04-24
+    notes: "Corrected 2026-04-24: was $0.05/$0.40 — real prices ~3-4× higher. Cheapest OpenAI tier but NOT as cheap as we claimed."
+
+  # ── Google ────────────────────────────────────────────────────────────
+  "google_genai:gemini-2.5-flash":
+    input_per_mtok: 0.300
+    output_per_mtok: 2.500
+    cache_read_per_mtok: 0.030
+    source: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    last_verified: 2026-04-24
+    notes: "Corrected 2026-04-24: was $0.15/$0.60 — output was 4× too low."
+
+  "google_genai:gemini-3.1-flash-lite-preview":
+    input_per_mtok: 0.250
+    output_per_mtok: 1.500
+    cache_read_per_mtok: 0.025
+    source: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    last_verified: 2026-04-24
+    notes: "Corrected 2026-04-24: was $0.075/$0.30 — 3-5× too low across the board."
+
+  # ── OpenRouter (passthrough pricing) ──────────────────────────────────
+  "openrouter:deepseek/deepseek-v3.2:nitro":
+    input_per_mtok: 0.27
+    output_per_mtok: 1.10
+    cache_read_per_mtok: null
+    source: "https://openrouter.ai/deepseek/deepseek-v3.2"
+    last_verified: 2026-04-23
+    notes: "estimate; :nitro variant is the fast/expensive route"
+
+  "openrouter:meta-llama/llama-4-scout":
+    input_per_mtok: 0.08
+    output_per_mtok: 0.30
+    cache_read_per_mtok: null
+    source: "https://openrouter.ai/meta-llama/llama-4-scout"
+    last_verified: 2026-04-23
+    notes: "estimate"
+
+  # ── Local / free ──────────────────────────────────────────────────────
+  "ollama:qwen2.5:3b":
+    input_per_mtok: 0.0
+    output_per_mtok: 0.0
+    cache_read_per_mtok: 0.0
+    source: "local"
+    last_verified: 2026-04-23
+    notes: "electricity only"
+
+  "ollama:gemma4":
+    input_per_mtok: 0.0
+    output_per_mtok: 0.0
+    cache_read_per_mtok: 0.0
+    source: "local"
+    last_verified: 2026-04-23
+
+  "ollama:gemma3:1b":
+    input_per_mtok: 0.0
+    output_per_mtok: 0.0
+    cache_read_per_mtok: 0.0
+    source: "local"
+    last_verified: 2026-04-23
+
+  # ── Unknown providers — fill in as needed ─────────────────────────────
+  "spark:bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4":
+    input_per_mtok: 0.0
+    output_per_mtok: 0.0
+    cache_read_per_mtok: 0.0
+    source: "internal-spark"
+    last_verified: 2026-04-23
+    notes: "internal hosted — treat as free for routing purposes"

@@ -1,0 +1,182 @@
+version: "2"
+
+# Baseline config. Kept tight on mechanical linters so CI catches regressions.
+# Behavioral linters (errcheck, errorlint, gosec, nilerr, noctx) are deferred —
+# enabling them requires per-call-site review. Tracked for follow-up PRs.
+
+run:
+  timeout: 5m
+  tests: true
+  go: "1.25"
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - gocritic
+    - govet
+    - ineffassign
+    - misspell
+    - noctx
+    - gosec
+    - nilerr
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+
+  # All behavioral linters enabled. No deferred linters at this tree.
+
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      # Best-effort calls that we intentionally do not check. Most of these are
+      # either shutdown/cleanup paths, user-input prompts where empty input is
+      # acceptable, or log-file writers where a failure would cascade anyway.
+      exclude-functions:
+        - fmt.Scanln
+        - fmt.Sscanf
+        - (*os.File).Seek
+        - (*os.File).Sync
+        - (*os.File).WriteString
+        - os.WriteFile
+        - io.Copy
+        - (*golang.org/x/term.State).Restore
+        - golang.org/x/term.Restore
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true
+        - name: redefines-builtin-id
+          disabled: true
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+    gosec:
+      # OAT is a CLI orchestrator that legitimately shells out to git, gh,
+      # and tmux with user-supplied args (repo paths, branch names, PR
+      # numbers) and writes operator-readable logs into the user's home dir.
+      # These rules fire on every such call site with no actionable finding.
+      excludes:
+        - G101  # Hardcoded credential strings — false positives in prompts/tests
+        - G104  # errcheck already handles this (and is enforced separately)
+        - G115  # Integer overflow (uintptr->int TTY size, test fixtures) — safe
+        - G122  # Symlink TOCTOU false positives in filepath.Walk helpers
+        - G204  # Subprocess with variable args — by design
+        - G304  # File inclusion via variable — user paths
+        - G306  # WriteFile permission — logs are intentionally group/world-readable
+        - G404  # math/rand for docker-style agent names; not security-sensitive
+        - G602  # Bounds analyzer is too conservative for our prefix-dedup loops
+        - G702  # Subprocess spawn of user agent binary — by design
+        - G703  # Path traversal via variable — user paths are expected
+    misspell:
+      locale: US
+    staticcheck:
+      checks:
+        - all
+        # Naming conventions: we intentionally use project-specific names.
+        - -ST1000
+        - -ST1003
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        # Quickfix: noisy suggestions that don't change behavior.
+        - -QF1008
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+    rules:
+      # Self-deprecated prompts.LoadCustomPrompt called by its own daemon
+      # consumer; tracked under the agent-system migration PR.
+      - linters:
+          - staticcheck
+        text: "SA1019: prompts.LoadCustomPrompt"
+      # gosec G703 (path traversal) fires on the three dev-only code generators
+      # under cmd/ (generate-docs, oat-agent, verify-docs) which legitimately
+      # walk user-supplied filesystem paths. Not a deployable surface.
+      - path: cmd/
+        linters:
+          - gosec
+        text: "G70[23]"
+      # gosec G101 (hardcoded credentials) false-positives on a routing test
+      # fixture YAML and the [OAT_TOKENS] marker string in output_parser.go.
+      # Neither is a credential.
+      - linters:
+          - gosec
+        text: "G101: Potential hardcoded credentials"
+      # contextcheck warns when CLI helpers called from ctx-aware functions
+      # use c.cmdCtx() (the CLI's stored ctx) rather than accepting ctx as a
+      # parameter. Threading ctx through every helper is a bigger refactor
+      # tracked separately; c.cmdCtx() already returns the root CLI ctx so
+      # daemon-shutdown cancellation still propagates.
+      - path: internal/cli/
+        linters:
+          - contextcheck
+      # Tests deliberately shortcut error handling.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - contextcheck
+          - errcheck
+          - gosec
+          - noctx
+          - staticcheck
+      - path: cmd/
+        linters:
+          - revive
+      # Fast one-shot version / availability probes with no cancellation value.
+      # These run at startup or for --help / diagnostics; adding ctx threading
+      # here is pure noise.
+      - path: internal/(bugreport|diagnostics|fork|socket)/
+        linters:
+          - noctx
+      # Quick availability probes (<10ms), one-shot ps lookup. Follow-up PR
+      # should either plumb ctx through Runner APIs or keep as-is.
+      - path: pkg/agent/runner\.go
+        linters:
+          - noctx
+      # cmd/oat-agent is the spawned-by-tmux child process binary; it has its
+      # own short lifecycle and isn't part of daemon shutdown. Follow-up could
+      # add a root ctx if needed.
+      - path: cmd/oat-agent/
+        linters:
+          - noctx
+      # internal/tui is the foreground TUI; user input is the cancel signal,
+      # and terminal I/O often ignores write errors once the screen is broken.
+      - path: internal/tui/
+        linters:
+          - errcheck
+          - noctx
+      # Backend process management has many best-effort cleanup paths.
+      - path: pkg/backend/
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

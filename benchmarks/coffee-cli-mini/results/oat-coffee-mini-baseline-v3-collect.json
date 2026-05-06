@@ -1,0 +1,245 @@
+{
+  "repo": "oat-coffee-mini-baseline-v3",
+  "timestamp": "2026-04-23T17:46:10Z",
+  "schema_version": "2",
+  "waves": {
+    "1": {
+      "total": 3,
+      "closed": 3
+    },
+    "2": {
+      "total": 0,
+      "closed": 0
+    }
+  },
+  "prs": {
+    "total": 3,
+    "merged": 3
+  },
+  "provenance": {
+    "git_sha": "27d1dad2bb7551ce6ed5f302800766cc275ec9b3",
+    "git_dirty": true,
+    "oat_version": "oat 0.0.0+27d1dad-dev",
+    "start_ts": "2026-04-23T13:28:13.812872-04:00",
+    "start_ts_source": "worker_log_ctime",
+    "end_ts": "2026-04-23T13:31:29.707827-04:00",
+    "end_ts_source": "max_last_token_update",
+    "duration_seconds": 195,
+    "models_seen": [
+      "anthropic:claude-sonnet-4-6"
+    ],
+    "nudges_sent": 2,
+    "nudges_sent_note": "counted from daemon.log within [start_ts, end_ts]; lower bound if log rotated",
+    "state_source": "snapshot",
+    "state_source_note": "snapshot = frozen at run end, live = current (may include post-run activity)"
+  },
+  "pricing": {
+    "sources": {
+      "anthropic": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+      "openai": "https://openai.com/api/pricing/",
+      "google": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    "snapshot_date": "2026-04-19",
+    "models": {
+      "anthropic:claude-sonnet-4-6": {
+        "input": 3.0,
+        "cache_read": 0.3,
+        "cache_creation": 3.75,
+        "output": 15.0
+      },
+      "anthropic:claude-haiku-4-5": {
+        "input": 0.8,
+        "cache_read": 0.08,
+        "cache_creation": 1.0,
+        "output": 4.0
+      },
+      "anthropic:claude-opus-4-7": {
+        "input": 15.0,
+        "cache_read": 1.5,
+        "cache_creation": 18.75,
+        "output": 75.0
+      },
+      "openai:gpt-4o-mini": {
+        "input": 0.15,
+        "cache_read": 0.075,
+        "cache_creation": null,
+        "output": 0.6
+      },
+      "openai:o4-mini": {
+        "input": 1.1,
+        "cache_read": 0.275,
+        "cache_creation": null,
+        "output": 4.4
+      },
+      "google:gemini-2.5-flash": {
+        "input": 0.3,
+        "cache_read": 0.075,
+        "cache_creation": null,
+        "output": 2.5
+      },
+      "ollama:qwen2.5:3b": {
+        "input": 0.0,
+        "cache_read": 0.0,
+        "cache_creation": 0.0,
+        "output": 0.0
+      },
+      "ollama:gemma3:1b": {
+        "input": 0.0,
+        "cache_read": 0.0,
+        "cache_creation": 0.0,
+        "output": 0.0
+      }
+    },
+    "note": "Add missing models as they appear in .models_seen. cache_creation=null means provider doesn't separately bill cache writes."
+  },
+  "tokens": {
+    "agents": [
+      {
+        "name": "default",
+        "type": "workspace",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 188731,
+        "output_tokens": 1280,
+        "cache_read_tokens": 165585,
+        "cache_creation_tokens": 23133,
+        "cache_hit_pct": 87.7,
+        "assistant_turns": 5,
+        "tool_calls": 11,
+        "user_messages": 3,
+        "cost": {
+          "observed": 0.1557,
+          "cold_start": 0.7269
+        }
+      },
+      {
+        "name": "merge-queue",
+        "type": "merge-queue",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 531217,
+        "output_tokens": 1482,
+        "cache_read_tokens": 505297,
+        "cache_creation_tokens": 25868,
+        "cache_hit_pct": 95.1,
+        "assistant_turns": 20,
+        "tool_calls": 17,
+        "user_messages": 14,
+        "cost": {
+          "observed": 0.271,
+          "cold_start": 2.0143
+        }
+      },
+      {
+        "name": "supervisor",
+        "type": "supervisor",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 3660358,
+        "output_tokens": 8425,
+        "cache_read_tokens": 3590886,
+        "cache_creation_tokens": 69363,
+        "cache_hit_pct": 98.1,
+        "assistant_turns": 40,
+        "tool_calls": 109,
+        "user_messages": 6,
+        "cost": {
+          "observed": 1.4641,
+          "cold_start": 13.8526
+        }
+      }
+    ],
+    "workers": [
+      {
+        "name": "bold-heron",
+        "type": "worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": false,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": 0.0,
+        "source": "log",
+        "assistant_turns": 8,
+        "tool_calls": 28,
+        "user_messages": 1,
+        "cost": {
+          "observed": 0.0,
+          "cold_start": 0.0
+        }
+      },
+      {
+        "name": "crystal-phoenix",
+        "type": "worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 1409465,
+        "output_tokens": 5744,
+        "cache_read_tokens": 1374560,
+        "cache_creation_tokens": 34853,
+        "cache_hit_pct": 97.5,
+        "source": "log",
+        "assistant_turns": 15,
+        "tool_calls": 42,
+        "user_messages": 5,
+        "cost": {
+          "observed": 0.6294,
+          "cold_start": 5.3716
+        }
+      },
+      {
+        "name": "golden-raven",
+        "type": "worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 891051,
+        "output_tokens": 4173,
+        "cache_read_tokens": 860268,
+        "cache_creation_tokens": 30749,
+        "cache_hit_pct": 96.5,
+        "source": "log",
+        "assistant_turns": 9,
+        "tool_calls": 30,
+        "user_messages": 4,
+        "cost": {
+          "observed": 0.4361,
+          "cold_start": 3.404
+        }
+      },
+      {
+        "name": "crystal-phoenix",
+        "type": "verify-worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 1052171,
+        "output_tokens": 7501,
+        "cache_read_tokens": 1018929,
+        "cache_creation_tokens": 33202,
+        "cache_hit_pct": 96.8,
+        "source": "log",
+        "assistant_turns": 14,
+        "tool_calls": 46,
+        "user_messages": 4,
+        "cost": {
+          "observed": 0.5428,
+          "cold_start": 4.0581
+        }
+      }
+    ],
+    "totals": {
+      "input": 7732993,
+      "output": 28605,
+      "cache_read": 7515525,
+      "cache_creation": 217168,
+      "hit_pct": 97.2,
+      "io_ratio": 270.3,
+      "cost": {
+        "observed": 3.4991,
+        "cold_start": 29.4275,
+        "unpriced_rows": [],
+        "warming_discount_pct": 88.1
+      }
+    }
+  }
+}

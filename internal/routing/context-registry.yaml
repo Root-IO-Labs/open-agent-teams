@@ -1,0 +1,109 @@
+# Context-window registry — authoritative `max_input_tokens` per model.
+#
+# Rationale: the probe script's `context_profile` probe relies on LangChain's
+# model.profile field, which only populates reliably for Anthropic. OpenAI's
+# `/v1/models/{id}` endpoint does NOT return context_window (dead fallback in
+# probe-model.py:1365-1384 — we left the code as-is pending its removal).
+# Google and Ollama have no fallback at all.
+#
+# Downstream consumer: onboard → probe → writes `max_input_tokens: unknown` if
+# not resolved. Router reads this registry as a last-resort lookup before
+# accepting `unknown`. Hand-curated. Update when providers announce window changes.
+#
+# Schema:
+#   models:
+#     "<model_id>":
+#       max_input_tokens: <int>
+#       max_output_tokens: <int>        # optional, for future use
+#       source: "<URL or note>"
+#       last_verified: YYYY-MM-DD
+
+version: 1
+last_updated: 2026-04-23
+
+models:
+  # ── Anthropic ──────────────────────────────────────────────────────────
+  # (Usually populated by LangChain's model.profile; listed for completeness
+  # and as a failsafe if that path breaks.)
+  "anthropic:claude-sonnet-4-6":
+    max_input_tokens: 1000000
+    max_output_tokens: 64000
+    source: "https://docs.anthropic.com/en/docs/about-claude/models"
+    last_verified: 2026-04-23
+
+  "anthropic:claude-haiku-4-5":
+    max_input_tokens: 200000
+    max_output_tokens: 64000
+    source: "https://docs.anthropic.com/en/docs/about-claude/models"
+    last_verified: 2026-04-23
+
+  # ── OpenAI (probe fallback doesn't work; registry is the source of truth) ─
+  "openai:o4-mini":
+    max_input_tokens: 200000
+    max_output_tokens: 65536
+    source: "https://platform.openai.com/docs/models"
+    last_verified: 2026-04-23
+    notes: "reasoning model — output tokens include chain-of-thought"
+
+  "openai:gpt-5.4-mini":
+    max_input_tokens: 400000
+    max_output_tokens: 16384
+    source: "https://platform.openai.com/docs/models"
+    last_verified: 2026-04-23
+    notes: "estimate — verify against live API"
+
+  "openai:gpt-5.4-nano":
+    max_input_tokens: 400000
+    max_output_tokens: 16384
+    source: "https://platform.openai.com/docs/models"
+    last_verified: 2026-04-23
+    notes: "estimate"
+
+  # ── Google (no probe fallback at all; registry is required) ────────────
+  "google_genai:gemini-2.5-flash":
+    max_input_tokens: 1048576
+    max_output_tokens: 8192
+    source: "https://ai.google.dev/gemini-api/docs/models/gemini"
+    last_verified: 2026-04-23
+
+  "google_genai:gemini-3.1-flash-lite-preview":
+    max_input_tokens: 1048576
+    max_output_tokens: 8192
+    source: "https://ai.google.dev/gemini-api/docs/models/gemini"
+    last_verified: 2026-04-23
+    notes: "preview model — window may change before GA"
+
+  # ── OpenRouter (probe DOES have a working fallback for this provider) ──
+  # Included anyway so the registry wins if the OpenRouter endpoint is down.
+  "openrouter:deepseek/deepseek-v3.2:nitro":
+    max_input_tokens: 163840
+    max_output_tokens: 8192
+    source: "https://openrouter.ai/deepseek/deepseek-v3.2"
+    last_verified: 2026-04-23
+
+  "openrouter:meta-llama/llama-4-scout":
+    max_input_tokens: 131072
+    max_output_tokens: 8192
+    source: "https://openrouter.ai/meta-llama/llama-4-scout"
+    last_verified: 2026-04-23
+
+  # ── Ollama (local — windows depend on `modelfile` settings) ────────────
+  "ollama:qwen2.5:3b":
+    max_input_tokens: 32768
+    max_output_tokens: 8192
+    source: "https://ollama.com/library/qwen2.5:3b"
+    last_verified: 2026-04-23
+    notes: "default Ollama context — can be extended via modelfile"
+
+  "ollama:gemma4":
+    max_input_tokens: 128000
+    max_output_tokens: 8192
+    source: "https://ollama.com/library/gemma"
+    last_verified: 2026-04-23
+
+  "ollama:gemma3:1b":
+    max_input_tokens: 8192
+    max_output_tokens: 2048
+    source: "https://ollama.com/library/gemma3"
+    last_verified: 2026-04-23
+    notes: "small local model — restricted for worker role"

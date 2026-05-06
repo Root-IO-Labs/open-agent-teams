@@ -1,0 +1,47 @@
+name: release
+
+# Triggered by pushing an annotated `v*` tag (e.g. v0.1.0). GoReleaser
+# cross-compiles oat + oat-agent for linux/darwin on amd64+arm64,
+# stamps the binaries with the tag + short SHA + build date, and creates
+# a GitHub Release with tar.gz archives and SHA256 checksums.
+#
+# The Homebrew tap publication is disabled in .goreleaser.yml until the
+# tap repo is public and HOMEBREW_TAP_GITHUB_TOKEN is provisioned; until
+# then this workflow only publishes binaries.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed by GoReleaser to upload release assets
+
+jobs:
+  goreleaser:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so changelog + git describe work
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify staging script is executable
+        run: chmod +x scripts/stage-agent-runtime.sh
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}

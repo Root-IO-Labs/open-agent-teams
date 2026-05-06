@@ -1,0 +1,264 @@
+{
+  "repo": "oat-coffee-mini-snapshot-v2",
+  "timestamp": "2026-04-23T18:04:05Z",
+  "schema_version": "2",
+  "waves": {
+    "1": {
+      "total": 3,
+      "closed": 3
+    },
+    "2": {
+      "total": 0,
+      "closed": 0
+    }
+  },
+  "prs": {
+    "total": 3,
+    "merged": 3
+  },
+  "provenance": {
+    "git_sha": "bbe21915330cf3b7aba1b60440300d6dd438e7cb",
+    "git_dirty": true,
+    "oat_version": "oat 0.0.0+27d1dad-dev",
+    "start_ts": "2026-04-23T17:57:52+00:00",
+    "start_ts_source": "flag",
+    "end_ts": "2026-04-23T18:04:04+00:00",
+    "end_ts_source": "flag",
+    "duration_seconds": 372,
+    "models_seen": [
+      "anthropic:claude-sonnet-4-6"
+    ],
+    "nudges_sent": 2,
+    "nudges_sent_note": "counted from daemon.log within [start_ts, end_ts]; lower bound if log rotated",
+    "state_source": "snapshot",
+    "state_source_note": "snapshot = frozen at run end, live = current (may include post-run activity)"
+  },
+  "pricing": {
+    "sources": {
+      "anthropic": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+      "openai": "https://openai.com/api/pricing/",
+      "google": "https://ai.google.dev/gemini-api/docs/pricing"
+    },
+    "snapshot_date": "2026-04-19",
+    "models": {
+      "anthropic:claude-sonnet-4-6": {
+        "input": 3.0,
+        "cache_read": 0.3,
+        "cache_creation": 3.75,
+        "output": 15.0
+      },
+      "anthropic:claude-haiku-4-5": {
+        "input": 0.8,
+        "cache_read": 0.08,
+        "cache_creation": 1.0,
+        "output": 4.0
+      },
+      "anthropic:claude-opus-4-7": {
+        "input": 15.0,
+        "cache_read": 1.5,
+        "cache_creation": 18.75,
+        "output": 75.0
+      },
+      "openai:gpt-4o-mini": {
+        "input": 0.15,
+        "cache_read": 0.075,
+        "cache_creation": null,
+        "output": 0.6
+      },
+      "openai:o4-mini": {
+        "input": 1.1,
+        "cache_read": 0.275,
+        "cache_creation": null,
+        "output": 4.4
+      },
+      "google:gemini-2.5-flash": {
+        "input": 0.3,
+        "cache_read": 0.075,
+        "cache_creation": null,
+        "output": 2.5
+      },
+      "ollama:qwen2.5:3b": {
+        "input": 0.0,
+        "cache_read": 0.0,
+        "cache_creation": 0.0,
+        "output": 0.0
+      },
+      "ollama:gemma3:1b": {
+        "input": 0.0,
+        "cache_read": 0.0,
+        "cache_creation": 0.0,
+        "output": 0.0
+      }
+    },
+    "note": "Add missing models as they appear in .models_seen. cache_creation=null means provider doesn't separately bill cache writes."
+  },
+  "tokens": {
+    "agents": [
+      {
+        "name": "default",
+        "type": "workspace",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 279623,
+        "output_tokens": 1924,
+        "cache_read_tokens": 254403,
+        "cache_creation_tokens": 25205,
+        "cache_hit_pct": 91.0,
+        "assistant_turns": 3,
+        "tool_calls": 16,
+        "user_messages": 1,
+        "cost": {
+          "observed": 0.1997,
+          "cold_start": 1.0774
+        }
+      },
+      {
+        "name": "merge-queue",
+        "type": "merge-queue",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 447055,
+        "output_tokens": 1166,
+        "cache_read_tokens": 433419,
+        "cache_creation_tokens": 13590,
+        "cache_hit_pct": 96.9,
+        "assistant_turns": 16,
+        "tool_calls": 13,
+        "user_messages": 12,
+        "cost": {
+          "observed": 0.1986,
+          "cold_start": 1.6939
+        }
+      },
+      {
+        "name": "supervisor",
+        "type": "supervisor",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": false,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_hit_pct": 0.0,
+        "assistant_turns": 12,
+        "tool_calls": 19,
+        "user_messages": 1,
+        "cost": {
+          "observed": 0.0,
+          "cold_start": 0.0
+        }
+      }
+    ],
+    "workers": [
+      {
+        "name": "azure-tiger",
+        "type": "worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 1514543,
+        "output_tokens": 6728,
+        "cache_read_tokens": 1477870,
+        "cache_creation_tokens": 36619,
+        "cache_hit_pct": 97.6,
+        "source": "log",
+        "assistant_turns": 17,
+        "tool_calls": 45,
+        "user_messages": 6,
+        "cost": {
+          "observed": 0.6818,
+          "cold_start": 5.7804
+        }
+      },
+      {
+        "name": "royal-gecko",
+        "type": "worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 920751,
+        "output_tokens": 4812,
+        "cache_read_tokens": 891012,
+        "cache_creation_tokens": 29702,
+        "cache_hit_pct": 96.8,
+        "source": "log",
+        "assistant_turns": 7,
+        "tool_calls": 30,
+        "user_messages": 5,
+        "cost": {
+          "observed": 0.451,
+          "cold_start": 3.525
+        }
+      },
+      {
+        "name": "swift-falcon",
+        "type": "worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 851748,
+        "output_tokens": 4222,
+        "cache_read_tokens": 822061,
+        "cache_creation_tokens": 29654,
+        "cache_hit_pct": 96.5,
+        "source": "log",
+        "assistant_turns": 5,
+        "tool_calls": 27,
+        "user_messages": 4,
+        "cost": {
+          "observed": 0.4212,
+          "cold_start": 3.2574
+        }
+      },
+      {
+        "name": "azure-tiger",
+        "type": "verify-worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 453698,
+        "output_tokens": 3953,
+        "cache_read_tokens": 430087,
+        "cache_creation_tokens": 23590,
+        "cache_hit_pct": 94.8,
+        "source": "log",
+        "assistant_turns": 15,
+        "tool_calls": 41,
+        "user_messages": 5,
+        "cost": {
+          "observed": 0.2768,
+          "cold_start": 1.7606
+        }
+      },
+      {
+        "name": "royal-gecko",
+        "type": "verify-worker",
+        "model": "anthropic:claude-sonnet-4-6",
+        "invoked": true,
+        "input_tokens": 510936,
+        "output_tokens": 3425,
+        "cache_read_tokens": 485732,
+        "cache_creation_tokens": 25181,
+        "cache_hit_pct": 95.1,
+        "source": "log",
+        "assistant_turns": 7,
+        "tool_calls": 20,
+        "user_messages": 2,
+        "cost": {
+          "observed": 0.2916,
+          "cold_start": 1.9674
+        }
+      }
+    ],
+    "totals": {
+      "input": 4978354,
+      "output": 26230,
+      "cache_read": 4794584,
+      "cache_creation": 183541,
+      "hit_pct": 96.3,
+      "io_ratio": 189.8,
+      "cost": {
+        "observed": 2.5207,
+        "cold_start": 19.0621,
+        "unpriced_rows": [],
+        "warming_discount_pct": 86.8
+      }
+    }
+  }
+}

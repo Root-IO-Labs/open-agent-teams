@@ -1,0 +1,59 @@
+Install OAT (Open Agent Teams) on this machine end-to-end. Follow the
+contract in oats/INSTALL.md after cloning. Rules:
+
+REPO: https://github.com/Root-IO-Labs/open-agent-teams
+DEFAULT BRANCH: main
+CLONE LOCATION: ~/src/open-agent-teams (confirm if non-empty)
+
+EXECUTE IN ORDER. Verify each gate before moving on. Stop on the first
+real failure and report the exact command, exit code, and last ~30 lines
+of output.
+
+1) Check prereqs: go (>=1.24.2), python3 (>=3.11), uv, git, gh, jq.
+   Install missing tools via brew on macOS or apt on Linux. Ask before
+   any sudo or curl|sh install. If Go < 1.24.2, STOP.
+
+2) `gh auth status`. If not logged in, ask the user to run
+   `gh auth login` themselves and wait. Do not attempt interactive login.
+
+3) Clone to ~/src/open-agent-teams. cd in. The default branch is `main`;
+   stay on it unless the user explicitly names another branch.
+
+4) `./scripts/install.sh`. On success the summary contains
+   "OAT installed successfully" and both `$(go env GOPATH)/bin/oat` and
+   `$(go env GOPATH)/bin/oat-agent` exist. If not, STOP.
+
+5) Ensure $GOPATH/bin is on PATH. If not, append the export to ~/.zshrc
+   or ~/.bashrc after confirming with the user, then ask them to source
+   it or open a new terminal.
+
+6) Provider key: if any *_API_KEY is already exported, proceed.
+   Otherwise ask the user which provider they want and request the key.
+   Append (do not overwrite) one uncommented line to ~/.oat/.env using
+   the correct env var name (ANTHROPIC_API_KEY / OPENAI_API_KEY /
+   GOOGLE_API_KEY / DEEPSEEK_API_KEY / OPENROUTER_API_KEY).
+
+7) `oat start`, then `oat daemon status`. Verify daemon is up.
+
+8) `oat model list`. Verify >= 1 row with status=known and worker=true.
+   If empty, check `ls ~/.oat/model-profiles/` and report — do NOT
+   hand-write profile YAML.
+
+9) Ask if the user wants a test repo. If yes, ask for a GitHub URL they
+   own, then run:
+     oat init <url> --model <chosen-model>
+     oat repo use <repo-name>
+     oat worker create "Add a file HELLO.md containing 'hello from oat'"
+   Wait ~5 min. Re-run `oat worker list`. If the worker reaches
+   `dormant` or `complete`, the install is verified end-to-end.
+
+10) Final report: what got installed, what's running, what to run next
+    (`oat ui` or `oat worker create …`), and any skipped steps. Be
+    honest — do not claim success you did not verify.
+
+DO NOT: guess API keys, skip gates, silently retry, edit shell rc files
+without asking, modify git config, or run destructive commands
+(`rm -rf ~/.oat`, `oat stop-all --clean`) without explicit user
+approval. If a step is partial or skipped, say so.
+
+Full contract with verification gates: oats/INSTALL.md.
