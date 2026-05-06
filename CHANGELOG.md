@@ -104,6 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`benchmarks/llm_call.py` now imports `create_model` from the canonical
+  `oat_cli.config` path** used by the rest of the benchmark tooling
+  (e.g. `benchmarks/probe-model.py`), fixing a runtime
+  `ModuleNotFoundError` warning that masked custom-provider support from
+  `~/.oat/config.toml`. The langchain `init_chat_model` fallback was hiding
+  the breakage but routing all bench LLM calls through the non-config path.
+  `.gitignore` cleaned up: removed a stale entry that was redundant with the
+  existing `.oat/*` ignore rule covering the project-local cache directory.
 - **`benchmarks/setup.sh` no longer silently swallows `gh label create`
   failures.** GitHub's secondary rate limit can throttle the burst of 28
   label creates against a fresh repo, leaving a subset of labels uncreated.
