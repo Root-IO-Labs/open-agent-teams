@@ -890,6 +890,7 @@ Do not change issue numbers, repo names, or task descriptions in the commands. D
     # -- Step C: Wait for all wave:0 issues to close --
 
     GATE_START=$(date +%s)
+    WAVE_START_0=$GATE_START
     GATE_TIMEOUT_SECS=$((GATE_TIMEOUT * 60))
     WAVE0_TIMED_OUT=false
     if [[ "$GATE_PASSED" == true ]]; then
@@ -932,6 +933,11 @@ Do not change issue numbers, repo names, or task descriptions in the commands. D
 
         sleep "$POLL_INTERVAL"
     done
+
+    # Capture wave 0 end-of-work for wave-timing.json. Set on every loop-exit
+    # path (success, partial-extract, hard-fail) so `collect.sh` can derive
+    # an accurate wave 0 duration without falling back to fuzzy PR-search.
+    WAVE_END_0=$(date +%s)
 
     # Merge grace period: wait for wave:0 PRs that may still be in CI/merging.
     # Only needed on the timeout path -- if all issues closed, PRs already merged.
@@ -1071,8 +1077,8 @@ fi
 # --- Step 3: Wave progression loop ---
 
 WAVE_RESULTS=()
-WAVE_START_1=0 WAVE_START_2=0 WAVE_START_3=0 WAVE_START_4=0
-WAVE_END_1=0 WAVE_END_2=0 WAVE_END_3=0 WAVE_END_4=0
+WAVE_START_0=0 WAVE_START_1=0 WAVE_START_2=0 WAVE_START_3=0 WAVE_START_4=0
+WAVE_END_0=0 WAVE_END_1=0 WAVE_END_2=0 WAVE_END_3=0 WAVE_END_4=0
 
 if [[ "$GATE_PASSED" == false ]]; then
     if [[ "$GATE_ONLY" == false ]]; then
@@ -1160,11 +1166,13 @@ fi  # end gate_passed check
 # Write wave timing for collect.sh early (defense in depth: captured even if
 # the script crashes during the merge grace period or convergence loop).
 jq -n \
+    --argjson w0s "$WAVE_START_0" --argjson w0e "$WAVE_END_0" \
     --argjson w1s "$WAVE_START_1" --argjson w1e "$WAVE_END_1" \
     --argjson w2s "$WAVE_START_2" --argjson w2e "$WAVE_END_2" \
     --argjson w3s "$WAVE_START_3" --argjson w3e "$WAVE_END_3" \
     --argjson w4s "$WAVE_START_4" --argjson w4e "$WAVE_END_4" \
     '{
+        "0": {"started_epoch": $w0s, "completed_epoch": $w0e},
         "1": {"started_epoch": $w1s, "completed_epoch": $w1e},
         "2": {"started_epoch": $w2s, "completed_epoch": $w2e},
         "3": {"started_epoch": $w3s, "completed_epoch": $w3e},

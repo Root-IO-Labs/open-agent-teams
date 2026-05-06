@@ -104,6 +104,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Wave 0 timing in `collect.json` is no longer derived from a fuzzy
+  GitHub PR search.** `benchmarks/run.sh` now records `wave 0`
+  `started_epoch` / `completed_epoch` to `wave-timing.json` alongside
+  waves 1–4, and `benchmarks/collect.sh` reads that data via
+  `wave_timing_from_file "0"` instead of falling back to
+  `gh pr list --search "closes #N OR fixes #N"`. The GitHub search was
+  too fuzzy and matched PRs whose body referenced unrelated issues whose
+  numbers contained `N` as a digit substring (e.g. issue #1 spuriously
+  matching a PR body that mentioned #17), inflating wave 0's reported
+  duration on a real run from ~24 min to ~119 min. Older result
+  directories without a `"0"` key in `wave-timing.json` continue to fall
+  back to the PR-derived path, so historical analysis is unchanged.
 - **`benchmarks/llm_call.py` now imports `create_model` from the canonical
   `oat_cli.config` path** used by the rest of the benchmark tooling
   (e.g. `benchmarks/probe-model.py`), fixing a runtime
