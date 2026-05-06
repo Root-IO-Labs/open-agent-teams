@@ -902,14 +902,18 @@ Do not change issue numbers, repo names, or task descriptions in the commands. D
         open_count=$(count_open_issues "$REPO_FULL" "0")
 
         if [[ "$open_count" == "-1" ]]; then
-            log "Wave:0 query failed, retrying... ($(format_duration "$elapsed") elapsed)"
+            log "    Wave 0 query failed, retrying... ($(format_duration "$elapsed") elapsed)"
         elif [[ "$open_count" -eq 0 ]]; then
-            log "All wave:0 issues closed after $(format_duration "$elapsed")"
+            log "    All wave 0 issues closed after $(format_duration "$elapsed")"
             break
         else
             total_w0=$(count_total_wave_issues "$REPO_FULL" "0")
             closed_w0=$((total_w0 - open_count))
-            log "Wave:0: ${closed_w0}/${total_w0} issues closed ($(format_duration "$elapsed") elapsed)"
+            workers_active=true
+            if ! has_active_workers "$REPO_NAME"; then
+                workers_active=false
+            fi
+            log "    Wave 0: ${closed_w0}/${total_w0} issues closed, workers active: ${workers_active} ($(format_duration "$elapsed") elapsed)"
         fi
 
         if [[ $elapsed -ge $GATE_TIMEOUT_SECS ]]; then
