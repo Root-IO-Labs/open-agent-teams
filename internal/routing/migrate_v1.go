@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -54,6 +55,10 @@ type MigrateV1Stats struct {
 // installs are a normal case.
 func MigrateV1ToV2(historyPath string) (MigrateV1Stats, error) {
 	stats := MigrateV1Stats{OutputPath: historyPath}
+
+	if strings.Contains(historyPath, "..") {
+		return stats, fmt.Errorf("invalid file path")
+	}
 
 	in, err := os.Open(historyPath)
 	if err != nil {
