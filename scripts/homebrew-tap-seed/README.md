@@ -29,7 +29,7 @@ cp -R "$OAT_REPO/scripts/homebrew-tap-seed/tap/." .
 git add .
 git commit -m "chore: initial tap scaffolding
 
-Seed formula + README + LICENSE + .gitignore. The formula is a stub that
+Seed formula + README + .gitignore. The formula is a stub that
 fails fast with an 'install from source' message until goreleaser
 overwrites it on the first v* tag of Root-IO-Labs/open-agent-teams."
 git push origin main
