@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/screenshots/oat-logo.png" alt="OAT — Open Agent Teams" width="520">
+</p>
+
 # OAT - Open Agent Teams
 
 OAT is a framework for running teams of AI coding agents that collaborate on a shared codebase. It assembles a coordinated team of AI agents — supervisor, merge queue, workers, reviewers — that plan, implement, test, and ship code while you focus on architecture and direction. Every agent gets its own process and git worktree. You coach. They deliver.
@@ -243,6 +247,10 @@ If a worker gets stuck, a three-tier escalation kicks in automatically: gentle n
 You watch everything from `oat ui`, or close your laptop and come back to PRs.
 
 ## Dashboard (`oat ui`)
+
+<p align="center">
+  <img src="docs/screenshots/oat-ui.png" alt="oat ui — terminal dashboard with eight parallel coding agents working on the robotic-barista benchmark" width="900">
+</p>
 
 Full-screen terminal dashboard built with [Bubble Tea](https://github.com/charmbracelet/bubbletea). Runs in any standard terminal.
 
