@@ -575,12 +575,16 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if a.activeAgent != "" {
 			logPath := a.getAgentLogPath(a.activeAgent)
 			if logPath != "" {
-				if _, err := os.Stat(logPath); err == nil {
+				validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+				if !validPath.MatchString(logPath) {
+					a.statusMsg = "invalid input"
+				} else if _, err := os.Stat(logPath); err == nil {
 					return a, tea.ExecProcess(exec.Command("less", "+G", "-R", logPath), func(err error) tea.Msg {
 						return openLogDoneMsg{err: err}
 					})
+				} else {
+					a.statusMsg = fmt.Sprintf("Log file not found: %s", logPath)
 				}
-				a.statusMsg = fmt.Sprintf("Log file not found: %s", logPath)
 			} else {
 				a.statusMsg = "No log file for this agent"
 			}

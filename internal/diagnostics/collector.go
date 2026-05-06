@@ -2,8 +2,10 @@ package diagnostics
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -205,6 +207,13 @@ func (c *Collector) getAgentInfo() AgentInfo {
 
 // getToolVersion returns the version string for a tool
 func (c *Collector) getToolVersion(tool string, versionFlag string) string {
+	validInput := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+	if !validInput.MatchString(tool) {
+		return fmt.Sprintf("invalid input: %s", tool)
+	}
+	if !validInput.MatchString(versionFlag) {
+		return fmt.Sprintf("invalid input: %s", versionFlag)
+	}
 	cmd := exec.Command(tool, versionFlag)
 	output, err := cmd.Output()
 	if err != nil {

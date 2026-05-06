@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+var validPath = regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\:]+$`)
+var validRemoteName = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+var validGitHubIdentifier = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+var validURL = regexp.MustCompile(`^[a-zA-Z0-9_\-\./:@]+$`)
+
 // ForkInfo contains information about whether a repository is a fork
 // and its relationship to upstream.
 type ForkInfo struct {
@@ -88,6 +93,12 @@ func DetectFork(repoPath string) (*ForkInfo, error) {
 
 // getRemoteURL returns the URL of a git remote.
 func getRemoteURL(repoPath, remoteName string) (string, error) {
+	if !validPath.MatchString(repoPath) {
+		return "", fmt.Errorf("invalid input")
+	}
+	if !validRemoteName.MatchString(remoteName) {
+		return "", fmt.Errorf("invalid input")
+	}
 	cmd := exec.Command("git", "-C", repoPath, "remote", "get-url", remoteName)
 	output, err := cmd.Output()
 	if err != nil {
@@ -122,6 +133,12 @@ func ParseGitHubURL(url string) (owner, repo string, err error) {
 
 // detectForkViaGitHubAPI uses the gh CLI to check if a repo is a fork.
 func detectForkViaGitHubAPI(owner, repo string) (*ForkInfo, error) {
+	if !validGitHubIdentifier.MatchString(owner) {
+		return nil, fmt.Errorf("invalid input")
+	}
+	if !validGitHubIdentifier.MatchString(repo) {
+		return nil, fmt.Errorf("invalid input")
+	}
 	// Use gh api to get repo info
 	cmd := exec.Command("gh", "api", fmt.Sprintf("repos/%s/%s", owner, repo),
 		"--jq", "{fork: .fork, parent_owner: .parent.owner.login, parent_repo: .parent.name, parent_url: .parent.clone_url}")
@@ -156,6 +173,12 @@ func detectForkViaGitHubAPI(owner, repo string) (*ForkInfo, error) {
 
 // AddUpstreamRemote adds an upstream remote to a git repository.
 func AddUpstreamRemote(repoPath, upstreamURL string) error {
+	if !validPath.MatchString(repoPath) {
+		return fmt.Errorf("invalid input")
+	}
+	if !validURL.MatchString(upstreamURL) {
+		return fmt.Errorf("invalid input")
+	}
 	// Check if upstream already exists
 	_, err := getRemoteURL(repoPath, "upstream")
 	if err == nil {

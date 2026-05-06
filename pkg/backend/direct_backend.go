@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -229,6 +230,10 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 	shell := os.Getenv("SHELL")
 	if shell == "" {
 		shell = "bash"
+	}
+	validShell := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+	if !validShell.MatchString(shell) {
+		return nil, fmt.Errorf("invalid input")
 	}
 	cmd := exec.CommandContext(ctx, shell, "-l", "-c", shellCmd)
 	cmd.Dir = cfg.WorkDir

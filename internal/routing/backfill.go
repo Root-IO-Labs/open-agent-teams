@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -276,6 +277,11 @@ func (b *PRBackfiller) processRecord(ctx context.Context, rec OutcomeRecord, cov
 func (b *PRBackfiller) fetchPRState(ctx context.Context, rec OutcomeRecord) (PRStateSnapshot, error) {
 	if rec.PRNumber <= 0 && rec.PRURL == "" {
 		return PRStateSnapshot{}, fmt.Errorf("no PR identifier on record")
+	}
+
+	validPRURL := regexp.MustCompile(`^[a-zA-Z0-9_\-\./:]+$`)
+	if rec.PRURL != "" && !validPRURL.MatchString(rec.PRURL) {
+		return PRStateSnapshot{}, fmt.Errorf("invalid input")
 	}
 
 	args := []string{"pr", "view", "--json", "state,mergedAt,closedAt,statusCheckRollup"}
