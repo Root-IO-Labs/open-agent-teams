@@ -206,6 +206,8 @@ See `docs/AGENTS.md` for detailed agent documentation including:
 
 **Token use / idle mode:** When a repo has no workers, the daemon stops nudging supervisor/merge-queue/PR shepherd (idle mode); `oat daemon status` and `oat status` show idle vs active by repo.
 
+**Rejection cap:** Workers are auto-completed after repeated verification rejections (default: 3, configurable via `OAT_MAX_REJECTIONS`). The daemon escalates to the supervisor for task reassignment, preventing unbounded token waste from stuck workers.
+
 ## Extensibility
 
 External tools can integrate via:

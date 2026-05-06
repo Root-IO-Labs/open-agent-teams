@@ -44,7 +44,13 @@ Options:
   --gate-threshold <score>  Pass/fail threshold for gate (default: 70)
   --gate-only               Run only the gate, skip waves even if gate passes
   --gate-timeout <min>      Max minutes for gate worker (default: 30)
-  --judge-model <model>     Model for the LLM gate judge (default: claude-sonnet-4-6)
+  --judge-model <model>     Model for the LLM gate judge (default: tracks --model
+                            so the gate uses the same provider you're testing).
+                            Override to pin a fixed judge across runs when
+                            comparing scores between orchestrators.
+  --summary-model <model>   Model for the post-run LLM summary (default:
+                            tracks --model so the summary uses the same
+                            provider you're testing).
   --skip-convergence        Skip the post-wave convergence loop
   --convergence-timeout <min>  Max total minutes for convergence loop (default: 60)
   --convergence-iter-timeout <min>  Max minutes per convergence iteration (default: 30)
@@ -76,7 +82,11 @@ SKIP_GATE=false
 GATE_THRESHOLD=70
 GATE_ONLY=false
 GATE_TIMEOUT=30
-JUDGE_MODEL="claude-sonnet-4-6"
+# Empty until after arg parsing so we can default to $MODEL (the orchestrator
+# model) rather than hard-coding an Anthropic SKU. Avoids surprise charges
+# when the user runs --model openai:... but also has ANTHROPIC_API_KEY set.
+JUDGE_MODEL=""
+SUMMARY_MODEL=""
 SKIP_CONVERGENCE=false
 CONVERGENCE_TIMEOUT=60
 CONVERGENCE_ITER_TIMEOUT=30
@@ -102,6 +112,7 @@ while [[ $# -gt 0 ]]; do
         --gate-only) GATE_ONLY=true; shift ;;
         --gate-timeout) GATE_TIMEOUT="$2"; shift 2 ;;
         --judge-model) JUDGE_MODEL="$2"; shift 2 ;;
+        --summary-model) SUMMARY_MODEL="$2"; shift 2 ;;
         --skip-convergence) SKIP_CONVERGENCE=true; shift ;;
         --convergence-timeout) CONVERGENCE_TIMEOUT="$2"; shift 2 ;;
         --convergence-iter-timeout) CONVERGENCE_ITER_TIMEOUT="$2"; shift 2 ;;
@@ -129,6 +140,27 @@ if [[ "$ROUTING_MODE" == true && -z "$AVAILABLE_MODELS" ]]; then
     echo "Error: --available-worker-models is required when using --routing-mode"
     echo "Run with --help for usage."
     exit 1
+fi
+
+# Default judge / summary models to the orchestrator model so the gate and
+# the post-run summary use the same provider the user is testing. This
+# prevents surprise Anthropic (or any other) charges when running --model
+# against a different provider with multiple keys present in the env.
+if [[ -z "$JUDGE_MODEL" ]]; then
+    if [[ -n "$MODEL" ]]; then
+        JUDGE_MODEL="$MODEL"
+    else
+        # --skip-setup path with no --model; preserve historical behavior
+        # by falling back to Sonnet so existing automation doesn't break.
+        JUDGE_MODEL="anthropic:claude-sonnet-4-6"
+    fi
+fi
+if [[ -z "$SUMMARY_MODEL" ]]; then
+    if [[ -n "$MODEL" ]]; then
+        SUMMARY_MODEL="$MODEL"
+    else
+        SUMMARY_MODEL="anthropic:claude-sonnet-4-6"
+    fi
 fi
 
 # Set NAME_SUFFIX default so we can create RUN_DIR and capture terminal output from the start
@@ -433,7 +465,7 @@ count_open_issues() {
     local repo_full="$1"
     local wave_num="$2"
     local result
-    result=$(gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state open --json number --jq 'length' 2>/dev/null) || true
+    result=$(timeout 30 gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state open --json number --jq 'length' 2>/dev/null) || true
     if [[ -z "$result" || ! "$result" =~ ^[0-9]+$ ]]; then
         echo "-1"
     else
@@ -447,7 +479,7 @@ count_total_wave_issues() {
     # Live count via gh issue list. May be silently undercounted during a
     # GitHub indexing/search degradation (see Apr 27 2026 incident).
     local live
-    live=$(gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state all --json number --jq 'length' 2>/dev/null || echo "0")
+    live=$(timeout 30 gh issue list --repo "$repo_full" --label "wave:${wave_num}" --state all --json number --jq 'length' 2>/dev/null || echo "0")
     if [[ -z "$live" || ! "$live" =~ ^[0-9]+$ ]]; then
         live=0
     fi
@@ -526,6 +558,9 @@ wait_for_wave() {
             fi
         fi
 
+        # Refresh elapsed after API calls (which can hang for minutes)
+        elapsed=$(( $(date +%s) - wave_start ))
+
         # Soft nudge after nudge timeout (once per wave)
         if [[ $elapsed -ge $nudge_secs && "$nudge_sent" == false ]]; then
             nudge_sent=true
@@ -533,7 +568,7 @@ wait_for_wave() {
             send_to_workspace "$repo_name" "[automated benchmark script] Some wave ${wave_num} issues are still open. Please check if any workers are stuck. If a worker needs help, send it a message via oat message send. Do NOT make code changes or fix issues yourself -- only delegate to workers."
         fi
 
-        # Hard timeout
+        # Hard timeout (checked with fresh elapsed to catch API call hangs)
         if [[ $elapsed -ge $timeout_secs ]]; then
             log "    Wave ${wave_num} timed out (${open_count} issues still open)"
             return 1
@@ -1417,14 +1452,14 @@ Focus on one specific failure per issue. Then spawn a worker for each issue with
             # Issues close when workers call oat agent complete, but the merge-queue
             # may not have merged their PR yet. Without this, the next convergence
             # iteration tests main without the fix, producing identical results.
-            EXPECTED_PRS=$(gh issue list --repo "$REPO_FULL" --label "$FIX_LABEL" --state all --json number --jq 'length' 2>/dev/null || echo "0")
+            EXPECTED_PRS=$(timeout 30 gh issue list --repo "$REPO_FULL" --label "$FIX_LABEL" --state all --json number --jq 'length' 2>/dev/null || echo "0")
             if [[ "$EXPECTED_PRS" -gt 0 ]]; then
                 log "    Waiting for ${FIX_LABEL} PRs to merge (expecting ~${EXPECTED_PRS})..."
                 MERGE_WAIT_START=$(date +%s)
                 MERGE_WAIT_TIMEOUT=180
                 LAST_PRINT_TIME=0
                 while true; do
-                    MERGED_COUNT=$(gh pr list --repo "$REPO_FULL" --state merged --label "$FIX_LABEL" --json number --jq 'length' 2>/dev/null || echo "0")
+                    MERGED_COUNT=$(timeout 30 gh pr list --repo "$REPO_FULL" --state merged --label "$FIX_LABEL" --json number --jq 'length' 2>/dev/null || echo "0")
                     MERGE_ELAPSED=$(( $(date +%s) - MERGE_WAIT_START ))
                     NOW=$(date +%s)
                     if [[ "$MERGED_COUNT" -ge "$EXPECTED_PRS" ]]; then
@@ -1536,7 +1571,8 @@ fi
 
 if [[ "$SKIP_SUMMARY" == false ]]; then
     log "Running summarize.sh..."
-    "${SCRIPT_DIR}/summarize.sh" --dir "$RUN_DIR" --repo "$REPO_NAME" || log "Warning: summarize.sh failed"
+    "${SCRIPT_DIR}/summarize.sh" --dir "$RUN_DIR" --repo "$REPO_NAME" \
+        --model "$SUMMARY_MODEL" || log "Warning: summarize.sh failed"
     echo ""
 fi
 

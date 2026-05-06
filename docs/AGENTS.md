@@ -158,6 +158,8 @@ Verification agents:
 - Run tests in an isolated worktree
 - Deliver a verdict via `oat worker set-verdict`
 
+**Rejection cap**: Workers are auto-completed after repeated rejections (default: 3, configurable via `OAT_MAX_REJECTIONS`). When the cap is hit, the daemon escalates to the supervisor with context for task reassignment. This prevents unbounded token burn from workers stuck in rejection loops.
+
 ### 7. PR Shepherd (`internal/templates/agent-templates/pr-shepherd.md`)
 
 **Role**: Monitors and manages PRs in fork mode

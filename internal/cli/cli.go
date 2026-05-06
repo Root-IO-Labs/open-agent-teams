@@ -4313,18 +4313,31 @@ func (c *CLI) requestVerification(args []string) error {
 
 	verifierName := fmt.Sprintf("verify-%s", workerName)
 
+	// Snap the base branch SHA from the worker's worktree (fresher than daemon clone)
+	var baseSHA string
+	if baseRef := c.getBaseBranchRef(); baseRef != "" {
+		baseCmd := exec.CommandContext(c.cmdCtx(), "git", "rev-parse", baseRef)
+		if baseOut, err := baseCmd.Output(); err == nil {
+			baseSHA = strings.TrimSpace(string(baseOut))
+		}
+	}
+
 	fmt.Printf("Requesting verification for worker '%s' (SHA: %s)\n", workerName, commitSHA[:min(len(commitSHA), 8)])
 
 	// Set pending state atomically via daemon
 	client := socket.NewClient(c.paths.DaemonSock)
+	startVerArgs := map[string]interface{}{
+		"repo":          repoName,
+		"worker":        workerName,
+		"verifier_name": verifierName,
+		"commit_sha":    commitSHA,
+	}
+	if baseSHA != "" {
+		startVerArgs["base_sha"] = baseSHA
+	}
 	resp, err := client.Send(socket.Request{
 		Command: "start_verification",
-		Args: map[string]interface{}{
-			"repo":          repoName,
-			"worker":        workerName,
-			"verifier_name": verifierName,
-			"commit_sha":    commitSHA,
-		},
+		Args:    startVerArgs,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to contact daemon: %w", err)

@@ -178,6 +178,7 @@ type Agent struct {
 	PromptUserHash              string    `json:"prompt_user_hash,omitempty"`               // sha256 of user task message at spawn
 	PromptUserTokens            int       `json:"prompt_user_tokens,omitempty"`             // estimated token count of user task message
 	BaseSHA                     string    `json:"base_sha,omitempty"`                       // Pinned remote base commit (e.g. origin/main HEAD at request-review time); used as the verifier's diff base so concurrently-landed commits don't appear as deletions
+	RejectionCount              int       `json:"rejection_count,omitempty"`                // Number of times verification has rejected this worker; used for rejection cap escalation
 	InputTokens                 int64     `json:"input_tokens,omitempty"`                   // Cumulative input tokens from LLM API
 	OutputTokens                int64     `json:"output_tokens,omitempty"`                  // Cumulative output tokens from LLM API
 	TotalTokens                 int64     `json:"total_tokens,omitempty"`                   // InputTokens + OutputTokens

@@ -10,6 +10,11 @@ set -uo pipefail
 #   GH_TOKEN_CLASSIC=$GH_TOKEN_CLASSIC ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
 #     ./benchmarks/run-comparison.sh [--wave-timeout 45] [--timeout 360]
 #
+# (ANTHROPIC_API_KEY is only required because both legs run Anthropic models
+# by default. If you point this script at non-Anthropic models, set the
+# corresponding provider key instead — run.sh / summarize.sh /
+# judge-blackbox.sh resolve provider keys per-run via llm_call.py.)
+#
 # Results land in: benchmarks/results/comparison-<timestamp>/
 #   sonnet/        — full benchmark results + all logs
 #   haiku/         — full benchmark results + all logs
@@ -24,22 +29,53 @@ WAVE_TIMEOUT=45
 GRAND_TIMEOUT=360
 CONVERGENCE_TIMEOUT=90
 
+# When unset, the inner run.sh defaults each to the orchestrator model
+# being compared (so an OpenAI vs Anthropic comparison won't accidentally
+# bill the judge/summary calls to a third provider).
+JUDGE_MODEL=""
+SUMMARY_MODEL=""
+
 # Parse optional overrides
 while [[ $# -gt 0 ]]; do
     case $1 in
         --wave-timeout) WAVE_TIMEOUT="$2"; shift 2 ;;
         --timeout) GRAND_TIMEOUT="$2"; shift 2 ;;
         --convergence-timeout) CONVERGENCE_TIMEOUT="$2"; shift 2 ;;
+        --judge-model) JUDGE_MODEL="$2"; shift 2 ;;
+        --summary-model) SUMMARY_MODEL="$2"; shift 2 ;;
         --help)
             cat <<'EOF'
-Usage: ./benchmarks/run-comparison.sh [--wave-timeout MIN] [--timeout MIN] [--convergence-timeout MIN]
+Usage: ./benchmarks/run-comparison.sh [--wave-timeout MIN] [--timeout MIN]
+                                       [--convergence-timeout MIN]
+                                       [--judge-model PROVIDER:MODEL]
+                                       [--summary-model PROVIDER:MODEL]
 
 Runs robotic-barista benchmarks on Sonnet 4.6 and Haiku 4.5 in parallel.
 Results saved to benchmarks/results/comparison-<timestamp>/
 
 Required env vars:
   GH_TOKEN_CLASSIC    Classic PAT with repo scope
-  ANTHROPIC_API_KEY   Anthropic API key
+
+Optional env vars:
+  <PROVIDER>_API_KEY  API key for whichever provider each leg's model uses
+                      (ANTHROPIC_API_KEY for the default Sonnet+Haiku legs;
+                      OPENAI_API_KEY / GOOGLE_API_KEY / etc. if you swap
+                      models below). run.sh, summarize.sh, and
+                      judge-blackbox.sh surface a clear per-run error if
+                      the relevant key is missing.
+  OAT_BENCH_LLM_MODEL Optional override for the judge / summary models
+                      used by the per-run scripts (lower precedence than
+                      --judge-model / --summary-model below).
+
+Optional flags:
+  --judge-model       Override the LLM gate judge for both legs. Forwarded
+                      to each inner run.sh invocation. When unset, each leg
+                      defaults to its own orchestrator model (Sonnet for the
+                      Sonnet leg, Haiku for the Haiku leg) so cross-provider
+                      comparisons don't incur surprise charges to a third
+                      provider.
+  --summary-model     Override the LLM summarizer for both legs. Same
+                      semantics as --judge-model.
 
 Defaults: --wave-timeout 45  --timeout 360  --convergence-timeout 90
 EOF
@@ -72,11 +108,11 @@ else
     echo "  OK  GH_TOKEN_CLASSIC is set"
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "  WARN ANTHROPIC_API_KEY not set — summaries will be skipped"
-else
-    echo "  OK  ANTHROPIC_API_KEY is set"
-fi
+# Provider API keys are checked per-run by llm_call.py (it knows which
+# provider each leg's model resolves to and emits an actionable
+# "missing FOO_API_KEY" error). We deliberately don't pin Anthropic at
+# startup so cross-provider comparison runs (e.g. Sonnet vs gpt-5.2) work
+# without requiring keys for both providers up front.
 
 # Verify gh auth actually works
 echo ""
@@ -86,19 +122,6 @@ if gh auth status &>/dev/null; then
 else
     echo "  FAIL gh auth status failed — run 'gh auth login' first"
     fail=true
-fi
-
-# Verify API key works (quick model list call)
-if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    if curl -s --max-time 10 -H "x-api-key: $ANTHROPIC_API_KEY" \
-        -H "anthropic-version: 2023-06-01" \
-        "https://api.anthropic.com/v1/messages" \
-        -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
-        | grep -q '"id"' 2>/dev/null; then
-        echo "  OK  Anthropic API key works"
-    else
-        echo "  WARN Anthropic API check failed — key may be invalid or rate-limited"
-    fi
 fi
 
 echo ""
@@ -225,6 +248,17 @@ run_benchmark() {
 
     echo "[$(date '+%H:%M:%S')] Starting $short_name benchmark → $repo_name" | tee -a "$log_file"
 
+    # Build optional model-override args. ${arr[@]+"${arr[@]}"} is the
+    # bash-3.2-safe expansion under `set -u`: expands to nothing when the
+    # array is empty rather than tripping "unbound variable".
+    local extra_args=()
+    if [[ -n "$JUDGE_MODEL" ]]; then
+        extra_args+=(--judge-model "$JUDGE_MODEL")
+    fi
+    if [[ -n "$SUMMARY_MODEL" ]]; then
+        extra_args+=(--summary-model "$SUMMARY_MODEL")
+    fi
+
     # Run the benchmark, capturing all stdout/stderr.
     # || true ensures we continue even if run.sh exits non-zero.
     "$SCRIPT_DIR/run.sh" \
@@ -235,6 +269,7 @@ run_benchmark() {
         --convergence-timeout "$CONVERGENCE_TIMEOUT" \
         --nudge-timeout 12 \
         --poll-interval 120 \
+        ${extra_args[@]+"${extra_args[@]}"} \
         >> "$log_file" 2>&1 || {
         echo "[$(date '+%H:%M:%S')] $short_name run.sh exited with code $?" >> "$log_file"
     }
