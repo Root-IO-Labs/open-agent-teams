@@ -34,7 +34,5 @@ If you spot a problem with the formula, file an issue in the main repo:
 
 ## License
 
-The tap itself is MIT-licensed (see [`LICENSE`](LICENSE)). The
-underlying OAT project is also MIT-licensed; see
-<https://github.com/Root-IO-Labs/open-agent-teams/blob/main/LICENSE>
-for details.
+OAT is MIT-licensed. See
+<https://github.com/Root-IO-Labs/open-agent-teams/blob/main/LICENSE>.
