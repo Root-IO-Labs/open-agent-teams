@@ -26,6 +26,7 @@ Works with 17+ LLM providers via [langchain](docs/SUPPORTED_LLM_PROVIDERS.md), i
 - [Public Libraries](#public-libraries)
 - [Building from Source](#building-from-source)
 - [License](#license)
+- [Acknowledgements](#acknowledgements)
 
 ## AI-First Install
 
@@ -447,3 +448,13 @@ Requires: Go 1.24.2+, git, gh (authenticated)
 ## License
 
 MIT
+
+## Acknowledgements
+
+OAT drew inspiration from several projects:
+
+- **[Gastown](https://github.com/gastownhall/gastown)** — coordinating multiple agents on real engineering workflows.
+- **[multiclaude](https://github.com/dlorenc/multiclaude)** — multi-agent orchestration using Claude Code tenets and tmux.
+- **[Deep Agents](https://github.com/langchain-ai/deepagents)** — planning, tooling, and harness patterns for capable agent runtimes.
+
+Thank you to the authors and communities behind these projects.
