@@ -117,6 +117,12 @@ def reset_agent(agent_name: str, source_agent: str | None = None) -> None:
 
     agent_dir.mkdir(parents=True, exist_ok=True)
     agent_md = agent_dir / "AGENTS.md"
+
+    base_real = os.path.realpath(agents_dir)
+    target_real = os.path.realpath(agent_md)
+    if os.path.commonpath([base_real, target_real]) != base_real:
+        raise Exception("Invalid file path")
+
     agent_md.write_text(source_content)
 
     console.print(
