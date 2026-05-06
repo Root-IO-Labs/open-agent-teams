@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -86,6 +87,10 @@ func (m *Manager) CreateDetached(path, commit string) error {
 // If the branch is already checked out in another worktree (e.g., the main clone),
 // falls back to creating a local tracking branch (e.g., supervisor-main).
 func (m *Manager) CheckoutBranch(worktreePath, branch string) error {
+	validBranch := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validBranch.MatchString(branch) {
+		return fmt.Errorf("invalid input")
+	}
 	cmd := exec.CommandContext(m.ctx, "git", "checkout", branch)
 	cmd.Dir = worktreePath
 	if _, err := cmd.CombinedOutput(); err == nil {
@@ -317,6 +322,10 @@ func parseWorktreeList(output string) []WorktreeInfo {
 
 // BranchExists checks if a branch exists in the repository
 func (m *Manager) BranchExists(branchName string) (bool, error) {
+	validBranch := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validBranch.MatchString(branchName) {
+		return false, fmt.Errorf("invalid input")
+	}
 	cmd := exec.CommandContext(m.ctx, "git", "show-ref", "--verify", "--quiet", "refs/heads/"+branchName)
 	cmd.Dir = m.repoPath
 	err := cmd.Run()
@@ -345,6 +354,10 @@ func (m *Manager) DeleteBranch(branchName string) error {
 
 // ListBranchesWithPrefix lists all branches that start with the given prefix
 func (m *Manager) ListBranchesWithPrefix(prefix string) ([]string, error) {
+	validPrefix := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]*$`)
+	if !validPrefix.MatchString(prefix) {
+		return nil, fmt.Errorf("invalid input")
+	}
 	cmd := exec.CommandContext(m.ctx, "git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"+prefix)
 	cmd.Dir = m.repoPath
 	output, err := cmd.Output()
@@ -495,6 +508,10 @@ func (m *Manager) GetUpstreamRemote() (string, error) {
 
 // GetDefaultBranch returns the default branch name for a remote (e.g., "main" or "master")
 func (m *Manager) GetDefaultBranch(remote string) (string, error) {
+	validRemote := regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+	if !validRemote.MatchString(remote) {
+		return "", fmt.Errorf("invalid input")
+	}
 	// Try to get the default branch from the remote's HEAD
 	cmd := exec.CommandContext(m.ctx, "git", "symbolic-ref", fmt.Sprintf("refs/remotes/%s/HEAD", remote))
 	cmd.Dir = m.repoPath
@@ -742,6 +759,14 @@ type WorktreeState struct {
 
 // GetWorktreeState checks the current state of a worktree and whether it can be safely refreshed
 func GetWorktreeState(ctx context.Context, worktreePath string, remote string, mainBranch string) (WorktreeState, error) {
+	validRemote := regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+	validBranch := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validRemote.MatchString(remote) {
+		return WorktreeState{}, fmt.Errorf("invalid input")
+	}
+	if !validBranch.MatchString(mainBranch) {
+		return WorktreeState{}, fmt.Errorf("invalid input")
+	}
 	state := WorktreeState{
 		Path:       worktreePath,
 		CanRefresh: true,
@@ -863,6 +888,20 @@ type RefreshResult struct {
 // It fetches from the remote, stashes any uncommitted changes, rebases onto main,
 // and restores the stash. Returns detailed results about what happened.
 func RefreshWorktree(ctx context.Context, worktreePath string, remote string, mainBranch string) RefreshResult {
+	validRemote := regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+	validBranch := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validRemote.MatchString(remote) {
+		return RefreshResult{
+			WorktreePath: worktreePath,
+			Error:        fmt.Errorf("invalid input"),
+		}
+	}
+	if !validBranch.MatchString(mainBranch) {
+		return RefreshResult{
+			WorktreePath: worktreePath,
+			Error:        fmt.Errorf("invalid input"),
+		}
+	}
 	result := RefreshResult{
 		WorktreePath: worktreePath,
 	}

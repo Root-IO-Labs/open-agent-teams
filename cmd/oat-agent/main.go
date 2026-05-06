@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/version"
@@ -235,6 +236,12 @@ func hasRequiredPackages(pythonPath string) bool {
 // the package's `__init__.py` imports `oat_cli.main` eagerly. Invoking
 // the package instead lets the runtime handle double-registration cleanly.
 func buildPythonCommand(pythonExe, agentRuntimeDir string, args []string) *exec.Cmd {
+	validArg := regexp.MustCompile(`^[a-zA-Z0-9_\-\./:=,@+ ]+$`)
+	for _, arg := range args {
+		if arg != "" && !validArg.MatchString(arg) {
+			panic(fmt.Errorf("invalid input"))
+		}
+	}
 	// The command will be: python -m oat_cli [args...]
 	cmdArgs := []string{"-m", "oat_cli"}
 	cmdArgs = append(cmdArgs, args...)

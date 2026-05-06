@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -384,6 +385,11 @@ func (d *Daemon) escalatePRWakeToSupervisor(repoName, agentName string, prNumber
 // queryPRStatus tries to get PR status, falling back gracefully if statusCheckRollup
 // is inaccessible due to token permissions.
 func (d *Daemon) queryPRStatus(repoPath, prNum, repoName, agentName string) (prViewResult, bool) {
+	validPRNum := regexp.MustCompile(`^[0-9]+$`)
+	if !validPRNum.MatchString(prNum) {
+		d.logger.Debug("Invalid PR number for %s/%s: %s", repoName, agentName, prNum)
+		return prViewResult{}, false
+	}
 	// Try with statusCheckRollup first
 	cmd := exec.CommandContext(d.ctx, "gh", "pr", "view", prNum,
 		"--json", "mergeable,state,statusCheckRollup")
@@ -466,6 +472,10 @@ func allChecksPassed(checks []prCheckResult) bool {
 
 // hasCIPassedFallback checks if CI passed via `gh run list` when statusCheckRollup is unavailable.
 func (d *Daemon) hasCIPassedFallback(repoPath, agentName string) bool {
+	validAgentName := regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
+	if !validAgentName.MatchString(agentName) {
+		return false
+	}
 	branch := "work/" + agentName
 	cmd := exec.CommandContext(d.ctx, "gh", "run", "list",
 		"--branch", branch, "--limit", "1", "--json", "conclusion,status")
@@ -548,6 +558,10 @@ func (d *Daemon) buildMergeQueueCISummary(repoPath string) string {
 
 // getBranchCIStatus returns a human-readable CI status for a branch.
 func (d *Daemon) getBranchCIStatus(repoPath, branch string) string {
+	validBranch := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validBranch.MatchString(branch) {
+		return "unknown"
+	}
 	cmd := exec.CommandContext(d.ctx, "gh", "run", "list", "--branch", branch, "--limit", "1", "--json", "conclusion,status")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()

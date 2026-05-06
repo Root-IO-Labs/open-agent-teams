@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -270,6 +271,7 @@ func (c *CLI) validateSyntax(ctx context.Context) VerificationCheck {
 
 	modifiedFiles := c.getModifiedFiles()
 	vetedGoPkgs := make(map[string]bool) // deduplicate go vet by package dir
+	validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./ \\]+$`)
 
 	for _, file := range modifiedFiles {
 		select {
@@ -277,6 +279,13 @@ func (c *CLI) validateSyntax(ctx context.Context) VerificationCheck {
 			check.Issues = append(check.Issues, "Syntax validation timed out")
 			return check
 		default:
+		}
+
+		if !validPath.MatchString(file) {
+			check.Issues = append(check.Issues, fmt.Sprintf("Invalid file path: %s", file))
+			check.Score = math.Max(0, check.Score-15)
+			check.Passed = false
+			continue
 		}
 
 		ext := strings.ToLower(filepath.Ext(file))
@@ -300,6 +309,12 @@ func (c *CLI) validateSyntax(ctx context.Context) VerificationCheck {
 				pkgDir = "./."
 			} else {
 				pkgDir = "./" + pkgDir
+			}
+			if !validPath.MatchString(pkgDir) {
+				check.Issues = append(check.Issues, fmt.Sprintf("Invalid package path: %s", pkgDir))
+				check.Score = math.Max(0, check.Score-15)
+				check.Passed = false
+				continue
 			}
 			if vetedGoPkgs[pkgDir] {
 				continue // already vetted this package
@@ -360,6 +375,7 @@ func (c *CLI) runProjectTests(ctx context.Context) VerificationCheck {
 	testCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
+	validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./ \\]+$`)
 	var cmd *exec.Cmd
 	switch testRunner {
 	case "npm":
@@ -368,9 +384,23 @@ func (c *CLI) runProjectTests(ctx context.Context) VerificationCheck {
 		// Scope to changed directories containing Python files
 		changedDirs := c.changedDirectories(".py")
 		if len(changedDirs) > 0 {
-			args := append([]string{"-v"}, changedDirs...)
-			cmd = exec.CommandContext(testCtx, "pytest", args...)
-			fmt.Printf("    📁 Scoped to changed dirs: %s\n", strings.Join(changedDirs, ", "))
+			validDirs := []string{}
+			for _, dir := range changedDirs {
+				if !validPath.MatchString(dir) {
+					check.Issues = append(check.Issues, fmt.Sprintf("Invalid directory path: %s", dir))
+					check.Score = math.Max(0, check.Score-15)
+					check.Passed = false
+					continue
+				}
+				validDirs = append(validDirs, dir)
+			}
+			if len(validDirs) > 0 {
+				args := append([]string{"-v"}, validDirs...)
+				cmd = exec.CommandContext(testCtx, "pytest", args...)
+				fmt.Printf("    📁 Scoped to changed dirs: %s\n", strings.Join(validDirs, ", "))
+			} else {
+				cmd = exec.CommandContext(testCtx, "pytest", "-v")
+			}
 		} else {
 			cmd = exec.CommandContext(testCtx, "pytest", "-v")
 		}
@@ -378,9 +408,23 @@ func (c *CLI) runProjectTests(ctx context.Context) VerificationCheck {
 		// Scope to changed Go packages instead of running ./...
 		changedPkgs := c.changedGoPackages()
 		if len(changedPkgs) > 0 {
-			args := append([]string{"test"}, changedPkgs...)
-			cmd = exec.CommandContext(testCtx, "go", args...)
-			fmt.Printf("    📁 Scoped to changed packages: %s\n", strings.Join(changedPkgs, ", "))
+			validPkgs := []string{}
+			for _, pkg := range changedPkgs {
+				if !validPath.MatchString(pkg) {
+					check.Issues = append(check.Issues, fmt.Sprintf("Invalid package path: %s", pkg))
+					check.Score = math.Max(0, check.Score-15)
+					check.Passed = false
+					continue
+				}
+				validPkgs = append(validPkgs, pkg)
+			}
+			if len(validPkgs) > 0 {
+				args := append([]string{"test"}, validPkgs...)
+				cmd = exec.CommandContext(testCtx, "go", args...)
+				fmt.Printf("    📁 Scoped to changed packages: %s\n", strings.Join(validPkgs, ", "))
+			} else {
+				cmd = exec.CommandContext(testCtx, "go", "test", "./...")
+			}
 		} else {
 			cmd = exec.CommandContext(testCtx, "go", "test", "./...")
 		}

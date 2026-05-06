@@ -125,6 +125,10 @@ func (c *CLI) getImplementationSummary() string {
 	// HEAD as fallback for the case where no remote is configured.
 	refs := []string{"HEAD"}
 	if base := c.getDiffBaseRef(); base != "" {
+		validRef := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+		if !validRef.MatchString(base) {
+			return ""
+		}
 		refs = []string{base + "...HEAD", "HEAD"}
 	}
 

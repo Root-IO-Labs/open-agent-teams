@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -248,6 +249,11 @@ func (d *Daemon) alertSupervisorAboutWorker(repoName, agentName string, nudgeCou
 
 // getBranchSHA returns the remote SHA for a branch, or empty string if not pushed.
 func (d *Daemon) getBranchSHA(repoPath, branchName string) string {
+	validBranchName := regexp.MustCompile(`^[a-zA-Z0-9_\-/]+$`)
+	if !validBranchName.MatchString(branchName) {
+		d.logger.Error("Invalid branch name: %s", branchName)
+		return ""
+	}
 	cmd := exec.CommandContext(d.ctx, "git", "ls-remote", "--heads", "origin", branchName)
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -269,6 +275,11 @@ type workerPRInfo struct {
 
 // getWorkerPR checks if an open PR exists for the worker's branch.
 func (d *Daemon) getWorkerPR(repoPath, branchName string) *workerPRInfo {
+	validBranchName := regexp.MustCompile(`^[a-zA-Z0-9_\-/]+$`)
+	if !validBranchName.MatchString(branchName) {
+		d.logger.Error("Invalid branch name: %s", branchName)
+		return nil
+	}
 	cmd := exec.CommandContext(d.ctx, "gh", "pr", "list", "--head", branchName, "--state", "open", "--json", "number,title")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -372,6 +383,11 @@ func (d *Daemon) checkWorkerProgress(repoName, repoPath, agentName string, agent
 
 	// No branch pushed — check worktree for uncommitted changes
 	if agent.WorktreePath != "" {
+		validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+		if !validPath.MatchString(agent.WorktreePath) {
+			d.logger.Error("Invalid worktree path for worker %s: %s", agentName, agent.WorktreePath)
+			return
+		}
 		cmd := exec.CommandContext(d.ctx, "git", "status", "--porcelain")
 		cmd.Dir = agent.WorktreePath
 		output, err := cmd.Output()
@@ -406,6 +422,16 @@ func (d *Daemon) checkWorkerProgress(repoName, repoPath, agentName string, agent
 // the auto-complete flow.
 func (d *Daemon) closeAssociatedIssue(repoName, agentName string, agent state.Agent, reason string) {
 	if agent.IssueNumber == "" {
+		return
+	}
+	validIssueNumber := regexp.MustCompile(`^[0-9]+$`)
+	validAgentName := regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
+	if !validIssueNumber.MatchString(agent.IssueNumber) {
+		d.logger.Error("Invalid issue number for %s/%s: %s", repoName, agentName, agent.IssueNumber)
+		return
+	}
+	if !validAgentName.MatchString(agentName) {
+		d.logger.Error("Invalid agent name: %s", agentName)
 		return
 	}
 	repoPath := d.paths.RepoDir(repoName)
