@@ -301,7 +301,8 @@ async def _invoke_with_retries(
                     f"({type(exc).__name__}: {exc}). Giving up."
                 )
 
-    assert last_exc is not None
+    if last_exc is None:
+        raise AssertionError
     raise last_exc
 
 
