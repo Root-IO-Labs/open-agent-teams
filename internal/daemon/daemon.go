@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -5989,6 +5990,13 @@ func buildAgentEnvPrefix(paths *config.Paths, repoName string) string {
 	envVars := loadEnvFiles(paths.Root, paths.RepoDir(repoName))
 	if len(envVars) > 0 {
 		for k, v := range envVars {
+			// SECURITY: env keys are interpolated raw into a shell string
+			// passed to "$SHELL -l -c". A malformed key like
+			// `FOO; rm -rf $HOME #` would break out of the export
+			// statement. Skip anything that isn't a valid POSIX env name.
+			if !validEnvKey.MatchString(k) {
+				continue
+			}
 			prefix += "export " + k + "=" + quoteShellValue(v) + "; "
 		}
 	}
@@ -6030,6 +6038,10 @@ func loadEnvFiles(globalRoot, repoDir string) map[string]string {
 	}
 	return out
 }
+
+// validEnvKey matches the POSIX-conformant env-var name grammar. Used by
+// buildAgentEnvPrefix to reject .env keys that would break shell parsing.
+var validEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // quoteShellValue returns a single-quoted shell-safe representation of v (no logging of v).
 func quoteShellValue(v string) string {

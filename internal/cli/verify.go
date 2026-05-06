@@ -284,9 +284,11 @@ func (c *CLI) validateSyntax(ctx context.Context) VerificationCheck {
 
 		switch ext {
 		case ".py":
-			cmd = exec.CommandContext(ctx, "python", "-m", "py_compile", file)
+			cmd = exec.CommandContext(ctx, "python", "-m", "py_compile", "--", file)
 		case ".sh", ".bash":
-			cmd = exec.CommandContext(ctx, "bash", "-n", file)
+			// `--` prevents bash from interpreting filenames that start
+			// with `-` as flags (e.g. a repo containing `-r.sh`).
+			cmd = exec.CommandContext(ctx, "bash", "-n", "--", file)
 		case ".go":
 			// Convert to relative path and deduplicate by package directory
 			relFile := file

@@ -2,13 +2,53 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from tavily import TavilyClient
 
 _UNSET = object()
 _tavily_client: TavilyClient | object | None = _UNSET
+
+# Hosts/IPs that an LLM tool call must not reach. Cloud-instance metadata
+# services are the most common SSRF target — exfiltrating them yields IAM
+# credentials. We only block the well-known metadata IPs and link-local
+# range; deliberately do NOT block 127.0.0.1 / RFC1918 because dev workflows
+# legitimately call localhost APIs.
+_BLOCKED_HOSTS = frozenset(
+    {
+        "169.254.169.254",  # AWS / GCP / Azure / DigitalOcean / Oracle metadata
+        "metadata.google.internal",
+        "metadata.goog",
+        "fd00:ec2::254",  # AWS IPv6 metadata
+    }
+)
+
+
+def _ssrf_check(url: str) -> str | None:
+    """Return a reason string if the URL is unsafe to fetch, else None.
+
+    Blocks non-http(s) schemes (file://, gopher://, etc.) and well-known
+    cloud-metadata endpoints. Does not block private/loopback ranges since
+    dev tooling routinely calls them.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"scheme '{parsed.scheme}' is not allowed (only http/https)"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "URL has no host"
+    if host in _BLOCKED_HOSTS:
+        return f"host '{host}' is a cloud-metadata endpoint"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None  # hostname, not an IP — DNS resolution happens in requests
+    if ip.is_link_local:
+        return f"link-local address '{host}' is not allowed"
+    return None
 
 
 def _get_tavily_client() -> TavilyClient | None:
@@ -54,6 +94,15 @@ def http_request(
         Dictionary with response data including status, headers, and content
     """
     import requests
+
+    if reason := _ssrf_check(url):
+        return {
+            "success": False,
+            "status_code": 0,
+            "headers": {},
+            "content": f"Refused to fetch URL: {reason}",
+            "url": url,
+        }
 
     try:
         kwargs: dict[str, Any] = {}

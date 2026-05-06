@@ -127,6 +127,13 @@ type AgentConfig struct {
 
 	// EnvPrefix is a shell prefix run before the agent binary
 	// (e.g., "source ~/.zshrc; export GH_TOKEN=...;").
+	//
+	// SECURITY: This string is concatenated verbatim into the
+	// `$SHELL -l -c <cmd>` invocation in DirectBackend.Spawn. Anything
+	// placed here must already be shell-safe — values quoted via
+	// quoteShellValue (or equivalent), identifiers validated. Never
+	// populate this field from caller-supplied or repo-supplied data.
+	// The only sanctioned producer is daemon.buildAgentEnvPrefix.
 	EnvPrefix string
 
 	// InitialPrompt is the system prompt file path to write before launch.
