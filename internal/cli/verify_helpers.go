@@ -120,6 +120,7 @@ func (c *CLI) getBaseBranchRef() string {
 // It diffs against the base branch so committed work is visible (same as getModifiedFiles).
 func (c *CLI) getImplementationSummary() string {
 	var statOutput, diffOutput []byte
+	validRef := regexp.MustCompile(`^[a-zA-Z0-9_\-\.\/]+$`)
 
 	// Build diff refs: pinned BaseSHA (or live base branch) first, then
 	// HEAD as fallback for the case where no remote is configured.
@@ -129,6 +130,9 @@ func (c *CLI) getImplementationSummary() string {
 	}
 
 	for _, ref := range refs {
+		if !validRef.MatchString(ref) {
+			continue
+		}
 		cmd := exec.CommandContext(c.cmdCtx(), "git", "diff", "--stat", ref)
 		if out, err := cmd.Output(); err == nil && len(out) > 0 {
 			statOutput = out

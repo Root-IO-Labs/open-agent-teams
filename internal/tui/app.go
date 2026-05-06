@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -575,6 +576,11 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if a.activeAgent != "" {
 			logPath := a.getAgentLogPath(a.activeAgent)
 			if logPath != "" {
+				validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+				if !validPath.MatchString(logPath) {
+					a.statusMsg = "invalid input"
+					return a, nil
+				}
 				if _, err := os.Stat(logPath); err == nil {
 					return a, tea.ExecProcess(exec.Command("less", "+G", "-R", logPath), func(err error) tea.Msg {
 						return openLogDoneMsg{err: err}

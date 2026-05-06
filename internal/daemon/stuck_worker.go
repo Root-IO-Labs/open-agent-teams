@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -248,6 +249,10 @@ func (d *Daemon) alertSupervisorAboutWorker(repoName, agentName string, nudgeCou
 
 // getBranchSHA returns the remote SHA for a branch, or empty string if not pushed.
 func (d *Daemon) getBranchSHA(repoPath, branchName string) string {
+	validBranchName := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validBranchName.MatchString(branchName) {
+		return ""
+	}
 	cmd := exec.CommandContext(d.ctx, "git", "ls-remote", "--heads", "origin", branchName)
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -269,6 +274,10 @@ type workerPRInfo struct {
 
 // getWorkerPR checks if an open PR exists for the worker's branch.
 func (d *Daemon) getWorkerPR(repoPath, branchName string) *workerPRInfo {
+	validBranchName := regexp.MustCompile(`^[a-zA-Z0-9_\-\./]+$`)
+	if !validBranchName.MatchString(branchName) {
+		return nil
+	}
 	cmd := exec.CommandContext(d.ctx, "gh", "pr", "list", "--head", branchName, "--state", "open", "--json", "number,title")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
@@ -372,6 +381,10 @@ func (d *Daemon) checkWorkerProgress(repoName, repoPath, agentName string, agent
 
 	// No branch pushed — check worktree for uncommitted changes
 	if agent.WorktreePath != "" {
+		validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+		if !validPath.MatchString(agent.WorktreePath) {
+			return
+		}
 		cmd := exec.CommandContext(d.ctx, "git", "status", "--porcelain")
 		cmd.Dir = agent.WorktreePath
 		output, err := cmd.Output()
@@ -406,6 +419,17 @@ func (d *Daemon) checkWorkerProgress(repoName, repoPath, agentName string, agent
 // the auto-complete flow.
 func (d *Daemon) closeAssociatedIssue(repoName, agentName string, agent state.Agent, reason string) {
 	if agent.IssueNumber == "" {
+		return
+	}
+	validIssueNumber := regexp.MustCompile(`^[0-9]+$`)
+	validInput := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\ :,\n]+$`)
+	if !validIssueNumber.MatchString(agent.IssueNumber) {
+		return
+	}
+	if !validInput.MatchString(reason) {
+		return
+	}
+	if !validInput.MatchString(agentName) {
 		return
 	}
 	repoPath := d.paths.RepoDir(repoName)

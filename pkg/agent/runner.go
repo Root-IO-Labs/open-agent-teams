@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -160,6 +161,10 @@ func ResolveBinaryPath() string {
 // This is useful for verifying prerequisites before attempting to use the Runner.
 // Similar to checking backend availability before use.
 func (r *Runner) IsBinaryAvailable() bool {
+	validPath := regexp.MustCompile(`^[a-zA-Z0-9_\-\./\\]+$`)
+	if !validPath.MatchString(r.BinaryPath) {
+		return false
+	}
 	cmd := exec.Command(r.BinaryPath, "--version")
 	return cmd.Run() == nil
 }
