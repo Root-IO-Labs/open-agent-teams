@@ -377,8 +377,17 @@ wave_timing_from_file() {
     fi
 }
 
-# Wave 0 (gate phase) always uses PR-derived timing — run.sh doesn't track wave 0 epochs
-WAVE0_TIMING=$(wave_timing "wave:0")
+# Wave 0 (gate phase) prefers run.sh-tracked epochs from wave-timing.json;
+# falls back internally to PR-derived timing for old result dirs that
+# pre-date wave 0 epoch tracking. PR-derived fallback is unreliable for
+# wave 0 (GitHub's "closes #N OR fixes #N" search is too fuzzy and matches
+# substrings, e.g. issue #1 spuriously matching PR bodies that mention #17),
+# but it's still the only option for historical runs.
+if [[ -f "$WAVE_TIMING_FILE" ]]; then
+    WAVE0_TIMING=$(wave_timing_from_file "0")
+else
+    WAVE0_TIMING=$(wave_timing "wave:0")
+fi
 
 if [[ -f "$WAVE_TIMING_FILE" ]]; then
     echo "    Using wave-timing.json from run script"

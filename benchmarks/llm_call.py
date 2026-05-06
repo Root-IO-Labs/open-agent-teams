@@ -7,7 +7,7 @@ openrouter, deepseek, ollama, custom config.toml providers, ...) instead of
 calling the Anthropic REST API directly with curl.
 
 Resolution path mirrors ``benchmarks/probe-model.py``: try
-``deepagents_cli.config.create_model`` first (honors ``~/.oat/config.toml``
+``oat_cli.config.create_model`` first (honors ``~/.oat/config.toml``
 custom providers), then fall back to ``langchain.chat_models.init_chat_model``.
 
 Usage::
@@ -51,7 +51,7 @@ import sys
 import time
 from typing import Any
 
-# Add OAT's Python paths so we can import deepagents_cli.config and langchain
+# Add OAT's Python paths so we can import oat_cli.config and langchain
 # without requiring the caller to activate the venv. Mirrors probe-model.py
 # lines 56-63 — keep these in sync.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +117,7 @@ def _resolve_model(model_string: str) -> tuple[Any, str]:
 
     Two-path resolution mirrors ``probe-model.py``:
 
-    1. ``deepagents_cli.config.create_model`` — honors ``~/.oat/config.toml``
+    1. ``oat_cli.config.create_model`` — honors ``~/.oat/config.toml``
        custom providers.
     2. ``langchain.chat_models.init_chat_model`` — fallback for installations
        without the OAT CLI venv (e.g. in CI).
@@ -127,9 +127,9 @@ def _resolve_model(model_string: str) -> tuple[Any, str]:
 
     # Path 1: OAT's create_model (preferred — supports config.toml).
     try:
-        from deepagents_cli.config import create_model  # type: ignore[import-not-found]
+        from oat_cli.config import create_model  # type: ignore[import-not-found]
     except ImportError as exc:
-        _log(f"WARN: deepagents_cli.config unavailable ({type(exc).__name__}): {exc}")
+        _log(f"WARN: oat_cli.config unavailable ({type(exc).__name__}): {exc}")
     else:
         try:
             wrapper = create_model(canonical)

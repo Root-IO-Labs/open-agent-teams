@@ -36,9 +36,6 @@ Thumbs.db
 .oat/*
 !.oat/*.md
 
-# OAT Agent Runtime prompt injection (written per-worktree)
-.deepagents/
-
 # Benchmark results (generated per-run)
 benchmarks/results/
 benchmarks/routing-test-repo/results/

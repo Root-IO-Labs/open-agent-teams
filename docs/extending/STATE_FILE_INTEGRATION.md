@@ -2,7 +2,7 @@
 
 <!-- state-struct: State repos current_repo -->
 <!-- state-struct: Repository github_url session_name agents task_history merge_queue_config pr_shepherd_config fork_config target_branch idle_mode model allowed_worker_models workspace_stuck_detection -->
-<!-- state-struct: Agent type worktree_path window_name session_id pid task summary failure_reason created_at last_nudge last_nudge_hash nudge_skip_count ready_for_cleanup ready_for_cleanup_at issue_number issue_url nudge_count nudge_reset_used last_branch_sha model routing_source base_sha input_tokens output_tokens total_tokens cache_read_tokens cache_creation_tokens last_token_update max_tokens waiting_for_pr waiting_for_pr_since waiting_for_verification waiting_for_verification_since pr_number verification_agent verification_status verified_commit_sha verification_at verification_reason last_pr_comment_id last_wake_reason woken_for_merged_pr_at last_nudge_tier suppressed_nudge_count -->
+<!-- state-struct: Agent type worktree_path window_name session_id pid task summary failure_reason created_at last_nudge last_nudge_hash nudge_skip_count ready_for_cleanup ready_for_cleanup_at issue_number issue_url nudge_count nudge_reset_used last_branch_sha model routing_source routing_decision_reason routing_candidates routing_allowlist prompt_system_hash prompt_system_tokens prompt_user_hash prompt_user_tokens rejection_count base_sha input_tokens output_tokens total_tokens cache_read_tokens cache_creation_tokens last_token_update max_tokens waiting_for_pr waiting_for_pr_since waiting_for_verification waiting_for_verification_since pr_number verification_agent verification_status verified_commit_sha verification_at verification_reason last_pr_comment_id last_wake_reason woken_for_merged_pr_at last_nudge_tier suppressed_nudge_count -->
 <!-- state-struct: TaskHistoryEntry name task branch pr_url pr_number status summary failure_reason model created_at completed_at input_tokens output_tokens total_tokens -->
 <!-- state-struct: MergeQueueConfig enabled track_mode -->
 <!-- state-struct: PRShepherdConfig enabled track_mode -->
@@ -84,6 +84,14 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
   "verification_reason": "",          // Verdict reason text (workers only)
   "base_sha": "",                     // Pinned remote default-branch SHA for the verifier diff (workers only; set at request-review)
   "routing_source": "",               // Tag identifying which routing rule chose this agent's model
+  "routing_decision_reason": "",      // Human-readable reason from the router (e.g. "complexity=complex floor=9 chose haiku")
+  "routing_candidates": [],           // Ranked candidate model IDs at decision time; first = the pick (counterfactual replay)
+  "routing_allowlist": [],            // Snapshot of repo's AllowedWorkerModels at decision time
+  "prompt_system_hash": "",           // sha256 of system prompt at spawn (feeds OutcomeRecord.Prompt)
+  "prompt_system_tokens": 0,          // Estimated token count of system prompt at spawn
+  "prompt_user_hash": "",             // sha256 of user task message at spawn
+  "prompt_user_tokens": 0,            // Estimated token count of user task message at spawn
+  "rejection_count": 0,               // Number of times verification rejected this worker; used for rejection cap escalation (workers only)
   "last_nudge_hash": "",              // Hash of last nudge body for deduplication
   "nudge_skip_count": 0               // Consecutive nudges suppressed by hash dedup
 }
