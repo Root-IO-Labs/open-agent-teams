@@ -1,0 +1,7 @@
+# Gitleaks configuration for open-agent-teams.
+# Full-history scan (gitleaks detect --source .) was run clean before enabling CI.
+
+title = "OAT Gitleaks"
+
+# Add [[allowlist.commits]], [allowlist.paths], or regexes here if a future scan
+# reports false positives that cannot be fixed in source.

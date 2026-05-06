@@ -1,0 +1,18 @@
+[project]
+name = "oat-agent-builder"
+version = "0.1.0"
+description = "Built-in OAT agent that creates new agent types via an interactive builder"
+requires-python = ">=3.11"
+dependencies = [
+    "deep-loom-kit",
+    "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+agent-builder = "run:main"
+
+[tool.uv.sources]
+deep-loom-kit = { path = "./libs/deep_loom_kit-0.3.2-py3-none-any.whl" }
+
+[tool.uv]
+package = false

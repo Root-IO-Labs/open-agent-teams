@@ -1,0 +1,67 @@
+name: Bug report
+description: Report something that is broken or behaving unexpectedly
+title: "[bug] <short summary>"
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug! Please fill out the sections below so we can reproduce
+        and fix it. If this is a security issue, **do not** file it here — use the
+        [security advisory form](https://github.com/Root-IO-Labs/open-agent-teams/security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected to happen instead.
+      placeholder: When I ran `oat ...`, I expected X but got Y.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal command sequence or code snippet that reliably triggers the bug.
+      placeholder: |
+        1. `oat init ...`
+        2. `oat spawn ...`
+        3. Observe error in logs
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: oat-version
+    attributes:
+      label: oat version
+      description: Output of `oat version`
+      placeholder: "oat vX.Y.Z (commit abcd123, built 2026-04-20)"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. macOS 15.2 (arm64), Ubuntu 24.04 (amd64)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / traceback
+      description: Paste daemon, agent, or CLI logs. Redact secrets first.
+      render: shell
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I redacted any secrets, tokens, or private information from logs.
+          required: true

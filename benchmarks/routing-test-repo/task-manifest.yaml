@@ -1,0 +1,231 @@
+# Routing-test task manifest.
+#
+# Each task: an isolated, verifiable worker assignment. The harness sends
+# `task_text` to the supervisor or directly to `oat worker create`, waits for
+# completion, then runs `verify` from the repo root. Verify MUST:
+#   - exit 0 on success, non-zero on failure
+#   - be deterministic (no time/net/random)
+#   - not write outside the repo's worktree
+#
+# `complexity` is the operator's judgement of how much model capability this
+# needs — trivial/simple/standard/complex. It's what we measure routing
+# against: "did the router pick a model whose success rate in this complexity
+# class is ≥ floor?"
+#
+# `expected_tier_floor` maps to the RouterCheapestWithFloor tier levels in
+# benchmarks/routing-replay/replay.py. Pre-registration of "cheapest we expect
+# to handle this" lets us flag WRONG routing without waiting for a failure.
+#
+# `depends_on` lists other task IDs that should run first. Empty = independent.
+
+version: 1
+fixture: budget-cli
+last_updated: 2026-04-23
+
+tasks:
+  # ── Trivial ────────────────────────────────────────────────────────────
+  - id: typo-01
+    complexity: trivial
+    expected_tier_floor: 0  # any eligible model should handle this
+    task_text: |
+      Fix the typo "expance" in src/budget_cli/cli.py — it should read
+      "expense". Only the user-facing string needs to change. Run `pytest`
+      to confirm; there is an xfail test that flips to passing once the
+      typo is fixed.
+    verify:
+      # Only check the xfail test — the string "expance" appearing in a
+      # docstring or comment is fine (and the task explicitly says so).
+      # The earlier grep-based check produced false-FAILs when the worker
+      # correctly scoped the change to the user-facing string.
+      - cmd: "pytest tests/test_cli.py::test_typo_expense_not_expance -x"
+        expect_exit: 0
+    depends_on: []
+
+  # ── Simple ─────────────────────────────────────────────────────────────
+  - id: validate-01
+    complexity: simple
+    expected_tier_floor: 2
+    task_text: |
+      The `budget add` command in src/budget_cli/cli.py accepts negative
+      amounts silently. Reject negative amounts: return a non-zero exit code
+      and print a clear error. The xfail test
+      tests/test_cli.py::test_reject_negative_amount flips to pass when done.
+    verify:
+      - cmd: "pytest tests/test_cli.py::test_reject_negative_amount -x"
+        expect_exit: 0
+    depends_on: []
+
+  - id: env-home-01
+    complexity: simple
+    expected_tier_floor: 2
+    task_text: |
+      src/budget_cli/storage.py hardcodes the state path to
+      `~/.budget/state.json`. It should honor a `BUDGET_HOME` environment
+      variable if set (pointing at a directory containing `state.json`);
+      fall back to `~/.budget` otherwise. The xfail test
+      tests/test_cli.py::test_env_home_respected flips to pass when done.
+      Existing tests must continue to pass.
+    verify:
+      - cmd: "pytest tests/test_cli.py::test_env_home_respected tests/test_cli.py::test_add_then_list -x"
+        expect_exit: 0
+    depends_on: []
+
+  - id: filter-01
+    complexity: simple
+    expected_tier_floor: 2
+    task_text: |
+      Add a `--category` option to `budget list` in src/budget_cli/cli.py.
+      When set, only show entries whose category matches (exact match, case
+      sensitive is fine). No flag → behave as today. The xfail test
+      tests/test_cli.py::test_list_category_filter flips to pass when done.
+    verify:
+      - cmd: "pytest tests/test_cli.py::test_list_category_filter tests/test_cli.py::test_add_then_list -x"
+        expect_exit: 0
+    depends_on: []
+
+  # ── Standard ───────────────────────────────────────────────────────────
+  - id: csv-export-01
+    complexity: standard
+    expected_tier_floor: 3
+    task_text: |
+      Extend `budget export` in src/budget_cli/cli.py to support
+      `--format csv`. Columns: date,category,amount,note (in that order).
+      First row is the header. Keep `--format json` working. The xfail test
+      tests/test_cli.py::test_export_csv flips to pass when done. Existing
+      tests must continue to pass. Don't add any new dependencies.
+    verify:
+      - cmd: "pytest tests/test_cli.py::test_export_csv tests/test_cli.py::test_export_json_is_valid -x"
+        expect_exit: 0
+    depends_on: []
+
+  - id: month-total-02
+    complexity: standard
+    expected_tier_floor: 3
+    task_text: |
+      Add a `--month YYYY-MM` flag to `budget total` in src/budget_cli/cli.py.
+      When set, sum only entries whose date matches the given month (YYYY-MM
+      prefix of the ISO date). Invalid format should fail with a clear error.
+      No flag → behave as today. The xfail test
+      tests/test_cli.py::test_total_month_filter flips to pass when done.
+    verify:
+      - cmd: "pytest tests/test_cli.py::test_total_month_filter tests/test_cli.py::test_total_sums_entries -x"
+        expect_exit: 0
+    depends_on: []
+
+  # ── Complex ────────────────────────────────────────────────────────────
+  - id: storage-split-01
+    complexity: complex
+    expected_tier_floor: 5
+    task_text: |
+      Refactor src/budget_cli/storage.py. Today it mixes serialization
+      (dict↔json) with file I/O. Split into two pieces:
+
+        1. A Serializer interface (or duck-typed class) with at least
+           `serialize(state) -> str` and `deserialize(text) -> state`,
+           plus a JsonSerializer implementation. The module can be named
+           `budget_cli.serializer` or `budget_cli.serialization` — either
+           works for the test hook.
+        2. A Repo class that owns the file path, uses a Serializer, and
+           exposes `load()` / `save(state)`.
+
+      Update src/budget_cli/cli.py to use the new Repo class. All existing
+      tests in tests/test_cli.py must continue to pass. The xfail test
+      test_storage_split_has_serializer flips to pass when done.
+
+      Keep the default state path behavior from storage.py (respecting
+      BUDGET_HOME if env-home-01 has already landed).
+    verify:
+      # Run the tests relevant to storage (add/list/total/export/roundtrip)
+      # plus the test hook for this task. We deliberately exclude the xfail
+      # tests for OTHER seeded tasks — those are expected to still xfail
+      # since this worker only handled the storage split.
+      - cmd: "pytest tests/test_cli.py::test_add_then_list tests/test_cli.py::test_total_sums_entries tests/test_cli.py::test_export_json_is_valid tests/test_cli.py::test_entry_roundtrip tests/test_cli.py::test_storage_split_has_serializer -x"
+        expect_exit: 0
+      - cmd: "test -f src/budget_cli/serializer.py -o -f src/budget_cli/serialization.py"
+        expect_exit: 0
+    depends_on: []
+    notes: |
+      This is a real multi-file refactor. A trivial-tier model will likely
+      fail to preserve all tests. The "expected_tier_floor: 5" reflects
+      that — we expect sonnet / haiku to handle it, and anything below
+      to struggle.
+
+  - id: typed-errors-01
+    complexity: complex
+    expected_tier_floor: 5
+    task_text: |
+      Introduce a small error-class hierarchy in a new file
+      src/budget_cli/errors.py:
+
+        class BudgetError(Exception): ...
+        class StorageError(BudgetError): ...
+        class ValidationError(BudgetError): ...
+        class ExportError(BudgetError): ...
+
+      Replace `ValueError` and `click.BadParameter` raises in
+      src/budget_cli/cli.py and src/budget_cli/storage.py with the
+      appropriate subclass. In the CLI's top-level handler, catch
+      BudgetError, print the message, return a non-zero exit code
+      (use 1 for ValidationError, 2 for StorageError, 3 for ExportError).
+
+      Add one test per error subclass in tests/test_cli.py demonstrating
+      the exit-code mapping. The xfail test test_typed_errors_hierarchy
+      flips to pass when done. All other tests must continue to pass.
+    verify:
+      # Run the non-other-task tests plus the typed-errors hook. Excluding
+      # the OTHER seeded-task xfail tests (typo, negative-amount, etc.)
+      # keeps this verify independent of their completion state.
+      - cmd: "pytest tests/test_cli.py::test_add_then_list tests/test_cli.py::test_total_sums_entries tests/test_cli.py::test_export_json_is_valid tests/test_cli.py::test_entry_roundtrip tests/test_cli.py::test_typed_errors_hierarchy -x"
+        expect_exit: 0
+      - cmd: "test -f src/budget_cli/errors.py"
+        expect_exit: 0
+    depends_on: []
+
+  # ── Diverse extensions (Tier 0 expansion 2026-04-24) ───────────────────
+  # Two tasks that exercise the bottom and top of the tier ladder, where
+  # the original 8-task suite never sent any work. Designed to test whether
+  # nano (cheapest) and sonnet (most-capable) ever get routed to.
+
+  - id: gitignore-01
+    complexity: trivial
+    expected_tier_floor: 0
+    task_text: |
+      Create a .gitignore file at the repo root with these entries (one per
+      line): __pycache__/, *.pyc, .venv/, .pytest_cache/, *.egg-info/.
+      Commit the file. No other changes.
+    verify:
+      - cmd: "test -f .gitignore"
+        expect_exit: 0
+      - cmd: "grep -q '__pycache__' .gitignore && grep -q '\\.venv' .gitignore && grep -q '\\*.pyc' .gitignore"
+        expect_exit: 0
+    depends_on: []
+    notes: |
+      Pure trivial — single file, no logic, no tests to update. If V1
+      doesn't route this to nano (tier 3) or below, the classifier is
+      mis-bucketing it.
+
+  - id: transactions-01
+    complexity: complex
+    expected_tier_floor: 9
+    task_text: |
+      Add transactional rollback to src/budget_cli/storage.py:
+      save_state() should write to a temp file first, then atomically
+      rename to the target path. If the temp-write fails midway, the
+      previous state file must remain intact.
+
+      Add a new test in tests/test_cli.py named
+      test_storage_atomic_rollback that:
+        - Pre-seeds a state file with one entry
+        - Uses monkeypatch to make json.dump raise IOError mid-write
+        - Calls save_state with new data
+        - Asserts the original state file is unchanged
+
+      All existing tests must continue to pass.
+    verify:
+      - cmd: "pytest tests/test_cli.py::test_storage_atomic_rollback tests/test_cli.py::test_add_then_list tests/test_cli.py::test_total_sums_entries -x"
+        expect_exit: 0
+    depends_on: []
+    notes: |
+      Real complex task: requires understanding of atomic-write pattern
+      AND adding a non-trivial test (with monkeypatch). A worker that
+      hand-waves the rollback or skips the test will fail verify.

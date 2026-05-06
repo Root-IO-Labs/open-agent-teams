@@ -1,0 +1,164 @@
+# goreleaser config for open-agent-teams.
+#
+# Triggered by `git tag v*` + a push of the tag. Builds oat (and oat-agent)
+# for Linux/macOS on amd64+arm64, stamps internal/version with the tag /
+# commit / RFC-3339 build date, and publishes a GitHub Release with tar.gz
+# archives + SHA256 checksums.
+#
+# The Homebrew tap block is intentionally left commented out until
+# Root-IO-Labs/homebrew-oat is flipped public AND the HOMEBREW_TAP_GITHUB_TOKEN
+# secret is provisioned on this repo. Both steps happen right before the
+# first v* tag; until then a goreleaser run that can't push to the tap
+# would fail the whole release workflow, so keep the block off by default.
+
+version: 2
+
+project_name: oat
+
+before:
+  hooks:
+    - go mod tidy
+    # Stage agent-runtime/ (excluding venvs / pycache / partners / examples)
+    # into .release-stage/ so each archive ships the Python runtime alongside
+    # the Go binaries. The bundled install.sh runs `uv sync` on this tree.
+    - bash scripts/stage-agent-runtime.sh
+
+builds:
+  - id: oat
+    main: ./cmd/oat
+    binary: oat
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Version={{.Version}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Date={{.Date}}
+
+  - id: oat-agent
+    main: ./cmd/oat-agent
+    binary: oat-agent
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Version={{.Version}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Root-IO-Labs/open-agent-teams/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    ids: [oat, oat-agent]
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - CONTRIBUTING.md
+      - SECURITY.md
+      # Bundled post-extract installer (symlinks binaries into ~/.local/bin
+      # and runs `uv sync` on the staged agent-runtime). Renamed to install.sh
+      # so users can extract and run `./install.sh` directly.
+      - src: scripts/install-from-release.sh
+        dst: install.sh
+      # Staged Python runtime (excludes venvs, pycache, examples, partners).
+      # See scripts/stage-agent-runtime.sh for the exact filter.
+      - src: .release-stage/agent-runtime/**/*
+        dst: agent-runtime
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: Root-IO-Labs
+    name: open-agent-teams
+  draft: false
+  prerelease: auto
+  name_template: "{{ .ProjectName }} {{ .Tag }}"
+  header: |
+    ## Installation
+
+    ### One-line install (recommended)
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/Root-IO-Labs/open-agent-teams/main/install.sh | bash
+    ```
+
+    Detects your OS/arch, downloads the matching archive below, and runs
+    the bundled installer (symlinks `oat` + `oat-agent` into `~/.local/bin`,
+    sets up the Python agent-runtime via `uv sync`). Pin a version with
+    `OAT_VERSION={{ .Tag }} curl … | bash`.
+
+    ### Homebrew (once the tap lands)
+
+    ```bash
+    brew tap Root-IO-Labs/oat
+    brew install oat
+    ```
+
+    ### Direct download
+
+    Pick the archive for your OS/arch below, `tar -xzf` it, then run
+    `./install.sh` from the extracted directory.
+
+    ### From source
+
+    ```bash
+    go install github.com/Root-IO-Labs/open-agent-teams/cmd/oat@{{ .Tag }}
+    ```
+
+# Homebrew tap publication. The Root-IO-Labs/homebrew-oat tap is public
+# and HOMEBREW_TAP_GITHUB_TOKEN is provisioned on this repo. GoReleaser
+# auto-commits Formula/oat.rb on each v* tag.
+brews:
+  - name: oat
+    # Archive id (from archives[].id) — the bundled tarball that ships
+    # both `oat` and `oat-agent`, so the formula can install both.
+    ids: [default]
+    repository:
+      owner: Root-IO-Labs
+      name: homebrew-oat
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: oat-releaser
+      email: releases@root.io
+    directory: Formula
+    homepage: https://github.com/Root-IO-Labs/open-agent-teams
+    description: Orchestrate parallel coding agents on GitHub repos.
+    license: MIT
+    test: |
+      system "#{bin}/oat", "version"
+      system "#{bin}/oat-agent", "--version"
+    install: |
+      bin.install "oat"
+      bin.install "oat-agent"

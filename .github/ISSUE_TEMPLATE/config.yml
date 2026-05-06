@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Root-IO-Labs/open-agent-teams/security/advisories/new
+    about: Privately report a security issue via GitHub Security Advisories. Do NOT open a public issue.
+  - name: Discussions
+    url: https://github.com/Root-IO-Labs/open-agent-teams/discussions
+    about: Ask a question, share an idea, or start a conversation with the community.
