@@ -21,6 +21,7 @@ func TestGetDefaultPrompt(t *testing.T) {
 		{"worker", state.AgentTypeWorker, true},
 		{"merge-queue", state.AgentTypeMergeQueue, true},
 		{"review", state.AgentTypeReview, true},
+		{"browser", state.AgentTypeBrowser, true},
 		{"unknown", state.AgentType("unknown"), true},
 	}
 
@@ -72,6 +73,9 @@ func TestGetDefaultPromptContent(t *testing.T) {
 	}
 	if GetDefaultPrompt(state.AgentTypeReview) != "" {
 		t.Error("review prompt should be empty (configurable agent)")
+	}
+	if GetDefaultPrompt(state.AgentTypeBrowser) != "" {
+		t.Error("browser prompt should be empty (uses template, not embedded prompt)")
 	}
 }
 
@@ -176,6 +180,37 @@ func TestLoadCustomPrompt(t *testing.T) {
 		}
 		if prompt != customContent {
 			t.Errorf("expected %q, got %q", customContent, prompt)
+		}
+	})
+
+	t.Run("with custom browser prompt", func(t *testing.T) {
+		customContent := "Custom browser instructions"
+		promptPath := filepath.Join(oatDir, "BROWSER.md")
+		if err := os.WriteFile(promptPath, []byte(customContent), 0644); err != nil {
+			t.Fatalf("failed to write custom prompt: %v", err)
+		}
+
+		prompt, err := LoadCustomPrompt(tmpDir, state.AgentTypeBrowser)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if prompt != customContent {
+			t.Errorf("expected %q, got %q", customContent, prompt)
+		}
+	})
+
+	t.Run("browser prompt absent returns empty", func(t *testing.T) {
+		emptyDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(emptyDir, ".oat"), 0755); err != nil {
+			t.Fatalf("failed to create .oat dir: %v", err)
+		}
+
+		prompt, err := LoadCustomPrompt(emptyDir, state.AgentTypeBrowser)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if prompt != "" {
+			t.Errorf("expected empty prompt when BROWSER.md doesn't exist, got: %s", prompt)
 		}
 	})
 }

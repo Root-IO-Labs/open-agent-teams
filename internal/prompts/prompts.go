@@ -61,6 +61,8 @@ func LoadCustomPrompt(repoPath string, agentType state.AgentType) (string, error
 		filename = "REVIEW.md"
 	case state.AgentTypeVerification:
 		filename = "VERIFICATION.md"
+	case state.AgentTypeBrowser:
+		filename = "BROWSER.md"
 	case state.AgentTypeGenericPersistent:
 		// Generic persistent agents get their prompt from the spawn request,
 		// not from embedded templates. No custom prompt file to load.

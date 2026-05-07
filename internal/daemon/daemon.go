@@ -1476,6 +1476,8 @@ func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now 
 			message = "[daemon] Status check: Update on your review progress?"
 		case state.AgentTypeVerification:
 			message = "[daemon] Status check: Update on your verification progress? Deliver your verdict soon."
+		case state.AgentTypeBrowser:
+			message = "[daemon] Status check: Update on your browser task progress?"
 		case state.AgentTypeGenericPersistent:
 			message = "[daemon] Status check: Update on your progress?"
 		default:
@@ -2532,6 +2534,7 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 		state.AgentTypeWorkspace:         true,
 		state.AgentTypeMergeQueue:        true,
 		state.AgentTypePRShepherd:        true,
+		state.AgentTypeBrowser:           true,
 		state.AgentTypeGenericPersistent: true,
 	}
 	if permanentTypes[agent.Type] {
@@ -5498,7 +5501,7 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 	var promptText string
 
 	switch agentType {
-	case state.AgentTypeMergeQueue, state.AgentTypeWorker, state.AgentTypeReview, state.AgentTypeVerification:
+	case state.AgentTypeMergeQueue, state.AgentTypeWorker, state.AgentTypeReview, state.AgentTypeVerification, state.AgentTypeBrowser:
 		localAgentsDir := d.paths.RepoAgentsDir(repoName)
 		reader := agents.NewReader(localAgentsDir, repoPath)
 		definitions, err := reader.ReadAllDefinitions()

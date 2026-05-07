@@ -315,6 +315,27 @@ Inside agent sessions, agents get these superpowers:
 - `/workers` - Who else is working?
 - `/messages` - Check the group chat
 
+## Browser Agent
+
+The browser agent is a persistent agent that controls Chrome through MCP tools for web-based tasks (scraping, form filling, web research, etc.). It auto-starts with the repo and runs as a singleton alongside the supervisor and merge queue.
+
+```bash
+oat attach browser-agent                  # Watch the browser agent work
+oat attach browser-agent --read-only      # Observe without interacting
+oat message send browser-agent "Navigate to https://example.com and extract the pricing table"
+oat agent tell browser-agent "Check the CI dashboard for failures"
+oat agent restart browser-agent           # Restart if stuck
+```
+
+Other agents can delegate web tasks to the browser agent via inter-agent messaging:
+
+```bash
+# From any agent session:
+oat message send browser-agent "Go to <url> and report what you find"
+```
+
+The browser agent logs actions to `<repo-root>/.oat-logs/browser-agent-actions.jsonl` and downloads files to `~/.oat/downloads/<repo>/`. See the [oat-browser-agent repo](https://github.com/Root-IO-Labs/oat-browser-agent) for setup and Chrome extension details.
+
 ## Custom Agents
 
 Roll your own agents with markdown.

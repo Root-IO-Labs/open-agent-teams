@@ -29,6 +29,13 @@ It is intended to help with debugging and understanding how oat organizes its da
 │       └── <agent-name>/
 │           └── msg-<uuid>.json
 │
+├── output/             # Agent output logs
+│   └── <repo-name>/
+│       └── <agent-name>.log
+│
+├── downloads/          # Browser agent downloads
+│   └── <repo-name>/    # Files downloaded by the browser agent
+│
 └── prompts/            # Generated agent prompts
     └── <agent-name>.md
 ```
@@ -221,6 +228,22 @@ They are used for inter-agent communication.
 | `body` | `string` | Message content (markdown text) |
 | `status` | `string` | Message status: pending, delivered, read, or acked |
 | `acked_at` | `time.Time` | When the message was acknowledged (omitempty) |
+
+### 📄 Browser agent audit log
+
+**Type**: file (`<repo-root>/.oat-logs/browser-agent-actions.jsonl`)
+
+JSONL audit log of all browser agent actions (navigations, clicks, extractions, etc.)
+
+**Notes**: Written by the browser agent bridge to `.oat-logs/` relative to the repository root (not inside `~/.oat/`). Each line is a JSON object with timestamp, tool name, tab ID, URL, parameters, result, and duration. Useful for debugging browser agent behavior and auditing web interactions.
+
+### 📁 `downloads/<repo-name>/`
+
+**Type**: directory
+
+Files downloaded by the browser agent during web interactions
+
+**Notes**: The browser agent saves downloaded files here instead of the system default. Each repo gets its own download directory to avoid collisions.
 
 ## Debugging Tips
 

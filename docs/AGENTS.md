@@ -171,6 +171,33 @@ The PR Shepherd is similar to the merge-queue but designed for fork workflows wh
 - Tracks PR status on the upstream repository
 - Helps coordinate rebases and conflict resolution
 
+### 8. Agent Builder (`internal/templates/agent-templates/agent-builder.md`)
+
+**Role**: Creates agent definitions (YAML configs and skills) for custom agent types
+**Worktree**: Main repository
+**Lifecycle**: Persistent
+
+The Agent Builder generates agent definition files for new agent types. It:
+- Creates YAML configuration files for custom agents
+- Generates skill files for specialized agent behaviors
+- Is used to bootstrap new agent types (like the browser agent)
+
+### 9. Browser Agent (`internal/templates/agent-templates/browser.md`)
+
+**Role**: Controls a Chrome browser through MCP tools for web-based tasks
+**Worktree**: Main repository
+**Lifecycle**: Persistent
+
+The Browser Agent interacts with web pages through the OAT Browser Agent extension and MCP bridge. It:
+- Navigates websites, clicks elements, fills forms using 44 MCP tools
+- Reads page content via accessibility tree snapshots (primary) or screenshots (fallback)
+- Works within authenticated sessions (leverages the user's existing Chrome login state)
+- Operates under strict safety constraints: cannot enter financial data, blocked from banking/payment pages, JavaScript execution is sandboxed
+
+The Browser Agent requires the `oat-browser-agent` Chrome extension and bridge to be installed. See the [oat-browser-agent repository](https://github.com/Root-IO-Labs/oat-browser-agent) for setup instructions.
+
+**Status reporting**: The browser agent emits `[OAT_BROWSER] status: <message>` sentinel lines for OAT's OutputWatcher.
+
 ## Daemon (Background Process)
 
 The daemon is **not an AI agent**. It is a deterministic Go process (`internal/daemon/`) that runs in the background, managing agent lifecycles and coordinating work through timers and programmatic checks. It has no LLM, no reasoning ability, and no capacity for nuanced judgment. It can check binary conditions (is a PR merged? has a timer expired?) but it cannot investigate *why* something is stuck or decide whether an agent is making meaningful progress on a complex task.
@@ -448,6 +475,7 @@ Repositories can customize agent behavior by creating markdown files in `.oat/ag
 | worker | `.oat/agents/worker.md` |
 | merge-queue | `.oat/agents/merge-queue.md` |
 | reviewer | `.oat/agents/reviewer.md` |
+| browser | `.oat/agents/browser.md` |
 
 **Precedence order:**
 1. `<repo>/.oat/agents/<agent>.md` (checked into repo, highest priority)
@@ -614,6 +642,7 @@ The daemon periodically "nudges" agents to keep them active:
 | merge-queue | "Status check: Review open PRs and check CI status." |
 | worker | "Status check: Update on your progress?" |
 | review | "Status check: Update on your review progress?" |
+| browser | "Status check: Update on your browser task progress?" |
 | workspace | **Not nudged** (user-driven only) |
 
 Nudges are sent every 60 seconds, but agents are skipped if nudged within the last cycle.

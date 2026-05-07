@@ -30,7 +30,7 @@ Use conventional commit messages (feat:, fix:, chore:).
 EOF
 ```
 
-Valid filenames: `worker.md`, `merge-queue.md`, `review.md`, `pr-shepherd.md`.
+Valid filenames: `worker.md`, `merge-queue.md`, `review.md`, `pr-shepherd.md`, `browser.md`.
 
 ### Spawn a fully custom agent
 

@@ -62,12 +62,12 @@ OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (d
                                  │
     ┌────────────────────────────┼────────────────────────────────┐
     │                            │                                │
-┌───▼───┐  ┌───────────┐  ┌─────▼─────┐  ┌──────────┐  ┌────────┐
-│super- │  │merge-     │  │workspace  │  │worker-N  │  │review  │
-│visor  │  │queue      │  │           │  │          │  │        │
-└───────┘  └───────────┘  └───────────┘  └──────────┘  └────────┘
-    │           │              │              │             │
-    └───────────┴──────────────┴──────────────┴─────────────┘
+┌───▼───┐  ┌───────────┐  ┌─────▼─────┐  ┌──────────┐  ┌────────┐  ┌────────┐
+│super- │  │merge-     │  │workspace  │  │worker-N  │  │review  │  │browser │
+│visor  │  │queue      │  │           │  │          │  │        │  │agent   │
+└───────┘  └───────────┘  └───────────┘  └──────────┘  └────────┘  └────────┘
+    │           │              │              │             │           │
+    └───────────┴──────────────┴──────────────┴─────────────┴───────────┘
               oat session: <repo>  (one process per agent)
 ```
 
@@ -88,6 +88,7 @@ OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (d
 | `internal/errors` | User-friendly errors | `CLIError`, error constructors |
 | `internal/names` | Worker name generation | `Generate()` (adjective-animal) |
 | `internal/templates` | Agent prompt templates | Template loading and embedding |
+| `internal/templates/agent-templates/browser.md` | Browser agent prompt | MCP-based Chrome control |
 | `internal/agents` | Agent management | Agent definition loading |
 | `pkg/config` | Path configuration | `Paths`, `NewTestPaths()` |
 | `pkg/backend` | **Public** backend abstraction | `ProcessBackend` interface |
@@ -197,6 +198,8 @@ cli := cli.NewWithPaths(paths)
 
 **Worker prompt extensions:** Projects can add a folder **`oat-worker-prompt-extensions`** at the project root (repo root). Workers are instructed to read all files in that folder when present; they contain project-specific instructions and context. OAT does not create this folder—users or Overlord add it. See `docs/AGENTS.md` for details.
 
+**Browser agent:** A persistent agent that controls Chrome through MCP tools (via the [oat-browser-agent](https://github.com/Root-IO-Labs/oat-browser-agent) Chrome extension) for web-based tasks such as scraping, form filling, and research. It auto-starts with the repo, receives tasks via inter-agent messaging, logs actions to `~/.oat/output/<repo>/browser-agent-actions.jsonl`, and saves downloads to `~/.oat/downloads/<repo>/`. Its prompt template lives at `internal/templates/agent-templates/browser.md`.
+
 See `docs/AGENTS.md` for detailed agent documentation including:
 - Agent types and their roles
 - Message routing implementation
@@ -256,7 +259,9 @@ When modifying extension points (state, socket API):
 ├── wts/<repo>/<agent>/     # Git worktrees (one per agent)
 ├── messages/<repo>/<agent>/ # Message JSON files
 ├── output/<repo>/          # Agent output logs
-│   └── workers/            # Worker-specific logs
+│   ├── workers/            # Worker-specific logs
+│   └── browser-agent-actions.jsonl  # Browser agent audit log
+├── downloads/<repo>/       # Browser agent download directory
 └── agent-config/<repo>/<agent>/ # Per-agent OAT config directory
     └── commands/           # Slash command files (*.md)
 ```

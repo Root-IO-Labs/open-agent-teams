@@ -15,6 +15,7 @@ func TestListAgentTemplates(t *testing.T) {
 	// Check that we have the expected templates
 	expected := map[string]bool{
 		"agent-builder.md": true,
+		"browser.md":       true,
 		"merge-queue.md":   true,
 		"pr-shepherd.md":   true,
 		"worker.md":        true,
@@ -54,7 +55,7 @@ func TestCopyAgentTemplates(t *testing.T) {
 	}
 
 	// Verify all expected files exist and have content
-	expectedFiles := []string{"agent-builder.md", "merge-queue.md", "pr-shepherd.md", "worker.md", "reviewer.md", "verification.md"}
+	expectedFiles := []string{"agent-builder.md", "browser.md", "merge-queue.md", "pr-shepherd.md", "worker.md", "reviewer.md", "verification.md"}
 	for _, filename := range expectedFiles {
 		path := filepath.Join(destDir, filename)
 		info, err := os.Stat(path)
