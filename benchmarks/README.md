@@ -14,6 +14,8 @@ The benchmark evaluates a model's ability to:
 
 For results from previous benchmark runs, see [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
 
+> **Looking for the browser agent testbed?** The OAT Browser Agent ships its own containerized fixture site and harness for verifying tools and security defenses. It lives in the separate [`oat-browser-agent` repo under `benchmarks/testbed/`](https://github.com/Root-IO-Labs/oat-browser-agent/tree/main/benchmarks/testbed) and is independent of this multi-model code-generation benchmark.
+
 ## Table of Contents
 
 - [Quickstart](#quickstart)

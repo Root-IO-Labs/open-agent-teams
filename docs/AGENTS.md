@@ -189,12 +189,23 @@ The Agent Builder generates agent definition files for new agent types. It:
 **Lifecycle**: Persistent
 
 The Browser Agent interacts with web pages through the OAT Browser Agent extension and MCP bridge. It:
-- Navigates websites, clicks elements, fills forms using 44 MCP tools
-- Reads page content via accessibility tree snapshots (primary) or screenshots (fallback)
-- Works within authenticated sessions (leverages the user's existing Chrome login state)
-- Operates under strict safety constraints: cannot enter financial data, blocked from banking/payment pages, JavaScript execution is sandboxed
+- Navigates websites, clicks elements, fills forms using 44 MCP tools.
+- Reads page content via accessibility tree snapshots (primary) or screenshots (fallback).
+- Works within authenticated sessions (leverages the user's existing Chrome login state).
+- Operates under hard, programmatic safety constraints enforced in the bridge — not just by prompt instruction:
+  - URL blocklist (Chrome internals blocked by default) and optional `domainAllowlist`.
+  - Sensitive-page detection on banking / login / payment pages.
+  - Password-field interaction guard and `browser_evaluate` outbound-request guard.
+  - Untrusted-content delimiters wrap page-derived text returned to the LLM.
+  - Per-call defenses also run inside `browser_batch` (no batch-bypass).
+  - Programmatic circuit breaker (`maxCallsPerSession`, default 1000) with 80% warning.
+  - Side-panel "Stop agent" button issues an `AGENT_PANIC` halt that propagates across four layers.
 
-The Browser Agent requires the `oat-browser-agent` Chrome extension and bridge to be installed. See the [oat-browser-agent repository](https://github.com/Root-IO-Labs/oat-browser-agent) for setup instructions.
+The Browser Agent requires the `oat-browser-agent` Chrome extension and bridge to be installed. See:
+- [oat-browser-agent repository](https://github.com/Root-IO-Labs/oat-browser-agent) — setup instructions and full configuration reference.
+- [SECURITY.md](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/SECURITY.md) — disclosure policy.
+- [THREAT_MODEL.md](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/docs/THREAT_MODEL.md) — attack-surface analysis and the structured `securityEvent` enum used in audit logs.
+- [Testbed](https://github.com/Root-IO-Labs/oat-browser-agent/tree/main/benchmarks/testbed) — containerized fixture site + harness for verifying tools and defenses.
 
 **Status reporting**: The browser agent emits `[OAT_BROWSER] status: <message>` sentinel lines for OAT's OutputWatcher.
 
