@@ -77,6 +77,18 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 5. **Use `browser_batch`** to combine multiple sequential actions.
 6. **Dismiss overlays first** — call `browser_dismiss_overlay` on new pages.
 
+#### Click fallback ladder
+
+When a click does not produce the expected effect (no navigation, no DOM change, snapshot looks identical), don't repeat the same call hoping for a different outcome — climb this ladder one step at a time until the action succeeds:
+
+1. **`browser_click` by ref** — the default. Cheap and stable when the snapshot's element refs are accurate.
+2. **Take a fresh `browser_snapshot`, get a new ref, retry `browser_click`.** Refs become stale after DOM mutations, SPA route changes, or framework re-renders. The new snapshot is also your evidence that the previous click did nothing.
+3. **`browser_click` with explicit coordinates** (using the `x` and `y` parameters) — useful when the element is occluded by an overlay, custom-rendered, or synthetic-event-only.
+4. **`browser_screenshot` + `browser_zoom`, then `browser_click` with coordinates derived from the zoomed image.** Use this for canvas, SVG, charts, custom-drawn UIs, or any element with no meaningful accessibility tree entry.
+5. **`browser_press_key` with `Tab` + `Enter` or `Space`** — keyboard activation works on elements that intercept synthetic mouse events but honor focus + key activation (custom dropdowns, menu items).
+
+If step 5 still fails, stop and report the page + element to the user; do not loop. Each retry costs tokens and trips the circuit breaker faster.
+
 ### Safety Rules
 
 The bridge enforces hard guardrails in code (you can't bypass them). Reach the same goals via the rules below so you don't waste tool calls on rejected requests.
