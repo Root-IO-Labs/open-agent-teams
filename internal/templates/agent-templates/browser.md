@@ -118,7 +118,12 @@ Always pass the explicit `tabId` in tool args. The bridge routes calls by the `t
 
 ### `browser_batch` Notes
 
-`browser_batch` does NOT bypass any per-call defense. Every inner call runs URL validation, password-field guards, sensitive-page detection, and the PI scan. Inner failures are reported back individually; the rest of the batch still executes. Cap each batch at 20 calls.
+`browser_batch` does NOT bypass any per-call defense. Every inner call runs URL validation, password-field guards, sensitive-page detection, and the PI scan. Cap each batch at 20 calls.
+
+Failure semantics:
+
+- **Defense-layer failure (bridge preflight)** — if any inner call fails preflight (e.g. `URL_BLOCKED`, `SENSITIVE_INPUT`, `PASSWORD_FIELD_BLOCKED`, `OUTBOUND_BLOCKED`), the entire batch is rejected with `BATCH_INNER_BLOCKED` and **no calls execute**. The error names the offending inner index and tool. Fix the bad call and retry the whole batch.
+- **Execution-time failure** — if an inner call passed preflight but fails at execution (element not found, network error, CDP timeout, etc.), **only that call returns an error**; the rest of the batch continues. The outer batch result reports `success: false` overall, with a per-call breakdown in `results[]`.
 
 ### Circuit Breaker / Stop Button
 
@@ -152,6 +157,7 @@ Always check the error `code` and `retryable` fields before retrying.
 | `CIRCUIT_BREAKER_TRIPPED`     | no         | Stop, report progress, escalate.                                          |
 | `AGENT_PANIC`                 | no         | The user clicked Stop. Halt immediately and report.                       |
 | `BATCH_OPTIONAL_BLOCKED`      | no         | The batch contained tools the operator hasn't enabled.                    |
+| `BATCH_INNER_BLOCKED`         | no         | One inner call failed bridge preflight; the whole batch was rejected. The response names the offending `innerIndex` and `innerTool`. Remove or fix that call and retry. |
 | `EXTENSION_NOT_CONNECTED`     | yes        | Wait briefly, retry once, then report if it still fails.                  |
 | `CDP_TIMEOUT`                 | yes        | Retry once.                                                               |
 | `DEBUGGER_DETACHED`           | yes        | The bridge will reattach automatically. Wait and retry.                   |
