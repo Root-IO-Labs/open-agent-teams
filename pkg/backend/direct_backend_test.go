@@ -91,16 +91,26 @@ func TestDirectBackend_StartAndStopAgent(t *testing.T) {
 		t.Fatal("session should exist after StartAgent")
 	}
 
-	// Wait for the short-lived process to finish writing
-	time.Sleep(500 * time.Millisecond)
-
-	// Check log file has output
-	data, err := os.ReadFile(logFile)
-	if err != nil {
-		t.Fatalf("failed to read log file: %v", err)
-	}
-	if !strings.Contains(string(data), "hello from agent") {
-		t.Fatalf("log file should contain agent output, got: %q", string(data))
+	// Poll for log output. The PTY → cleanLogWriter pipeline buffers a
+	// pending line and only flushes on EOF (when echo exits and the read
+	// loop closes the writer). On slow CI the process exit + flush can
+	// take longer than a fixed sleep, so wait up to 10s for the bytes
+	// to land before failing.
+	deadline := time.Now().Add(10 * time.Second)
+	var data []byte
+	for {
+		var readErr error
+		data, readErr = os.ReadFile(logFile)
+		if readErr == nil && strings.Contains(string(data), "hello from agent") {
+			break
+		}
+		if time.Now().After(deadline) {
+			if readErr != nil {
+				t.Fatalf("failed to read log file: %v", readErr)
+			}
+			t.Fatalf("log file should contain agent output, got: %q", string(data))
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	// Stop agent
