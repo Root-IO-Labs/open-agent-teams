@@ -451,6 +451,19 @@ MIT
 
 ## Acknowledgements
 
+### Sponsor
+
+Thanks to **[Root.io](https://www.root.io/)** for sponsoring this project.
+
+### Authors
+
+- John Amaral — [LinkedIn](https://www.linkedin.com/in/john-amaral-a359241/)
+- Raj Jagirdar — [LinkedIn](https://www.linkedin.com/in/raj-jagirdar/)
+- Rahul Rao — [LinkedIn](https://www.linkedin.com/in/rahulrao2908/)
+- Albert Giang — [LinkedIn](https://www.linkedin.com/in/albertgiang/)
+
+### Inspiration
+
 OAT drew inspiration from several projects:
 
 - **[Gastown](https://github.com/gastownhall/gastown)** — coordinating multiple agents on real engineering workflows.
