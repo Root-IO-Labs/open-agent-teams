@@ -22,6 +22,7 @@ type keyMap struct {
 	ToggleReadOnly key.Binding
 	ExpandView     key.Binding
 	OpenLog        key.Binding
+	OpenPlanner    key.Binding
 }
 
 var keys = keyMap{
@@ -96,5 +97,9 @@ var keys = keyMap{
 	OpenLog: key.NewBinding(
 		key.WithKeys("ctrl+o"),
 		key.WithHelp("ctrl+o", "open log"),
+	),
+	OpenPlanner: key.NewBinding(
+		key.WithKeys("ctrl+l"),
+		key.WithHelp("ctrl+l", "open planner"),
 	),
 }

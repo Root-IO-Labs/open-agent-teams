@@ -23,15 +23,16 @@ const (
 	AgentTypeVerification      AgentType = "verification"
 	AgentTypeGenericPersistent AgentType = "generic-persistent"
 	AgentTypeAgentBuilder      AgentType = "agent-builder"
+	AgentTypePlanner           AgentType = "planner"
 )
 
 // IsPersistent returns true if this agent type represents a persistent agent
 // that should be auto-restarted when dead. Persistent agents include supervisor,
-// merge-queue, pr-shepherd, workspace, and generic-persistent. Transient agents
+// merge-queue, pr-shepherd, workspace, planner, and generic-persistent. Transient agents
 // (worker, review, verification) are not auto-restarted.
 func (t AgentType) IsPersistent() bool {
 	switch t {
-	case AgentTypeSupervisor, AgentTypeMergeQueue, AgentTypePRShepherd, AgentTypeWorkspace, AgentTypeGenericPersistent, AgentTypeAgentBuilder:
+	case AgentTypeSupervisor, AgentTypeMergeQueue, AgentTypePRShepherd, AgentTypeWorkspace, AgentTypeGenericPersistent, AgentTypeAgentBuilder, AgentTypePlanner:
 		return true
 	default:
 		return false

@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/tui/views"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
 )
 
@@ -27,6 +28,7 @@ const (
 	ViewWorkspace ViewMode = iota
 	ViewAgent              // viewing a specific non-workspace agent
 	ViewAgentList          // agent list panel is focused
+	ViewPlanner            // planner view for collaborative task planning
 )
 
 // AgentInfo holds display information about an agent.
@@ -86,6 +88,7 @@ type App struct {
 	input    textinput.Model
 	filter   *OutputFilter
 	renderer *LineRenderer
+	planner  *views.PlannerView
 
 	// Output streaming
 	streams        map[string]OutputStreamI
@@ -129,15 +132,17 @@ func NewApp(socketPath, repoName string, paths *config.Paths) *App {
 	ti.Width = 80
 
 	filter := NewOutputFilter(DefaultFilterConfig())
+	client := socket.NewClient(socketPath)
 	return &App{
 		socketPath:     socketPath,
 		repoName:       repoName,
 		paths:          paths,
-		client:         socket.NewClient(socketPath),
+		client:         client,
 		filter:         filter,
 		renderer:       NewLineRenderer(filter, 80),
 		filterEnabled:  true,
 		input:          ti,
+		planner:        views.NewPlannerView(client, repoName),
 		streams:        make(map[string]OutputStreamI),
 		streamMode:     make(map[string]string),
 		eventStreams:   make(map[string]*EventStream),
@@ -468,11 +473,23 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
+		// Handle planner-specific keys first
+		if a.mode == ViewPlanner && msg.String() == "esc" {
+			a.mode = ViewWorkspace
+			a.showAgentList = false
+			a.input.Focus()
+			a.recalcLayout()
+			return a, nil
+		}
 		return a.handleKey(msg)
 	}
 
 	// Update sub-components
-	if a.mode != ViewAgentList {
+	if a.mode == ViewPlanner {
+		var cmd tea.Cmd
+		a.planner, cmd = a.planner.Update(msg)
+		cmds = append(cmds, cmd)
+	} else if a.mode != ViewAgentList {
 		var cmd tea.Cmd
 		a.input, cmd = a.input.Update(msg)
 		cmds = append(cmds, cmd)
@@ -589,6 +606,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.NewWorker):
 		a.statusMsg = "Use: oat work \"task description\" (from CLI)"
+		return a, nil
+
+	case key.Matches(msg, keys.OpenPlanner):
+		a.mode = ViewPlanner
+		a.showAgentList = false
+		a.input.Blur()
+		a.recalcLayout()
 		return a, nil
 	}
 
@@ -715,6 +739,11 @@ func (a *App) View() string {
 			styleStatusAgent.Render("  Open Agent Teams") + "\n\n" +
 			styleHelp.Render("  Loading...")
 		return styleViewport.Width(w).Height(h).Render(body)
+	}
+
+	// Render planner view if in planner mode
+	if a.mode == ViewPlanner {
+		return a.planner.View()
 	}
 
 	var sections []string
@@ -1116,9 +1145,9 @@ func (a *App) renderHelp() string {
 		}
 	default:
 		if a.width < 70 {
-			help = "tab:agents  esc:back  ^e:expand  ^f:filter  ^c:quit"
+			help = "tab:agents  ^l:planner  ^e:expand  ^f:filter  ^c:quit"
 		} else {
-			help = "tab:agents  esc:workspace  ^o:log  ^e:expand  ^f:filter  ^x:interrupt  ^c:quit"
+			help = "tab:agents  esc:workspace  ^l:planner  ^o:log  ^e:expand  ^f:filter  ^x:interrupt  ^c:quit"
 		}
 	}
 	return styleHelp.Width(a.width).MaxWidth(a.width).MaxHeight(1).Render("  " + help)
