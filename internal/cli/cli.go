@@ -2320,6 +2320,34 @@ func (c *CLI) initRepo(args []string) error {
 		return fmt.Errorf("failed to register default workspace: %s", resp.Error)
 	}
 
+	// Create planner worktree
+	plannerWtPath := c.paths.AgentWorktree(repoName, "planner")
+	fmt.Printf("Creating planner worktree at: %s\n", plannerWtPath)
+	if err := wtMgr.CreateDetached(plannerWtPath, "HEAD"); err != nil {
+		return fmt.Errorf("failed to create planner worktree: %w", err)
+	}
+	if err := wtMgr.CheckoutBranch(plannerWtPath, "main"); err != nil {
+		return fmt.Errorf("failed to checkout main for planner: %w", err)
+	}
+
+	// Add planner agent
+	resp, err = client.Send(socket.Request{
+		Command: "add_agent",
+		Args: map[string]interface{}{
+			"repo":          repoName,
+			"agent":         "planner",
+			"type":          "planner",
+			"worktree_path": plannerWtPath,
+			"window_name":   "planner",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to register planner: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("failed to register planner: %s", resp.Error)
+	}
+
 	// Ask the daemon to create the backend session and start all agents.
 	// The daemon owns the backend, so agent processes survive CLI exit.
 	// Forward relevant env vars so agents inherit tokens even when the
@@ -2360,9 +2388,9 @@ func (c *CLI) initRepo(args []string) error {
 	fmt.Println("✓ Repository initialized successfully!")
 	fmt.Printf("  Session: %s\n", sessionName)
 	if mqEnabled {
-		fmt.Printf("  Agents: supervisor, merge-queue, default (workspace)\n")
+		fmt.Printf("  Agents: supervisor, merge-queue, planner, default (workspace)\n")
 	} else {
-		fmt.Printf("  Agents: supervisor, default (workspace)\n")
+		fmt.Printf("  Agents: supervisor, planner, default (workspace)\n")
 	}
 	fmt.Printf("\nMonitor agents: oat ui --repo %s\n", repoName)
 	fmt.Printf("Or tail one agent: oat attach <agent-name> --repo %s\n", repoName)
