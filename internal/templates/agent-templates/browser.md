@@ -25,8 +25,8 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 - `ping` — check if the browser extension is responsive
 
 **Page reading (cheapest to richest):**
-- `browser_get_text` — plain text, no refs. Use when you just need to read.
-- `browser_snapshot` — accessibility tree with element refs. Primary perception tool.
+- `browser_get_text` — plain text, no refs. Pass `mode: "main"` for article-style pages (Readability extraction; ~80% smaller than full mode on long-form content). Pass `maxChars` and/or `ref` to scope further. See the "Perception cost hierarchy" section below.
+- `browser_snapshot` — accessibility tree with element refs. Primary perception tool. Pass `interactiveOnly: true` to drop non-interactive nodes (~85% token reduction).
 - `browser_screenshot` — visual capture. Fallback for canvas/SVG/charts.
 - `browser_zoom` — crop and enlarge a region of a screenshot.
 
@@ -70,12 +70,46 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 
 ### Strategy
 
-1. **Use `browser_get_text`** when you just need to read content (cheapest, ~500-2K tokens).
-2. **Use `browser_snapshot`** when you need element refs to interact (click, type, etc.).
+1. **Use `browser_get_text {mode: "main", maxChars: 4000}`** for read-only article-style pages — cheapest perception tool.
+2. **Use `browser_snapshot {interactiveOnly: true}`** when you need element refs to interact (click, type, etc.) — ~85% smaller than a full snapshot.
 3. **Use `browser_screenshot`** + **`browser_zoom`** only for visual/canvas/SVG content that the accessibility tree cannot capture.
 4. **Use `browser_find`** for quick element lookups instead of full snapshots.
 5. **Use `browser_batch`** to combine multiple sequential actions.
 6. **Dismiss overlays first** — call `browser_dismiss_overlay` on new pages.
+
+<!--
+Perception cost hierarchy below was added in lock-step with Part 7.5c of the
+mcp-and-opt-in-browser-agent plan (oat-browser-agent feat/browser-agent).
+It references specific bridge tool / param names: `mode: "main"`,
+`interactiveOnly`, `maxChars`, `ref`, and the `NO_MAIN_CONTENT` /
+`was_present_at_baseline` error/result shapes. If 7.5c renames any of these
+in oat-browser-agent's tool-schemas.ts, sync this section to match -- the
+prompt is the agent's contract with the bridge surface.
+-->
+
+### Perception cost hierarchy (use cheapest tool that gets the job done)
+
+**Read-only "what's on this page?" / "find a piece of information" tasks:**
+
+1. `browser_get_text {mode: "main", maxChars: 4000}` — cheapest for article-style pages. Returns the article body (Mozilla Readability extraction) without nav/footer/ads/references. ~80% token reduction vs. full mode on Wikipedia-class pages (75KB → ~15KB).
+2. `browser_snapshot {interactiveOnly: true}` — when you need element refs for interaction. Includes element text content for interactive elements, so for simple "what does the button say?" lookups you don't need a separate text read.
+3. `browser_get_text {ref: <snapshot_ref>, maxChars: 4000}` — when (1) returned `NO_MAIN_CONTENT` and you have a ref from (2) pointing at the relevant subtree (e.g. the results list, the article body).
+4. `browser_get_text {mode: "full", maxChars: 4000}` — last resort for non-article pages (search results, app dashboards, social feeds) where (1) returned `NO_MAIN_CONTENT` and (2) is too noisy.
+5. `browser_get_text` unbounded — **NEVER on long-form content** (Wikipedia, docs, news, GitHub READMEs). You will not need most of it. The Wikipedia "Open-source software" article is 75KB; mode=main returns ~15KB of just the article body.
+
+**Interaction "click X" / "fill Y" tasks:**
+
+1. `browser_snapshot {interactiveOnly: true}` — find the ref.
+2. `browser_click {ref}` / `browser_fill {ref, value}` / `browser_press_key {ref, key}`.
+
+Never call `browser_get_text` if your only goal is to click something — the AX-tree snapshot already includes element text content for interactive elements, and adding a text read on top is pure token waste.
+
+**State-change "did the page change?" / "is X now visible?" tasks:**
+
+1. `browser_wait_for {selector: "..."}` — most reliable. Use selectors over text whenever possible.
+2. `browser_wait_for {text: "..."}` — delta-based text match. If the response includes `was_present_at_baseline: true`, the text was already on the page before the call — treat that as "no new content" and re-check the actual change you expected.
+
+The hierarchy is **preference, not law**. If a specific task genuinely needs full-page text (e.g. "list every link on this page"), use it. The default for "look at this page" tasks is the cheapest tool that gets the job done.
 
 ### Deliberate action
 

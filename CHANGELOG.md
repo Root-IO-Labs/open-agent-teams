@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Browser-agent system prompt (`internal/templates/agent-templates/browser.md`)
+  gains a "Perception cost hierarchy" section that teaches the cheapest-tool-
+  that-gets-the-job-done order for read-only, interaction, and state-change
+  tasks. Read-only "what's on this page?" tasks now default to
+  `browser_get_text {mode: "main", maxChars: 4000}` (Mozilla Readability
+  extraction; ~80% token reduction on Wikipedia-class long-form pages vs.
+  the full-page walk that Part 4.5 confirmed real LLMs reach for first),
+  with `browser_snapshot {interactiveOnly: true}` as the interaction
+  primary and a fallback ladder for `NO_MAIN_CONTENT` cases. The Strategy
+  section's `browser_get_text` / `browser_snapshot` entries also gain the
+  `mode: "main"` and `interactiveOnly: true` hints. Land in lockstep with
+  oat-browser-agent's Part 7.5c (`mode: "main"` Readability path + the
+  Part 7.5d post-completion / `tabId` enrichment). End users running the
+  browser-agent against article-style pages will see ~5x lower perception
+  token cost on the first read.
+
+- Browser-agent system prompt (`internal/templates/agent-templates/browser.md`)
   gains a "Deliberate action" section. Production browser-agents are now
   guided to act like a careful operator: one destructive action at a time per
   domain, re-snapshot before clicking visually close controls, confirm
