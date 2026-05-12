@@ -388,16 +388,11 @@ func (p *PlannerView) unlockPlan() {
 	})
 }
 
-// Commands for async operations
+// Commands for async operations.
+// TODO: replace mocked responses below with a real socket.Client call to the
+// planner agent now that state.AgentTypePlanner is spawned by the daemon.
 func (p *PlannerView) sendToOverlord(command string, args map[string]interface{}) tea.Cmd {
 	return func() tea.Msg {
-		// First show thinking state
-		thinking := plannerThinkingMsg{text: "Thinking..."}
-		
-		// For now, simulate overlord response since we don't have the actual overlord agent
-		// In a real implementation, this would send to the overlord agent via socket
-		
-		// Simulate processing time
 		time.Sleep(500 * time.Millisecond)
 		
 		switch command {
@@ -453,8 +448,6 @@ func (p *PlannerView) sendToOverlord(command string, args map[string]interface{}
 				},
 			}
 		}
-		
-		return thinking
 	}
 }
 
@@ -608,6 +601,39 @@ func (p *PlannerView) getMaxWave() int {
 		}
 	}
 	return maxWave
+}
+
+// SummaryForList returns a short, one-line description of the planner's
+// current state. The TUI agent sidebar renders this on the planner row.
+func (p *PlannerView) SummaryForList() string {
+	if len(p.tasks) > 0 {
+		return fmt.Sprintf("%d tasks · %d waves", len(p.tasks), p.getMaxWave())
+	}
+	switch p.state {
+	case StateDefiningRequirement:
+		return "defining requirement"
+	case StateRefiningRequirement:
+		if p.requirement != nil {
+			return fmt.Sprintf("refining (v%d)", p.requirement.Iteration)
+		}
+		return "refining requirement"
+	case StateDecomposingTasks:
+		return "decomposing tasks"
+	case StateReviewingPlan:
+		return "reviewing plan"
+	case StatePlanLocked:
+		return "plan locked"
+	case StateExecuting:
+		return "executing plan"
+	default:
+		return "idle"
+	}
+}
+
+// Thinking reports whether the planner is mid-roundtrip with the overlord.
+// Used by the TUI sidebar to drive the per-agent status indicator.
+func (p *PlannerView) Thinking() bool {
+	return p.thinking
 }
 
 // View renders the planner view
