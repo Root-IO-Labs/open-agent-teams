@@ -36,6 +36,12 @@ echo
 echo "=== 2. vet + build + tui/state/prompts tests ==="
 go vet ./... && echo "vet: ok"
 go build -o "$OAT_BIN" ./cmd/oat && echo "build: ok"
+# Also install to ~/go/bin so any 'oat' command launched off PATH (e.g.
+# from another shell) uses the same binary. Earlier we hit a nasty bug
+# where the daemon was being spawned via the stale ~/go/bin/oat from a
+# prior `go install`, which didn't know about AgentTypePlanner and kept
+# cleaning up the planner agent as transient on every restart.
+go install ./cmd/oat && echo "install: ok"
 go test ./internal/tui/... ./internal/state/... ./internal/prompts/... 2>&1 | tail -5
 echo
 
