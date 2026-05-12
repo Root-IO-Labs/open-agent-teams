@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Browser-agent system prompt (`internal/templates/agent-templates/browser.md`)
+  gains a "Deliberate action" section. Production browser-agents are now
+  guided to act like a careful operator: one destructive action at a time per
+  domain, re-snapshot before clicking visually close controls, confirm
+  intermediate state before the next destructive call, prefer to stop and
+  explain on password fields / sensitive pages / unfamiliar UI patterns, and
+  use slower deliberate motion on logged-in or session-bearing pages. End
+  users will see fewer simultaneous clicks and a more measured pace on
+  multi-step flows. The change ships in lockstep with the oat-browser-agent
+  model bench so the same prompt drives both production and benchmark
+  scoring.
+
 ### Added
 
 - `benchmarks/llm_call.py` — provider-agnostic LangChain wrapper used by the
