@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sys
 import traceback
 from collections.abc import Callable, Sequence
@@ -519,76 +520,114 @@ async def run_textual_cli_async(
         if settings.has_tavily:
             tools.append(web_search)
 
-        # Handle sandbox mode
-        sandbox_backend = None
-        sandbox_cm = None
+        # Discover MCP servers declared in <cwd>/.oat/mcp.json. The daemon
+        # writes this file at agent spawn time when MCPConfig is non-empty
+        # (see pkg/backend/direct_backend.go); when no MCP is configured
+        # the file is absent and this returns no tools.
+        from oat_sdk.mcp_client import load_mcp_config, load_mcp_tools
 
-        if sandbox_type != "none":
-            # Deferred: sandbox_factory imports provider-specific SDKs,
-            # only needed when a sandbox is actually requested.
-            from oat_cli.integrations.sandbox_factory import (
-                create_sandbox,
-            )
+        mcp_specs = load_mcp_config(Path.cwd() / ".oat" / "mcp.json")
+        builtin_tool_names: set[str] = set()
+        for t in tools:
+            name = getattr(t, "name", None) or getattr(t, "__name__", None)
+            if isinstance(name, str):
+                builtin_tool_names.add(name)
+        mcp_tools, mcp_stack = await load_mcp_tools(
+            mcp_specs, builtin_tool_names=builtin_tool_names
+        )
+        tools = [*tools, *mcp_tools]
+
+        # SIGTERM handler: the daemon sends SIGTERM when stopping an agent.
+        # We want the AsyncExitStack to close cleanly so each MCP server's
+        # stdio child is reaped, not orphaned. Cancelling the running task
+        # propagates CancelledError through the ``async with mcp_stack``
+        # block below, which triggers stack.aclose() through the normal
+        # context-manager exit path. add_signal_handler isn't available on
+        # Windows; suppress NotImplementedError there.
+        with contextlib.suppress(NotImplementedError):
+            loop = asyncio.get_running_loop()
+            main_task = asyncio.current_task()
+            if main_task is not None:
+                loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
+
+        try:
+            # Handle sandbox mode
+            sandbox_backend = None
+            sandbox_cm = None
+
+            if sandbox_type != "none":
+                # Deferred: sandbox_factory imports provider-specific SDKs,
+                # only needed when a sandbox is actually requested.
+                from oat_cli.integrations.sandbox_factory import (
+                    create_sandbox,
+                )
+
+                try:
+                    # Create sandbox context manager but keep it open
+                    sandbox_cm = create_sandbox(
+                        sandbox_type,
+                        sandbox_id=sandbox_id,
+                        setup_script_path=sandbox_setup,
+                    )
+                    sandbox_backend = sandbox_cm.__enter__()  # noqa: PLC2801  # Context manager used without `with` for long-lived sandbox lifecycle
+                except (ImportError, ValueError, RuntimeError, NotImplementedError) as e:
+                    console.print()
+                    console.print("[red]Sandbox creation failed[/red]")
+                    console.print(Text(str(e), style="dim"))
+                    sys.exit(1)
 
             try:
-                # Create sandbox context manager but keep it open
-                sandbox_cm = create_sandbox(
-                    sandbox_type,
-                    sandbox_id=sandbox_id,
-                    setup_script_path=sandbox_setup,
+                agent, composite_backend = create_cli_agent(
+                    model=model,
+                    assistant_id=assistant_id,
+                    tools=tools,
+                    sandbox=sandbox_backend,
+                    sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                    auto_approve=auto_approve,
+                    checkpointer=checkpointer,
                 )
-                sandbox_backend = sandbox_cm.__enter__()  # noqa: PLC2801  # Context manager used without `with` for long-lived sandbox lifecycle
-            except (ImportError, ValueError, RuntimeError, NotImplementedError) as e:
-                console.print()
-                console.print("[red]Sandbox creation failed[/red]")
-                console.print(Text(str(e), style="dim"))
+            except Exception as e:  # broad catch for friendly CLI errors
+                logger.debug("Failed to create agent", exc_info=True)
+                error_text = Text("Failed to create agent: ", style="red")
+                error_text.append(str(e))
+                console.print(error_text)
+                if logger.isEnabledFor(logging.DEBUG):
+                    console.print(Text(traceback.format_exc(), style="dim"))
                 sys.exit(1)
 
-        try:
-            agent, composite_backend = create_cli_agent(
-                model=model,
-                assistant_id=assistant_id,
-                tools=tools,
-                sandbox=sandbox_backend,
-                sandbox_type=sandbox_type if sandbox_type != "none" else None,
-                auto_approve=auto_approve,
-                checkpointer=checkpointer,
-            )
-        except Exception as e:  # broad catch for friendly CLI errors
-            logger.debug("Failed to create agent", exc_info=True)
-            error_text = Text("Failed to create agent: ", style="red")
-            error_text.append(str(e))
-            console.print(error_text)
-            if logger.isEnabledFor(logging.DEBUG):
-                console.print(Text(traceback.format_exc(), style="dim"))
-            sys.exit(1)
+            # Run Textual app - errors propagate to caller
+            from oat_cli.app import AppResult
 
-        # Run Textual app - errors propagate to caller
-        from oat_cli.app import AppResult
-
-        result = AppResult(return_code=1, thread_id=None)
-        try:
-            result = await run_textual_app(
-                agent=agent,
-                assistant_id=assistant_id,
-                backend=composite_backend,
-                auto_approve=auto_approve,
-                cwd=Path.cwd(),
-                thread_id=thread_id,
-                initial_prompt=initial_prompt,
-                checkpointer=checkpointer,
-                tools=tools,
-                sandbox=sandbox_backend,
-                sandbox_type=sandbox_type if sandbox_type != "none" else None,
-            )
+            result = AppResult(return_code=1, thread_id=None)
+            try:
+                result = await run_textual_app(
+                    agent=agent,
+                    assistant_id=assistant_id,
+                    backend=composite_backend,
+                    auto_approve=auto_approve,
+                    cwd=Path.cwd(),
+                    thread_id=thread_id,
+                    initial_prompt=initial_prompt,
+                    checkpointer=checkpointer,
+                    tools=tools,
+                    sandbox=sandbox_backend,
+                    sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                )
+            finally:
+                # Clean up sandbox after app exits (success or error)
+                if sandbox_cm is not None:
+                    try:
+                        sandbox_cm.__exit__(None, None, None)
+                    except Exception:
+                        logger.warning("Sandbox cleanup failed", exc_info=True)
+            return result
         finally:
-            # Clean up sandbox after app exits (success or error)
-            if sandbox_cm is not None:
-                try:
-                    sandbox_cm.__exit__(None, None, None)
-                except Exception:
-                    logger.warning("Sandbox cleanup failed", exc_info=True)
-        return result
+            # Close MCP stdio children last. The stack is empty when no
+            # mcp.json was present; aclose() is a safe no-op in that case.
+            try:
+                await mcp_stack.aclose()
+            except Exception:
+                logger.warning("MCP exit-stack cleanup failed", exc_info=True)
 
 
 def apply_stdin_pipe(args: argparse.Namespace) -> None:

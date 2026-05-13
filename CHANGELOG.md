@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- MCP (Model Context Protocol) client support in agent-runtime.
+  `oat_sdk.mcp_client` loads MCP servers declared in
+  `<cwd>/.oat/mcp.json` at agent startup and exposes their tools as
+  LangChain `BaseTool` instances merged into the existing
+  `create_cli_agent(tools=...)` call. Stdio transport only for now;
+  the file shape is `{servers: [{name, command, args, env,
+  transport: "stdio"}]}`. The daemon writes this file at agent
+  spawn time when `MCPConfig` is non-empty (analogous to how it
+  already writes `AGENTS.md`); when no MCP is configured the file
+  is absent and the agent runs unchanged. Both the interactive
+  (`oat_cli.main`) and daemon-spawn / non-interactive
+  (`oat_cli.non_interactive`) paths are wired. SIGTERM from the
+  daemon cancels the running task; the resulting `CancelledError`
+  propagates through a `try/finally` that calls
+  `AsyncExitStack.aclose()` so each MCP server's stdio child is
+  reaped, not orphaned. Concerns the adapter owns directly:
+  per-session `asyncio.Lock` to serialise parallel tool calls on
+  one stdio stream, sidecar `KIND_TOOL_CALL`/`KIND_TOOL_RESULT`
+  event emission on both success and error paths, canonicalisation
+  of MCP `TextContent`/`ImageContent`/`EmbeddedResource` blocks to
+  LangChain-friendly shapes, tool-name collision resolution
+  (built-in tools win; colliding MCP tools are exposed as
+  `<server>__<tool>`), and graceful degradation on malformed
+  `mcp.json` (warning + zero MCP tools; never a crash).
+
 ### Changed
 
 - Browser-agent system prompt (`internal/templates/agent-templates/browser.md`)

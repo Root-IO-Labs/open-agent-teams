@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -905,54 +906,89 @@ async def run_non_interactive(
             if settings.has_tavily:
                 tools.append(web_search)
 
-            # If an allow-list is provided, enable shell but disable
-            # auto-approve so HITL can gate commands. If no allow-list, disable
-            # shell entirely and auto-approve all other tools.
-            enable_shell = bool(settings.shell_allow_list)
-            use_auto_approve = not enable_shell
+            # Discover MCP servers declared in <cwd>/.oat/mcp.json. The
+            # daemon writes this file at agent spawn time when MCPConfig
+            # is non-empty; when no MCP is configured the file is absent
+            # and load_mcp_tools returns no tools (and an empty stack).
+            from oat_sdk.mcp_client import load_mcp_config, load_mcp_tools
 
-            # When spawned by the OAT daemon (signaled by OAT_TOOL_LOG
-            # env var), disable SkillsMiddleware. OAT agents don't use
-            # Claude-Code-style skills — workers run shell commands and
-            # open PRs, supervisors monitor state. The middleware's
-            # ~1.6KB "progressive disclosure" system prompt is pure
-            # overhead in that context.
-            #
-            # Memory middleware is intentionally left enabled: the
-            # repo's AGENTS.md (pointing workers at the operational
-            # spec) is loaded through it and is load-bearing for
-            # worker guidance. Disabling memory would regress that.
-            #
-            # Standalone CLI users (no OAT_TOOL_LOG set) get the
-            # default behavior with skills enabled.
-            oat_spawned = bool(os.environ.get("OAT_TOOL_LOG"))
-            agent, composite_backend = create_cli_agent(
-                model=model,
-                assistant_id=assistant_id,
-                tools=tools,
-                sandbox=sandbox_backend,
-                sandbox_type=sandbox_type if sandbox_type != "none" else None,
-                auto_approve=use_auto_approve,
-                enable_shell=enable_shell,
-                enable_skills=not oat_spawned,
-                checkpointer=checkpointer,
+            mcp_specs = load_mcp_config(Path.cwd() / ".oat" / "mcp.json")
+            builtin_tool_names: set[str] = set()
+            for t in tools:
+                name = getattr(t, "name", None) or getattr(t, "__name__", None)
+                if isinstance(name, str):
+                    builtin_tool_names.add(name)
+            mcp_tools, mcp_stack = await load_mcp_tools(
+                mcp_specs, builtin_tool_names=builtin_tool_names
             )
+            tools = [*tools, *mcp_tools]
 
-            file_op_tracker = FileOpTracker(
-                assistant_id=assistant_id, backend=composite_backend
-            )
+            # SIGTERM handler: the daemon sends SIGTERM when stopping an
+            # agent. Cancelling the running task propagates CancelledError
+            # through the finally block below so mcp_stack.aclose() runs
+            # and each MCP server's stdio child is reaped, not orphaned.
+            with contextlib.suppress(NotImplementedError):
+                loop = asyncio.get_running_loop()
+                main_task = asyncio.current_task()
+                if main_task is not None:
+                    loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
 
-            await _run_agent_loop(
-                agent,
-                message,
-                config,
-                console,
-                file_op_tracker,
-                quiet=quiet,
-                stream=stream,
-                thread_url_lookup=thread_url_lookup,
-            )
-            return 0
+            try:
+                # If an allow-list is provided, enable shell but disable
+                # auto-approve so HITL can gate commands. If no allow-list, disable
+                # shell entirely and auto-approve all other tools.
+                enable_shell = bool(settings.shell_allow_list)
+                use_auto_approve = not enable_shell
+
+                # When spawned by the OAT daemon (signaled by OAT_TOOL_LOG
+                # env var), disable SkillsMiddleware. OAT agents don't use
+                # Claude-Code-style skills — workers run shell commands and
+                # open PRs, supervisors monitor state. The middleware's
+                # ~1.6KB "progressive disclosure" system prompt is pure
+                # overhead in that context.
+                #
+                # Memory middleware is intentionally left enabled: the
+                # repo's AGENTS.md (pointing workers at the operational
+                # spec) is loaded through it and is load-bearing for
+                # worker guidance. Disabling memory would regress that.
+                #
+                # Standalone CLI users (no OAT_TOOL_LOG set) get the
+                # default behavior with skills enabled.
+                oat_spawned = bool(os.environ.get("OAT_TOOL_LOG"))
+                agent, composite_backend = create_cli_agent(
+                    model=model,
+                    assistant_id=assistant_id,
+                    tools=tools,
+                    sandbox=sandbox_backend,
+                    sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                    auto_approve=use_auto_approve,
+                    enable_shell=enable_shell,
+                    enable_skills=not oat_spawned,
+                    checkpointer=checkpointer,
+                )
+
+                file_op_tracker = FileOpTracker(
+                    assistant_id=assistant_id, backend=composite_backend
+                )
+
+                await _run_agent_loop(
+                    agent,
+                    message,
+                    config,
+                    console,
+                    file_op_tracker,
+                    quiet=quiet,
+                    stream=stream,
+                    thread_url_lookup=thread_url_lookup,
+                )
+                return 0
+            finally:
+                # Close MCP stdio children. aclose() is a safe no-op when
+                # mcp.json was absent (the stack is empty in that case).
+                try:
+                    await mcp_stack.aclose()
+                except Exception:
+                    logger.warning("MCP exit-stack cleanup failed", exc_info=True)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted[/yellow]")
