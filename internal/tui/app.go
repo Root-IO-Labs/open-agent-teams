@@ -479,13 +479,25 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
-		// Handle planner-specific keys first
-		if a.mode == ViewPlanner && msg.String() == "esc" {
-			a.mode = ViewWorkspace
-			a.showAgentList = false
-			a.input.Focus()
-			a.recalcLayout()
-			return a, nil
+		// In planner mode, keys belong to the PlannerView's own textinput
+		// and shortcut handler — NOT to the app's handleKey (which would
+		// route Enter to sendInput against the daemon planner agent, and
+		// other keys to a.input). Only esc (leave planner) and ctrl+c
+		// (quit) need to fall through to the app.
+		if a.mode == ViewPlanner {
+			switch msg.String() {
+			case "esc":
+				a.mode = ViewWorkspace
+				a.showAgentList = false
+				a.input.Focus()
+				a.recalcLayout()
+				return a, nil
+			case "ctrl+c":
+				return a.handleKey(msg)
+			}
+			var cmd tea.Cmd
+			a.planner, cmd = a.planner.Update(msg)
+			return a, cmd
 		}
 		return a.handleKey(msg)
 	}
