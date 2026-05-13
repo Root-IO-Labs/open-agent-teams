@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `oat agent add <type> [name] [--repo <repo>]` CLI verb for opt-in
+  persistent agents. Only `browser-agent` is supported today; the
+  dispatcher is structured so additional opt-in types can land
+  without restructuring. The browser-agent flow runs a preflight
+  bridge probe (`OAT_BROWSER_AGENT_BRIDGE_PATH` env > `PATH` >
+  `~/.oat/oat-browser-agent/dist/bridge/index.js`) and bails with
+  an actionable message listing every install option if no bridge
+  is found. Idempotency: re-adding a healthy browser-agent is a
+  hard fail (suggesting `oat agent restart` or `remove`); a stopped
+  record is silently respawned. Worktree at
+  `~/.oat/wts/<repo>/<agent>/` is created on first add and reused
+  on respawn. End-to-end: `bridge preflight -> list_agents idempotency
+  check -> worktree create -> add_agent -> start_repo_agents`.
+- `AgentConfig.MCPConfig` (`pkg/backend`): when non-empty, the
+  direct backend writes the string to `<WorkDir>/.oat/mcp.json`
+  before launching the agent process, alongside the existing
+  `AGENTS.md` write. The daemon populates this for `AgentType ==
+  browser` in both initial spawn (`startRegisteredAgent`) and
+  manual restart (`restartAgent`) paths, so the bridge command and
+  audit-log dir are always fresh. `.oat/.gitignore` now also lists
+  `mcp.json` so worktrees never accidentally commit the bridge
+  configuration.
+- `internal/agents/browser_bridge.go::ResolveBrowserBridge` --
+  shared bridge resolver used by both the CLI preflight and the
+  daemon's MCP config builder, so they agree byte-for-byte on
+  what command will be spawned. Returns a `BridgeCommand` with
+  `Command`, `Args`, and a human-readable `Source` describing
+  where it was found.
+
+### Changed
+
+- `handleStartRepoAgents` now skips agents whose PID is still alive,
+  making the verb idempotent. Required to safely re-call after
+  `oat agent add` registers a single new agent on an
+  already-running repo (without the skip, every existing supervisor
+  / merge-queue / worker would be double-spawned).
+- `list_agents` socket response includes the agent's `pid` field
+  alongside the existing name / type / worktree_path / window_name /
+  task / summary / model / created_at fields. Used by `oat agent
+  add`'s liveness check; backwards-compatible (new key, no shape
+  change).
+
 - MCP (Model Context Protocol) client support in agent-runtime.
   `oat_sdk.mcp_client` loads MCP servers declared in
   `<cwd>/.oat/mcp.json` at agent startup and exposes their tools as

@@ -160,7 +160,7 @@ func (b *DirectBackend) ListSessions(ctx context.Context) ([]string, error) {
 // OAT runtime files (AGENTS.md, settings.json) from being committed by workers.
 // Appends missing entries if the file already exists with custom content.
 func ensureOatGitignore(oatDir string) {
-	requiredEntries := []string{"AGENTS.md", "settings.json"}
+	requiredEntries := []string{"AGENTS.md", "settings.json", "mcp.json"}
 	gitignorePath := filepath.Join(oatDir, ".gitignore")
 
 	existing, _ := os.ReadFile(gitignorePath)
@@ -211,6 +211,21 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 			return nil, fmt.Errorf("failed to write agent prompt (AGENTS.md): %w", err)
 		}
 		ensureOatGitignore(agentsDir)
+	}
+
+	// Write .oat/mcp.json if MCPConfig is set. Mirrors the AGENTS.md path
+	// above: the file is the daemon's contract with the agent-runtime;
+	// failure means the agent launches without its declared MCP tools,
+	// so we surface the write error rather than continuing silently.
+	if cfg.MCPConfig != "" {
+		mcpDir := filepath.Join(cfg.WorkDir, ".oat")
+		if err := os.MkdirAll(mcpDir, 0o755); err != nil {
+			return nil, fmt.Errorf("failed to create .oat dir for MCP config: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(mcpDir, "mcp.json"), []byte(cfg.MCPConfig), 0o644); err != nil {
+			return nil, fmt.Errorf("failed to write MCP config (.oat/mcp.json): %w", err)
+		}
+		ensureOatGitignore(mcpDir)
 	}
 
 	// Build the command string for bash -l -c

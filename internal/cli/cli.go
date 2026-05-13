@@ -849,6 +849,23 @@ func (c *CLI) registerCommands() {
 		Run:         c.interruptAgent,
 	}
 
+	agentCmd.Subcommands["add"] = &Command{
+		Name:        "add",
+		Description: "Add an opt-in persistent agent to a repo (currently: browser-agent)",
+		Usage: "oat agent add <type> [name] [--repo <repo>]\n\n" +
+			"Types:\n" +
+			"  browser-agent   Add the browser-agent (MCP bridge to Chrome).\n" +
+			"                  Requires oat-browser-agent installed; the daemon\n" +
+			"                  probes OAT_BROWSER_AGENT_BRIDGE_PATH, then PATH for\n" +
+			"                  `oat-browser-agent`, then ~/.oat/oat-browser-agent/\n" +
+			"                  dist/bridge/index.js. See:\n" +
+			"                  https://github.com/Root-IO-Labs/oat-browser-agent\n\n" +
+			"Idempotency: re-adding a healthy browser-agent is a no-op. If a\n" +
+			"previous browser-agent record exists but the process is dead, it\n" +
+			"is respawned (rather than failing).",
+		Run: c.addAgentCmd,
+	}
+
 	// Default Run for "oat agent" with no subcommand: resume agent session
 	agentCmd.Run = c.restartAgentInContext
 
@@ -6820,6 +6837,215 @@ func (c *CLI) restartAgentCmd(args []string) error {
 	}
 
 	return nil
+}
+
+// addAgentCmd registers an opt-in persistent agent type with a repo and
+// spawns it. Currently only the browser-agent is supported; the
+// dispatcher is structured so additional opt-in types (e.g. a code-
+// search MCP server, a database agent) can land without restructuring.
+//
+// The browser-agent flow is:
+//
+//  1. Preflight: resolve the oat-browser-agent bridge (see
+//     internal/agents/browser_bridge.go) and fail fast with an
+//     actionable message if it's missing.
+//  2. Idempotency: if a "browser-agent" record already exists, accept
+//     if dead (restart it) and reject if alive (no clobbering).
+//  3. Create a "browser-agent" worktree off the repo's current HEAD.
+//  4. Register via add_agent socket call with type="browser".
+//  5. Spawn via start_repo_agents (idempotent for already-running peers
+//     thanks to the live-PID skip in handleStartRepoAgents).
+func (c *CLI) addAgentCmd(args []string) error {
+	flags, remaining := ParseFlags(args)
+	if len(remaining) < 1 {
+		return errors.InvalidUsage(
+			"usage: oat agent add <type> [name] [--repo <repo>]\n" +
+				"supported types: browser-agent",
+		)
+	}
+	rawType := remaining[0]
+	// The user-facing token is "browser-agent" (matches the default
+	// agent name); the underlying state.AgentType is "browser".
+	if rawType != "browser-agent" && rawType != "browser" {
+		return errors.InvalidUsage(
+			fmt.Sprintf("unknown agent type %q; supported: browser-agent", rawType),
+		)
+	}
+	agentType := state.AgentTypeBrowser
+	agentName := "browser-agent"
+	if len(remaining) >= 2 && remaining[1] != "" {
+		agentName = remaining[1]
+	}
+
+	repoName := flags["repo"]
+	if repoName == "" {
+		inferred, err := c.inferRepoFromCwd()
+		if err != nil {
+			return errors.InvalidUsage(
+				"could not determine repository -- use --repo flag or run from within a oat worktree",
+			)
+		}
+		repoName = inferred
+	}
+
+	bridge, err := agents.ResolveBrowserBridge()
+	if err != nil {
+		return errors.Wrap(errors.CategoryRuntime, "browser-agent preflight failed", err)
+	}
+	fmt.Printf("Bridge resolved: %s (%s)\n", bridge.Command, bridge.Source)
+
+	client := socket.NewClient(c.paths.DaemonSock)
+
+	// Idempotency check: look up existing agent record via list_agents.
+	// "Already alive" is a hard fail (re-adding clobbers nothing useful
+	// and the user probably meant `oat agent restart`); "already
+	// registered but dead" falls through to the spawn path -- the
+	// duplicate add_agent below is tolerated.
+	listResp, err := client.Send(socket.Request{
+		Command: "list_agents",
+		Args:    map[string]interface{}{"repo": repoName, "rich": false},
+	})
+	if err != nil {
+		return errors.DaemonCommunicationFailed("listing agents", err)
+	}
+	if !listResp.Success {
+		return errors.Wrap(
+			errors.CategoryRuntime,
+			fmt.Sprintf("repository %q not registered with daemon", repoName),
+			fmt.Errorf("%s", listResp.Error),
+		)
+	}
+	alreadyRegistered := false
+	if existing, ok := c.lookupAgentInListResp(listResp.Data, agentName); ok {
+		alreadyRegistered = true
+		if existing.PID > 0 && isProcessAlive(existing.PID) {
+			return errors.Wrap(
+				errors.CategoryRuntime,
+				fmt.Sprintf("agent %q is already running (PID %d)", agentName, existing.PID),
+				fmt.Errorf("use `oat agent restart %s` to bounce it, or remove first with `oat agent remove %s`", agentName, agentName),
+			)
+		}
+		fmt.Printf("Found stopped %s record (PID %d); will respawn.\n", agentName, existing.PID)
+	}
+
+	worktreePath := c.paths.AgentWorktree(repoName, agentName)
+	if _, statErr := os.Stat(worktreePath); statErr != nil {
+		repoPath := c.paths.RepoDir(repoName)
+		wt := worktree.NewManagerWithContext(c.cmdCtx(), repoPath)
+		branchName := "agents/" + agentName
+		fmt.Printf("Creating worktree at %s (branch %s)\n", worktreePath, branchName)
+		if err := wt.CreateNewBranch(worktreePath, branchName, "HEAD"); err != nil {
+			return errors.Wrap(errors.CategoryRuntime, "failed to create worktree", err)
+		}
+	}
+
+	if !alreadyRegistered {
+		addResp, err := client.Send(socket.Request{
+			Command: "add_agent",
+			Args: map[string]interface{}{
+				"repo":          repoName,
+				"agent":         agentName,
+				"type":          string(agentType),
+				"worktree_path": worktreePath,
+				"window_name":   agentName,
+			},
+		})
+		if err != nil {
+			return errors.DaemonCommunicationFailed("registering agent", err)
+		}
+		if !addResp.Success {
+			return errors.Wrap(errors.CategoryRuntime, "failed to register agent", fmt.Errorf("%s", addResp.Error))
+		}
+	}
+
+	startArgs := map[string]interface{}{"repo": repoName}
+	if cliEnv := collectCLIEnvVars(); len(cliEnv) > 0 {
+		startArgs["cli_env"] = cliEnv
+	}
+	startResp, err := client.Send(socket.Request{
+		Command: "start_repo_agents",
+		Args:    startArgs,
+	})
+	if err != nil {
+		return errors.DaemonCommunicationFailed("spawning agent", err)
+	}
+	if !startResp.Success {
+		return errors.Wrap(errors.CategoryRuntime, "failed to spawn agent", fmt.Errorf("%s", startResp.Error))
+	}
+
+	// Look for our specific agent in the result and report just its
+	// PID. The other agents in the repo are skipped by the live-PID
+	// guard in handleStartRepoAgents, so they should appear here with
+	// their existing PIDs; we don't echo those (would be noisy).
+	if results, ok := startResp.Data.([]interface{}); ok {
+		for _, r := range results {
+			m, ok := r.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if name != agentName {
+				continue
+			}
+			pid, _ := m["pid"].(float64)
+			fmt.Printf("✓ %s spawned (PID %d)\n", agentName, int(pid))
+			fmt.Printf("Attach: oat agent attach %s --repo %s\n", agentName, repoName)
+			return nil
+		}
+	}
+	fmt.Printf("✓ %s added (no PID reported -- check `oat daemon status`)\n", agentName)
+	return nil
+}
+
+// agentRecord is the minimum shape we read out of a get_repo response
+// when checking for an existing agent in addAgentCmd. Keeping this
+// local rather than importing state.Agent avoids a circular dep
+// concern at the CLI/daemon JSON boundary.
+type agentRecord struct {
+	PID int
+}
+
+// isProcessAlive returns true if a process with the given PID exists.
+// Local copy of the daemon helper -- duplicated rather than exported
+// to avoid pulling all of `internal/daemon` into the CLI's import graph
+// (the daemon owns context.Context, sockets, state mutexes, etc).
+func isProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return process.Signal(syscall.Signal(0)) == nil
+}
+
+// lookupAgentInListResp pulls a single agent record out of the
+// list_agents socket response (which is a []agentDetail). Returns
+// (record, true) on hit and (zero-value, false) on miss or on any
+// shape mismatch (treated as "no such agent" so the caller proceeds
+// with add).
+func (c *CLI) lookupAgentInListResp(data interface{}, agentName string) (agentRecord, bool) {
+	arr, ok := data.([]interface{})
+	if !ok {
+		return agentRecord{}, false
+	}
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := m["name"].(string)
+		if name != agentName {
+			continue
+		}
+		pid := 0
+		if v, ok := m["pid"].(float64); ok {
+			pid = int(v)
+		}
+		return agentRecord{PID: pid}, true
+	}
+	return agentRecord{}, false
 }
 
 func (c *CLI) reviewPR(args []string) error {

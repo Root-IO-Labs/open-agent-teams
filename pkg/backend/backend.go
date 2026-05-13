@@ -133,6 +133,17 @@ type AgentConfig struct {
 	// If non-empty, written to .oat/AGENTS.md in the WorkDir.
 	InitialPrompt string
 
+	// MCPConfig, when non-empty, is written to .oat/mcp.json in the
+	// WorkDir before the agent launches. The agent-runtime reads this
+	// file at startup and instantiates the declared MCP servers as
+	// LangChain tools (see agent-runtime/libs/oat_sdk/oat_sdk/mcp_client.py).
+	//
+	// Clobber-on-spawn: hand-edits to .oat/mcp.json are overwritten on
+	// every agent spawn. Users who need custom MCP servers should set
+	// the relevant env var (e.g. OAT_BROWSER_AGENT_BRIDGE_PATH) or
+	// extend the daemon's MCPConfig builder; don't edit the file.
+	MCPConfig string
+
 	// LogFile is the path to capture agent output. If empty, a default
 	// path is derived from the session/agent name.
 	LogFile string

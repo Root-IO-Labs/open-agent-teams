@@ -372,6 +372,82 @@ func TestDirectBackend_InitialPrompt(t *testing.T) {
 	}
 }
 
+func TestDirectBackend_MCPConfig(t *testing.T) {
+	b := NewDirectBackend()
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+
+	mcpJSON := `{
+  "servers": [
+    {
+      "name": "browser_bridge",
+      "command": "node",
+      "args": ["/tmp/bridge.js"],
+      "transport": "stdio"
+    }
+  ]
+}`
+
+	_, err := b.StartAgent(ctx, AgentConfig{
+		SessionName: "s-mcp",
+		AgentName:   "a-mcp",
+		WorkDir:     tmpDir,
+		BinaryPath:  "echo",
+		Args:        []string{"done"},
+		MCPConfig:   mcpJSON,
+	})
+	if err != nil {
+		t.Fatalf("StartAgent failed: %v", err)
+	}
+	defer b.StopAgent(ctx, "s-mcp", "a-mcp")
+
+	mcpFile := filepath.Join(tmpDir, ".oat", "mcp.json")
+	data, err := os.ReadFile(mcpFile)
+	if err != nil {
+		t.Fatalf("failed to read .oat/mcp.json: %v", err)
+	}
+	if string(data) != mcpJSON {
+		t.Fatalf(".oat/mcp.json = %q, want %q", string(data), mcpJSON)
+	}
+
+	// .oat/.gitignore must list mcp.json so worktrees don't commit it.
+	gi, err := os.ReadFile(filepath.Join(tmpDir, ".oat", ".gitignore"))
+	if err != nil {
+		t.Fatalf("failed to read .oat/.gitignore: %v", err)
+	}
+	if !strings.Contains(string(gi), "mcp.json") {
+		t.Fatalf(".oat/.gitignore must include 'mcp.json', got: %q", string(gi))
+	}
+}
+
+func TestDirectBackend_MCPConfig_EmptyIsNoOp(t *testing.T) {
+	b := NewDirectBackend()
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+
+	_, err := b.StartAgent(ctx, AgentConfig{
+		SessionName: "s-mcp-empty",
+		AgentName:   "a-mcp-empty",
+		WorkDir:     tmpDir,
+		BinaryPath:  "echo",
+		Args:        []string{"done"},
+	})
+	if err != nil {
+		t.Fatalf("StartAgent failed: %v", err)
+	}
+	defer b.StopAgent(ctx, "s-mcp-empty", "a-mcp-empty")
+
+	// No InitialPrompt and no MCPConfig -- the .oat dir may not exist
+	// at all. If it does, mcp.json must NOT have been written; an
+	// agent without MCPConfig must launch unchanged.
+	mcpFile := filepath.Join(tmpDir, ".oat", "mcp.json")
+	if _, err := os.Stat(mcpFile); err == nil {
+		t.Fatalf(".oat/mcp.json must not be created when MCPConfig is empty")
+	}
+}
+
 func TestDirectBackend_SessionPersistence(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

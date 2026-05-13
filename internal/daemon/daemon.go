@@ -2433,6 +2433,7 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 			"summary":       agent.Summary,
 			"model":         agent.Model,
 			"created_at":    agent.CreatedAt,
+			"pid":           agent.PID,
 		}
 
 		// Add rich status information if requested
@@ -3178,6 +3179,16 @@ func (d *Daemon) handleStartRepoAgents(req socket.Request) socket.Response {
 	results := make([]agentResult, 0)
 
 	for agentName, agent := range repo.Agents {
+		// Idempotency: skip agents that are already running. This makes
+		// start_repo_agents safe to re-invoke after an incremental
+		// add_agent (e.g. `oat agent add browser-agent` adds a single
+		// agent to an already-running repo, then calls start_repo_agents
+		// to spawn just it -- without this guard we'd double-spawn every
+		// existing supervisor / merge-queue / worker).
+		if agent.PID > 0 && isProcessAlive(agent.PID) {
+			results = append(results, agentResult{Name: agentName, PID: agent.PID})
+			continue
+		}
 		pid, err := d.startRegisteredAgent(repoName, repo, agentName, agent, cliEnvVars)
 		if err != nil {
 			d.logger.Error("Failed to start agent %s/%s: %v", repoName, agentName, err)
@@ -3286,6 +3297,23 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// SidecarPath stays empty and the agent runs unchanged.
 		sidecarPath := sidecarSocketPath(repoName, agentName)
 
+		// MCP config: only browser-agent currently declares an MCP
+		// server (the oat-browser-agent stdio bridge). Resolution
+		// failure is logged but non-fatal -- the agent starts with
+		// just its built-in tools (http_request, fetch_url) so the
+		// operator can still attach and see what went wrong. The
+		// CLI `oat agent add browser-agent` runs the same probe at
+		// add-time so users get the actionable error earlier.
+		var mcpConfig string
+		if agent.Type == state.AgentTypeBrowser {
+			cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName)
+			if mcpErr != nil {
+				d.logger.Warn("Browser agent %s/%s starting without MCP tools: %v", repoName, agentName, mcpErr)
+			} else {
+				mcpConfig = cfg
+			}
+		}
+
 		handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
 			SessionName:   repo.SessionName,
 			AgentName:     agentName,
@@ -3295,6 +3323,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 			Env:           envVars,
 			EnvPrefix:     envPrefix,
 			InitialPrompt: promptContent,
+			MCPConfig:     mcpConfig,
 			LogFile:       logFile,
 			SidecarPath:   sidecarPath,
 		})
@@ -4993,6 +5022,37 @@ func (d *Daemon) getAgentBinaryPath() (string, error) {
 	return path, nil
 }
 
+// buildBrowserAgentMCPConfig produces the JSON written to .oat/mcp.json
+// for a browser-agent worktree. The Python agent-runtime reads this at
+// startup (see oat_sdk.mcp_client.load_mcp_config) and exposes the
+// bridge's tools as LangChain tools. Returns "" if the bridge cannot be
+// resolved -- the caller logs and continues without MCP rather than
+// failing the agent spawn.
+func (d *Daemon) buildBrowserAgentMCPConfig(repoName string) (string, error) {
+	bridge, err := agents.ResolveBrowserBridge()
+	if err != nil {
+		return "", err
+	}
+	auditLogDir := d.paths.RepoOutputDir(repoName)
+	server := map[string]any{
+		"name":      "browser_bridge",
+		"command":   bridge.Command,
+		"args":      bridge.Args,
+		"transport": "stdio",
+		"env": map[string]string{
+			"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": auditLogDir,
+		},
+	}
+	cfg := map[string]any{
+		"servers": []map[string]any{server},
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal MCP config: %w", err)
+	}
+	return string(data), nil
+}
+
 // findColocatedBinary returns the absolute path to name if it exists next to
 // the currently running executable (resolving symlinks).
 func findColocatedBinary(name string) (string, error) {
@@ -5708,6 +5768,20 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// Sidecar path also wired on restart so an agent that was started
 	// with sidecar on keeps sidecar on across a manual restart.
 	sidecarPath := sidecarSocketPath(repoName, agentName)
+
+	// Re-resolve MCP config on restart -- the bridge binary may have
+	// been upgraded between the first spawn and the restart, and we
+	// always want to write the freshest .oat/mcp.json.
+	var mcpConfig string
+	if agent.Type == state.AgentTypeBrowser {
+		cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName)
+		if mcpErr != nil {
+			d.logger.Warn("Browser agent %s/%s restarting without MCP tools: %v", repoName, agentName, mcpErr)
+		} else {
+			mcpConfig = cfg
+		}
+	}
+
 	handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
 		SessionName:   repo.SessionName,
 		AgentName:     agentName,
@@ -5717,6 +5791,7 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		Env:           envVars,
 		EnvPrefix:     envPrefix,
 		InitialPrompt: promptContent,
+		MCPConfig:     mcpConfig,
 		LogFile:       logFile,
 		SidecarPath:   sidecarPath,
 	})
