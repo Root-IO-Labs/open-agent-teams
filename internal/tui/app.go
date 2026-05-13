@@ -194,6 +194,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.width = msg.Width
 		a.height = msg.Height
 		a.recalcLayout()
+		// Forward to PlannerView so its width/height get set; otherwise
+		// PlannerView.View() returns the "Initializing planner..." placeholder
+		// because its size check (width<=0 || height<=0) never passes.
+		if a.planner != nil {
+			a.planner, _ = a.planner.Update(msg)
+		}
 		return a, nil
 
 	case tickMsg:
