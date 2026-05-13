@@ -12,7 +12,7 @@ import (
 )
 
 // Embedded default prompts
-// Only supervisor and workspace are "hardcoded" - other agent types (worker, merge-queue, review)
+// Only supervisor, workspace, and planner are "hardcoded" - other agent types (worker, merge-queue, review)
 // should come from configurable agent definitions in agent-templates.
 //
 //go:embed supervisor.md
@@ -21,8 +21,11 @@ var defaultSupervisorPrompt string
 //go:embed workspace.md
 var defaultWorkspacePrompt string
 
+//go:embed planner.md
+var defaultPlannerPrompt string
+
 // GetDefaultPrompt returns the default prompt for the given agent type.
-// Only supervisor and workspace have embedded default prompts.
+// Only supervisor, workspace, and planner have embedded default prompts.
 // Worker, merge-queue, and review prompts should come from agent definitions.
 func GetDefaultPrompt(agentType state.AgentType) string {
 	switch agentType {
@@ -30,6 +33,8 @@ func GetDefaultPrompt(agentType state.AgentType) string {
 		return defaultSupervisorPrompt
 	case state.AgentTypeWorkspace:
 		return defaultWorkspacePrompt
+	case state.AgentTypePlanner:
+		return defaultPlannerPrompt
 	case state.AgentTypeWorker, state.AgentTypeMergeQueue, state.AgentTypeReview, state.AgentTypeVerification:
 		// These agent types should use configurable agent definitions
 		// from ~/.oat/repos/<repo>/agents/ or <repo>/.oat/agents/
@@ -57,6 +62,8 @@ func LoadCustomPrompt(repoPath string, agentType state.AgentType) (string, error
 		filename = "PR-SHEPHERD.md"
 	case state.AgentTypeWorkspace:
 		filename = "WORKSPACE.md"
+	case state.AgentTypePlanner:
+		filename = "PLANNER.md"
 	case state.AgentTypeReview:
 		filename = "REVIEW.md"
 	case state.AgentTypeVerification:
