@@ -2326,8 +2326,11 @@ func (c *CLI) initRepo(args []string) error {
 	if err := wtMgr.CreateDetached(plannerWtPath, "HEAD"); err != nil {
 		return fmt.Errorf("failed to create planner worktree: %w", err)
 	}
+	// Match supervisor/merge-queue/pr-shepherd: a missing "main" branch is a
+	// warning, not fatal. Repos using "master" (or other default branch names)
+	// still get a working planner worktree at the detached HEAD.
 	if err := wtMgr.CheckoutBranch(plannerWtPath, "main"); err != nil {
-		return fmt.Errorf("failed to checkout main for planner: %w", err)
+		fmt.Printf("Warning: failed to checkout main in planner worktree: %v\n", err)
 	}
 
 	// Add planner agent
