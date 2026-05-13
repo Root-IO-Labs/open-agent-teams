@@ -1,6 +1,7 @@
 package views
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -36,14 +37,15 @@ type Requirement struct {
 
 // Task represents an atomic task in the decomposed plan
 type Task struct {
-	ID           string
-	Title        string
-	Description  string
-	Dependencies []string
-	Wave         int // Execution wave (parallel tasks have same wave)
-	Status       TaskStatus
-	AssignedTo   string // Worker agent name
-	EstimatedDuration time.Duration
+	ID                 string
+	Title              string
+	Description        string
+	Dependencies       []string
+	AcceptanceCriteria []string
+	Wave               int // Execution wave (parallel tasks have same wave)
+	Status             TaskStatus
+	AssignedTo         string // Worker agent name
+	EstimatedDuration  time.Duration
 }
 
 type TaskStatus int
@@ -55,6 +57,32 @@ const (
 	TaskStatusFailed
 	TaskStatusBlocked
 )
+
+// PlannerResponse is the structured JSON the planner agent emits every turn.
+type PlannerResponse struct {
+	Phase       string              `json:"phase"`
+	Message     string              `json:"message"`
+	Questions   []string            `json:"questions"`
+	Requirement *PlannerRequirement `json:"requirement"`
+	Tasks       []PlannerTask       `json:"tasks"`
+}
+
+// PlannerRequirement is the requirement block inside a PlannerResponse.
+type PlannerRequirement struct {
+	Title    string `json:"title"`
+	Original string `json:"original"`
+	Refined  string `json:"refined"`
+}
+
+// PlannerTask is a single task inside a PlannerResponse.
+type PlannerTask struct {
+	ID                 string   `json:"id"`
+	Title              string   `json:"title"`
+	Description        string   `json:"description"`
+	Wave               int      `json:"wave"`
+	Dependencies       []string `json:"dependencies"`
+	AcceptanceCriteria []string `json:"acceptance_criteria"`
+}
 
 // PlannerView handles collaborative requirement definition and task decomposition
 type PlannerView struct {
@@ -80,9 +108,9 @@ type PlannerView struct {
 	repoName    string
 	
 	// Feedback and collaboration
-	feedback    []FeedbackEntry
-	lastAIResponse time.Time
-	thinkingText   string
+	feedback      []FeedbackEntry
+	thinkingText  string
+	plannerBuffer string // accumulates planner output for JSON detection
 	
 	// Key bindings
 	keyMap PlannerKeyMap
@@ -203,15 +231,36 @@ func (p *PlannerView) Update(msg tea.Msg) (*PlannerView, tea.Cmd) {
 	case tea.KeyMsg:
 		return p.handleKey(msg)
 
-	case plannerThinkingMsg:
+	case plannerSentMsg:
 		p.thinking = true
-		p.thinkingText = msg.text
+		p.thinkingText = "Planner is thinking..."
 		return p, p.tickThinking()
 
-	case plannerResponseMsg:
+	case plannerDispatchedMsg:
 		p.thinking = false
-		p.lastAIResponse = time.Now()
-		p.handleAIResponse(msg)
+		p.state = StateExecuting
+		target := msg.target
+		if target == "" {
+			target = "workspace"
+		}
+		p.feedback = append(p.feedback, FeedbackEntry{
+			Type:      "system",
+			Content:   fmt.Sprintf("Plan dispatched to %s agent. Workers are starting.", target),
+			Timestamp: time.Now(),
+		})
+		return p, nil
+
+	case plannerErrorMsg:
+		p.thinking = false
+		errText := "Error communicating with planner agent"
+		if msg.err != nil {
+			errText += ": " + msg.err.Error()
+		}
+		p.feedback = append(p.feedback, FeedbackEntry{
+			Type:      "system",
+			Content:   errText,
+			Timestamp: time.Now(),
+		})
 		return p, nil
 
 	case plannerTickMsg:
@@ -247,9 +296,16 @@ func (p *PlannerView) handleKey(msg tea.KeyMsg) (*PlannerView, tea.Cmd) {
 	if msg.Type == tea.KeyCtrlR && p.requirement != nil {
 		return p, p.refineRequirement()
 	}
-	if msg.Type == tea.KeyCtrlA && p.state == StateReviewingPlan {
-		p.approvePlan()
-		return p, nil
+	// Ctrl+P — stop the planner (interrupt any running tool) and request the
+	// current plan as structured JSON so the TUI can populate tasks/waves and
+	// dispatch workers. Works at any point in the conversation.
+	if msg.Type == tea.KeyCtrlP && p.requirement != nil {
+		return p, p.stopAndPullPlan()
+	}
+	// Ctrl+A — approve the plan and dispatch to workspace/workers.
+	// If tasks haven't been parsed yet, prompt the user to use Ctrl+P first.
+	if msg.Type == tea.KeyCtrlA {
+		return p, p.approvePlan()
 	}
 	if msg.Type == tea.KeyCtrlX && p.state == StateReviewingPlan {
 		return p, p.rejectPlan()
@@ -270,15 +326,13 @@ func (p *PlannerView) handleInput() (*PlannerView, tea.Cmd) {
 
 	p.input.SetValue("")
 
-	// Add user input to feedback
 	p.feedback = append(p.feedback, FeedbackEntry{
 		Type:      "user",
 		Content:   text,
 		Timestamp: time.Now(),
 	})
 
-	switch p.state {
-	case StateDefiningRequirement:
+	if p.requirement == nil {
 		p.requirement = &Requirement{
 			ID:          fmt.Sprintf("req-%d", time.Now().Unix()),
 			Original:    text,
@@ -287,27 +341,9 @@ func (p *PlannerView) handleInput() (*PlannerView, tea.Cmd) {
 			LastUpdated: time.Now(),
 		}
 		p.state = StateRefiningRequirement
-		return p, p.sendToOverlord("refine_requirement", map[string]interface{}{
-			"requirement": text,
-			"context":     p.buildContext(),
-		})
-
-	case StateRefiningRequirement, StateReviewingPlan:
-		// Send feedback to overlord
-		return p, p.sendToOverlord("process_feedback", map[string]interface{}{
-			"feedback":    text,
-			"requirement": p.requirement.Refined,
-			"tasks":       p.tasksToMap(),
-			"context":     p.buildContext(),
-		})
-
-	default:
-		// General chat/feedback
-		return p, p.sendToOverlord("chat", map[string]interface{}{
-			"message": text,
-			"context": p.buildContext(),
-		})
 	}
+
+	return p, p.sendToPlanner(text)
 }
 
 func (p *PlannerView) startNewRequirement() {
@@ -325,14 +361,172 @@ func (p *PlannerView) startNewRequirement() {
 	})
 }
 
-func (p *PlannerView) approvePlan() {
+// approvePlan locks the plan and dispatches it. If no tasks have been parsed
+// yet, it prompts the user to run Ctrl+P (pull plan as JSON) first.
+func (p *PlannerView) approvePlan() tea.Cmd {
+	if len(p.tasks) == 0 {
+		p.feedback = append(p.feedback, FeedbackEntry{
+			Type:      "system",
+			Content:   "No tasks to dispatch yet. Press ^p to stop the planner and pull the plan as JSON.",
+			Timestamp: time.Now(),
+		})
+		return nil
+	}
 	p.state = StatePlanLocked
 	p.isLocked = true
 	p.feedback = append(p.feedback, FeedbackEntry{
 		Type:      "system",
-		Content:   "Plan approved and locked. You can now execute the plan or unlock to make changes.",
+		Content:   fmt.Sprintf("Plan approved. Dispatching %d tasks (%d waves) to workspace agent...", len(p.tasks), p.getMaxWave()),
 		Timestamp: time.Now(),
 	})
+	return p.dispatchToWorkspace()
+}
+
+// stopAndPullPlan interrupts the planner agent (stopping any in-flight tool
+// use) and sends it a message requesting its current plan as structured JSON.
+// Use this when the planner has started implementing instead of planning.
+func (p *PlannerView) stopAndPullPlan() tea.Cmd {
+	p.feedback = append(p.feedback, FeedbackEntry{
+		Type:      "system",
+		Content:   "Interrupting planner and requesting plan as JSON...",
+		Timestamp: time.Now(),
+	})
+
+	client := p.client
+	repoName := p.repoName
+	extractMsg := fmt.Sprintf(
+		"[planner-tui phase=ready_for_review]\n"+
+			"STOP all implementation work immediately. You are the PLANNER, not the implementer. "+
+			"Output your complete current plan as a single JSON code block (```json ... ```) "+
+			"in the required format with phase, message, requirement, and tasks fields. "+
+			"Include wave numbers, dependencies, and acceptance_criteria for every task. "+
+			"Do NOT create files, run commands, or implement anything.",
+	)
+
+	return func() tea.Msg {
+		if client == nil {
+			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
+		}
+		// Interrupt any running tool first so the message lands on a clean turn.
+		_, _ = client.Send(socket.Request{
+			Command: "interrupt_agent",
+			Args:    map[string]interface{}{"repo": repoName, "agent": "planner"},
+		})
+		resp, err := client.Send(socket.Request{
+			Command: "send_agent_input",
+			Args: map[string]interface{}{
+				"repo":    repoName,
+				"agent":   "planner",
+				"message": extractMsg,
+			},
+		})
+		if err != nil {
+			return plannerErrorMsg{err: err}
+		}
+		if !resp.Success {
+			return plannerErrorMsg{err: fmt.Errorf("%s", resp.Error)}
+		}
+		return plannerSentMsg{}
+	}
+}
+
+// dispatchToWorkspace sends the approved plan to the workspace agent so it
+// can spawn workers in the correct waves. Falls back to direct spawn_agent
+// calls for Wave 1 if the workspace agent is unreachable.
+func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
+	client := p.client
+	repoName := p.repoName
+	handoffMsg := p.buildWorkspaceHandoff()
+	wave1Tasks := p.tasksForWave(1)
+	req := p.requirement
+
+	return func() tea.Msg {
+		if client == nil {
+			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
+		}
+
+		// Primary path: hand off to workspace agent.
+		resp, err := client.Send(socket.Request{
+			Command: "send_agent_input",
+			Args: map[string]interface{}{
+				"repo":    repoName,
+				"agent":   "workspace",
+				"message": handoffMsg,
+			},
+		})
+		if err == nil && resp.Success {
+			return plannerDispatchedMsg{target: "workspace"}
+		}
+
+		// Fallback: workspace not running — spawn Wave 1 workers directly.
+		var errs []string
+		for _, task := range wave1Tasks {
+			wr, werr := client.Send(socket.Request{
+				Command: "spawn_agent",
+				Args: map[string]interface{}{
+					"repo":   repoName,
+					"name":   fmt.Sprintf("worker-%s", task.ID),
+					"class":  "ephemeral",
+					"prompt": buildWorkerPrompt(task, req),
+					"task":   task.Title + ": " + task.Description,
+				},
+			})
+			if werr != nil {
+				errs = append(errs, task.ID+": "+werr.Error())
+			} else if !wr.Success {
+				errs = append(errs, task.ID+": "+wr.Error)
+			}
+		}
+		if len(errs) > 0 {
+			return plannerErrorMsg{err: fmt.Errorf("direct dispatch errors: %s", strings.Join(errs, "; "))}
+		}
+		return plannerDispatchedMsg{target: "direct"}
+	}
+}
+
+// buildWorkspaceHandoff formats the approved plan as a structured message the
+// workspace agent can parse to spawn and sequence workers.
+func (p *PlannerView) buildWorkspaceHandoff() string {
+	var sb strings.Builder
+	sb.WriteString("[PLANNER-APPROVED] Plan ready for execution.\n\n")
+
+	if p.requirement != nil && p.requirement.Refined != "" {
+		sb.WriteString("## Requirement\n")
+		sb.WriteString(p.requirement.Refined)
+		sb.WriteString("\n\n")
+	}
+
+	waves := make(map[int][]Task)
+	for _, t := range p.tasks {
+		waves[t.Wave] = append(waves[t.Wave], t)
+	}
+	for wave := 1; wave <= p.getMaxWave(); wave++ {
+		tasks := waves[wave]
+		if len(tasks) == 0 {
+			continue
+		}
+		if wave == 1 {
+			sb.WriteString(fmt.Sprintf("## Wave %d — spawn immediately\n", wave))
+		} else {
+			sb.WriteString(fmt.Sprintf("## Wave %d — spawn after Wave %d completes\n", wave, wave-1))
+		}
+		for _, t := range tasks {
+			sb.WriteString(fmt.Sprintf("### %s: %s\n", t.ID, t.Title))
+			sb.WriteString(t.Description + "\n")
+			if len(t.Dependencies) > 0 {
+				sb.WriteString("Depends on: " + strings.Join(t.Dependencies, ", ") + "\n")
+			}
+			if len(t.AcceptanceCriteria) > 0 {
+				sb.WriteString("Acceptance criteria:\n")
+				for _, c := range t.AcceptanceCriteria {
+					sb.WriteString("- " + c + "\n")
+				}
+			}
+			sb.WriteString("\n")
+		}
+	}
+	sb.WriteString("Spawn Wave 1 workers immediately. Advance to the next wave when all tasks in the current wave are complete.")
+	return sb.String()
 }
 
 func (p *PlannerView) lockPlan() {
@@ -355,75 +549,57 @@ func (p *PlannerView) unlockPlan() {
 	})
 }
 
-// Commands for async operations.
-// TODO: replace mocked responses below with a real socket.Client call to the
-// planner agent now that state.AgentTypePlanner is spawned by the daemon.
-func (p *PlannerView) sendToOverlord(command string, args map[string]interface{}) tea.Cmd {
+func (p *PlannerView) sendToPlanner(text string) tea.Cmd {
+	client := p.client
+	repoName := p.repoName
+	// Prefix the user text with the current planning phase so the agent always
+	// knows its context, even after a restart or a confused turn.
+	message := p.buildPlannerMessage(text)
 	return func() tea.Msg {
-		time.Sleep(500 * time.Millisecond)
-		
-		switch command {
-		case "refine_requirement":
-			return plannerResponseMsg{
-				responseType: "requirement_refined",
-				data: map[string]interface{}{
-					"refined_requirement": args["requirement"].(string) + " (refined with better specificity and clear acceptance criteria)",
-					"questions": []string{
-						"Should this be implemented as a web interface or CLI tool?",
-						"What's the expected scale/performance requirements?",
-						"Are there any security considerations?",
-					},
-				},
-			}
-		case "process_feedback":
-			return plannerResponseMsg{
-				responseType: "tasks_decomposed",
-				data: map[string]interface{}{
-					"tasks": []map[string]interface{}{
-						{
-							"id": "task-1",
-							"title": "Setup project structure",
-							"description": "Initialize project with proper directory structure and dependencies",
-							"wave": 1,
-							"dependencies": []string{},
-							"estimated_duration": "30m",
-						},
-						{
-							"id": "task-2", 
-							"title": "Implement core functionality",
-							"description": "Build the main features according to requirements",
-							"wave": 2,
-							"dependencies": []string{"task-1"},
-							"estimated_duration": "2h",
-						},
-						{
-							"id": "task-3",
-							"title": "Add testing",
-							"description": "Write unit and integration tests",
-							"wave": 3,
-							"dependencies": []string{"task-2"},
-							"estimated_duration": "1h",
-						},
-					},
-				},
-			}
-		default:
-			return plannerResponseMsg{
-				responseType: "chat_response",
-				data: map[string]interface{}{
-					"response": "I understand. Let me help you with that.",
-				},
-			}
+		if client == nil {
+			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
 		}
+		resp, err := client.Send(socket.Request{
+			Command: "send_agent_input",
+			Args: map[string]interface{}{
+				"repo":    repoName,
+				"agent":   "planner",
+				"message": message,
+			},
+		})
+		if err != nil {
+			return plannerErrorMsg{err: err}
+		}
+		if !resp.Success {
+			return plannerErrorMsg{err: fmt.Errorf("%s", resp.Error)}
+		}
+		return plannerSentMsg{}
 	}
 }
 
+// buildPlannerMessage prefixes the user text with a one-line phase hint so
+// the planner agent always knows which conversation phase it is in, even if
+// it was restarted mid-session. The hint is invisible in the TUI (user only
+// sees their own text in the chat panel).
+func (p *PlannerView) buildPlannerMessage(userText string) string {
+	var phase string
+	switch p.state {
+	case StateDefiningRequirement:
+		phase = "clarifying — gathering initial requirements"
+	case StateRefiningRequirement, StateDecomposingTasks:
+		phase = "clarifying — refining requirements"
+	case StateReviewingPlan:
+		phase = "draft_plan — plan under review"
+	case StatePlanLocked:
+		phase = "ready_for_review — plan locked awaiting approval"
+	default:
+		phase = "clarifying"
+	}
+	return fmt.Sprintf("[planner-tui phase=%s]\n%s", phase, userText)
+}
+
 func (p *PlannerView) refineRequirement() tea.Cmd {
-	return p.sendToOverlord("refine_requirement", map[string]interface{}{
-		"requirement": p.requirement.Refined,
-		"iteration":   p.requirement.Iteration + 1,
-		"context":     p.buildContext(),
-	})
+	return p.sendToPlanner("Please refine the current requirement further.")
 }
 
 func (p *PlannerView) rejectPlan() tea.Cmd {
@@ -437,17 +613,90 @@ func (p *PlannerView) rejectPlan() tea.Cmd {
 }
 
 func (p *PlannerView) executePlan() tea.Cmd {
+	wave1 := p.tasksForWave(1)
+	if len(wave1) == 0 {
+		p.feedback = append(p.feedback, FeedbackEntry{
+			Type:      "system",
+			Content:   "No Wave 1 tasks to execute.",
+			Timestamp: time.Now(),
+		})
+		return nil
+	}
 	p.state = StateExecuting
 	p.feedback = append(p.feedback, FeedbackEntry{
-		Type:    "system",
-		Content: "Executing plan... Workers will be spawned for each task wave.",
+		Type:      "system",
+		Content:   fmt.Sprintf("Dispatching %d Wave 1 worker(s)...", len(wave1)),
 		Timestamp: time.Now(),
 	})
-	
-	return p.sendToOverlord("execute_plan", map[string]interface{}{
-		"tasks":       p.tasksToMap(),
-		"requirement": p.requirement.Refined,
-	})
+
+	client := p.client
+	repoName := p.repoName
+	tasks := wave1
+	req := p.requirement
+
+	return func() tea.Msg {
+		if client == nil {
+			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
+		}
+		var errs []string
+		for _, task := range tasks {
+			workerPrompt := buildWorkerPrompt(task, req)
+			resp, err := client.Send(socket.Request{
+				Command: "spawn_agent",
+				Args: map[string]interface{}{
+					"repo":   repoName,
+					"name":   fmt.Sprintf("worker-%s", task.ID),
+					"class":  "ephemeral",
+					"prompt": workerPrompt,
+					"task":   task.Title + ": " + task.Description,
+				},
+			})
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", task.ID, err))
+				continue
+			}
+			if !resp.Success {
+				errs = append(errs, fmt.Sprintf("%s: %s", task.ID, resp.Error))
+			}
+		}
+		if len(errs) > 0 {
+			return plannerErrorMsg{err: fmt.Errorf("spawn errors: %s", strings.Join(errs, "; "))}
+		}
+		return plannerSentMsg{}
+	}
+}
+
+// tasksForWave returns all tasks with the given wave number.
+func (p *PlannerView) tasksForWave(wave int) []Task {
+	var result []Task
+	for _, t := range p.tasks {
+		if t.Wave == wave {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
+// buildWorkerPrompt creates a concise system prompt for a spawned worker.
+func buildWorkerPrompt(task Task, req *Requirement) string {
+	var sb strings.Builder
+	sb.WriteString("You are a worker agent. Complete exactly the task assigned to you, then stop.\n\n")
+	if req != nil && req.Refined != "" {
+		sb.WriteString("## Project context\n")
+		sb.WriteString(req.Refined)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("## Your task\n")
+	sb.WriteString("**" + task.Title + "**\n\n")
+	sb.WriteString(task.Description + "\n\n")
+	if len(task.AcceptanceCriteria) > 0 {
+		sb.WriteString("## Acceptance criteria\n")
+		for _, c := range task.AcceptanceCriteria {
+			sb.WriteString("- " + c + "\n")
+		}
+	}
+	sb.WriteString("\nWhen done, verify your work against the acceptance criteria and report completion.")
+	return sb.String()
 }
 
 func (p *PlannerView) tickThinking() tea.Cmd {
@@ -456,109 +705,6 @@ func (p *PlannerView) tickThinking() tea.Cmd {
 	})
 }
 
-func (p *PlannerView) handleAIResponse(msg plannerResponseMsg) {
-	switch msg.responseType {
-	case "requirement_refined":
-		if data, ok := msg.data.(map[string]interface{}); ok {
-			if refined, ok := data["refined_requirement"].(string); ok {
-				p.requirement.Refined = refined
-				p.requirement.Iteration++
-				p.requirement.LastUpdated = time.Now()
-			}
-			
-			responseText := "Requirement refined: " + p.requirement.Refined
-			if questions, ok := data["questions"].([]string); ok && len(questions) > 0 {
-				responseText += "\n\nQuestions for clarification:\n"
-				for i, q := range questions {
-					responseText += fmt.Sprintf("%d. %s\n", i+1, q)
-				}
-			}
-			
-			p.feedback = append(p.feedback, FeedbackEntry{
-				Type:      "ai",
-				Content:   responseText,
-				Timestamp: time.Now(),
-			})
-		}
-		p.state = StateDecomposingTasks
-		
-	case "tasks_decomposed":
-		p.parseTasksFromResponse(msg.data)
-		p.state = StateReviewingPlan
-		p.feedback = append(p.feedback, FeedbackEntry{
-			Type:      "ai",
-			Content:   fmt.Sprintf("I've decomposed your requirement into %d tasks across %d execution waves. Please review the plan below.", len(p.tasks), p.getMaxWave()),
-			Timestamp: time.Now(),
-		})
-		
-	case "chat_response":
-		if data, ok := msg.data.(map[string]interface{}); ok {
-			if response, ok := data["response"].(string); ok {
-				p.feedback = append(p.feedback, FeedbackEntry{
-					Type:      "ai",
-					Content:   response,
-					Timestamp: time.Now(),
-				})
-			}
-		}
-	}
-}
-
-func (p *PlannerView) parseTasksFromResponse(data interface{}) {
-	if dataMap, ok := data.(map[string]interface{}); ok {
-		if tasksData, ok := dataMap["tasks"].([]map[string]interface{}); ok {
-			p.tasks = nil
-			for _, taskData := range tasksData {
-				task := Task{
-					ID:          getString(taskData, "id"),
-					Title:       getString(taskData, "title"), 
-					Description: getString(taskData, "description"),
-					Wave:        getInt(taskData, "wave"),
-					Status:      TaskStatusPending,
-				}
-				
-				if deps, ok := taskData["dependencies"].([]string); ok {
-					task.Dependencies = deps
-				}
-				
-				if durStr, ok := taskData["estimated_duration"].(string); ok {
-					if dur, err := time.ParseDuration(durStr); err == nil {
-						task.EstimatedDuration = dur
-					}
-				}
-				
-				p.tasks = append(p.tasks, task)
-			}
-		}
-	}
-}
-
-func (p *PlannerView) buildContext() map[string]interface{} {
-	return map[string]interface{}{
-		"repo":         p.repoName,
-		"state":        p.state,
-		"has_requirement": p.requirement != nil,
-		"task_count":   len(p.tasks),
-		"locked":       p.isLocked,
-	}
-}
-
-func (p *PlannerView) tasksToMap() []map[string]interface{} {
-	result := make([]map[string]interface{}, len(p.tasks))
-	for i, task := range p.tasks {
-		result[i] = map[string]interface{}{
-			"id":                task.ID,
-			"title":             task.Title,
-			"description":       task.Description,
-			"dependencies":      task.Dependencies,
-			"wave":              task.Wave,
-			"status":            task.Status,
-			"assigned_to":       task.AssignedTo,
-			"estimated_duration": task.EstimatedDuration.String(),
-		}
-	}
-	return result
-}
 
 func (p *PlannerView) getMaxWave() int {
 	maxWave := 0
@@ -885,16 +1031,20 @@ func (p *PlannerView) renderHelp() string {
 	case StateDefiningRequirement:
 		helps = []string{"Enter: submit", "esc: back"}
 	case StateRefiningRequirement, StateDecomposingTasks:
-		helps = []string{"Enter: feedback", "^r: refine", "esc: back"}
+		helps = []string{"Enter: feedback", "^p: pull plan", "^r: refine", "esc: back"}
 	case StateReviewingPlan:
-		helps = []string{"^a: approve", "^x: reject", "Enter: feedback", "esc: back"}
+		if len(p.tasks) > 0 {
+			helps = []string{"^a: approve+dispatch", "^x: reject", "^p: repull plan", "Enter: feedback", "esc: back"}
+		} else {
+			helps = []string{"^p: pull plan as JSON", "^x: reject", "Enter: feedback", "esc: back"}
+		}
 	case StatePlanLocked:
-		helps = []string{"Enter: feedback", "esc: back"}
+		helps = []string{"^a: dispatch", "Enter: feedback", "esc: back"}
 	case StateExecuting:
 		helps = []string{"esc: back"}
 	}
 
-	helps = append(helps, "^n: new requirement")
+	helps = append(helps, "^n: new")
 
 	helpText := strings.Join(helps, " • ")
 	
@@ -905,38 +1055,161 @@ func (p *PlannerView) renderHelp() string {
 		Render(helpText)
 }
 
-// Message types for bubbletea
-type plannerThinkingMsg struct {
-	text string
+// ReceiveOutput forwards lines from the planner agent's output stream.
+// Text lines (lineType == "" or "text") are accumulated into plannerBuffer.
+// When a complete ```json ... ``` fence is detected, the JSON is parsed to
+// update requirement/tasks/state and the message field is shown in chat.
+// Any freeform text that precedes a JSON block is also shown in chat.
+func (p *PlannerView) ReceiveOutput(lines []string, lineTypes []string) {
+	p.thinking = false
+	for i, line := range lines {
+		lt := ""
+		if i < len(lineTypes) {
+			lt = lineTypes[i]
+		}
+		if lt != "" && lt != "text" {
+			continue
+		}
+		if strings.ContainsAny(line, "\x1b\x00\x01\x02\x03") {
+			continue
+		}
+		p.plannerBuffer += line + "\n"
+	}
+	p.drainBuffer()
 }
 
-type plannerResponseMsg struct {
-	responseType string
-	data         interface{}
+// drainBuffer scans plannerBuffer for complete ```json...``` fences.
+//
+// Freeform text (no fence) is shown in chat immediately — it is never held
+// silently. Text before a fence is shown, the JSON drives state updates and
+// only its message field appears in chat, and any remainder after the fence
+// stays buffered for the next batch.
+//
+// An incomplete fence (opening found, closing not yet arrived) is held in
+// the buffer unchanged so the next batch can complete it.
+func (p *PlannerView) drainBuffer() {
+	const fenceOpen = "```json"
+	const fenceClose = "```"
+
+	for {
+		fenceStart := strings.Index(p.plannerBuffer, fenceOpen)
+		if fenceStart < 0 {
+			// No JSON fence at all — show everything as plain chat and clear.
+			if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
+				p.addAIChat(trimmed)
+			}
+			p.plannerBuffer = ""
+			return
+		}
+
+		// Freeform text before the opening fence → show in chat.
+		if preamble := strings.TrimSpace(p.plannerBuffer[:fenceStart]); preamble != "" {
+			p.addAIChat(preamble)
+		}
+
+		// Advance past "```json" and optional newline.
+		jsonStart := fenceStart + len(fenceOpen)
+		if jsonStart < len(p.plannerBuffer) && p.plannerBuffer[jsonStart] == '\n' {
+			jsonStart++
+		}
+
+		// Find the closing "```".
+		closeIdx := strings.Index(p.plannerBuffer[jsonStart:], fenceClose)
+		if closeIdx < 0 {
+			// Incomplete fence — keep from the opening marker, wait for more.
+			p.plannerBuffer = p.plannerBuffer[fenceStart:]
+			return
+		}
+
+		jsonStr := p.plannerBuffer[jsonStart : jsonStart+closeIdx]
+		p.plannerBuffer = p.plannerBuffer[jsonStart+closeIdx+len(fenceClose):]
+
+		var resp PlannerResponse
+		if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil {
+			p.applyPlannerResponse(resp)
+		} else {
+			// Malformed JSON — show raw so the problem is visible.
+			p.addAIChat(jsonStr)
+		}
+		// Loop: process any further fences in the remaining buffer.
+	}
 }
+
+func (p *PlannerView) addAIChat(text string) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return
+	}
+	p.feedback = append(p.feedback, FeedbackEntry{
+		Type:      "ai",
+		Content:   trimmed,
+		Timestamp: time.Now(),
+	})
+}
+
+// applyPlannerResponse updates TUI state from a parsed planner JSON response.
+func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
+	// Transition state machine
+	switch resp.Phase {
+	case "clarifying":
+		if p.state == StateDefiningRequirement || p.state == StateRefiningRequirement {
+			p.state = StateRefiningRequirement
+		}
+	case "draft_plan":
+		p.state = StateReviewingPlan
+	case "ready_for_review":
+		p.state = StateReviewingPlan
+	}
+
+	// Update requirement
+	if resp.Requirement != nil {
+		if p.requirement == nil {
+			p.requirement = &Requirement{
+				ID:          fmt.Sprintf("req-%d", time.Now().Unix()),
+				LastUpdated: time.Now(),
+			}
+		}
+		p.requirement.Original = resp.Requirement.Original
+		p.requirement.Refined = resp.Requirement.Refined
+		p.requirement.Iteration++
+		p.requirement.LastUpdated = time.Now()
+	}
+
+	// Update tasks
+	if len(resp.Tasks) > 0 {
+		p.tasks = make([]Task, len(resp.Tasks))
+		for i, t := range resp.Tasks {
+			p.tasks[i] = Task{
+				ID:                 t.ID,
+				Title:              t.Title,
+				Description:        t.Description,
+				Wave:               t.Wave,
+				Dependencies:       t.Dependencies,
+				AcceptanceCriteria: t.AcceptanceCriteria,
+				Status:             TaskStatusPending,
+			}
+		}
+	}
+
+	// Show the human-readable message in chat
+	if resp.Message != "" {
+		p.addAIChat(resp.Message)
+	} else if len(resp.Questions) > 0 {
+		// Fallback: render questions inline if message is empty
+		var sb strings.Builder
+		for i, q := range resp.Questions {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, q))
+		}
+		p.addAIChat(strings.TrimSpace(sb.String()))
+	}
+}
+
+// Message types for bubbletea
+type plannerSentMsg struct{}
+
+type plannerErrorMsg struct{ err error }
+
+type plannerDispatchedMsg struct{ target string } // "workspace" or "direct"
 
 type plannerTickMsg time.Time
 
-// Helper functions
-func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return s
-		}
-	}
-	return ""
-}
-
-func getInt(m map[string]interface{}, key string) int {
-	if v, ok := m[key]; ok {
-		switch n := v.(type) {
-		case float64:
-			return int(n)
-		case int:
-			return n
-		case int64:
-			return int(n)
-		}
-	}
-	return 0
-}

@@ -408,6 +408,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.renderer.InvalidateCacheFromIndex(msg.agent, replacedIdx)
 		}
 
+		// Forward new planner agent lines to the PlannerView conversation panel.
+		if msg.agent == "planner" && a.planner != nil && len(result) > prevLen {
+			newTypes := types
+			if len(newTypes) > prevLen {
+				newTypes = newTypes[prevLen:]
+			} else {
+				newTypes = nil
+			}
+			a.planner.ReceiveOutput(result[prevLen:], newTypes)
+		}
+
 		// Detect activity events from new lines for the activity log
 		activities := detectActivity(msg.agent, msg.lines)
 		if len(activities) > 0 {
