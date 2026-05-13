@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Docs canonicalised on the browser-agent audit log path:
+  `~/.oat/output/<repo>/browser-agent-actions.jsonl`. The daemon
+  already passes `OAT_BROWSER_AGENT_AUDIT_LOG_DIR=<that dir>` in the
+  MCP server's env block (Part 2), so this is the path actually
+  written when the agent runs under OAT. Older docs in
+  `docs/DIRECTORY_STRUCTURE.md` and `docs/COMMANDS.md` claimed
+  `<repo-root>/.oat-logs/...`, which was never accurate under OAT
+  and has been corrected. Root `AGENTS.md` also updated to call out
+  that the browser-agent is opt-in via `oat agent add browser-agent`
+  rather than auto-started with the repo.
+
 - `handleStartRepoAgents` now skips agents whose PID is still alive,
   making the verb idempotent. Required to safely re-call after
   `oat agent add` registers a single new agent on an

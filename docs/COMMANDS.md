@@ -334,7 +334,7 @@ Other agents can delegate web tasks to the browser agent via inter-agent messagi
 oat message send browser-agent "Go to <url> and report what you find"
 ```
 
-The browser agent logs actions to `<repo-root>/.oat-logs/browser-agent-actions.jsonl` and downloads files to `~/.oat/downloads/<repo>/`. See the [oat-browser-agent repo](https://github.com/Root-IO-Labs/oat-browser-agent) for setup and Chrome extension details.
+The browser agent logs actions to `~/.oat/output/<repo>/browser-agent-actions.jsonl` (canonical OAT per-repo output path, set via `OAT_BROWSER_AGENT_AUDIT_LOG_DIR` at spawn) and downloads files to `~/.oat/downloads/<repo>/`. See the [oat-browser-agent repo](https://github.com/Root-IO-Labs/oat-browser-agent) for setup and Chrome extension details.
 
 ## Custom Agents
 

@@ -231,11 +231,15 @@ They are used for inter-agent communication.
 
 ### 📄 Browser agent audit log
 
-**Type**: file (`<repo-root>/.oat-logs/browser-agent-actions.jsonl`)
+**Type**: file (`~/.oat/output/<repo>/browser-agent-actions.jsonl`)
 
-JSONL audit log of all browser agent actions (navigations, clicks, extractions, etc.)
+JSONL audit log of all browser agent actions (navigations, clicks, extractions, etc.) — one JSON object per line.
 
-**Notes**: Written by the browser agent bridge to `.oat-logs/` relative to the repository root (not inside `~/.oat/`). Each line is a JSON object with timestamp, tool name, tab ID, URL, parameters, result, and duration. Useful for debugging browser agent behavior and auditing web interactions.
+**Notes**: Written by the oat-browser-agent bridge into the canonical per-repo OAT output directory alongside `supervisor.log` / `default.log`. The daemon passes `OAT_BROWSER_AGENT_AUDIT_LOG_DIR=~/.oat/output/<repo>` to the bridge at spawn time, so audit logs are automatically isolated per repo without bridge-side awareness of repo names. The bridge rotates the file at 10 MB by copy-and-truncate to `browser-agent-actions.jsonl.1` to preserve the active inode for tail-followers.
+
+Each line is a JSON object with timestamp, tool name, tab ID, URL, parameters, result, and duration. Defense-layer denials carry a `securityEvent.type` field — see [THREAT_MODEL.md](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/docs/THREAT_MODEL.md) for the enum.
+
+Older OAT installs (before the Part-4 audit-log canonicalisation) may have written the log to `<repo-root>/.oat-logs/browser-agent-actions.jsonl` instead. Tooling that needs to support both locations should probe `~/.oat/output/<repo>/browser-agent-actions.jsonl` first and fall back to the legacy path.
 
 ### 📁 `downloads/<repo-name>/`
 
