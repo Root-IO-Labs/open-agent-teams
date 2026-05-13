@@ -362,7 +362,79 @@ Run `oat --help` for the full command tree. See [Commands Reference](docs/COMMAN
 | **Reviewer** | Reviews PRs before merge. Posts blocking or non-blocking feedback. | Ephemeral |
 | **Verification** | Independent quality gate. Reviews diff, runs tests, delivers approve/reject. | Ephemeral |
 
-Agent definitions: [supervisor](internal/prompts/supervisor.md) | [merge-queue](internal/templates/agent-templates/merge-queue.md) | [pr-shepherd](internal/templates/agent-templates/pr-shepherd.md) | [workspace](internal/prompts/workspace.md) | [worker](internal/templates/agent-templates/worker.md) | [reviewer](internal/templates/agent-templates/reviewer.md) | [verification](internal/templates/agent-templates/verification.md)
+Agent definitions: [supervisor](internal/prompts/supervisor.md) | [merge-queue](internal/templates/agent-templates/merge-queue.md) | [pr-shepherd](internal/templates/agent-templates/pr-shepherd.md) | [workspace](internal/prompts/workspace.md) | [worker](internal/templates/agent-templates/worker.md) | [reviewer](internal/templates/agent-templates/reviewer.md) | [verification](internal/templates/agent-templates/verification.md) | [overlord](internal/templates/agent-templates/overlord.md)
+
+## Planner/Overlord Agent
+
+The **Planner/Overlord** agent is OAT's intelligent requirement decomposition and task planning system. It transforms vague requirements into detailed, executable plans with wave-based task batching and ensures complete requirement fulfillment.
+
+### Purpose
+
+**Intelligent requirement decomposition** — The overlord analyzes complex requirements and breaks them down into atomic, parallelizable tasks organized in dependency-safe waves.
+
+**Wave-based task batching** — Groups related tasks into sequential waves that minimize merge conflicts while maximizing parallel execution within each wave.
+
+**GitHub issue integration** — Automatically creates tracked GitHub issues for each task with proper labels, acceptance criteria, and technical hints for workers.
+
+**Convergence tracking** — Monitors progress and ensures 100% requirement completion by spawning fix tasks for gaps or failures.
+
+### Features
+
+- **EARS format requirements** — Converts goals into structured Entity, Attribute, Relationship, State specifications
+- **Dependency-aware scheduling** — Maintains task dependency graphs for optimal parallelization
+- **Smart model routing** — Assigns appropriate model tiers (simple/standard/complex) based on task characteristics
+- **Repository orientation** — Analyzes codebase structure, recent changes, and active work before planning
+- **Interactive checkpoints** — Provides plan reviews and wave completion summaries
+
+### Usage Examples
+
+**Spawn an overlord agent:**
+```bash
+oat agent create overlord --repo my-project --class persistent
+```
+
+**Send a requirement for planning:**
+```bash
+oat message send overlord "Add OAuth2 authentication with JWT and RBAC"
+```
+
+**View generated plans:**
+```bash
+ls .oat/specs/                        # List all plans
+cat .oat/specs/add-oauth2/tasks.md    # Review task breakdown
+```
+
+**Approve and execute a plan:**
+```bash
+oat-plan-approve add-oauth2-auth       # Approve plan and create GitHub issues
+```
+
+**Monitor plan progress:**
+```bash
+oat status                             # View overall progress
+oat agent attach overlord             # Interactive plan monitoring
+```
+
+### Workflow
+
+1. **Requirement** → User sends high-level requirement to overlord
+2. **Plan** → Overlord analyzes repo, decomposes into waves of atomic tasks  
+3. **Issues** → Plan approval creates GitHub issues with proper labeling
+4. **Workers** → Workspace spawns workers for approved tasks in wave order
+5. **Completion** → Overlord tracks progress and ensures convergence
+
+**Plan artifacts** are saved to `.oat/specs/<plan-slug>/` containing:
+- `requirements.md` - Structured EARS requirements
+- `design.md` - Architecture and implementation strategy  
+- `tasks.md` - Wave-organized task breakdown
+- `plan.yaml` - Machine-readable plan metadata
+
+### Integration
+
+The planner integrates seamlessly with existing OAT workflows:
+- **Non-blocking** — Plans during natural pause points, never slows simple tasks
+- **Bypass mechanisms** — Simple tasks continue to use direct worker creation
+- **Smart defaults** — Automatically detects complexity and activates when beneficial
 
 ## Customize Your Team
 

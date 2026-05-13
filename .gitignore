@@ -104,3 +104,4 @@ docs/bedrock-benchmarking.md
 # GoReleaser output and staging
 /dist/
 /.release-stage/
+.env
