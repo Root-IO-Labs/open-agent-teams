@@ -1303,7 +1303,7 @@ func (a *App) activityPanelWidth() int {
 // isPrimaryAgent returns true for agent types that act as the main orchestrator.
 func isPrimaryAgent(agentType string) bool {
 	switch agentType {
-	case "workspace", "supervisor":
+	case "workspace", "supervisor", "planner":
 		return true
 	}
 	return false
@@ -1318,20 +1318,22 @@ func agentTypePriority(agentType string) int {
 		return 0
 	case "supervisor":
 		return 1
-	case "merge-queue":
+	case "planner":
 		return 2
-	case "pr-shepherd":
+	case "merge-queue":
 		return 3
-	case "generic-persistent":
+	case "pr-shepherd":
 		return 4
-	case "worker":
+	case "generic-persistent":
 		return 5
-	case "review":
+	case "worker":
 		return 6
-	case "verification":
+	case "review":
 		return 7
-	default:
+	case "verification":
 		return 8
+	default:
+		return 9
 	}
 }
 
