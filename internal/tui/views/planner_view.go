@@ -231,68 +231,35 @@ func (p *PlannerView) Update(msg tea.Msg) (*PlannerView, tea.Cmd) {
 }
 
 func (p *PlannerView) handleKey(msg tea.KeyMsg) (*PlannerView, tea.Cmd) {
-	switch {
-	case key.Matches(msg, p.keyMap.NewRequirement):
-		p.startNewRequirement()
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.RefineReq):
-		if p.requirement != nil {
-			return p, p.refineRequirement()
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.ApprovePlan):
-		if p.state == StateReviewingPlan {
-			p.approvePlan()
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.RejectPlan):
-		if p.state == StateReviewingPlan {
-			return p, p.rejectPlan()
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.LockPlan):
-		if len(p.tasks) > 0 && !p.isLocked {
-			p.lockPlan()
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.UnlockPlan):
-		if p.isLocked {
-			p.unlockPlan()
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.Execute):
-		if p.isLocked && p.state == StatePlanLocked {
-			return p, p.executePlan()
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.ScrollUp):
-		if p.scrollY > 0 {
-			p.scrollY--
-		}
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.ScrollDown):
-		p.scrollY++
-		return p, nil
-
-	case key.Matches(msg, p.keyMap.SelectTask):
-		if len(p.tasks) > 0 {
-			p.selectedTask = (p.selectedTask + 1) % len(p.tasks)
-		}
-		return p, nil
-
-	case msg.Type == tea.KeyEnter && p.input.Focused():
+	// Enter submits the current input text to the planner state machine.
+	if msg.Type == tea.KeyEnter && p.input.Focused() {
 		return p.handleInput()
 	}
 
-	return p, nil
+	// Action shortcuts use ctrl-prefixed bindings so they don't collide with
+	// regular typing (the prior keymap intercepted plain letters like n, r,
+	// a, x, l, u, e, j, k — which made it impossible to type any word
+	// containing those letters into the requirement input).
+	if msg.Type == tea.KeyCtrlN {
+		p.startNewRequirement()
+		return p, nil
+	}
+	if msg.Type == tea.KeyCtrlR && p.requirement != nil {
+		return p, p.refineRequirement()
+	}
+	if msg.Type == tea.KeyCtrlA && p.state == StateReviewingPlan {
+		p.approvePlan()
+		return p, nil
+	}
+	if msg.Type == tea.KeyCtrlX && p.state == StateReviewingPlan {
+		return p, p.rejectPlan()
+	}
+
+	// Everything else — including printable characters, backspace, arrows,
+	// home/end, etc. — goes to the textinput so the user can actually type.
+	var cmd tea.Cmd
+	p.input, cmd = p.input.Update(msg)
+	return p, cmd
 }
 
 func (p *PlannerView) handleInput() (*PlannerView, tea.Cmd) {
@@ -916,22 +883,18 @@ func (p *PlannerView) renderHelp() string {
 
 	switch p.state {
 	case StateDefiningRequirement:
-		helps = []string{"Enter: submit requirement", "esc: back"}
+		helps = []string{"Enter: submit", "esc: back"}
 	case StateRefiningRequirement, StateDecomposingTasks:
-		helps = []string{"Enter: provide feedback", "r: refine", "esc: back"}
+		helps = []string{"Enter: feedback", "^r: refine", "esc: back"}
 	case StateReviewingPlan:
-		helps = []string{"a: approve", "x: reject", "l: lock", "Enter: feedback", "esc: back"}
+		helps = []string{"^a: approve", "^x: reject", "Enter: feedback", "esc: back"}
 	case StatePlanLocked:
-		if p.isLocked {
-			helps = []string{"e: execute", "u: unlock", "esc: back"}
-		} else {
-			helps = []string{"l: lock", "Enter: feedback", "esc: back"}
-		}
+		helps = []string{"Enter: feedback", "esc: back"}
 	case StateExecuting:
 		helps = []string{"esc: back"}
 	}
 
-	helps = append(helps, "n: new requirement")
+	helps = append(helps, "^n: new requirement")
 
 	helpText := strings.Join(helps, " • ")
 	
