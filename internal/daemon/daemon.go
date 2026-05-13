@@ -2692,6 +2692,15 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 			} else {
 				d.logger.Info("Sent completion notification to merge-queue for worker %s", agentName)
 			}
+
+			workspaceMessage := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Worker '%s' has completed. Supervisor and merge-queue have been notified.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMessage); err != nil {
+				d.logger.Warn("Failed to send completion message to workspace (may not be running): %v", err)
+			} else {
+				d.logger.Info("Sent completion notification to workspace for worker %s", agentName)
+			}
+
 		case state.AgentTypeReview:
 			mergeQueueMessage := d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue,
 				fmt.Sprintf("[daemon] Review agent '%s' has completed its review. Check the review summary and decide on next steps.", agentName))
@@ -2700,6 +2709,13 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 			} else {
 				d.logger.Info("Sent completion notification to merge-queue for review agent %s", agentName)
 			}
+
+			workspaceMessage := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Review agent '%s' has completed its review.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMessage); err != nil {
+				d.logger.Warn("Failed to send completion message to workspace (may not be running): %v", err)
+			}
+
 		case state.AgentTypeVerification:
 			// Notify supervisor that verification completed
 			supervisorMessage := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor,
@@ -2708,6 +2724,12 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 				d.logger.Error("Failed to send completion message to supervisor: %v", err)
 			} else {
 				d.logger.Info("Sent completion notification to supervisor for verification agent %s", agentName)
+			}
+
+			workspaceMessage := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Verification agent '%s' has completed. The worker has received its verdict.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMessage); err != nil {
+				d.logger.Warn("Failed to send completion message to workspace (may not be running): %v", err)
 			}
 		}
 
@@ -3454,6 +3476,11 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 			if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mergeQueueMsg); err != nil {
 				d.logger.Error("Failed to send auto-complete notification to merge-queue: %v", err)
 			}
+			workspaceMsg := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Worker '%s' auto-completed without a PR.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMsg); err != nil {
+				d.logger.Warn("Failed to send auto-complete notification to workspace: %v", err)
+			}
 			d.triggerRouteMessages()
 		}
 		d.safeGo("health-check-auto-complete", d.checkAgentHealth)
@@ -3568,6 +3595,11 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 			fmt.Sprintf("[daemon] Worker '%s' has submitted PR #%d. Please check and merge when CI is green.", agentName, agent.PRNumber))
 		if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mqMsg); err != nil {
 			d.logger.Error("Failed to notify merge-queue about dormant worker %s/%s: %v", repoName, agentName, err)
+		}
+		wsMsg := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+			fmt.Sprintf("[daemon] Worker '%s' has submitted PR #%d and is waiting for CI + merge.", agentName, agent.PRNumber))
+		if _, err := msgMgr.Send(repoName, "daemon", "workspace", wsMsg); err != nil {
+			d.logger.Warn("Failed to notify workspace about PR submission for worker %s/%s: %v", repoName, agentName, err)
 		}
 		d.triggerRouteMessages()
 	}
