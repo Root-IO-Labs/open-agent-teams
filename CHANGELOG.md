@@ -38,6 +38,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Command`, `Args`, and a human-readable `Source` describing
   where it was found.
 
+### Fixed
+
+- Daemon recovery now restores the opt-in browser-agent after a
+  backend-session loss. `restoreRepoAgents` previously rebuilt only
+  the always-on agent set (supervisor, merge-queue or pr-shepherd,
+  workspace) and left a `~/.oat/wts/<repo>/browser-agent/` worktree
+  orphaned in state. The fix: when the worktree path exists,
+  `restoreRepoAgents` now calls `startAgent(AgentTypeBrowser, ...)`
+  so the agent is respawned. The worktree path acts as the "user
+  opted in" persistence marker; no extra state-file field is
+  needed. Without this, `oat agent add browser-agent` followed by
+  any daemon crash + restart would silently drop the agent.
+- `startAgentWithConfig` (used by `restoreRepoAgents` and other
+  generic spawn paths) now also writes `.oat/mcp.json` for
+  `AgentTypeBrowser` -- previously only `startRegisteredAgent`
+  (the `start_repo_agents` path) did this, so a recovery-restored
+  browser-agent would launch with no MCP tools. Both spawn paths
+  now go through `buildBrowserAgentMCPConfig`.
+
 ### Changed
 
 - Docs canonicalised on the browser-agent audit log path:

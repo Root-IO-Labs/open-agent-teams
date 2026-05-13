@@ -4864,6 +4864,24 @@ func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) erro
 		}
 	}
 
+	// Restore opt-in browser-agent. The worktree at ~/.oat/wts/<repo>/
+	// browser-agent/ acts as the "user opted in" persistence marker --
+	// `oat agent add browser-agent` creates it, `oat agent remove`
+	// deletes it (when it lands). If the path exists, we must respawn
+	// the agent so a daemon crash + restart doesn't silently drop an
+	// opted-in extension. The MCP config is rewritten at spawn time by
+	// startRegisteredAgent's AgentTypeBrowser branch, so a fresh bridge
+	// resolution + audit-log dir is always written.
+	browserName := "browser-agent"
+	browserWtPath := d.paths.AgentWorktree(repoName, browserName)
+	if _, err := os.Stat(browserWtPath); err == nil {
+		if err := d.startAgent(repoName, repo, browserName, state.AgentTypeBrowser, browserWtPath); err != nil {
+			d.logger.Error("Failed to restore browser-agent for %s: %v", repoName, err)
+		} else {
+			d.logger.Info("Restored opt-in browser-agent for %s", repoName)
+		}
+	}
+
 	return nil
 }
 
@@ -5259,6 +5277,24 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		// partial — agents created through this path would silently skip
 		// sidecar emission even when the operator enabled it.
 		sidecarPath := sidecarSocketPath(repoName, cfg.agentName)
+
+		// MCP config for browser-agent. This path is hit by
+		// startAgent() -> startAgentWithConfig() which is what
+		// restoreRepoAgents (the recovery path) calls. Without this
+		// branch, a daemon-restart-restored browser-agent would
+		// launch with no .oat/mcp.json and silently lose all its
+		// browser tools. Resolution failure logs a WARN; the agent
+		// still spawns so the operator can attach and diagnose.
+		var mcpConfig string
+		if cfg.agentType == state.AgentTypeBrowser {
+			mc, mcpErr := d.buildBrowserAgentMCPConfig(repoName)
+			if mcpErr != nil {
+				d.logger.Warn("Browser agent %s/%s starting without MCP tools: %v", repoName, cfg.agentName, mcpErr)
+			} else {
+				mcpConfig = mc
+			}
+		}
+
 		handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
 			SessionName:   repo.SessionName,
 			AgentName:     cfg.agentName,
@@ -5268,6 +5304,7 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 			Env:           envVars,
 			EnvPrefix:     envPrefix,
 			InitialPrompt: promptContent,
+			MCPConfig:     mcpConfig,
 			LogFile:       logFile,
 			SidecarPath:   sidecarPath,
 		})

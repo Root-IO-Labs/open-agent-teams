@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2639,6 +2640,127 @@ func TestRestoreDeadAgentsIncludesWorkspace(t *testing.T) {
 	// The IsPersistent() method is tested comprehensively in state_test.go
 	if !state.AgentTypeWorkspace.IsPersistent() {
 		t.Error("Workspace agents should be classified as persistent")
+	}
+}
+
+// TestBuildBrowserAgentMCPConfig_StructureAndContents verifies the
+// JSON written to <wt>/.oat/mcp.json for a browser-agent. The Python
+// agent-runtime parses this with pydantic via oat_sdk.mcp_client; the
+// shape contract is:
+//
+//	{"servers": [{"name", "command", "args", "transport": "stdio",
+//	              "env": {"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "..."}}]}
+//
+// We assert structure + that the audit-log dir is per-repo (so two
+// browser-agents on the same daemon don't cross-contaminate logs)
+// and that the bridge resolution agrees with what
+// internal/agents.ResolveBrowserBridge would have returned.
+func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// Point the bridge resolver at a real file so resolution succeeds
+	// (a .js path -> `node <path>` per ResolveBrowserBridge).
+	scriptPath := filepath.Join(t.TempDir(), "bridge.js")
+	if err := os.WriteFile(scriptPath, []byte("// stub"), 0644); err != nil {
+		t.Fatalf("write stub bridge: %v", err)
+	}
+	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
+
+	cfg, err := d.buildBrowserAgentMCPConfig("my-repo")
+	if err != nil {
+		t.Fatalf("buildBrowserAgentMCPConfig failed: %v", err)
+	}
+
+	// Round-trip through encoding/json so the assertions don't depend on
+	// the marshaller's whitespace decisions.
+	var parsed struct {
+		Servers []struct {
+			Name      string            `json:"name"`
+			Command   string            `json:"command"`
+			Args      []string          `json:"args"`
+			Transport string            `json:"transport"`
+			Env       map[string]string `json:"env"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &parsed); err != nil {
+		t.Fatalf("unmarshal cfg: %v\ncfg=%s", err, cfg)
+	}
+	if len(parsed.Servers) != 1 {
+		t.Fatalf("want 1 server, got %d: %+v", len(parsed.Servers), parsed.Servers)
+	}
+	s := parsed.Servers[0]
+	if s.Name != "browser_bridge" {
+		t.Errorf("server.name = %q, want %q", s.Name, "browser_bridge")
+	}
+	if s.Transport != "stdio" {
+		t.Errorf("server.transport = %q, want %q", s.Transport, "stdio")
+	}
+	if s.Command != "node" {
+		t.Errorf("server.command = %q, want %q for .js bridge", s.Command, "node")
+	}
+	if len(s.Args) != 1 || s.Args[0] != scriptPath {
+		t.Errorf("server.args = %v, want [%q]", s.Args, scriptPath)
+	}
+	expectedAuditDir := d.paths.RepoOutputDir("my-repo")
+	if got := s.Env["OAT_BROWSER_AGENT_AUDIT_LOG_DIR"]; got != expectedAuditDir {
+		t.Errorf("OAT_BROWSER_AGENT_AUDIT_LOG_DIR = %q, want %q (canonical per-repo output dir)", got, expectedAuditDir)
+	}
+}
+
+// TestBuildBrowserAgentMCPConfig_PerRepoAuditDir documents that two
+// repos get distinct audit-log dirs even though they share the same
+// bridge command -- the audit-log isolation is repo-scoped.
+func TestBuildBrowserAgentMCPConfig_PerRepoAuditDir(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	scriptPath := filepath.Join(t.TempDir(), "bridge.js")
+	if err := os.WriteFile(scriptPath, []byte("// stub"), 0644); err != nil {
+		t.Fatalf("write stub bridge: %v", err)
+	}
+	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
+
+	cfgA, err := d.buildBrowserAgentMCPConfig("repo-a")
+	if err != nil {
+		t.Fatalf("repo-a: %v", err)
+	}
+	cfgB, err := d.buildBrowserAgentMCPConfig("repo-b")
+	if err != nil {
+		t.Fatalf("repo-b: %v", err)
+	}
+	if cfgA == cfgB {
+		t.Fatalf("two repos should produce distinct configs (audit dirs differ); both=%s", cfgA)
+	}
+	if !strings.Contains(cfgA, "repo-a") {
+		t.Errorf("repo-a config missing repo name in audit dir: %s", cfgA)
+	}
+	if !strings.Contains(cfgB, "repo-b") {
+		t.Errorf("repo-b config missing repo name in audit dir: %s", cfgB)
+	}
+}
+
+// TestBuildBrowserAgentMCPConfig_BridgeMissingError verifies the
+// failure mode used by callers (startRegisteredAgent /
+// startAgentWithConfig / restartAgent) to decide whether to log a
+// WARN and start with no MCP tools, vs propagate an error. The
+// resolution failure must produce a structured error, not a panic.
+func TestBuildBrowserAgentMCPConfig_BridgeMissingError(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", "")
+	// Wipe HOME + PATH to ensure neither fallback hits.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+
+	_, err := d.buildBrowserAgentMCPConfig("my-repo")
+	if err == nil {
+		t.Fatal("expected resolution error when no bridge is installed, got nil")
+	}
+	// Error must be actionable (callers log it verbatim).
+	if !strings.Contains(err.Error(), "oat-browser-agent") {
+		t.Errorf("error should mention oat-browser-agent; got: %v", err)
 	}
 }
 
