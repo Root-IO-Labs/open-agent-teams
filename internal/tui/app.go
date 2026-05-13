@@ -609,9 +609,18 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case key.Matches(msg, keys.OpenPlanner):
+		// Route through the same path as selecting the planner row from the
+		// sidebar list so activeAgent and agentIndex stay consistent — esc
+		// will return the cursor to the planner row.
+		a.switchToAgent("planner")
 		a.mode = ViewPlanner
 		a.showAgentList = false
-		a.input.Blur()
+		for i, ag := range a.agents {
+			if ag.Name == "planner" {
+				a.agentIndex = i
+				break
+			}
+		}
 		a.recalcLayout()
 		return a, nil
 	}
@@ -1235,6 +1244,14 @@ func (a *App) recalcLayout() {
 func (a *App) switchToAgent(name string) {
 	a.activeAgent = name
 
+	// Planner has its own input/state inside PlannerView and doesn't stream
+	// log output through the normal viewport — so blur the main input and
+	// skip viewport/auto-scroll setup. The caller flips mode via modeForAgent.
+	if name == "planner" {
+		a.input.Blur()
+		return
+	}
+
 	// Initialize auto-scroll for new agents, but preserve existing state
 	if _, exists := a.autoScroll[name]; !exists {
 		a.autoScroll[name] = true
@@ -1269,6 +1286,14 @@ func (a *App) syncViewportWithAutoScroll(agentName string) {
 }
 
 func (a *App) modeForAgent(name string) ViewMode {
+	// Selecting the planner row opens the collaborative PlannerView instead
+	// of the standard log viewport, regardless of whether the planner is a
+	// daemon-spawned agent or a TUI-local view. Check by name before falling
+	// through to the primary-agent check (which would otherwise route to
+	// ViewWorkspace since isPrimaryAgent("planner") == true).
+	if name == "planner" {
+		return ViewPlanner
+	}
 	for _, ag := range a.agents {
 		if ag.Name == name && isPrimaryAgent(ag.Type) {
 			return ViewWorkspace
@@ -1314,26 +1339,26 @@ func isPrimaryAgent(agentType string) bool {
 // primary agents at top, infrastructure next, then workers and transient agents.
 func agentTypePriority(agentType string) int {
 	switch agentType {
+	case "planner":
+		return -1
 	case "workspace":
 		return 0
 	case "supervisor":
 		return 1
-	case "planner":
-		return 2
 	case "merge-queue":
-		return 3
+		return 2
 	case "pr-shepherd":
-		return 4
+		return 3
 	case "generic-persistent":
-		return 5
+		return 4
 	case "worker":
-		return 6
+		return 5
 	case "review":
-		return 7
+		return 6
 	case "verification":
-		return 8
+		return 7
 	default:
-		return 9
+		return 8
 	}
 }
 
