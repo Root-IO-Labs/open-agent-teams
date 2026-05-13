@@ -735,18 +735,18 @@ func TestHandleCompleteAgentSendsMessages(t *testing.T) {
 		expectedRecipients []string
 	}{
 		{
-			name:               "worker sends to supervisor and merge-queue",
+			name:               "worker sends to supervisor, merge-queue, and workspace",
 			agentType:          state.AgentTypeWorker,
 			agentName:          "test-worker",
 			task:               "implement feature X",
-			expectedRecipients: []string{"supervisor", "merge-queue"},
+			expectedRecipients: []string{"supervisor", "merge-queue", "workspace"},
 		},
 		{
-			name:               "review agent sends to merge-queue only",
+			name:               "review agent sends to merge-queue and workspace",
 			agentType:          state.AgentTypeReview,
 			agentName:          "test-review",
 			task:               "review PR #42",
-			expectedRecipients: []string{"merge-queue"},
+			expectedRecipients: []string{"merge-queue", "workspace"},
 		},
 		// Supervisor and merge-queue are now rejected by the permanent agent guard.
 		// See TestHandleCompleteAgentTableDriven for those tests.

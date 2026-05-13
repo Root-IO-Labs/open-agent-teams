@@ -37,17 +37,16 @@ const snapshotDisabledEnv = "OAT_DAEMON_SNAPSHOT_DISABLED"
 const snapshotMarker = "## Current State"
 
 // isSnapshotTarget reports whether a given agent type should receive
-// daemon-injected state snapshots. Today only supervisor and merge-queue
-// are supported; other types fall through untouched.
+// daemon-injected state snapshots.
 func isSnapshotTarget(t state.AgentType) bool {
-	return t == state.AgentTypeSupervisor || t == state.AgentTypeMergeQueue
+	return t == state.AgentTypeSupervisor || t == state.AgentTypeMergeQueue || t == state.AgentTypeWorkspace
 }
 
 // withRepoSnapshot returns msg with the appropriate daemon state snapshot
-// appended for supervisor or merge-queue recipients. For any other target,
-// for an empty snapshot (repo unknown, gh timeout), when the kill-switch
-// env var is set, or when msg already contains a snapshot block, it
-// returns msg unchanged.
+// appended for supervisor, merge-queue, or workspace recipients. For any
+// other target, for an empty snapshot (repo unknown, gh timeout), when the
+// kill-switch env var is set, or when msg already contains a snapshot block,
+// it returns msg unchanged.
 //
 // Safe to call from any goroutine. Cost is bounded: a 3s gh timeout and a
 // 3s in-memory cache protect against slow or repeated calls.
@@ -72,6 +71,10 @@ func (d *Daemon) withRepoSnapshot(repoName string, target state.AgentType, msg s
 		return msg + supSnap
 	case state.AgentTypeMergeQueue:
 		return msg + mqSnap
+	case state.AgentTypeWorkspace:
+		// Workspace gets the supervisor-view snapshot so it has the full
+		// project picture (worker list + open PRs) for coordination decisions.
+		return msg + supSnap
 	}
 	return msg
 }
