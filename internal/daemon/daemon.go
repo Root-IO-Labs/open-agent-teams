@@ -5871,7 +5871,8 @@ func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoMod
 
 	role := routing.RoleWorker
 	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace ||
-		agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd {
+		agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd ||
+		agentType == state.AgentTypePlanner {
 		role = routing.RoleOrchestrator
 	}
 

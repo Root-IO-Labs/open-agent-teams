@@ -8968,9 +8968,35 @@ func (c *CLI) printOnboardSummary(modelStr, probeSet, stderr string) {
 func (c *CLI) modelList(args []string) error {
 	profileDirs := c.modelProfileDirs()
 
+	// Detect which API keys are present so we can mark model availability.
+	keyEnvs := map[string]string{
+		"anthropic":   "ANTHROPIC_API_KEY",
+		"openai":      "OPENAI_API_KEY",
+		"openrouter":  "OPENROUTER_API_KEY",
+		"google_genai": "GOOGLE_API_KEY",
+		"deepseek":    "DEEPSEEK_API_KEY",
+		"ollama":      "", // local — always available
+		"spark":       "SPARK_API_KEY",
+	}
+	hasKey := func(modelID string) bool {
+		parts := strings.SplitN(modelID, ":", 2)
+		if len(parts) == 0 {
+			return false
+		}
+		provider := parts[0]
+		envVar, known := keyEnvs[provider]
+		if !known {
+			return false
+		}
+		if envVar == "" {
+			return true // local provider, no key needed
+		}
+		return os.Getenv(envVar) != ""
+	}
+
 	seen := make(map[string]bool)
-	fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n", "MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR")
-	fmt.Println(strings.Repeat("─", 84))
+	fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-10s\n", "MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR", "KEY")
+	fmt.Println(strings.Repeat("─", 95))
 
 	for _, profileDir := range profileDirs {
 		entries, err := os.ReadDir(profileDir)
@@ -8995,12 +9021,17 @@ func (c *CLI) modelList(args []string) error {
 			if orchEligible == "" {
 				orchEligible = fields["supervisor_eligible"]
 			}
-			fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n",
+			keyStatus := "✓"
+			if !hasKey(modelID) {
+				keyStatus = "✗ no key"
+			}
+			fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-10s\n",
 				modelID,
 				fields["status"],
 				fields["overall_score"],
 				fields["worker_eligible"],
 				orchEligible,
+				keyStatus,
 			)
 		}
 	}

@@ -17,8 +17,9 @@ func GenerateModelRoster(ps *ProfileStore, allowedModels []string) string {
 	var b strings.Builder
 
 	b.WriteString("## Available Models for Workers\n\n")
+	b.WriteString("**IMPORTANT:** Only use models listed in this table. Do NOT use models from `oat model list` that are not in this table — those may lack a valid API key on this machine.\n\n")
 	b.WriteString("When spawning workers with `oat work`, choose the best model for the task using `--model <model>`.\n")
-	b.WriteString("If you omit `--model`, the system picks the highest-scoring eligible model automatically.\n\n")
+	b.WriteString("If you omit `--model`, the system picks the highest-scoring eligible model automatically (recommended).\n\n")
 
 	// Table header — COVERAGE column is inserted between Score and Context (Q11)
 	// so operators can immediately see how many probes backed the score.
@@ -36,7 +37,7 @@ func GenerateModelRoster(ps *ProfileStore, allowedModels []string) string {
 	}
 
 	b.WriteString("\n### Model Selection Guidelines\n\n")
-	b.WriteString("**You MUST distribute tasks across the available models.** Do not send all tasks to the highest-scoring model.\n\n")
+	b.WriteString("**Only use models in the table above.** If you run `oat model list` and see additional models, ignore them — they require API keys not available on this machine.\n\n")
 	b.WriteString("Route tasks by complexity:\n\n")
 	b.WriteString("- **Complex** (multi-file refactors, architecture, debugging, services with many dependencies) → highest-scoring model with reasoning controls\n")
 	b.WriteString("- **Standard** (single-service implementation, adding tests, CLI commands) → second-tier models (score 90-96)\n")
