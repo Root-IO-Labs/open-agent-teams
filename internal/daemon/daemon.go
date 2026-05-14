@@ -4757,15 +4757,26 @@ func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) erro
 		mqConfig = state.DefaultMergeQueueConfig()
 	}
 
-	// Start supervisor agent — do this BEFORE clearing stale agents so we
-	// don't leave the repo with zero agents if supervisor startup fails.
+	// Clear ALL stale agents from state before restarting them. startAgent
+	// calls AddAgent internally, which fails with "already exists" if the
+	// agent is still registered from before the session died. Removing first
+	// lets startAgent register fresh entries.
+	for agentName := range repo.Agents {
+		d.logger.Debug("Removing stale agent %s/%s from state before restore", repoName, agentName)
+		if err := d.state.RemoveAgent(repoName, agentName); err != nil {
+			d.logger.Warn("Failed to remove stale agent %s/%s: %v", repoName, agentName, err)
+		}
+	}
+
+	// Start supervisor first — if it fails, abort so we don't end up with
+	// a repo that has merge-queue/workspace but no supervisor.
 	if err := d.startAgent(repoName, repo, "supervisor", state.AgentTypeSupervisor, supervisorWtPath); err != nil {
-		d.logger.Error("Failed to start supervisor for %s: %v (keeping stale agents in state for retry)", repoName, err)
+		d.logger.Error("Failed to start supervisor for %s: %v", repoName, err)
 		return fmt.Errorf("failed to start supervisor: %w", err)
 	}
 
-	// Supervisor started successfully — now safe to clear stale agents
-	// (the new supervisor was already added to state by startAgent).
+	// Supervisor started successfully — clear any residual agents that
+	// startAgent may have left in a partial state (defensive).
 	for agentName := range repo.Agents {
 		if agentName == "supervisor" {
 			continue // just started this one
