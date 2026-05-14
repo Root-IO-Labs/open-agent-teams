@@ -5123,7 +5123,9 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 	var modelErr error
 
 	v2Enabled := os.Getenv("OAT_ROUTER_VERSION") == "v2"
-	v1Enabled := os.Getenv("OAT_ROUTING_V1") == "1" || v2Enabled // V2 requires the V1 stack
+	// V1 complexity routing is ON by default for workers. Opt out with OAT_ROUTING_V1=0.
+	// V2 (historical lookup) is still opt-in via OAT_ROUTER_VERSION=v2.
+	v1Enabled := os.Getenv("OAT_ROUTING_V1") != "0" || v2Enabled
 	routerEligible := v1Enabled &&
 		cfg.agentType == state.AgentTypeWorker &&
 		cfg.model == "" &&

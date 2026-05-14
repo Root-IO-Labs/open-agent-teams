@@ -38,14 +38,13 @@ func GenerateModelRoster(ps *ProfileStore, allowedModels []string) string {
 	}
 
 	b.WriteString("\n### Model Selection Guidelines\n\n")
-	b.WriteString("**Only use models in the table above.** If you run `oat model list` and see additional models, ignore them — they require API keys not available on this machine.\n\n")
-	b.WriteString("Route tasks by complexity:\n\n")
-	b.WriteString("- **Complex** (multi-file refactors, architecture, debugging, services with many dependencies) → highest-scoring model with reasoning controls\n")
-	b.WriteString("- **Standard** (single-service implementation, adding tests, CLI commands) → second-tier models (score 90-96)\n")
-	b.WriteString("- **Simple** (contracts, schemas, docs, config, single-file fixes) → any eligible model, prefer lower-scoring ones to save capacity\n")
-	b.WriteString("- **Time-sensitive** (blocking other tasks, CI gates, critical path) → lowest-latency eligible model\n\n")
-	b.WriteString("A good distribution for a typical wave: ~30-40% of tasks to the top model, remainder spread across others.\n")
-	b.WriteString("If all tasks seem equally complex, round-robin across eligible models.\n")
+	b.WriteString("**Only use models in the table above.** If you run `oat model list` and see additional models, ignore them — they have not been onboarded on this machine.\n\n")
+	b.WriteString("**Match model to task complexity** — do not blindly use the highest-scoring model for everything:\n\n")
+	b.WriteString("- **Complex** (multi-file refactors, architecture, debugging across many files) → highest-scoring model\n")
+	b.WriteString("- **Standard** (single-service implementation, adding features, writing tests) → middle-tier models\n")
+	b.WriteString("- **Simple** (docs, config, single-file fixes, schemas) → lowest-scoring eligible model\n")
+	b.WriteString("- **Time-sensitive** (blocking other tasks, critical path) → lowest-latency eligible model\n\n")
+	b.WriteString("The daemon auto-selects the right model based on task complexity when you omit `--model`. Only override with `--model` when you have a specific reason (e.g. forcing sonnet for a very complex task).\n")
 
 	// Staleness footer: the roster is injected once at supervisor spawn and
 	// does not auto-refresh when operators onboard new models mid-session. A
