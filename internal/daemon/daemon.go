@@ -3255,16 +3255,27 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 
 		args := []string{"--auto-approve"}
 
-		// Re-validate the model against the current profile store and repo
-		// allowlist. Without this, startRegisteredAgent restored agents with
-		// models that may since have been un-onboarded or disallowed — the
-		// "silent bypass" identified in the routing live-test audit.
-		// Validation errors are non-fatal here: the agent still starts with
-		// its historical model (operator visibility wins over refusal for
-		// restore paths), but the WARN gives the operator a trail.
+		// Resolve model for this agent. Priority:
+		//   1. agent.Model (explicit model stored at registration)
+		//   2. repo.Model  (repo-wide default)
+		//   3. auto-routing via profile store (same logic as startAgentWithConfig)
+		//
+		// Without step 3, core agents (workspace, supervisor, merge-queue,
+		// planner) with no stored model receive no -M flag and Claude Code
+		// falls back to whatever its own default is — which may be a local or
+		// unavailable model on this machine. Auto-routing always picks the
+		// best onboarded, eligible model.
 		resolvedModel := agent.Model
 		if resolvedModel == "" {
 			resolvedModel = repo.Model
+		}
+		if resolvedModel == "" {
+			// No stored model — auto-select via routing so core agents always
+			// get a known-good model rather than Claude Code's own default.
+			if bestModel, _, routeErr := d.resolveAndValidateModelWithSource("", "", agent.Type, repo.AllowedWorkerModels); routeErr == nil && bestModel != "" {
+				resolvedModel = bestModel
+				d.logger.Info("Model routing: auto-selected %s for %s/%s (no stored model)", resolvedModel, repoName, agentName)
+			}
 		}
 		if resolvedModel != "" {
 			if vErr := d.validateModelForAgentType(resolvedModel, agent.Type, repo.AllowedWorkerModels); vErr != nil {
