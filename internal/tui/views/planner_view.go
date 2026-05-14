@@ -1248,13 +1248,18 @@ func (p *PlannerView) ReceiveOutput(lines []string, lineTypes []string) {
 
 // drainBuffer scans plannerBuffer for complete ```json...``` fences.
 //
-// Freeform text (no fence) is shown in chat immediately — it is never held
-// silently. Text before a fence is shown, the JSON drives state updates and
-// only its message field appears in chat, and any remainder after the fence
-// stays buffered for the next batch.
+// The planner streams JSON line-by-line. We must NOT flush content the moment
+// it arrives because the opening fence (```json) and its content arrive in
+// separate batches. Flushing early causes raw JSON fields like "tasks": []
+// to appear as chat messages.
 //
-// An incomplete fence (opening found, closing not yet arrived) is held in
-// the buffer unchanged so the next batch can complete it.
+// Strategy:
+//   - If buffer has no fence yet AND looks like JSON content (contains { or ")
+//     AND is under 4KB, hold it — the fence will arrive in the next batch.
+//   - If buffer clearly has non-JSON prose (no { or "), flush immediately so
+//     plain-text responses still show up promptly.
+//   - If buffer > 4KB with no fence, flush to avoid silent data loss.
+//   - Once an opening fence is found, hold until the closing fence arrives.
 func (p *PlannerView) drainBuffer() {
 	const fenceOpen = "```json"
 	const fenceClose = "```"
@@ -1262,7 +1267,14 @@ func (p *PlannerView) drainBuffer() {
 	for {
 		fenceStart := strings.Index(p.plannerBuffer, fenceOpen)
 		if fenceStart < 0 {
-			// No JSON fence at all — show everything as plain chat and clear.
+			// No opening fence found yet.
+			// If the buffer looks like streaming JSON content (contains { or ")
+			// and is small enough that a fence might still arrive, hold it.
+			looksLikeJSON := strings.ContainsAny(p.plannerBuffer, `{"`)
+			if looksLikeJSON && len(p.plannerBuffer) < 4096 {
+				return // wait for the fence
+			}
+			// Either plain prose or buffer is too large — flush as chat.
 			if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
 				p.addAIChat(trimmed)
 			}
@@ -1378,26 +1390,18 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		}
 	}
 
-	// Queue any explicit questions from the planner for later surfacing.
-	if len(resp.Questions) > 0 && p.pendingQuestions != nil {
-		p.pendingQuestions = append(p.pendingQuestions, resp.Questions...)
-	}
-
-	// Show the human-readable message in chat
+	// Show the human-readable message in chat. Questions are embedded in the
+	// message field by the planner — don't also surface them as system
+	// messages (that would show everything twice and clutter the view).
 	if resp.Message != "" {
 		p.addAIChat(resp.Message)
 	} else if len(resp.Questions) > 0 {
-		// Fallback: render questions inline if message is empty
+		// Fallback: render questions inline only if message is empty
 		var sb strings.Builder
 		for i, q := range resp.Questions {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, q))
 		}
 		p.addAIChat(strings.TrimSpace(sb.String()))
-	}
-
-	// Surface any pending questions immediately after a planner response.
-	if p.pendingQuestions != nil {
-		p.surfacePendingQuestions()
 	}
 
 	// Set plan-approval gate when a complete plan lands in StateReviewingPlan.
