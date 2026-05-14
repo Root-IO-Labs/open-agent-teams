@@ -602,9 +602,9 @@ func (p *PlannerView) unlockPlan() {
 func (p *PlannerView) sendToPlanner(text string) tea.Cmd {
 	client := p.client
 	repoName := p.repoName
-	// Prefix the user text with the current planning phase so the agent always
-	// knows its context, even after a restart or a confused turn.
-	message := p.buildPlannerMessage(text)
+	// Send raw text — no prefix. The prefix was causing PTY echo to leak
+	// "[planner-tui phase=...]user text" into the output viewport.
+	message := text
 	return func() tea.Msg {
 		if client == nil {
 			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
@@ -1264,11 +1264,11 @@ func (p *PlannerView) renderHelp() string {
 		Render(helpText)
 }
 
-// ReceiveOutput forwards lines from the planner agent's output stream.
-// Text lines (lineType == "" or "text") are accumulated into plannerBuffer.
-// When a complete ```json ... ``` fence is detected, the JSON is parsed to
-// update requirement/tasks/state and the message field is shown in chat.
-// Any freeform text that precedes a JSON block is also shown in chat.
+// ReceiveOutput is called when new lines arrive from the planner agent's
+// output stream. It accumulates text into plannerBuffer and tries to parse
+// JSON planner responses to update planning state (requirement, tasks, phase).
+// It does NOT render anything — rendering is handled by the standard viewport
+// via renderContentForViewport("planner") in app.go.
 func (p *PlannerView) ReceiveOutput(lines []string, lineTypes []string) {
 	p.thinking = false
 	for i, line := range lines {
@@ -1276,6 +1276,7 @@ func (p *PlannerView) ReceiveOutput(lines []string, lineTypes []string) {
 		if i < len(lineTypes) {
 			lt = lineTypes[i]
 		}
+		// Accept text and unknown-type lines; skip tool calls, tool output, etc.
 		if lt != "" && lt != "text" {
 			continue
 		}
@@ -1305,9 +1306,6 @@ func (p *PlannerView) drainBuffer() {
 	for {
 		// ── Pass 1: look for a ```json … ``` fence ────────────────────────
 		if fenceStart := strings.Index(p.plannerBuffer, fenceOpen); fenceStart >= 0 {
-			if preamble := strings.TrimSpace(p.plannerBuffer[:fenceStart]); preamble != "" {
-				p.addAIChat(preamble)
-			}
 			jsonStart := fenceStart + len(fenceOpen)
 			if jsonStart < len(p.plannerBuffer) && p.plannerBuffer[jsonStart] == '\n' {
 				jsonStart++
@@ -1321,48 +1319,33 @@ func (p *PlannerView) drainBuffer() {
 			p.plannerBuffer = p.plannerBuffer[jsonStart+closeIdx+len(fenceClose):]
 			var resp PlannerResponse
 			if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil {
-				p.applyPlannerResponse(resp)
+				p.applyPlannerResponse(resp) // state only — no rendering
 			}
-			continue // loop to check for more fences
+			continue
 		}
 
 		// ── Pass 2: try to extract a bare JSON object {…} ─────────────────
-		// The planner sometimes streams JSON without fence markers. Find the
-		// first '{' and walk braces to find the matching '}'. Only try when
-		// the buffer has at least a closing brace somewhere.
 		if braceAt := strings.Index(p.plannerBuffer, "{"); braceAt >= 0 &&
 			strings.Contains(p.plannerBuffer[braceAt:], "}") {
-
 			obj, end := extractJSONObject(p.plannerBuffer[braceAt:])
 			if obj != "" {
-				before := strings.TrimSpace(p.plannerBuffer[:braceAt])
-				if before != "" {
-					p.addAIChat(before)
-				}
 				var resp PlannerResponse
 				if err := json.Unmarshal([]byte(obj), &resp); err == nil && resp.Phase != "" {
-					p.applyPlannerResponse(resp)
-				} else if before == "" {
-					// Not a planner response — show as plain text
-					p.addAIChat(obj)
+					p.applyPlannerResponse(resp) // state only — no rendering
 				}
 				p.plannerBuffer = p.plannerBuffer[braceAt+end:]
 				continue
 			}
 		}
 
-		// ── Pass 3: decide whether to hold or flush ───────────────────────
-		// Hold if the buffer looks like mid-stream JSON (has quotes/braces)
-		// and is small enough that more content is likely coming.
+		// ── Pass 3: hold or discard ───────────────────────────────────────
+		// Hold if looks like mid-stream JSON; discard otherwise (the raw
+		// output shows through the standard viewport — no feedback list needed).
 		looksLikeJSON := strings.ContainsAny(p.plannerBuffer, `{"`)
 		if looksLikeJSON && len(p.plannerBuffer) < maxHold {
 			return // wait for more batches
 		}
-		// Plain prose or buffer too large — flush as chat and clear.
-		if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
-			p.addAIChat(trimmed)
-		}
-		p.plannerBuffer = ""
+		p.plannerBuffer = "" // discard — rendering is the viewport's job
 		return
 	}
 }
@@ -1478,51 +1461,20 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		}
 	}
 
-	// Show the human-readable message in chat. Questions are embedded in the
-	// message field by the planner — don't also surface them as system
-	// messages (that would show everything twice and clutter the view).
-	if resp.Message != "" {
-		p.addAIChat(resp.Message)
-	} else if len(resp.Questions) > 0 {
-		// Fallback: render questions inline only if message is empty
-		var sb strings.Builder
-		for i, q := range resp.Questions {
-			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, q))
-		}
-		p.addAIChat(strings.TrimSpace(sb.String()))
-	}
-
 	// Set plan-approval gate when a complete plan lands in StateReviewingPlan.
-	// This requires explicit user approval (^a or "approve") before dispatch.
 	if p.state == StateReviewingPlan && len(p.tasks) > 0 && p.currentGate == nil {
 		gates := p.initPhaseGates()
 		if len(gates) >= 3 {
-			gate := gates[2] // gate_3_plan
+			gate := gates[2]
 			gate.ApprovalPrompt = fmt.Sprintf(
-				"Plan ready: %d tasks in %d waves. Press ^a or type 'approve' to dispatch to workspace.",
+				"Plan ready: %d tasks in %d waves. Press ^a to dispatch.",
 				len(p.tasks), p.getMaxWave(),
 			)
 			p.currentGate = &gate
-			p.feedback = append(p.feedback, FeedbackEntry{
-				Type:      "system",
-				Content:   gate.ApprovalPrompt,
-				Timestamp: time.Now(),
-			})
 		}
 	}
 
-	// Handle the action field — the planner signals system-level intent.
 	switch resp.Action {
-	case "dispatch_tasks":
-		if len(p.tasks) > 0 && p.state != StatePlanLocked && p.state != StateExecuting {
-			p.feedback = append(p.feedback, FeedbackEntry{
-				Type:      "system",
-				Content:   "Planner signalled dispatch_tasks. Press ^a to approve and send to workspace.",
-				Timestamp: time.Now(),
-			})
-		}
-	case "advance_phase":
-		// Already handled by phase transition above.
 	case "revise":
 		if p.state == StateReviewingPlan || p.state == StatePlanLocked {
 			p.state = StateRefiningRequirement
@@ -1552,51 +1504,66 @@ type plannerTickMsg time.Time
 // test strategy, task waves, conversation, thinking indicator) sized to the
 // given width, with no header/input/help — those come from the host's chrome.
 // Height is informational only; the host viewport handles scrolling.
+// RenderEmbeddedContent returns a thin planning-state strip prepended to the
+// standard agent viewport. It shows only parsed metadata (phase, requirement
+// title, task count) — the actual conversation is the planner agent's raw
+// terminal output rendered by the standard line renderer, same as all agents.
 func (p *PlannerView) RenderEmbeddedContent(width, height int) string {
 	if width <= 0 {
 		width = 80
 	}
 	p.width = width
-	if height > 0 {
-		p.height = height
+
+	// No planning state yet — return empty so the raw output shows directly.
+	hasState := p.requirement != nil && p.requirement.Refined != ""
+	hasTasks := len(p.tasks) > 0
+	if !hasState && !hasTasks {
+		return ""
 	}
 
-	var content strings.Builder
-	if p.requirement != nil {
-		content.WriteString(p.renderRequirement())
-		content.WriteString("\n")
-	}
-	if p.testStrategy != nil {
-		content.WriteString(p.renderTestStrategy())
-		content.WriteString("\n")
-	}
-	if len(p.tasks) > 0 {
-		content.WriteString(p.renderTasks())
-		content.WriteString("\n")
-	}
-	content.WriteString(p.renderFeedback())
-	if p.thinking {
-		content.WriteString("\n")
-		content.WriteString(p.renderThinking())
-	}
+	divider := lipgloss.NewStyle().Foreground(lipgloss.Color("237")).
+		Render(strings.Repeat("─", width))
 
-	// If there is no requirement yet, surface the contextual onboarding tip
-	// so a fresh planner view doesn't look empty.
-	if p.requirement == nil && len(p.feedback) <= 1 {
-		hints := p.getContextualSuggestions()
-		if len(hints) > 0 {
-			tipStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-			content.WriteString("\n")
-			content.WriteString(tipStyle.Render("Tips:"))
-			content.WriteString("\n")
-			for _, h := range hints {
-				content.WriteString(tipStyle.Render("  • " + h))
-				content.WriteString("\n")
-			}
+	var parts []string
+
+	if hasState {
+		phase := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true).
+			Render(p.phaseLabel())
+		req := p.requirement.Refined
+		maxReqW := width - lipgloss.Width(phase) - 4
+		if maxReqW > 0 && len([]rune(req)) > maxReqW {
+			req = string([]rune(req)[:maxReqW-1]) + "…"
 		}
+		reqText := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render(req)
+		parts = append(parts, "  "+phase+"  "+reqText)
 	}
 
-	return content.String()
+	if hasTasks {
+		info := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+			Render(fmt.Sprintf("  %d tasks · %d waves", len(p.tasks), p.getMaxWave()))
+		parts = append(parts, info)
+	}
+
+	return strings.Join(parts, "\n") + "\n" + divider + "\n"
+}
+
+func (p *PlannerView) phaseLabel() string {
+	switch p.state {
+	case StateDefiningRequirement:
+		return "clarifying"
+	case StateRefiningRequirement:
+		return "clarifying"
+	case StateDecomposingTasks:
+		return "decomposing"
+	case StateReviewingPlan:
+		return "review"
+	case StatePlanLocked:
+		return "approved"
+	case StateExecuting:
+		return "executing"
+	default:
+		return "planning"
+	}
 }
 
 // HandleAppInput processes a line of text submitted from the host app's input
@@ -1609,11 +1576,9 @@ func (p *PlannerView) HandleAppInput(text string) tea.Cmd {
 		return nil
 	}
 
-	p.feedback = append(p.feedback, FeedbackEntry{
-		Type:      "user",
-		Content:   text,
-		Timestamp: time.Now(),
-	})
+	// No feedback list addition — the user's message shows through the
+	// standard viewport (app.go adds it to outputContent the same way
+	// workspace does, so it appears in the normal agent output stream).
 
 	if p.requirement == nil {
 		p.requirement = &Requirement{

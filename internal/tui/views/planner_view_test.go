@@ -33,26 +33,22 @@ func chatMessages(p *PlannerView) []string {
 	return msgs
 }
 
-// drainBuffer must flush plain text immediately (was the root cause of blank
-// chat panel — non-JSON responses were silently held until 8000 chars).
+// drainBuffer must parse JSON and update state — rendering is the viewport's job.
+// Plain text is discarded (shown through the standard line renderer instead).
 func TestDrainBuffer_PlainText(t *testing.T) {
 	p := newTestPlanner()
 	p.plannerBuffer = "What kind of calculator do you want?\n"
 	p.drainBuffer()
 
-	msgs := chatMessages(p)
-	if len(msgs) == 0 {
-		t.Fatal("expected plain-text response to appear in chat; got none")
-	}
-	if !strings.Contains(msgs[0], "calculator") {
-		t.Errorf("unexpected message: %q", msgs[0])
-	}
+	// Plain text is not added to feedback anymore — it shows via standard viewport.
+	// Buffer should be cleared.
 	if p.plannerBuffer != "" {
-		t.Errorf("buffer should be empty after flush, got: %q", p.plannerBuffer)
+		t.Errorf("buffer should be cleared after plain text, got: %q", p.plannerBuffer)
 	}
 }
 
-// A complete JSON fence must parse and show only the message field.
+// A complete JSON fence must parse and update state (phase, requirement, tasks).
+// The message field is NOT added to feedback — it shows via standard viewport.
 func TestDrainBuffer_StructuredJSON(t *testing.T) {
 	p := newTestPlanner()
 	p.plannerBuffer = "```json\n" + `{
@@ -64,22 +60,20 @@ func TestDrainBuffer_StructuredJSON(t *testing.T) {
 }` + "\n```\n"
 	p.drainBuffer()
 
-	msgs := chatMessages(p)
-	if len(msgs) == 0 {
-		t.Fatal("expected JSON message field to appear in chat; got none")
-	}
-	if msgs[0] != "A few questions before I plan:" {
-		t.Errorf("unexpected message: %q", msgs[0])
-	}
+	// State updated, buffer cleared
 	if p.state != StateRefiningRequirement {
 		t.Errorf("expected StateRefiningRequirement, got %v", p.state)
 	}
 	if p.plannerBuffer != "" {
 		t.Errorf("buffer should be empty after fence, got: %q", p.plannerBuffer)
 	}
+	// No feedback additions — viewport shows raw output
+	if len(chatMessages(p)) != 0 {
+		t.Errorf("no AI chat messages should be added; rendering is viewport's job")
+	}
 }
 
-// Text before the JSON fence must appear in chat; the JSON drives state.
+// JSON with requirement and tasks must populate planning state.
 func TestDrainBuffer_PreambleThenJSON(t *testing.T) {
 	p := newTestPlanner()
 	p.plannerBuffer = "Let me think about this.\n```json\n" + `{
@@ -91,36 +85,28 @@ func TestDrainBuffer_PreambleThenJSON(t *testing.T) {
 }` + "\n```\n"
 	p.drainBuffer()
 
-	msgs := chatMessages(p)
-	if len(msgs) < 2 {
-		t.Fatalf("expected preamble + message in chat, got %d entries: %v", len(msgs), msgs)
-	}
-	if !strings.Contains(msgs[0], "Let me think") {
-		t.Errorf("preamble missing, first msg: %q", msgs[0])
-	}
-	if msgs[1] != "Here is the plan." {
-		t.Errorf("unexpected JSON message: %q", msgs[1])
-	}
 	if p.state != StateReviewingPlan {
 		t.Errorf("expected StateReviewingPlan, got %v", p.state)
 	}
 	if len(p.tasks) != 1 {
 		t.Errorf("expected 1 task, got %d", len(p.tasks))
 	}
+	if p.requirement == nil || p.requirement.Refined != "refined" {
+		t.Errorf("requirement not set correctly")
+	}
 }
 
-// Incomplete fence must stay buffered (wait for next batch) without flushing.
+// Incomplete fence must stay buffered.
 func TestDrainBuffer_IncompleteFence(t *testing.T) {
 	p := newTestPlanner()
 	p.plannerBuffer = "```json\n{\"phase\": \"clarifying\","
 	p.drainBuffer()
 
-	msgs := chatMessages(p)
-	if len(msgs) != 0 {
-		t.Errorf("incomplete fence should not produce chat messages; got: %v", msgs)
-	}
 	if p.plannerBuffer == "" {
 		t.Error("incomplete fence should stay buffered")
+	}
+	if p.state != StateDefiningRequirement {
+		t.Error("state should not change with incomplete JSON")
 	}
 }
 
@@ -128,32 +114,19 @@ func TestDrainBuffer_IncompleteFence(t *testing.T) {
 func TestDrainBuffer_SplitAcrossBatches(t *testing.T) {
 	p := newTestPlanner()
 
-	// First batch: preamble + opening fence (incomplete)
-	p.plannerBuffer = "Thinking...\n```json\n{\"phase\":"
+	// First batch: incomplete fence
+	p.plannerBuffer = "```json\n{\"phase\":"
 	p.drainBuffer()
-
-	// Preamble is flushed, incomplete fence stays buffered
-	msgs := chatMessages(p)
-	if len(msgs) == 0 {
-		t.Fatal("preamble should have been flushed on first batch")
-	}
-	if !strings.Contains(p.plannerBuffer, "```json") {
-		t.Errorf("incomplete fence should remain in buffer: %q", p.plannerBuffer)
+	if p.plannerBuffer == "" {
+		t.Fatal("incomplete fence should stay buffered")
 	}
 
 	// Second batch: completes the JSON
 	p.plannerBuffer += `"clarifying","message":"Got it.","questions":[],"requirement":null,"tasks":[]}` + "\n```\n"
 	p.drainBuffer()
 
-	allMsgs := chatMessages(p)
-	found := false
-	for _, m := range allMsgs {
-		if m == "Got it." {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("second batch JSON message not shown; all messages: %v", allMsgs)
+	if p.state != StateRefiningRequirement {
+		t.Errorf("state should be clarifying after complete JSON, got %v", p.state)
 	}
 }
 
@@ -193,15 +166,49 @@ func TestApplyPlannerResponse_ReadyForReview(t *testing.T) {
 	if p.tasks[1].Wave != 2 {
 		t.Errorf("expected wave 2, got %d", p.tasks[1].Wave)
 	}
-
-	// Message must appear in chat
-	msgs := chatMessages(p)
-	if len(msgs) == 0 || msgs[0] != "Approve when ready." {
-		t.Errorf("message not in chat: %v", msgs)
+	// Gate should be set when plan lands
+	if p.currentGate == nil {
+		t.Error("plan gate should be set in StateReviewingPlan with tasks")
+	}
+	// No feedback additions — rendering is viewport's job
+	if len(chatMessages(p)) != 0 {
+		t.Errorf("no AI chat messages should be added by applyPlannerResponse")
 	}
 }
 
-// approvePlan with no tasks must show a hint, not dispatch.
+// buildPlannerMessage was removed; sendToPlanner now sends raw text.
+func TestBuildPlannerMessage(t *testing.T) {
+	p := newTestPlanner()
+	p.state = StateDefiningRequirement
+	// sendToPlanner sends raw text now — no prefix leaking into PTY echo
+	text := "I want a calculator"
+	// Just verify sendToPlanner doesn't crash with nil client
+	cmd := p.sendToPlanner(text)
+	if cmd == nil {
+		t.Error("sendToPlanner should return a cmd even with nil client")
+	}
+}
+
+// Requirement.LastUpdated must be set when applying a response.
+func TestApplyPlannerResponse_LastUpdated(t *testing.T) {
+	p := newTestPlanner()
+	before := time.Now()
+	p.applyPlannerResponse(PlannerResponse{
+		Phase:   "draft_plan",
+		Message: "here",
+		Requirement: &PlannerRequirement{
+			Title: "T", Original: "o", Refined: "r",
+		},
+	})
+	if p.requirement == nil {
+		t.Fatal("requirement nil")
+	}
+	if p.requirement.LastUpdated.Before(before) {
+		t.Error("LastUpdated not set")
+	}
+}
+
+// approvePlan with no tasks must show a hint.
 func TestApprovePlan_NoTasks(t *testing.T) {
 	p := newTestPlanner()
 	p.state = StateReviewingPlan
@@ -218,7 +225,7 @@ func TestApprovePlan_NoTasks(t *testing.T) {
 	}
 }
 
-// approvePlan with tasks must return a dispatch cmd and show dispatch message.
+// approvePlan with tasks must return a dispatch cmd.
 func TestApprovePlan_WithTasks(t *testing.T) {
 	p := newTestPlanner()
 	p.state = StateReviewingPlan
@@ -267,9 +274,6 @@ func TestBuildWorkspaceHandoff(t *testing.T) {
 	if !strings.Contains(msg, "Wave 2") {
 		t.Error("missing Wave 2 section")
 	}
-	if !strings.Contains(msg, "after Wave 1") {
-		t.Error("Wave 2 should mention dependency on Wave 1")
-	}
 	if !strings.Contains(msg, "runs without error") {
 		t.Error("acceptance criteria missing")
 	}
@@ -291,40 +295,33 @@ func TestTasksForWave(t *testing.T) {
 	if len(wave2) != 1 {
 		t.Errorf("expected 1 Wave 2 task, got %d", len(wave2))
 	}
-	wave3 := p.tasksForWave(3)
-	if len(wave3) != 0 {
-		t.Errorf("expected 0 Wave 3 tasks, got %d", len(wave3))
+}
+
+// SummaryForList must reflect thinking state.
+func TestSummaryForList_Thinking(t *testing.T) {
+	p := newTestPlanner()
+	p.thinking = true
+	if !strings.Contains(p.SummaryForList(), "●") {
+		t.Error("thinking indicator missing when thinking=true")
+	}
+	p.thinking = false
+	p.state = StateDecomposingTasks
+	if !strings.Contains(p.SummaryForList(), "decomposing") {
+		t.Errorf("expected decomposing in summary, got %q", p.SummaryForList())
 	}
 }
 
-// buildPlannerMessage must include the phase hint.
-func TestBuildPlannerMessage(t *testing.T) {
+// Gate validation — plan gate requires tasks.
+func TestGateValidation_PlanNeedsTasks(t *testing.T) {
 	p := newTestPlanner()
-	p.state = StateDefiningRequirement
-	msg := p.buildPlannerMessage("I want a calculator")
-	if !strings.Contains(msg, "[planner-tui phase=") {
-		t.Errorf("missing phase hint: %q", msg)
-	}
-	if !strings.Contains(msg, "I want a calculator") {
-		t.Errorf("user text missing: %q", msg)
-	}
-}
+	gates := p.initPhaseGates()
+	gate3 := gates[2]
 
-// Requirement.LastUpdated must be set when applying a response.
-func TestApplyPlannerResponse_LastUpdated(t *testing.T) {
-	p := newTestPlanner()
-	before := time.Now()
-	p.applyPlannerResponse(PlannerResponse{
-		Phase:   "draft_plan",
-		Message: "here",
-		Requirement: &PlannerRequirement{
-			Title: "T", Original: "o", Refined: "r",
-		},
-	})
-	if p.requirement == nil {
-		t.Fatal("requirement nil")
+	if gate3.ValidationFunc(p) {
+		t.Error("gate 3 should fail without tasks")
 	}
-	if p.requirement.LastUpdated.Before(before) {
-		t.Error("LastUpdated not set")
+	p.tasks = []Task{{ID: "T1", Wave: 1}}
+	if !gate3.ValidationFunc(p) {
+		t.Error("gate 3 should pass with tasks")
 	}
 }

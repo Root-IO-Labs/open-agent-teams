@@ -1765,21 +1765,31 @@ func (a *App) interruptAgent(agent string) tea.Cmd {
 var thinkingSpinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (a *App) renderContentForViewport(agent string) string {
-	// Planner uses its structured renderer (requirement card, task waves,
-	// conversation) instead of the raw line-by-line agent output. The raw
-	// daemon output is still accumulated in outputContent (and runs through
-	// the standard dedup pipeline) — the planner's ReceiveOutput parses it
-	// for JSON and feeds state into the structured view shown here.
+	// Planner: prepend a thin planning-state strip (phase, requirement, task count)
+	// then fall through to the standard line renderer below. This gives the
+	// planner view the same look as every other agent — raw terminal output
+	// through the dedup pipeline — while surfacing parsed planning state at top.
 	if agent == "planner" && a.planner != nil {
 		w := a.viewport.Width
 		if w <= 0 {
 			w = a.width
 		}
-		h := a.viewport.Height
-		if h <= 0 {
-			h = a.viewportHeight()
+		strip := a.planner.RenderEmbeddedContent(w-2, 0)
+		// Fall through: render the actual planner agent output below
+		_ = strip // will be prepended after standard rendering
+		// Use the standard renderer for the actual output, prepend the strip
+		lines, ok := a.outputContent[agent]
+		if !ok || len(lines) == 0 {
+			if strip != "" {
+				return strip
+			}
+		} else {
+			rendered := a.renderer.RenderLines(agent, lines, a.outputTypes[agent])
+			if strip != "" {
+				return strip + rendered
+			}
+			return rendered
 		}
-		return a.planner.RenderEmbeddedContent(w-2, h)
 	}
 
 	lines, ok := a.outputContent[agent]
