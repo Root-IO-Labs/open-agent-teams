@@ -296,6 +296,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Sync worker completions to planner view so execution progress shows.
+		if a.planner != nil && msg.daemonOK {
+			for _, ag := range msg.agents {
+				if ag.Type == "worker" && ag.Waiting {
+					// Worker submitted a PR — update task status
+					a.planner.UpdateWorkerStatus(ag.Name, 0, false)
+				}
+			}
+		}
+
 		// If no active agent set, default to workspace/supervisor (the primary agent)
 		if a.activeAgent == "" {
 			for _, ag := range a.agents {
@@ -405,6 +415,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.outputTypes[msg.agent] = types
 		if replacedIdx >= 0 {
 			a.renderer.InvalidateCacheFromIndex(msg.agent, replacedIdx)
+		}
+
+		// When workspace receives daemon worker-completion events, also update
+		// the planner's execution progress view.
+		if msg.agent == "workspace" || msg.agent == "default" {
+			if a.planner != nil {
+				for _, line := range msg.lines {
+					a.notifyPlannerOfDaemonEvent(line)
+				}
+			}
 		}
 
 		// Forward new planner agent lines to the PlannerView for JSON parsing.
@@ -1829,6 +1849,50 @@ func (a *App) renderContentForViewport(agent string) string {
 // thinkingIndicator returns a subtle "processing..." line when the agent is alive
 // and actively working but hasn't produced output recently. Returns empty string
 // if the agent is dead, waiting, or has been idle too long.
+// notifyPlannerOfDaemonEvent scans a daemon message line for worker completion
+// or PR submission events and updates the planner's execution progress.
+func (a *App) notifyPlannerOfDaemonEvent(line string) {
+	if a.planner == nil {
+		return
+	}
+	// Match: [daemon] Worker 'gentle-whale' has completed...
+	// Match: [daemon] Worker 'gentle-whale' has submitted PR #3...
+	if !strings.Contains(line, "[daemon] Worker") {
+		return
+	}
+
+	// Extract worker name between single quotes
+	start := strings.Index(line, "'")
+	end := strings.LastIndex(line, "'")
+	if start < 0 || end <= start {
+		return
+	}
+	workerName := line[start+1 : end]
+	if workerName == "" {
+		return
+	}
+
+	prNum := 0
+	completed := strings.Contains(line, "has completed") || strings.Contains(line, "auto-completed")
+
+	// Extract PR number if present
+	if idx := strings.Index(line, "PR #"); idx >= 0 {
+		rest := line[idx+4:]
+		for i, c := range rest {
+			if c < '0' || c > '9' {
+				if i > 0 {
+					if n, err := fmt.Sscanf(rest[:i], "%d", &prNum); err == nil && n == 1 {
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+
+	a.planner.UpdateWorkerStatus(workerName, prNum, completed)
+}
+
 func (a *App) thinkingIndicator(agent string) string {
 	// Only show for alive, non-waiting agents
 	var agentInfo *AgentInfo

@@ -150,6 +150,12 @@ type PlannerView struct {
 	// Clean conversation: extracted message fields + user messages, shown
 	// instead of raw PTY output in the planner viewport.
 	conversation []ConversationEntry
+
+	// Execution tracking: maps task ID → worker name and PR number
+	// populated after dispatch, updated from daemon completion events.
+	taskWorkers map[string]string // task.ID → worker agent name
+	taskPRs     map[string]int    // task.ID → PR number (0 = no PR yet)
+	wavesDone   map[int]bool      // wave → all tasks complete
 	
 	// Enhanced contextual awareness (Overlord integration)
 	context           *PlannerContext
@@ -501,6 +507,17 @@ func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
 	handoffMsg := p.buildWorkspaceHandoff()
 	wave1Tasks := p.tasksForWave(1)
 	req := p.requirement
+
+	// Initialize execution tracking maps.
+	p.taskWorkers = make(map[string]string)
+	p.taskPRs = make(map[string]int)
+	p.wavesDone = make(map[int]bool)
+	// Mark Wave 1 tasks as InProgress when dispatched.
+	for i, t := range p.tasks {
+		if t.Wave == 1 {
+			p.tasks[i].Status = TaskStatusInProgress
+		}
+	}
 
 	return func() tea.Msg {
 		if client == nil {
@@ -1353,14 +1370,22 @@ func (p *PlannerView) drainBuffer() {
 			}
 		}
 
-		// ── Pass 3: hold or discard ───────────────────────────────────────
-		// Hold if looks like mid-stream JSON; discard otherwise (the raw
-		// output shows through the standard viewport — no feedback list needed).
-		looksLikeJSON := strings.ContainsAny(p.plannerBuffer, `{"`)
+		// ── Pass 3: hold or flush to conversation ────────────────────────
+		// If the buffer looks like mid-stream JSON, hold up to maxHold.
+		// Otherwise treat it as plain-text prose from the planner and add
+		// it to the conversation — the planner may respond in prose, markdown,
+		// or other formats rather than JSON.
+		looksLikeJSON := strings.ContainsAny(p.plannerBuffer, `{"`) &&
+			(strings.Contains(p.plannerBuffer, "```json") || strings.Contains(p.plannerBuffer, `"phase"`))
 		if looksLikeJSON && len(p.plannerBuffer) < maxHold {
-			return // wait for more batches
+			return // wait for the fence / complete object
 		}
-		p.plannerBuffer = "" // discard — rendering is the viewport's job
+		// Prose or oversized buffer — add to conversation.
+		if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
+			p.thinking = false
+			p.conversation = append(p.conversation, ConversationEntry{Role: "planner", Text: trimmed})
+		}
+		p.plannerBuffer = ""
 		return
 	}
 }
@@ -1477,8 +1502,28 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 	}
 
 	// Add the planner's message to the clean conversation log.
+	// If the message ends without the questions listed, append them inline
+	// so the user always sees what was asked.
 	if resp.Message != "" {
-		p.conversation = append(p.conversation, ConversationEntry{Role: "planner", Text: resp.Message})
+		text := resp.Message
+		if len(resp.Questions) > 0 {
+			// Append numbered questions if the message doesn't already contain them.
+			hasQ := strings.Contains(strings.ToLower(text), "1.") || strings.Contains(text, "1)")
+			if !hasQ {
+				text += "\n"
+				for i, q := range resp.Questions {
+					text += fmt.Sprintf("\n%d. %s", i+1, q)
+				}
+			}
+		}
+		p.conversation = append(p.conversation, ConversationEntry{Role: "planner", Text: text})
+	} else if len(resp.Questions) > 0 {
+		// No message but questions exist — render them directly.
+		var sb strings.Builder
+		for i, q := range resp.Questions {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, q))
+		}
+		p.conversation = append(p.conversation, ConversationEntry{Role: "planner", Text: strings.TrimSpace(sb.String())})
 	}
 
 	// Set plan-approval gate when a complete plan lands in StateReviewingPlan.
@@ -1603,12 +1648,12 @@ func (p *PlannerView) RenderEmbeddedContent(width, height int) string {
 		out.WriteString("\n" + gate + "\n")
 	}
 
-	// Thinking indicator
+	// Thinking indicator with animated braille spinner
 	if p.thinking {
 		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		frame := frames[(int(lipgloss.Width("x")*0)%len(frames))]
-		_ = frame
-		out.WriteString(divStyle.Render("  ● thinking…") + "\n")
+		frame := frames[(int(time.Now().UnixMilli()/120))%len(frames)]
+		spinner := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Render(frame + " thinking…")
+		out.WriteString("  " + spinner + "\n")
 	}
 
 	return out.String()
@@ -1641,6 +1686,14 @@ func (p *PlannerView) HandleAppInput(text string) tea.Cmd {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil
+	}
+
+	// Flush any buffered prose from the previous planner response before
+	// recording the new user message. This ensures partial plain-text
+	// responses (e.g. when the planner replies without JSON) always appear.
+	if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
+		p.conversation = append(p.conversation, ConversationEntry{Role: "planner", Text: trimmed})
+		p.plannerBuffer = ""
 	}
 
 	// Add user message to clean conversation log.
@@ -1797,15 +1850,11 @@ func (p *PlannerView) HandleStreamMsg(msg tea.Msg) tea.Cmd {
 		return nil
 	case plannerErrorMsg:
 		p.thinking = false
-		errText := "Error communicating with planner agent"
+		errText := "Could not reach planner agent"
 		if m.err != nil {
 			errText += ": " + m.err.Error()
 		}
-		p.feedback = append(p.feedback, FeedbackEntry{
-			Type:      "system",
-			Content:   errText,
-			Timestamp: time.Now(),
-		})
+		p.conversation = append(p.conversation, ConversationEntry{Role: "system", Text: errText})
 		return nil
 	case plannerTickMsg:
 		if p.thinking {
@@ -1814,6 +1863,80 @@ func (p *PlannerView) HandleStreamMsg(msg tea.Msg) tea.Cmd {
 		return nil
 	}
 	return nil
+}
+
+// UpdateWorkerStatus updates task status when a worker completes or submits a PR.
+// Called from app.go when daemon completion/PR events arrive.
+// workerName: the agent name (e.g. "gentle-whale")
+// prNumber: PR number (0 = no PR / just completed)
+func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, completed bool) {
+	if p.taskWorkers == nil || p.tasks == nil {
+		return
+	}
+	// Find which task this worker was assigned to.
+	taskID := ""
+	for id, w := range p.taskWorkers {
+		if w == workerName {
+			taskID = id
+			break
+		}
+	}
+	if taskID == "" {
+		// Worker not tracked in this plan — record it by name.
+		taskID = workerName
+	}
+
+	if prNumber > 0 && p.taskPRs != nil {
+		p.taskPRs[taskID] = prNumber
+	}
+
+	// Update the matching task status.
+	for i, t := range p.tasks {
+		if t.ID == taskID || t.AssignedTo == workerName {
+			if completed {
+				p.tasks[i].Status = TaskStatusCompleted
+			} else if prNumber > 0 {
+				// PR submitted but not merged yet
+				p.tasks[i].Status = TaskStatusInProgress
+			}
+			p.tasks[i].AssignedTo = workerName
+			break
+		}
+	}
+
+	// Check if the current wave is complete and note it in conversation.
+	p.checkWaveCompletion()
+}
+
+// checkWaveCompletion checks if all tasks in the current execution wave are
+// done, and if so adds a conversation event and marks the wave complete.
+func (p *PlannerView) checkWaveCompletion() {
+	if p.wavesDone == nil {
+		return
+	}
+	for wave := 0; wave <= p.getMaxWave(); wave++ {
+		if p.wavesDone[wave] {
+			continue
+		}
+		tasks := p.tasksForWave(wave)
+		if len(tasks) == 0 {
+			continue
+		}
+		allDone := true
+		for _, t := range tasks {
+			if t.Status != TaskStatusCompleted {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			p.wavesDone[wave] = true
+			p.conversation = append(p.conversation, ConversationEntry{
+				Role: "system",
+				Text: fmt.Sprintf("Wave %d complete — %d tasks done.", wave, len(tasks)),
+			})
+		}
+	}
 }
 
 // IsPlannerMsg reports whether a bubbletea message originated from the planner.
