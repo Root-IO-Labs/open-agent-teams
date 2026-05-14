@@ -28,11 +28,12 @@ const (
 
 // Requirement represents a user requirement being refined
 type Requirement struct {
-	ID          string
-	Original    string
-	Refined     string
-	Iteration   int
-	LastUpdated time.Time
+	ID              string
+	Original        string
+	Refined         string
+	OperationalSpec string // Overlord: How the system works
+	Iteration       int
+	LastUpdated     time.Time
 }
 
 // Task represents an atomic task in the decomposed plan
@@ -40,9 +41,12 @@ type Task struct {
 	ID                 string
 	Title              string
 	Description        string
+	Type               string   // test|implementation|documentation (Overlord)
 	Dependencies       []string
 	AcceptanceCriteria []string
-	Wave               int // Execution wave (parallel tasks have same wave)
+	Wave               int // Execution wave (parallel tasks have same wave, Wave 0 = foundation)
+	SpecReference      string // Reference to operational spec section (Overlord)
+	TestFirst          bool   // TDD flag for implementation tasks (Overlord)
 	Status             TaskStatus
 	AssignedTo         string // Worker agent name
 	EstimatedDuration  time.Duration
@@ -60,18 +64,28 @@ const (
 
 // PlannerResponse is the structured JSON the planner agent emits every turn.
 type PlannerResponse struct {
-	Phase       string              `json:"phase"`
-	Message     string              `json:"message"`
-	Questions   []string            `json:"questions"`
-	Requirement *PlannerRequirement `json:"requirement"`
-	Tasks       []PlannerTask       `json:"tasks"`
+	Phase        string              `json:"phase"`
+	Message      string              `json:"message"`
+	Questions    []string            `json:"questions"`
+	Requirement  *PlannerRequirement `json:"requirement"`
+	TestStrategy *TestStrategy       `json:"test_strategy"`
+	Tasks        []PlannerTask       `json:"tasks"`
 }
 
 // PlannerRequirement is the requirement block inside a PlannerResponse.
 type PlannerRequirement struct {
-	Title    string `json:"title"`
-	Original string `json:"original"`
-	Refined  string `json:"refined"`
+	Title           string `json:"title"`
+	Original        string `json:"original"`
+	Refined         string `json:"refined"`
+	OperationalSpec string `json:"operational_spec"`
+}
+
+// TestStrategy defines the testing approach (Overlord methodology)
+type TestStrategy struct {
+	Unit       string `json:"unit"`
+	Integration string `json:"integration"`
+	Blackbox   string `json:"blackbox"`
+	GateScript string `json:"gate_script"`
 }
 
 // PlannerTask is a single task inside a PlannerResponse.
@@ -79,19 +93,23 @@ type PlannerTask struct {
 	ID                 string   `json:"id"`
 	Title              string   `json:"title"`
 	Description        string   `json:"description"`
+	Type               string   `json:"type"`           // test|implementation|documentation
 	Wave               int      `json:"wave"`
 	Dependencies       []string `json:"dependencies"`
+	SpecReference      string   `json:"spec_reference"`  // Reference to operational spec section
+	TestFirst          bool     `json:"test_first"`      // TDD flag for implementation tasks
 	AcceptanceCriteria []string `json:"acceptance_criteria"`
 }
 
 // PlannerView handles collaborative requirement definition and task decomposition
 type PlannerView struct {
 	// State
-	state       PlannerState
-	requirement *Requirement
-	tasks       []Task
-	isLocked    bool
-	thinking    bool
+	state        PlannerState
+	requirement  *Requirement
+	testStrategy *TestStrategy // Overlord: Test strategy
+	tasks        []Task
+	isLocked     bool
+	thinking     bool
 	
 	// Input handling
 	input       textinput.Model
@@ -111,6 +129,12 @@ type PlannerView struct {
 	feedback      []FeedbackEntry
 	thinkingText  string
 	plannerBuffer string // accumulates planner output for JSON detection
+	
+	// Enhanced contextual awareness (Overlord integration)
+	context           *PlannerContext
+	currentGate       *PhaseGate
+	pendingQuestions  []string
+	brainstormThemes  []BrainstormTheme
 	
 	// Key bindings
 	keyMap PlannerKeyMap
@@ -146,7 +170,7 @@ func NewPlannerView(client *socket.Client, repoName string) *PlannerView {
 	ti.CharLimit = 1000
 	ti.Width = 80
 
-	return &PlannerView{
+	p := &PlannerView{
 		state:       StateDefiningRequirement,
 		input:       ti,
 		inputPrompt: "Requirement",
@@ -162,6 +186,11 @@ func NewPlannerView(client *socket.Client, repoName string) *PlannerView {
 			},
 		},
 	}
+	
+	// Initialize enhanced fields
+	p.initializeEnhancements()
+	
+	return p
 }
 
 func defaultPlannerKeys() PlannerKeyMap {
@@ -825,6 +854,12 @@ func (p *PlannerView) renderMainContent() string {
 		content.WriteString("\n")
 	}
 
+	// Render test strategy (Overlord methodology)
+	if p.testStrategy != nil {
+		content.WriteString(p.renderTestStrategy())
+		content.WriteString("\n")
+	}
+
 	// Render tasks if any
 	if len(p.tasks) > 0 {
 		content.WriteString(p.renderTasks())
@@ -870,6 +905,38 @@ func (p *PlannerView) renderRequirement() string {
 			lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(p.requirement.Original))
 	}
 
+	// Add operational spec if present
+	if p.requirement.OperationalSpec != "" {
+		content += fmt.Sprintf("\n\nOperational Spec: %s", 
+			lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(p.requirement.OperationalSpec))
+	}
+
+	return style.Render(content)
+}
+
+func (p *PlannerView) renderTestStrategy() string {
+	if p.testStrategy == nil {
+		return ""
+	}
+
+	style := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("34")).
+		Padding(1).
+		Margin(0, 0, 1, 0)
+
+	title := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("34")).
+		Render("🧪 Test Strategy (Overlord Methodology)")
+
+	content := fmt.Sprintf("%s\n\n", title)
+	content += fmt.Sprintf("Unit Tests: %s\n", p.testStrategy.Unit)
+	content += fmt.Sprintf("Integration Tests: %s\n", p.testStrategy.Integration)
+	content += fmt.Sprintf("Blackbox Tests: %s\n", p.testStrategy.Blackbox)
+	content += fmt.Sprintf("Gate Script: %s", 
+		lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(p.testStrategy.GateScript))
+
 	return style.Render(content)
 }
 
@@ -894,11 +961,23 @@ func (p *PlannerView) renderTasks() string {
 		waves[task.Wave] = append(waves[task.Wave], task)
 	}
 
-	for wave := 1; wave <= p.getMaxWave(); wave++ {
+	// Wave names for Overlord methodology
+	waveNames := map[int]string{
+		0: "Foundation (Tests, CI, Contracts)",
+		1: "Core (Primary Implementation)",
+		2: "Features (Secondary Implementation)",
+		3: "Polish (Docs, Performance)",
+	}
+
+	for wave := 0; wave <= p.getMaxWave(); wave++ {
 		if tasks, exists := waves[wave]; exists {
+			waveName := waveNames[wave]
+			if waveName == "" {
+				waveName = "Extended"
+			}
 			waveTitle := lipgloss.NewStyle().
 				Foreground(lipgloss.Color("220")).
-				Render(fmt.Sprintf("Wave %d (Parallel Execution):", wave))
+				Render(fmt.Sprintf("Wave %d - %s:", wave, waveName))
 			content.WriteString(waveTitle)
 			content.WriteString("\n")
 
@@ -915,12 +994,26 @@ func (p *PlannerView) renderTasks() string {
 					status = "🚫"
 				}
 
+				// Add type indicator
+				typeIcon := ""
+				switch task.Type {
+				case "test":
+					typeIcon = "🧪"
+				case "implementation":
+					typeIcon = "⚙️"
+				case "documentation":
+					typeIcon = "📝"
+				}
+
 				taskStyle := lipgloss.NewStyle()
 				if i == p.selectedTask {
 					taskStyle = taskStyle.Background(lipgloss.Color("237"))
 				}
 
-				taskLine := fmt.Sprintf("  %s %s", status, task.Title)
+				taskLine := fmt.Sprintf("  %s %s %s", status, typeIcon, task.Title)
+				if task.TestFirst {
+					taskLine += " [TDD]"
+				}
 				if task.EstimatedDuration > 0 {
 					taskLine += fmt.Sprintf(" (%s)", task.EstimatedDuration)
 				}
@@ -1155,6 +1248,9 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		if p.state == StateDefiningRequirement || p.state == StateRefiningRequirement {
 			p.state = StateRefiningRequirement
 		}
+	case "architecture":
+		// New phase for Overlord methodology
+		p.state = StateRefiningRequirement
 	case "draft_plan":
 		p.state = StateReviewingPlan
 	case "ready_for_review":
@@ -1171,8 +1267,14 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		}
 		p.requirement.Original = resp.Requirement.Original
 		p.requirement.Refined = resp.Requirement.Refined
+		p.requirement.OperationalSpec = resp.Requirement.OperationalSpec
 		p.requirement.Iteration++
 		p.requirement.LastUpdated = time.Now()
+	}
+
+	// Update test strategy (Overlord methodology)
+	if resp.TestStrategy != nil {
+		p.testStrategy = resp.TestStrategy
 	}
 
 	// Update tasks
@@ -1183,8 +1285,11 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 				ID:                 t.ID,
 				Title:              t.Title,
 				Description:        t.Description,
+				Type:               t.Type,
 				Wave:               t.Wave,
 				Dependencies:       t.Dependencies,
+				SpecReference:      t.SpecReference,
+				TestFirst:          t.TestFirst,
 				AcceptanceCriteria: t.AcceptanceCriteria,
 				Status:             TaskStatusPending,
 			}
