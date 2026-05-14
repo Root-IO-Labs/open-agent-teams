@@ -28,7 +28,6 @@ const (
 	ViewWorkspace ViewMode = iota
 	ViewAgent              // viewing a specific non-workspace agent
 	ViewAgentList          // agent list panel is focused
-	ViewPlanner            // planner view for collaborative task planning
 )
 
 // AgentInfo holds display information about an agent.
@@ -490,35 +489,28 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
-		// In planner mode, keys belong to the PlannerView's own textinput
-		// and shortcut handler — NOT to the app's handleKey (which would
-		// route Enter to sendInput against the daemon planner agent, and
-		// other keys to a.input). Only esc (leave planner) and ctrl+c
-		// (quit) need to fall through to the app.
-		if a.mode == ViewPlanner {
-			switch msg.String() {
-			case "esc":
-				a.mode = ViewWorkspace
-				a.showAgentList = false
-				a.input.Focus()
-				a.recalcLayout()
-				return a, nil
-			case "ctrl+c":
-				return a.handleKey(msg)
-			}
-			var cmd tea.Cmd
-			a.planner, cmd = a.planner.Update(msg)
-			return a, cmd
-		}
 		return a.handleKey(msg)
 	}
 
-	// Update sub-components
-	if a.mode == ViewPlanner {
-		var cmd tea.Cmd
-		a.planner, cmd = a.planner.Update(msg)
-		cmds = append(cmds, cmd)
-	} else if a.mode != ViewAgentList {
+	// Dispatch planner-originated async messages (sent/dispatched/error/tick)
+	// so the planner can drive its thinking-spinner state without owning the
+	// full bubbletea Update loop.
+	if a.planner != nil && views.IsPlannerMsg(msg) {
+		if cmd := a.planner.HandleStreamMsg(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		// When the planner is the active agent, redraw the viewport so the
+		// thinking spinner / new feedback entries appear immediately.
+		if a.activeAgent == "planner" {
+			a.updateViewport()
+		}
+		return a, tea.Batch(cmds...)
+	}
+
+	// Update text input only when it owns the focus. In agent-list mode the
+	// cursor is in the sidebar; for the planner the standard input bar is
+	// still used (no separate view).
+	if a.mode != ViewAgentList {
 		var cmd tea.Cmd
 		a.input, cmd = a.input.Update(msg)
 		cmds = append(cmds, cmd)
@@ -528,12 +520,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Global keys that always work
-	switch {
-	case key.Matches(msg, keys.Quit):
+	// Quit takes absolute priority so the user can always exit.
+	if key.Matches(msg, keys.Quit) {
 		a.cleanup()
 		return a, tea.Quit
+	}
 
+	// Planner-specific shortcuts. Intercepted BEFORE the global handler so
+	// keys like ^x (which is otherwise the global Interrupt binding) and
+	// ^r (otherwise ToggleReadOnly) can drive planner actions when the
+	// planner is active. The planner returns handled=false for keys it has
+	// no current use for (e.g., ^x outside StateReviewingPlan), letting the
+	// global handler take over and preserving Interrupt-while-thinking.
+	if a.activeAgent == "planner" && a.planner != nil && a.mode != ViewAgentList {
+		if handled, cmd := a.planner.HandleAppShortcut(msg); handled {
+			a.updateViewport()
+			return a, cmd
+		}
+	}
+
+	// Global keys that always work
+	switch {
 	case key.Matches(msg, keys.TogglePanel):
 		a.showAgentList = !a.showAgentList
 		if a.showAgentList {
@@ -639,11 +646,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.OpenPlanner):
 		// Route through the same path as selecting the planner row from the
-		// sidebar list so activeAgent and agentIndex stay consistent — esc
-		// will return the cursor to the planner row.
+		// sidebar list so activeAgent and agentIndex stay consistent. The
+		// planner now uses the shared chrome (ViewWorkspace mode), so esc
+		// returns to the workspace agent just like for any primary agent.
 		a.switchToAgent("planner")
-		a.mode = ViewPlanner
+		a.mode = a.modeForAgent("planner")
 		a.showAgentList = false
+		a.input.Focus()
 		for i, ag := range a.agents {
 			if ag.Name == "planner" {
 				a.agentIndex = i
@@ -726,6 +735,21 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		text := strings.TrimSpace(a.input.Value())
 		if text != "" {
 			a.input.SetValue("")
+			// Planner gets a distinct path: it owns its own conversation
+			// buffer and contextual-intent detection, and the daemon planner
+			// agent receives a phase-prefixed message via sendToPlanner.
+			// We must NOT also push the raw text through the standard
+			// outputContent / sendInput pipeline — that would duplicate the
+			// message and bypass the planner state machine.
+			if a.activeAgent == "planner" && a.planner != nil {
+				cmd := a.planner.HandleAppInput(text)
+				if a.planner != nil {
+					a.input.Placeholder = a.planner.PlaceholderText()
+				}
+				a.autoScroll["planner"] = true
+				a.updateViewport()
+				return a, cmd
+			}
 			// Track input for PTY echo suppression (keep last 5)
 			now := time.Now()
 			a.pruneRecentInputs(now)
@@ -777,11 +801,6 @@ func (a *App) View() string {
 			styleStatusAgent.Render("  Open Agent Teams") + "\n\n" +
 			styleHelp.Render("  Loading...")
 		return styleViewport.Width(w).Height(h).Render(body)
-	}
-
-	// Render planner view if in planner mode
-	if a.mode == ViewPlanner {
-		return a.planner.View()
 	}
 
 	var sections []string
@@ -1170,6 +1189,28 @@ func (a *App) renderInputBar() string {
 }
 
 func (a *App) renderHelp() string {
+	// When the planner is the active agent its phase-specific shortcuts
+	// (^p extract, ^a approve, etc.) take priority over the generic help
+	// line so the user sees what they can actually do right now.
+	if a.activeAgent == "planner" && a.planner != nil && a.mode != ViewAgentList {
+		hints := a.planner.HelpHints()
+		var help string
+		if a.width < 80 {
+			if hints != "" {
+				help = hints + "  •  tab:agents  esc:back"
+			} else {
+				help = "tab:agents  esc:back  ^c:quit"
+			}
+		} else {
+			if hints != "" {
+				help = hints + "  •  tab:agents  esc:workspace  ^c:quit"
+			} else {
+				help = "tab:agents  esc:workspace  ^l:planner  ^c:quit"
+			}
+		}
+		return styleHelp.Width(a.width).MaxWidth(a.width).MaxHeight(1).Render("  " + help)
+	}
+
 	// Full and short variants for narrow terminals
 	var help string
 	switch a.mode {
@@ -1277,30 +1318,29 @@ func (a *App) recalcLayout() {
 func (a *App) switchToAgent(name string) {
 	a.activeAgent = name
 
-	// Planner has its own input/state inside PlannerView and doesn't stream
-	// log output through the normal viewport — so blur the main input and
-	// skip viewport/auto-scroll setup. The caller flips mode via modeForAgent.
-	if name == "planner" {
-		a.input.Blur()
-		return
-	}
-
 	// Initialize auto-scroll for new agents, but preserve existing state
 	if _, exists := a.autoScroll[name]; !exists {
 		a.autoScroll[name] = true
 	}
 
-	// Update input placeholder
-	for _, ag := range a.agents {
-		if ag.Name == name {
-			if isPrimaryAgent(ag.Type) {
-				a.input.Placeholder = fmt.Sprintf("Talk to %s agent...", ag.Type)
-				a.readOnly = false
-			} else {
-				a.input.Placeholder = fmt.Sprintf("Talk to %s...", name)
-				a.readOnly = false
+	// Update input placeholder. The planner has its own phase-aware
+	// placeholder (e.g. "Reply, or say 'done' to advance...") supplied
+	// by PlaceholderText so the input bar reflects the current state.
+	if name == "planner" && a.planner != nil {
+		a.input.Placeholder = a.planner.PlaceholderText()
+		a.readOnly = false
+	} else {
+		for _, ag := range a.agents {
+			if ag.Name == name {
+				if isPrimaryAgent(ag.Type) {
+					a.input.Placeholder = fmt.Sprintf("Talk to %s agent...", ag.Type)
+					a.readOnly = false
+				} else {
+					a.input.Placeholder = fmt.Sprintf("Talk to %s...", name)
+					a.readOnly = false
+				}
+				break
 			}
-			break
 		}
 	}
 
@@ -1319,13 +1359,13 @@ func (a *App) syncViewportWithAutoScroll(agentName string) {
 }
 
 func (a *App) modeForAgent(name string) ViewMode {
-	// Selecting the planner row opens the collaborative PlannerView instead
-	// of the standard log viewport, regardless of whether the planner is a
-	// daemon-spawned agent or a TUI-local view. Check by name before falling
-	// through to the primary-agent check (which would otherwise route to
-	// ViewWorkspace since isPrimaryAgent("planner") == true).
+	// Planner uses the shared chrome (status bar, sidebar, viewport, input),
+	// with planner-specific content rendered inside the viewport and planner
+	// shortcuts intercepted before the global key handler. Treat it as a
+	// primary agent here so the input bar stays focused and tab/sidebar
+	// navigation works without first pressing Escape.
 	if name == "planner" {
-		return ViewPlanner
+		return ViewWorkspace
 	}
 	for _, ag := range a.agents {
 		if ag.Name == name && isPrimaryAgent(ag.Type) {
@@ -1725,6 +1765,23 @@ func (a *App) interruptAgent(agent string) tea.Cmd {
 var thinkingSpinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (a *App) renderContentForViewport(agent string) string {
+	// Planner uses its structured renderer (requirement card, task waves,
+	// conversation) instead of the raw line-by-line agent output. The raw
+	// daemon output is still accumulated in outputContent (and runs through
+	// the standard dedup pipeline) — the planner's ReceiveOutput parses it
+	// for JSON and feeds state into the structured view shown here.
+	if agent == "planner" && a.planner != nil {
+		w := a.viewport.Width
+		if w <= 0 {
+			w = a.width
+		}
+		h := a.viewport.Height
+		if h <= 0 {
+			h = a.viewportHeight()
+		}
+		return a.planner.RenderEmbeddedContent(w-2, h)
+	}
+
 	lines, ok := a.outputContent[agent]
 	if !ok || len(lines) == 0 {
 		msg := fmt.Sprintf("\n  %s  %s\n\n  Waiting for output from %s...\n",
@@ -1828,6 +1885,12 @@ func (a *App) thinkingIndicator(agent string) string {
 func (a *App) updateViewport() {
 	a.viewport.SetContent(a.renderContentForViewport(a.activeAgent))
 	a.syncViewportWithAutoScroll(a.activeAgent)
+	// Keep the input bar placeholder in sync with the planner's current
+	// phase so the hint ("Type 'approve'...", "Reply, or say 'done'...")
+	// reflects state advanced by the most recent stream batch.
+	if a.activeAgent == "planner" && a.planner != nil {
+		a.input.Placeholder = a.planner.PlaceholderText()
+	}
 }
 
 // --- Helpers ---

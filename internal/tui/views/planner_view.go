@@ -1113,19 +1113,22 @@ func (p *PlannerView) renderFeedback() string {
 		Bold(true).
 		Foreground(lipgloss.Color("205")).
 		Render("💬 Conversation")
-	
+
 	content.WriteString(title)
 	content.WriteString("\n\n")
 
-	// Show recent feedback (last 10 entries)
-	start := 0
-	if len(p.feedback) > 10 {
-		start = len(p.feedback) - 10
+	// Render all entries — when embedded in a scrollable viewport, the host
+	// handles scroll, so showing full history is correct. The previous 10-entry
+	// cap hid context the user needed to scroll back to.
+	wrapWidth := p.width - 4
+	if wrapWidth < 20 {
+		wrapWidth = 0 // disable wrapping for tiny widths
 	}
 
-	for _, entry := range p.feedback[start:] {
+	timeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	for _, entry := range p.feedback {
 		timestamp := entry.Timestamp.Format("15:04")
-		
+
 		var prefix string
 		var style lipgloss.Style
 		switch entry.Type {
@@ -1140,12 +1143,14 @@ func (p *PlannerView) renderFeedback() string {
 			style = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 		}
 
-		timeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-		
-		content.WriteString(fmt.Sprintf("%s %s %s\n", 
-			timeStyle.Render("["+timestamp+"]"), 
-			prefix, 
-			style.Render(entry.Content)))
+		body := style.Render(entry.Content)
+		if wrapWidth > 0 {
+			body = lipgloss.NewStyle().Width(wrapWidth).Render(body)
+		}
+		content.WriteString(fmt.Sprintf("%s %s %s\n",
+			timeStyle.Render("["+timestamp+"]"),
+			prefix,
+			body))
 		content.WriteString("\n")
 	}
 
@@ -1443,4 +1448,258 @@ type plannerErrorMsg struct{ err error }
 type plannerDispatchedMsg struct{ target string } // "workspace" or "direct"
 
 type plannerTickMsg time.Time
+
+// --- Host integration ---
+//
+// These methods let the planner render inside the host TUI's shared chrome
+// (sidebar, status bar, viewport, input bar) instead of taking over the screen.
+// The PlannerView remains the source of truth for state, JSON-protocol parsing,
+// and planner-specific shortcuts; the host owns chrome and routing.
+
+// RenderEmbeddedContent returns the planner's body content (requirement card,
+// test strategy, task waves, conversation, thinking indicator) sized to the
+// given width, with no header/input/help — those come from the host's chrome.
+// Height is informational only; the host viewport handles scrolling.
+func (p *PlannerView) RenderEmbeddedContent(width, height int) string {
+	if width <= 0 {
+		width = 80
+	}
+	p.width = width
+	if height > 0 {
+		p.height = height
+	}
+
+	var content strings.Builder
+	if p.requirement != nil {
+		content.WriteString(p.renderRequirement())
+		content.WriteString("\n")
+	}
+	if p.testStrategy != nil {
+		content.WriteString(p.renderTestStrategy())
+		content.WriteString("\n")
+	}
+	if len(p.tasks) > 0 {
+		content.WriteString(p.renderTasks())
+		content.WriteString("\n")
+	}
+	content.WriteString(p.renderFeedback())
+	if p.thinking {
+		content.WriteString("\n")
+		content.WriteString(p.renderThinking())
+	}
+
+	// If there is no requirement yet, surface the contextual onboarding tip
+	// so a fresh planner view doesn't look empty.
+	if p.requirement == nil && len(p.feedback) <= 1 {
+		hints := p.getContextualSuggestions()
+		if len(hints) > 0 {
+			tipStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+			content.WriteString("\n")
+			content.WriteString(tipStyle.Render("Tips:"))
+			content.WriteString("\n")
+			for _, h := range hints {
+				content.WriteString(tipStyle.Render("  • " + h))
+				content.WriteString("\n")
+			}
+		}
+	}
+
+	return content.String()
+}
+
+// HandleAppInput processes a line of text submitted from the host app's input
+// bar. Mirrors the contextual-intent path used by handleInputEnhanced but
+// takes text as an argument instead of reading from the planner's internal
+// textinput (which the host bypasses in integrated mode).
+func (p *PlannerView) HandleAppInput(text string) tea.Cmd {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	p.feedback = append(p.feedback, FeedbackEntry{
+		Type:      "user",
+		Content:   text,
+		Timestamp: time.Now(),
+	})
+
+	if p.requirement == nil {
+		p.requirement = &Requirement{
+			ID:          fmt.Sprintf("req-%d", time.Now().Unix()),
+			Original:    text,
+			Refined:     text,
+			Iteration:   1,
+			LastUpdated: time.Now(),
+		}
+		p.state = StateRefiningRequirement
+	}
+
+	// After 3 quiet clarifying turns, append a Socratic brainstorm prompt.
+	if p.state == StateRefiningRequirement || p.state == StateDefiningRequirement {
+		p.clarifyingTurns++
+		if p.clarifyingTurns >= 3 && len(p.brainstormThemes) > 0 {
+			p.clarifyingTurns = 0
+			cmd := p.handleContextualInput(text)
+			brainstormCmd := p.conductSocraticDialogue()
+			if brainstormCmd != nil && cmd != nil {
+				return tea.Batch(cmd, brainstormCmd)
+			}
+			if brainstormCmd != nil {
+				return brainstormCmd
+			}
+			return cmd
+		}
+	} else {
+		p.clarifyingTurns = 0
+	}
+
+	return p.handleContextualInput(text)
+}
+
+// HandleAppShortcut tries to consume a planner-specific keyboard shortcut.
+// Returns handled=true if the key was a planner shortcut; the host should
+// not then dispatch it elsewhere. Non-planner keys return handled=false so
+// the host's global handler runs as usual.
+//
+// Conflict policy with global app keys:
+//   - ^p, ^n, ^r, ^a, ^b are consumed by the planner whenever it is active.
+//   - ^x is only consumed in StateReviewingPlan (to reject); otherwise the
+//     global Interrupt binding wins so the user can still cancel a thinking turn.
+func (p *PlannerView) HandleAppShortcut(msg tea.KeyMsg) (handled bool, cmd tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlN:
+		p.startNewRequirement()
+		return true, nil
+	case tea.KeyCtrlR:
+		if p.requirement != nil {
+			return true, p.refineRequirement()
+		}
+		return true, nil
+	case tea.KeyCtrlP:
+		if p.requirement != nil {
+			return true, p.stopAndPullPlan()
+		}
+		return false, nil
+	case tea.KeyCtrlB:
+		if len(p.brainstormThemes) > 0 {
+			return true, p.conductSocraticDialogue()
+		}
+		return false, nil
+	case tea.KeyCtrlA:
+		return true, p.approvePlan()
+	case tea.KeyCtrlX:
+		if p.state == StateReviewingPlan {
+			return true, p.rejectPlan()
+		}
+		return false, nil
+	}
+	return false, nil
+}
+
+// HelpHints returns a short " • "-separated list of planner-specific
+// shortcuts to append to the host's help line when the planner is active.
+func (p *PlannerView) HelpHints() string {
+	var hints []string
+	switch p.state {
+	case StateDefiningRequirement:
+		hints = []string{"^n:restart"}
+	case StateRefiningRequirement:
+		hints = []string{"^p:extract", "^r:refine", "^n:restart"}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
+		}
+	case StateDecomposingTasks:
+		hints = []string{"^p:extract", "^n:restart"}
+	case StateReviewingPlan:
+		if len(p.tasks) > 0 {
+			hints = []string{"^a:approve", "^x:reject", "^p:re-extract", "^n:restart"}
+		} else {
+			hints = []string{"^p:extract", "^n:restart"}
+		}
+	case StatePlanLocked:
+		hints = []string{"^a:dispatch"}
+	}
+	return strings.Join(hints, "  ")
+}
+
+// PlaceholderText returns the placeholder shown in the host's input bar when
+// the planner is active. It reflects the current phase so users always know
+// what kind of input the planner expects.
+func (p *PlannerView) PlaceholderText() string {
+	switch p.state {
+	case StateDefiningRequirement:
+		return "Describe what you want to accomplish..."
+	case StateRefiningRequirement:
+		return "Reply, or say 'done' to advance..."
+	case StateDecomposingTasks:
+		return "Reply to refine the task breakdown..."
+	case StateReviewingPlan:
+		if len(p.tasks) > 0 {
+			return "Type 'approve' (or ^a) to dispatch, or give feedback..."
+		}
+		return "Press ^p to extract the plan as JSON, or give feedback..."
+	case StatePlanLocked:
+		return "Plan locked — press ^a to dispatch, or feedback..."
+	case StateExecuting:
+		return "Plan executing — give feedback..."
+	}
+	return "Talk to the planner..."
+}
+
+// HandleStreamMsg dispatches a planner-related bubbletea message originating
+// from the planner's own async commands (sent/dispatched/error/tick). The
+// host calls this when it sees a planner message type so PlannerView can
+// update its internal state (e.g., thinking flag, dispatched feedback).
+//
+// Returns a follow-up cmd (e.g., the next tick for the thinking spinner)
+// or nil.
+func (p *PlannerView) HandleStreamMsg(msg tea.Msg) tea.Cmd {
+	switch m := msg.(type) {
+	case plannerSentMsg:
+		p.thinking = true
+		p.thinkingText = "Planner is thinking..."
+		return p.tickThinking()
+	case plannerDispatchedMsg:
+		p.thinking = false
+		p.state = StateExecuting
+		target := m.target
+		if target == "" {
+			target = "workspace"
+		}
+		p.feedback = append(p.feedback, FeedbackEntry{
+			Type:      "system",
+			Content:   fmt.Sprintf("Plan dispatched to %s agent. Workers are starting.", target),
+			Timestamp: time.Now(),
+		})
+		return nil
+	case plannerErrorMsg:
+		p.thinking = false
+		errText := "Error communicating with planner agent"
+		if m.err != nil {
+			errText += ": " + m.err.Error()
+		}
+		p.feedback = append(p.feedback, FeedbackEntry{
+			Type:      "system",
+			Content:   errText,
+			Timestamp: time.Now(),
+		})
+		return nil
+	case plannerTickMsg:
+		if p.thinking {
+			return p.tickThinking()
+		}
+		return nil
+	}
+	return nil
+}
+
+// IsPlannerMsg reports whether a bubbletea message originated from the planner.
+// The host uses this to decide whether to dispatch the message to HandleStreamMsg.
+func IsPlannerMsg(msg tea.Msg) bool {
+	switch msg.(type) {
+	case plannerSentMsg, plannerErrorMsg, plannerDispatchedMsg, plannerTickMsg:
+		return true
+	}
+	return false
+}
 
