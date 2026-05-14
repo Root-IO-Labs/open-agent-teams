@@ -8968,35 +8968,45 @@ func (c *CLI) printOnboardSummary(modelStr, probeSet, stderr string) {
 func (c *CLI) modelList(args []string) error {
 	profileDirs := c.modelProfileDirs()
 
-	// Detect which API keys are present so we can mark model availability.
-	keyEnvs := map[string]string{
-		"anthropic":   "ANTHROPIC_API_KEY",
-		"openai":      "OPENAI_API_KEY",
-		"openrouter":  "OPENROUTER_API_KEY",
-		"google_genai": "GOOGLE_API_KEY",
-		"deepseek":    "DEEPSEEK_API_KEY",
-		"ollama":      "", // local — always available
-		"spark":       "SPARK_API_KEY",
+	// Use directory origin as the availability signal.
+	//
+	// The daemon only loads profiles from ~/.oat/model-profiles/ — models
+	// there have been explicitly onboarded on THIS machine (oat model onboard
+	// actually tested them, so they definitely work). Profiles from the
+	// bundled model-routing/profiles/ directory are reference templates for
+	// other setups and have NOT been validated here.
+	//
+	// This avoids brittle env-var name guessing that breaks when users store
+	// credentials differently (e.g. ANTHROPIC_API_KEY vs CLAUDE_API_KEY vs
+	// set via a credentials helper).
+	home, _ := os.UserHomeDir()
+	userProfileDir := ""
+	if home != "" {
+		userProfileDir = filepath.Join(home, ".oat", "model-profiles")
 	}
-	hasKey := func(modelID string) bool {
-		parts := strings.SplitN(modelID, ":", 2)
-		if len(parts) == 0 {
-			return false
+
+	// First pass: collect which models are in the user's onboarded dir.
+	onboarded := make(map[string]bool)
+	if userProfileDir != "" {
+		if entries, err := os.ReadDir(userProfileDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
+					data, err := os.ReadFile(filepath.Join(userProfileDir, e.Name()))
+					if err == nil {
+						fields := parseYAMLFlat(string(data))
+						if id := fields["model_id"]; id != "" {
+							onboarded[id] = true
+						}
+					}
+				}
+			}
 		}
-		provider := parts[0]
-		envVar, known := keyEnvs[provider]
-		if !known {
-			return false
-		}
-		if envVar == "" {
-			return true // local provider, no key needed
-		}
-		return os.Getenv(envVar) != ""
 	}
 
 	seen := make(map[string]bool)
-	fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-10s\n", "MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR", "KEY")
-	fmt.Println(strings.Repeat("─", 95))
+	fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-12s\n",
+		"MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR", "AVAILABLE")
+	fmt.Println(strings.Repeat("─", 99))
 
 	for _, profileDir := range profileDirs {
 		entries, err := os.ReadDir(profileDir)
@@ -9021,23 +9031,35 @@ func (c *CLI) modelList(args []string) error {
 			if orchEligible == "" {
 				orchEligible = fields["supervisor_eligible"]
 			}
-			keyStatus := "✓"
-			if !hasKey(modelID) {
-				keyStatus = "✗ no key"
+
+			// A model is available if it has been onboarded on this machine.
+			// Onboarding runs actual capability probes, so if it succeeded the
+			// credentials and endpoint are confirmed working.
+			avail := "✓ onboarded"
+			if !onboarded[modelID] {
+				avail = "— not onboarded"
 			}
-			fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-10s\n",
+
+			fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-12s\n",
 				modelID,
 				fields["status"],
 				fields["overall_score"],
 				fields["worker_eligible"],
 				orchEligible,
-				keyStatus,
+				avail,
 			)
 		}
 	}
 
 	if len(seen) == 0 {
-		fmt.Println("No model profiles found. Run: oat model onboard <provider:model>")
+		fmt.Println("No model profiles found.")
+	}
+
+	if len(onboarded) == 0 {
+		fmt.Println("\nNo models onboarded yet. Run: oat model onboard <provider:model>")
+		fmt.Println("Example: oat model onboard anthropic:claude-haiku-4-5")
+	} else {
+		fmt.Printf("\n%d model(s) onboarded on this machine (✓). Others require onboarding before use.\n", len(onboarded))
 	}
 	return nil
 }

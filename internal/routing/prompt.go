@@ -17,7 +17,8 @@ func GenerateModelRoster(ps *ProfileStore, allowedModels []string) string {
 	var b strings.Builder
 
 	b.WriteString("## Available Models for Workers\n\n")
-	b.WriteString("**IMPORTANT:** Only use models listed in this table. Do NOT use models from `oat model list` that are not in this table — those may lack a valid API key on this machine.\n\n")
+	b.WriteString("**IMPORTANT:** Only use models listed in this table. These have been onboarded and confirmed working on this machine.\n")
+	b.WriteString("Do NOT use models from `oat model list` that are not in this table — they have not been onboarded here and will fail.\n\n")
 	b.WriteString("When spawning workers with `oat work`, choose the best model for the task using `--model <model>`.\n")
 	b.WriteString("If you omit `--model`, the system picks the highest-scoring eligible model automatically (recommended).\n\n")
 
