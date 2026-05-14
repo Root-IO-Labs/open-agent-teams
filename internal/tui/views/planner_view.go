@@ -70,6 +70,11 @@ type PlannerResponse struct {
 	Requirement  *PlannerRequirement `json:"requirement"`
 	TestStrategy *TestStrategy       `json:"test_strategy"`
 	Tasks        []PlannerTask       `json:"tasks"`
+	// Action signals a system-level intent from the planner:
+	// "advance_phase", "dispatch_tasks", "revise", "clarify", or "none".
+	Action   string `json:"action"`
+	PlanID   string `json:"plan_id"`
+	SavePath string `json:"save_path"`
 }
 
 // PlannerRequirement is the requirement block inside a PlannerResponse.
@@ -310,8 +315,10 @@ func (p *PlannerView) Update(msg tea.Msg) (*PlannerView, tea.Cmd) {
 
 func (p *PlannerView) handleKey(msg tea.KeyMsg) (*PlannerView, tea.Cmd) {
 	// Enter submits the current input text to the planner state machine.
+	// handleInputEnhanced wraps handleInput with contextual intent detection
+	// (approval signals, completion signals, revision requests).
 	if msg.Type == tea.KeyEnter && p.input.Focused() {
-		return p.handleInput()
+		return p.handleInputEnhanced()
 	}
 
 	// Action shortcuts use ctrl-prefixed bindings so they don't collide with
@@ -1306,6 +1313,26 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, q))
 		}
 		p.addAIChat(strings.TrimSpace(sb.String()))
+	}
+
+	// Handle the action field — the planner signals system-level intent.
+	switch resp.Action {
+	case "dispatch_tasks":
+		// Planner says the plan is ready — auto-trigger approval if tasks parsed.
+		if len(p.tasks) > 0 && p.state != StatePlanLocked && p.state != StateExecuting {
+			p.feedback = append(p.feedback, FeedbackEntry{
+				Type:      "system",
+				Content:   "Planner signalled dispatch_tasks. Press ^a to approve and send to workspace.",
+				Timestamp: time.Now(),
+			})
+		}
+	case "advance_phase":
+		// Already handled by phase transition above.
+	case "revise":
+		if p.state == StateReviewingPlan || p.state == StatePlanLocked {
+			p.state = StateRefiningRequirement
+			p.isLocked = false
+		}
 	}
 }
 

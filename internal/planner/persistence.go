@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-	"io/ioutil"
+	
 	"sync"
 )
 
@@ -145,13 +145,13 @@ func (ps *PlanStorage) SavePlan(plan *PlanDocument) error {
 		return fmt.Errorf("failed to marshal plan: %w", err)
 	}
 
-	if err := ioutil.WriteFile(planPath, data, 0644); err != nil {
+	if err := os.WriteFile(planPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write plan file: %w", err)
 	}
 
 	// Save versioned backup
 	versionPath := filepath.Join(planDir, fmt.Sprintf("v%d.json", plan.Version))
-	if err := ioutil.WriteFile(versionPath, data, 0644); err != nil {
+	if err := os.WriteFile(versionPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -179,7 +179,7 @@ func (ps *PlanStorage) LoadPlan(planID string) (*PlanDocument, error) {
 func (ps *PlanStorage) loadPlanNoLock(planID string) (*PlanDocument, error) {
 	planPath := filepath.Join(ps.basePath, planID, "plan.json")
 	
-	data, err := ioutil.ReadFile(planPath)
+	data, err := os.ReadFile(planPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("plan not found: %s", planID)
@@ -236,7 +236,7 @@ func (ps *PlanStorage) ListPlans() ([]PlanDocument, error) {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
-	entries, err := ioutil.ReadDir(ps.basePath)
+	entries, err := os.ReadDir(ps.basePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read plans directory: %w", err)
 	}
@@ -354,7 +354,7 @@ func (ps *PlanStorage) saveMarkdown(plan *PlanDocument) error {
 		}
 	}
 
-	return ioutil.WriteFile(mdPath, []byte(md), 0644)
+	return os.WriteFile(mdPath, []byte(md), 0644)
 }
 
 // saveWorkGraph generates a YAML work graph for task dispatch
@@ -399,7 +399,7 @@ waves:
 		}
 	}
 
-	return ioutil.WriteFile(graphPath, []byte(yaml), 0644)
+	return os.WriteFile(graphPath, []byte(yaml), 0644)
 }
 
 // detectChanges compares two plans and returns the differences
