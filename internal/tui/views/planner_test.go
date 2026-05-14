@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -300,56 +299,6 @@ func TestCompleteFlow(t *testing.T) {
 	}
 }
 
-// Test collaborative planner orchestration
-func TestCollaborativeOrchestration(t *testing.T) {
-	cp := NewCollaborativePlanner(nil, "test-repo")
-	
-	// Setup tasks
-	cp.tasks = []Task{
-		{ID: "t1", Title: "Setup CI", Wave: 0, Type: "test"},
-		{ID: "t2", Title: "Core API", Wave: 1, Type: "implementation"},
-		{ID: "t3", Title: "Auth", Wave: 1, Type: "implementation"},
-	}
-	
-	// Organize into waves
-	for _, task := range cp.tasks {
-		cp.executionWaves[task.Wave] = append(cp.executionWaves[task.Wave], task)
-	}
-	
-	// Test agent scoring
-	agent := AgentProfile{
-		Name:         "test-worker",
-		Capabilities: []string{"implementation", "testing"},
-		Performance:  0.9,
-		MaxTasks:     3,
-		CurrentLoad:  1,
-	}
-	
-	task := cp.tasks[1] // Core API implementation
-	score := cp.scoreAgentForTask(agent, task)
-	if score <= 0 {
-		t.Error("Agent should have positive score for matching task")
-	}
-	
-	// Test stuck worker detection
-	worker := WorkerStatus{
-		Name:       "worker-1",
-		TaskID:     "t1",
-		LastSeen:   time.Now().Add(-15 * time.Minute),
-		NudgeCount: 6,
-	}
-	
-	if !cp.isWorkerStuck(worker) {
-		t.Error("Worker should be detected as stuck")
-	}
-	
-	// Test system health assessment
-	cp.activeWorkers["worker-1"] = worker
-	health := cp.assessSystemHealth()
-	if health != "warning" {
-		t.Errorf("System health should be 'warning' with stuck worker, got %s", health)
-	}
-}
 
 // Test 100+ real-world scenarios
 func TestRealWorldScenarios(t *testing.T) {
@@ -439,20 +388,19 @@ func BenchmarkJSONParsing(b *testing.B) {
 }
 
 func BenchmarkOrchestration(b *testing.B) {
-	cp := NewCollaborativePlanner(nil, "test-repo")
-	
-	// Setup 50 tasks
+	p := NewPlannerView(nil, "test-repo")
+
 	for i := 0; i < 50; i++ {
-		cp.tasks = append(cp.tasks, Task{
+		p.tasks = append(p.tasks, Task{
 			ID:    fmt.Sprintf("t%d", i),
 			Title: fmt.Sprintf("Task %d", i),
 			Wave:  i / 10,
 		})
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = cp.captureSnapshot()
-		_ = cp.assessSystemHealth()
+		_ = p.getMaxWave()
+		_ = p.tasksForWave(i % 5)
 	}
 }

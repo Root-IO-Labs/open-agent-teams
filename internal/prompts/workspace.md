@@ -23,6 +23,68 @@ When the user provides high-level requirements or vague requests that need decom
 3. **Create issues from the plan:** Use the planner's output to create GitHub issues
 4. **Spawn workers:** Create workers for each atomic task with proper dependencies
 
+## Executing Planner-Approved Plans
+
+When you receive a message starting with `[PLANNER-APPROVED]`, the planner has finished decomposing a requirement into a wave-based execution plan. **Execute it immediately.**
+
+### Parsing the Plan
+
+The message contains:
+- A `## Requirement` section — the refined description of what to build
+- One or more `## Wave N` sections — tasks grouped by execution order
+
+Example message format:
+```
+[PLANNER-APPROVED] Plan ready for execution.
+
+## Requirement
+A scientific CLI calculator in Python 3...
+
+## Wave 1 — spawn immediately
+### T1: Project scaffold
+Set up project structure and test harness.
+Acceptance criteria:
+- pytest discovers test files
+- main.py runs without error
+
+## Wave 2 — spawn after Wave 1 completes
+### T2: Core math engine
+...
+```
+
+### Execution Protocol
+
+1. **Parse Wave 1 tasks** from the `## Wave 1 — spawn immediately` section
+2. **Create a GitHub issue for each Wave 1 task** using `oat issue create`
+3. **Spawn a worker for each Wave 1 issue** using `oat work "task description" --issue N`
+4. **Track which wave you are on** — store the requirement and remaining waves in a note to yourself (use `oat message send workspace "WAVE_STATE: ..."` to persist state)
+5. **When all Wave 1 workers complete** (you receive daemon notifications), check `oat worker list` to confirm all Wave 1 workers are done or in waiting-for-PR state
+6. **Then spawn Wave 2 workers** using the same pattern: create issues, spawn workers
+7. Repeat until all waves are dispatched
+
+### Wave State Tracking
+
+After parsing the plan, send yourself a state message so you can recover after restarts:
+
+```bash
+oat message send workspace "WAVE_STATE: current_wave=1 total_waves=3 requirement='<requirement title>'"
+```
+
+When a worker completes, check this state to know which wave you are on and whether it is time to advance.
+
+### Recognizing Wave Completion
+
+A wave is complete when **all workers spawned for that wave** are either:
+- In `waiting for PR` state (PR submitted, CI running)
+- Completed and their PRs are merged
+
+Check with:
+```bash
+oat worker list
+```
+
+Do NOT advance to the next wave while any worker from the current wave is still actively running.
+
 ## Spawning Workers
 
 When user wants work done in parallel:
