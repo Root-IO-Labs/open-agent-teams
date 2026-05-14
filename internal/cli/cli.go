@@ -2333,16 +2333,24 @@ func (c *CLI) initRepo(args []string) error {
 		fmt.Printf("Warning: failed to checkout main in planner worktree: %v\n", err)
 	}
 
+	// Select the best available model for the planner (prefers Anthropic for
+	// reasoning quality). Falls back silently so init never fails on this.
+	plannerModel, _ := routing.GetModelForTask("planner")
+
 	// Add planner agent
+	addPlannerArgs := map[string]interface{}{
+		"repo":          repoName,
+		"agent":         "planner",
+		"type":          "planner",
+		"worktree_path": plannerWtPath,
+		"window_name":   "planner",
+	}
+	if plannerModel != "" {
+		addPlannerArgs["model"] = plannerModel
+	}
 	resp, err = client.Send(socket.Request{
 		Command: "add_agent",
-		Args: map[string]interface{}{
-			"repo":          repoName,
-			"agent":         "planner",
-			"type":          "planner",
-			"worktree_path": plannerWtPath,
-			"window_name":   "planner",
-		},
+		Args:    addPlannerArgs,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to register planner: %w", err)

@@ -3,6 +3,8 @@ package views
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/Root-IO-Labs/open-agent-teams/internal/planner"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 )
 
@@ -410,6 +413,10 @@ func (p *PlannerView) approvePlan() tea.Cmd {
 	}
 	p.state = StatePlanLocked
 	p.isLocked = true
+
+	// Persist the plan so it survives TUI restarts.
+	p.persistPlan()
+
 	p.feedback = append(p.feedback, FeedbackEntry{
 		Type:      "system",
 		Content:   fmt.Sprintf("Plan approved. Dispatching %d tasks (%d waves) to workspace agent...", len(p.tasks), p.getMaxWave()),
@@ -648,58 +655,47 @@ func (p *PlannerView) rejectPlan() tea.Cmd {
 	return nil
 }
 
-func (p *PlannerView) executePlan() tea.Cmd {
-	wave1 := p.tasksForWave(1)
-	if len(wave1) == 0 {
-		p.feedback = append(p.feedback, FeedbackEntry{
-			Type:      "system",
-			Content:   "No Wave 1 tasks to execute.",
-			Timestamp: time.Now(),
+
+// persistPlan saves the current approved plan to ~/.oat/plans/<repo>/ so it
+// survives TUI restarts and can be referenced later.
+func (p *PlannerView) persistPlan() {
+	if p.requirement == nil || len(p.tasks) == 0 {
+		return
+	}
+	plansDir := filepath.Join(os.Getenv("HOME"), ".oat", "plans", p.repoName)
+	storage, err := planner.NewPlanStorage(plansDir)
+	if err != nil {
+		return // non-fatal — persistence is best-effort
+	}
+
+	doc := &planner.PlanDocument{
+		ID:        p.requirement.ID,
+		Version:   p.requirement.Iteration,
+		CreatedAt: p.requirement.LastUpdated,
+		UpdatedAt: time.Now(),
+		Status:    "approved",
+		Requirement: planner.RequirementDoc{
+			Title:           p.requirement.Refined,
+			Original:        p.requirement.Original,
+			Refined:         p.requirement.Refined,
+			OperationalSpec: p.requirement.OperationalSpec,
+			LastUpdated:     p.requirement.LastUpdated,
+		},
+	}
+	for _, t := range p.tasks {
+		doc.Tasks = append(doc.Tasks, planner.TaskDoc{
+			ID:                 t.ID,
+			Title:              t.Title,
+			Description:        t.Description,
+			Type:               t.Type,
+			Wave:               t.Wave,
+			Dependencies:       t.Dependencies,
+			SpecReference:      t.SpecReference,
+			TestFirst:          t.TestFirst,
+			AcceptanceCriteria: t.AcceptanceCriteria,
 		})
-		return nil
 	}
-	p.state = StateExecuting
-	p.feedback = append(p.feedback, FeedbackEntry{
-		Type:      "system",
-		Content:   fmt.Sprintf("Dispatching %d Wave 1 worker(s)...", len(wave1)),
-		Timestamp: time.Now(),
-	})
-
-	client := p.client
-	repoName := p.repoName
-	tasks := wave1
-	req := p.requirement
-
-	return func() tea.Msg {
-		if client == nil {
-			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
-		}
-		var errs []string
-		for _, task := range tasks {
-			workerPrompt := buildWorkerPrompt(task, req)
-			resp, err := client.Send(socket.Request{
-				Command: "spawn_agent",
-				Args: map[string]interface{}{
-					"repo":   repoName,
-					"name":   fmt.Sprintf("worker-%s", task.ID),
-					"class":  "ephemeral",
-					"prompt": workerPrompt,
-					"task":   task.Title + ": " + task.Description,
-				},
-			})
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", task.ID, err))
-				continue
-			}
-			if !resp.Success {
-				errs = append(errs, fmt.Sprintf("%s: %s", task.ID, resp.Error))
-			}
-		}
-		if len(errs) > 0 {
-			return plannerErrorMsg{err: fmt.Errorf("spawn errors: %s", strings.Join(errs, "; "))}
-		}
-		return plannerSentMsg{}
-	}
+	_ = storage.SavePlan(doc) // best-effort; failure is non-fatal
 }
 
 // tasksForWave returns all tasks with the given wave number.
@@ -713,25 +709,59 @@ func (p *PlannerView) tasksForWave(wave int) []Task {
 	return result
 }
 
-// buildWorkerPrompt creates a concise system prompt for a spawned worker.
+// buildWorkerPrompt creates the system prompt for a spawned worker, injecting
+// all available context from the planner: requirement, operational spec,
+// test strategy, and task-level spec references.
 func buildWorkerPrompt(task Task, req *Requirement) string {
 	var sb strings.Builder
 	sb.WriteString("You are a worker agent. Complete exactly the task assigned to you, then stop.\n\n")
-	if req != nil && req.Refined != "" {
-		sb.WriteString("## Project context\n")
-		sb.WriteString(req.Refined)
+
+	if req != nil {
+		if req.Refined != "" {
+			sb.WriteString("## Project requirement\n")
+			sb.WriteString(req.Refined)
+			sb.WriteString("\n\n")
+		}
+		if req.OperationalSpec != "" {
+			sb.WriteString("## How the system works (operational spec)\n")
+			sb.WriteString(req.OperationalSpec)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if task.TestFirst {
+		sb.WriteString("## Approach: Test-First (TDD)\n")
+		sb.WriteString("Write the tests BEFORE writing implementation code. " +
+			"Ensure tests fail first, then implement until they pass.\n\n")
+	}
+
+	if task.SpecReference != "" {
+		sb.WriteString("## Specification reference\n")
+		sb.WriteString(task.SpecReference)
 		sb.WriteString("\n\n")
 	}
+
 	sb.WriteString("## Your task\n")
 	sb.WriteString("**" + task.Title + "**\n\n")
 	sb.WriteString(task.Description + "\n\n")
+
+	if len(task.Dependencies) > 0 {
+		sb.WriteString("## Dependencies (must be complete before this task)\n")
+		for _, d := range task.Dependencies {
+			sb.WriteString("- " + d + "\n")
+		}
+		sb.WriteString("\n")
+	}
+
 	if len(task.AcceptanceCriteria) > 0 {
-		sb.WriteString("## Acceptance criteria\n")
+		sb.WriteString("## Acceptance criteria (your definition of done)\n")
 		for _, c := range task.AcceptanceCriteria {
 			sb.WriteString("- " + c + "\n")
 		}
 	}
-	sb.WriteString("\nWhen done, verify your work against the acceptance criteria and report completion.")
+
+	sb.WriteString("\nVerify your work against every acceptance criterion before submitting. " +
+		"Run `./scripts/check.sh` if it exists.")
 	return sb.String()
 }
 
@@ -755,25 +785,38 @@ func (p *PlannerView) getMaxWave() int {
 // SummaryForList returns a short, one-line description of the planner's
 // current state. The TUI agent sidebar renders this on the planner row.
 func (p *PlannerView) SummaryForList() string {
-	if len(p.tasks) > 0 {
-		return fmt.Sprintf("%d tasks · %d waves", len(p.tasks), p.getMaxWave())
+	thinking := ""
+	if p.thinking {
+		thinking = " ●"
 	}
+
+	if len(p.tasks) > 0 {
+		switch p.state {
+		case StatePlanLocked:
+			return fmt.Sprintf("plan locked · %d tasks", len(p.tasks))
+		case StateExecuting:
+			return fmt.Sprintf("executing · %d tasks · %d waves", len(p.tasks), p.getMaxWave())
+		default:
+			return fmt.Sprintf("%d tasks · %d waves%s", len(p.tasks), p.getMaxWave(), thinking)
+		}
+	}
+
 	switch p.state {
 	case StateDefiningRequirement:
-		return "defining requirement"
+		return "waiting for requirement"
 	case StateRefiningRequirement:
 		if p.requirement != nil {
-			return fmt.Sprintf("refining (v%d)", p.requirement.Iteration)
+			return fmt.Sprintf("clarifying (v%d)%s", p.requirement.Iteration, thinking)
 		}
-		return "refining requirement"
+		return "clarifying" + thinking
 	case StateDecomposingTasks:
-		return "decomposing tasks"
+		return "decomposing tasks" + thinking
 	case StateReviewingPlan:
-		return "reviewing plan"
+		return "plan ready for review"
 	case StatePlanLocked:
 		return "plan locked"
 	case StateExecuting:
-		return "executing plan"
+		return "executing"
 	default:
 		return "idle"
 	}
@@ -1129,22 +1172,22 @@ func (p *PlannerView) renderHelp() string {
 
 	switch p.state {
 	case StateDefiningRequirement:
-		helps = []string{"Enter: submit", "esc: back"}
-	case StateRefiningRequirement, StateDecomposingTasks:
-		helps = []string{"Enter: feedback", "^p: pull plan", "^r: refine", "esc: back"}
+		helps = []string{"Enter: describe requirement", "esc: back"}
+	case StateRefiningRequirement:
+		helps = []string{"Enter: reply", "^p: interrupt+extract plan", "^r: ask to refine", "^n: restart", "esc: back"}
+	case StateDecomposingTasks:
+		helps = []string{"Enter: reply", "^p: interrupt+extract plan", "^n: restart", "esc: back"}
 	case StateReviewingPlan:
 		if len(p.tasks) > 0 {
-			helps = []string{"^a: approve+dispatch", "^x: reject", "^p: repull plan", "Enter: feedback", "esc: back"}
+			helps = []string{"^a: approve & dispatch", "^x: reject", "^p: re-extract", "Enter: feedback", "^n: restart", "esc: back"}
 		} else {
-			helps = []string{"^p: pull plan as JSON", "^x: reject", "Enter: feedback", "esc: back"}
+			helps = []string{"^p: interrupt+extract plan as JSON", "^x: reject", "Enter: feedback", "^n: restart", "esc: back"}
 		}
 	case StatePlanLocked:
-		helps = []string{"^a: dispatch", "Enter: feedback", "esc: back"}
+		helps = []string{"^a: dispatch to workspace", "Enter: feedback", "esc: back"}
 	case StateExecuting:
 		helps = []string{"esc: back"}
 	}
-
-	helps = append(helps, "^n: new")
 
 	helpText := strings.Join(helps, " • ")
 	
@@ -1249,17 +1292,24 @@ func (p *PlannerView) addAIChat(text string) {
 
 // applyPlannerResponse updates TUI state from a parsed planner JSON response.
 func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
-	// Transition state machine
+	// Transition state machine based on planner phase.
+	// "architecture" is the active-decomposition phase — tasks are being built
+	// but not yet ready for review, so show StateDecomposingTasks.
 	switch resp.Phase {
 	case "clarifying":
 		if p.state == StateDefiningRequirement || p.state == StateRefiningRequirement {
 			p.state = StateRefiningRequirement
 		}
 	case "architecture":
-		// New phase for Overlord methodology
-		p.state = StateRefiningRequirement
+		p.state = StateDecomposingTasks
 	case "draft_plan":
-		p.state = StateReviewingPlan
+		// Tasks exist but user hasn't approved — show decomposing while tasks
+		// are partially formed, reviewing once we have a complete set.
+		if len(resp.Tasks) > 0 {
+			p.state = StateReviewingPlan
+		} else {
+			p.state = StateDecomposingTasks
+		}
 	case "ready_for_review":
 		p.state = StateReviewingPlan
 	}

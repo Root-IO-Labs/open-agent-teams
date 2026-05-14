@@ -1003,9 +1003,13 @@ func (a *App) renderAgentList(width, height int) string {
 			typeLine = string(typeRunes[:width-5]) + "..."
 		}
 
-		// Build summary line
+		// Build summary line — for the planner row, use the PlannerView's own
+		// live summary (state machine + thinking indicator) instead of the
+		// stale daemon-provided TaskSummary.
 		summary := ag.TaskSummary
-		if summary == "" && ag.Task != "" {
+		if ag.Name == "planner" && a.planner != nil {
+			summary = a.planner.SummaryForList()
+		} else if summary == "" && ag.Task != "" {
 			summary = ag.Task
 			summaryRunes := []rune(summary)
 			if len(summaryRunes) > 50 {
