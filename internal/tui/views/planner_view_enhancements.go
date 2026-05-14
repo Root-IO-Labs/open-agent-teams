@@ -265,14 +265,12 @@ func (p *PlannerView) handleInputEnhanced() (*PlannerView, tea.Cmd) {
 
 	p.input.SetValue("")
 
-	// Add to feedback
 	p.feedback = append(p.feedback, FeedbackEntry{
 		Type:      "user",
 		Content:   text,
 		Timestamp: time.Now(),
 	})
 
-	// Initialize requirement if needed
 	if p.requirement == nil {
 		p.requirement = &Requirement{
 			ID:          fmt.Sprintf("req-%d", time.Now().Unix()),
@@ -284,7 +282,28 @@ func (p *PlannerView) handleInputEnhanced() (*PlannerView, tea.Cmd) {
 		p.state = StateRefiningRequirement
 	}
 
-	// Handle based on context
+	// Track quiet turns in clarifying phase. After 3 turns with no phase
+	// advance, proactively offer the next brainstorm theme to help the user
+	// think through the requirement from a different angle.
+	if p.state == StateRefiningRequirement || p.state == StateDefiningRequirement {
+		p.clarifyingTurns++
+		if p.clarifyingTurns >= 3 && len(p.brainstormThemes) > 0 {
+			p.clarifyingTurns = 0
+			cmd := p.handleContextualInput(text)
+			// Append Socratic dialogue after the normal send.
+			brainstormCmd := p.conductSocraticDialogue()
+			if brainstormCmd != nil && cmd != nil {
+				return p, tea.Batch(cmd, brainstormCmd)
+			}
+			if brainstormCmd != nil {
+				return p, brainstormCmd
+			}
+			return p, cmd
+		}
+	} else {
+		p.clarifyingTurns = 0
+	}
+
 	return p, p.handleContextualInput(text)
 }
 

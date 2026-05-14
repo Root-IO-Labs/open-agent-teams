@@ -134,9 +134,10 @@ type PlannerView struct {
 	repoName    string
 	
 	// Feedback and collaboration
-	feedback      []FeedbackEntry
-	thinkingText  string
-	plannerBuffer string // accumulates planner output for JSON detection
+	feedback          []FeedbackEntry
+	thinkingText      string
+	plannerBuffer     string // accumulates planner output for JSON detection
+	clarifyingTurns   int   // turns in clarifying phase without advancing
 	
 	// Enhanced contextual awareness (Overlord integration)
 	context           *PlannerContext
@@ -340,6 +341,11 @@ func (p *PlannerView) handleKey(msg tea.KeyMsg) (*PlannerView, tea.Cmd) {
 	// dispatch workers. Works at any point in the conversation.
 	if msg.Type == tea.KeyCtrlP && p.requirement != nil {
 		return p, p.stopAndPullPlan()
+	}
+	// Ctrl+B — trigger the next brainstorm theme (Socratic dialogue). Useful
+	// when the conversation has stalled and needs a new angle.
+	if msg.Type == tea.KeyCtrlB && len(p.brainstormThemes) > 0 {
+		return p, p.conductSocraticDialogue()
 	}
 	// Ctrl+A — approve the plan and dispatch to workspace/workers.
 	// If tasks haven't been parsed yet, prompt the user to use Ctrl+P first.
@@ -1175,14 +1181,17 @@ func (p *PlannerView) renderHelp() string {
 	case StateDefiningRequirement:
 		helps = []string{"Enter: describe requirement", "esc: back"}
 	case StateRefiningRequirement:
-		helps = []string{"Enter: reply", "^p: interrupt+extract plan", "^r: ask to refine", "^n: restart", "esc: back"}
+		helps = []string{"Enter: reply", "^p: extract plan", "^r: refine", "^n: restart", "esc: back"}
+		if len(p.brainstormThemes) > 0 {
+			helps = append(helps, "^b: brainstorm")
+		}
 	case StateDecomposingTasks:
-		helps = []string{"Enter: reply", "^p: interrupt+extract plan", "^n: restart", "esc: back"}
+		helps = []string{"Enter: reply", "^p: extract plan", "^n: restart", "esc: back"}
 	case StateReviewingPlan:
 		if len(p.tasks) > 0 {
 			helps = []string{"^a: approve & dispatch", "^x: reject", "^p: re-extract", "Enter: feedback", "^n: restart", "esc: back"}
 		} else {
-			helps = []string{"^p: interrupt+extract plan as JSON", "^x: reject", "Enter: feedback", "^n: restart", "esc: back"}
+			helps = []string{"^p: extract plan as JSON", "^x: reject", "Enter: feedback", "^n: restart", "esc: back"}
 		}
 	case StatePlanLocked:
 		helps = []string{"^a: dispatch to workspace", "Enter: feedback", "esc: back"}
@@ -1191,7 +1200,17 @@ func (p *PlannerView) renderHelp() string {
 	}
 
 	helpText := strings.Join(helps, " • ")
-	
+
+	// Show the first contextual suggestion as a dim tip below the key bindings.
+	suggestions := p.getContextualSuggestions()
+	if len(suggestions) > 0 && p.state != StateExecuting && p.state != StatePlanLocked {
+		tip := "Tip: " + suggestions[0]
+		return lipgloss.JoinVertical(lipgloss.Left,
+			lipgloss.NewStyle().Width(p.width).Foreground(lipgloss.Color("8")).Padding(0, 1).Render(helpText),
+			lipgloss.NewStyle().Width(p.width).Foreground(lipgloss.Color("240")).Padding(0, 1).Render(tip),
+		)
+	}
+
 	return lipgloss.NewStyle().
 		Width(p.width).
 		Foreground(lipgloss.Color("8")).
