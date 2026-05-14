@@ -413,6 +413,7 @@ func (p *PlannerView) approvePlan() tea.Cmd {
 	}
 	p.state = StatePlanLocked
 	p.isLocked = true
+	p.currentGate = nil // gate passed or bypassed via ^a
 
 	// Persist the plan so it survives TUI restarts.
 	p.persistPlan()
@@ -803,7 +804,7 @@ func (p *PlannerView) SummaryForList() string {
 
 	switch p.state {
 	case StateDefiningRequirement:
-		return "waiting for requirement"
+		return "waiting for requirement" + thinking
 	case StateRefiningRequirement:
 		if p.requirement != nil {
 			return fmt.Sprintf("clarifying (v%d)%s", p.requirement.Iteration, thinking)
@@ -1353,6 +1354,11 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		}
 	}
 
+	// Queue any explicit questions from the planner for later surfacing.
+	if len(resp.Questions) > 0 && p.pendingQuestions != nil {
+		p.pendingQuestions = append(p.pendingQuestions, resp.Questions...)
+	}
+
 	// Show the human-readable message in chat
 	if resp.Message != "" {
 		p.addAIChat(resp.Message)
@@ -1365,10 +1371,33 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		p.addAIChat(strings.TrimSpace(sb.String()))
 	}
 
+	// Surface any pending questions immediately after a planner response.
+	if p.pendingQuestions != nil {
+		p.surfacePendingQuestions()
+	}
+
+	// Set plan-approval gate when a complete plan lands in StateReviewingPlan.
+	// This requires explicit user approval (^a or "approve") before dispatch.
+	if p.state == StateReviewingPlan && len(p.tasks) > 0 && p.currentGate == nil {
+		gates := p.initPhaseGates()
+		if len(gates) >= 3 {
+			gate := gates[2] // gate_3_plan
+			gate.ApprovalPrompt = fmt.Sprintf(
+				"Plan ready: %d tasks in %d waves. Press ^a or type 'approve' to dispatch to workspace.",
+				len(p.tasks), p.getMaxWave(),
+			)
+			p.currentGate = &gate
+			p.feedback = append(p.feedback, FeedbackEntry{
+				Type:      "system",
+				Content:   gate.ApprovalPrompt,
+				Timestamp: time.Now(),
+			})
+		}
+	}
+
 	// Handle the action field — the planner signals system-level intent.
 	switch resp.Action {
 	case "dispatch_tasks":
-		// Planner says the plan is ready — auto-trigger approval if tasks parsed.
 		if len(p.tasks) > 0 && p.state != StatePlanLocked && p.state != StateExecuting {
 			p.feedback = append(p.feedback, FeedbackEntry{
 				Type:      "system",
@@ -1382,6 +1411,7 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		if p.state == StateReviewingPlan || p.state == StatePlanLocked {
 			p.state = StateRefiningRequirement
 			p.isLocked = false
+			p.currentGate = nil
 		}
 	}
 }

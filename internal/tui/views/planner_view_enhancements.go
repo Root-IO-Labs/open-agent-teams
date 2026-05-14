@@ -353,28 +353,36 @@ func (p *PlannerView) validatePlanComplete(pv *PlannerView) bool {
 		pv.getMaxWave() > 0
 }
 
-// passGate handles phase gate approval
+// passGate handles phase gate approval. Gate_3 (plan approval) dispatches
+// directly; earlier gates advance to the next planning phase.
 func (p *PlannerView) passGate() tea.Cmd {
 	if p.currentGate == nil {
 		return nil
 	}
-	
+
 	if p.currentGate.ValidationFunc != nil && !p.currentGate.ValidationFunc(p) {
 		p.feedback = append(p.feedback, FeedbackEntry{
 			Type:      "system",
-			Content:   "⚠️ Gate validation failed. Please complete all requirements.",
+			Content:   "Gate validation failed. Please complete all requirements before continuing.",
 			Timestamp: time.Now(),
 		})
 		return nil
 	}
-	
+
+	gateName := p.currentGate.Name
+	gateID := p.currentGate.ID
+	p.currentGate = nil
+
 	p.feedback = append(p.feedback, FeedbackEntry{
 		Type:      "system",
-		Content:   fmt.Sprintf("✅ %s passed. Moving forward.", p.currentGate.Name),
+		Content:   fmt.Sprintf("%s passed.", gateName),
 		Timestamp: time.Now(),
 	})
-	
-	p.currentGate = nil
+
+	// Gate 3 is the plan-approval gate — dispatch rather than advance phase.
+	if gateID == "gate_3_plan" || p.state == StateReviewingPlan {
+		return p.approvePlan()
+	}
 	return p.advanceToNextPhase()
 }
 
