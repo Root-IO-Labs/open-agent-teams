@@ -898,44 +898,49 @@ func (p *PlannerView) renderHeader() string {
 }
 
 func (p *PlannerView) renderMainContent() string {
-	contentHeight := p.height - 6 // header + input + help + padding
+	contentHeight := p.height - 6
 	if contentHeight < 5 {
 		contentHeight = 5
 	}
 
 	var content strings.Builder
 
-	// Render current requirement
-	if p.requirement != nil {
-		content.WriteString(p.renderRequirement())
+	// Compact requirement strip — only when a refined requirement exists.
+	// No heavy border box; just a single dim line so it stays out of the way.
+	if p.requirement != nil && p.requirement.Refined != "" {
+		label := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true).Render("Req: ")
+		text := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render(p.requirement.Refined)
+		// Truncate if too wide
+		maxW := p.width - 10
+		if maxW > 0 && lipgloss.Width(p.requirement.Refined) > maxW {
+			runes := []rune(p.requirement.Refined)
+			if maxW > 3 {
+				text = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render(string(runes[:maxW-3]) + "…")
+			}
+		}
+		content.WriteString(label + text + "\n")
+		if len(p.tasks) > 0 {
+			taskInfo := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(
+				fmt.Sprintf("  %d tasks · %d waves", len(p.tasks), p.getMaxWave()))
+			content.WriteString(taskInfo + "\n")
+		}
+		content.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("237")).Render(strings.Repeat("─", p.width-4)))
+		content.WriteString("\n\n")
+	}
+
+	// Tasks compact view — only show if in review/locked/executing state
+	if len(p.tasks) > 0 && (p.state == StateReviewingPlan || p.state == StatePlanLocked || p.state == StateExecuting) {
+		content.WriteString(p.renderTasksCompact())
 		content.WriteString("\n")
 	}
 
-	// Render test strategy (Overlord methodology)
-	if p.testStrategy != nil {
-		content.WriteString(p.renderTestStrategy())
-		content.WriteString("\n")
-	}
-
-	// Render tasks if any
-	if len(p.tasks) > 0 {
-		content.WriteString(p.renderTasks())
-		content.WriteString("\n")
-	}
-
-	// Render conversation/feedback
+	// Main conversation — takes all remaining space
 	content.WriteString(p.renderFeedback())
-
-	// Render thinking indicator
-	if p.thinking {
-		content.WriteString("\n")
-		content.WriteString(p.renderThinking())
-	}
 
 	return lipgloss.NewStyle().
 		Width(p.width - 2).
 		Height(contentHeight).
-		Padding(1).
+		Padding(0, 1).
 		Render(content.String())
 }
 
@@ -1109,52 +1114,88 @@ func (p *PlannerView) renderTasks() string {
 func (p *PlannerView) renderFeedback() string {
 	var content strings.Builder
 
-	title := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("205")).
-		Render("💬 Conversation")
-
-	content.WriteString(title)
-	content.WriteString("\n\n")
-
-	// Render all entries — when embedded in a scrollable viewport, the host
-	// handles scroll, so showing full history is correct. The previous 10-entry
-	// cap hid context the user needed to scroll back to.
-	wrapWidth := p.width - 4
+	wrapWidth := p.width - 6
 	if wrapWidth < 20 {
-		wrapWidth = 0 // disable wrapping for tiny widths
+		wrapWidth = 0
 	}
 
-	timeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	for _, entry := range p.feedback {
-		timestamp := entry.Timestamp.Format("15:04")
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	userStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
+	aiStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	systemStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
 
-		var prefix string
-		var style lipgloss.Style
+	for _, entry := range p.feedback {
 		switch entry.Type {
 		case "user":
-			prefix = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("You:")
-			style = lipgloss.NewStyle()
-		case "ai":
-			prefix = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render("AI:")
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-		case "system":
-			prefix = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("System:")
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-		}
+			// User messages: "> text" in green, like a prompt line
+			line := userStyle.Render("> " + entry.Content)
+			if wrapWidth > 0 {
+				line = lipgloss.NewStyle().Width(wrapWidth).Render(line)
+			}
+			content.WriteString(line)
+			content.WriteString("\n\n")
 
-		body := style.Render(entry.Content)
-		if wrapWidth > 0 {
-			body = lipgloss.NewStyle().Width(wrapWidth).Render(body)
+		case "ai":
+			// AI messages: plain white text, no prefix, indented slightly
+			body := aiStyle.Render(entry.Content)
+			if wrapWidth > 0 {
+				body = lipgloss.NewStyle().Width(wrapWidth - 2).Padding(0, 0, 0, 2).Render(body)
+			}
+			content.WriteString(body)
+			content.WriteString("\n\n")
+
+		case "system":
+			// System messages: dim italic, used only for important gate/state changes
+			body := systemStyle.Render("⋯ " + entry.Content)
+			if wrapWidth > 0 {
+				body = lipgloss.NewStyle().Width(wrapWidth).Render(body)
+			}
+			content.WriteString(dimStyle.Render(body))
+			content.WriteString("\n")
 		}
-		content.WriteString(fmt.Sprintf("%s %s %s\n",
-			timeStyle.Render("["+timestamp+"]"),
-			prefix,
-			body))
+	}
+
+	if p.thinking {
+		content.WriteString(p.renderThinking())
 		content.WriteString("\n")
 	}
 
 	return content.String()
+}
+
+// renderTasksCompact shows tasks as a dense single-line list by wave,
+// used when plan is in review/locked/executing state.
+func (p *PlannerView) renderTasksCompact() string {
+	if len(p.tasks) == 0 {
+		return ""
+	}
+	waves := make(map[int][]Task)
+	for _, t := range p.tasks {
+		waves[t.Wave] = append(waves[t.Wave], t)
+	}
+	var sb strings.Builder
+	for wave := 0; wave <= p.getMaxWave(); wave++ {
+		tasks, ok := waves[wave]
+		if !ok {
+			continue
+		}
+		waveLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(fmt.Sprintf("W%d", wave))
+		var titles []string
+		for _, t := range tasks {
+			icon := "○"
+			switch t.Status {
+			case TaskStatusInProgress:
+				icon = "●"
+			case TaskStatusCompleted:
+				icon = "✓"
+			case TaskStatusFailed:
+				icon = "✗"
+			}
+			titles = append(titles, icon+" "+t.Title)
+		}
+		sb.WriteString(waveLabel + " " + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(strings.Join(titles, "  ")) + "\n")
+	}
+	return sb.String()
 }
 
 func (p *PlannerView) renderThinking() string {
@@ -1246,73 +1287,120 @@ func (p *PlannerView) ReceiveOutput(lines []string, lineTypes []string) {
 	p.drainBuffer()
 }
 
-// drainBuffer scans plannerBuffer for complete ```json...``` fences.
+// drainBuffer extracts planner JSON responses from the accumulated buffer.
 //
-// The planner streams JSON line-by-line. We must NOT flush content the moment
-// it arrives because the opening fence (```json) and its content arrive in
-// separate batches. Flushing early causes raw JSON fields like "tasks": []
-// to appear as chat messages.
+// The planner may output JSON with or without ```json fences — PTY rendering
+// sometimes strips fence markers. We handle both:
 //
-// Strategy:
-//   - If buffer has no fence yet AND looks like JSON content (contains { or ")
-//     AND is under 4KB, hold it — the fence will arrive in the next batch.
-//   - If buffer clearly has non-JSON prose (no { or "), flush immediately so
-//     plain-text responses still show up promptly.
-//   - If buffer > 4KB with no fence, flush to avoid silent data loss.
-//   - Once an opening fence is found, hold until the closing fence arrives.
+//  1. Fenced:    ```json\n{...}\n```  — highest priority, always correct
+//  2. Bare JSON: a complete {…} object that parses as PlannerResponse
+//  3. Hold:      buffer looks like mid-stream JSON (has " but no complete
+//     object yet) — hold up to 8KB before flushing as plain text
+//  4. Plain text: no JSON indicators — show immediately
 func (p *PlannerView) drainBuffer() {
 	const fenceOpen = "```json"
 	const fenceClose = "```"
+	const maxHold = 8192
 
 	for {
-		fenceStart := strings.Index(p.plannerBuffer, fenceOpen)
-		if fenceStart < 0 {
-			// No opening fence found yet.
-			// If the buffer looks like streaming JSON content (contains { or ")
-			// and is small enough that a fence might still arrive, hold it.
-			looksLikeJSON := strings.ContainsAny(p.plannerBuffer, `{"`)
-			if looksLikeJSON && len(p.plannerBuffer) < 4096 {
-				return // wait for the fence
+		// ── Pass 1: look for a ```json … ``` fence ────────────────────────
+		if fenceStart := strings.Index(p.plannerBuffer, fenceOpen); fenceStart >= 0 {
+			if preamble := strings.TrimSpace(p.plannerBuffer[:fenceStart]); preamble != "" {
+				p.addAIChat(preamble)
 			}
-			// Either plain prose or buffer is too large — flush as chat.
-			if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
-				p.addAIChat(trimmed)
+			jsonStart := fenceStart + len(fenceOpen)
+			if jsonStart < len(p.plannerBuffer) && p.plannerBuffer[jsonStart] == '\n' {
+				jsonStart++
 			}
-			p.plannerBuffer = ""
-			return
+			closeIdx := strings.Index(p.plannerBuffer[jsonStart:], fenceClose)
+			if closeIdx < 0 {
+				p.plannerBuffer = p.plannerBuffer[fenceStart:]
+				return // incomplete fence — wait
+			}
+			jsonStr := p.plannerBuffer[jsonStart : jsonStart+closeIdx]
+			p.plannerBuffer = p.plannerBuffer[jsonStart+closeIdx+len(fenceClose):]
+			var resp PlannerResponse
+			if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil {
+				p.applyPlannerResponse(resp)
+			}
+			continue // loop to check for more fences
 		}
 
-		// Freeform text before the opening fence → show in chat.
-		if preamble := strings.TrimSpace(p.plannerBuffer[:fenceStart]); preamble != "" {
-			p.addAIChat(preamble)
+		// ── Pass 2: try to extract a bare JSON object {…} ─────────────────
+		// The planner sometimes streams JSON without fence markers. Find the
+		// first '{' and walk braces to find the matching '}'. Only try when
+		// the buffer has at least a closing brace somewhere.
+		if braceAt := strings.Index(p.plannerBuffer, "{"); braceAt >= 0 &&
+			strings.Contains(p.plannerBuffer[braceAt:], "}") {
+
+			obj, end := extractJSONObject(p.plannerBuffer[braceAt:])
+			if obj != "" {
+				before := strings.TrimSpace(p.plannerBuffer[:braceAt])
+				if before != "" {
+					p.addAIChat(before)
+				}
+				var resp PlannerResponse
+				if err := json.Unmarshal([]byte(obj), &resp); err == nil && resp.Phase != "" {
+					p.applyPlannerResponse(resp)
+				} else if before == "" {
+					// Not a planner response — show as plain text
+					p.addAIChat(obj)
+				}
+				p.plannerBuffer = p.plannerBuffer[braceAt+end:]
+				continue
+			}
 		}
 
-		// Advance past "```json" and optional newline.
-		jsonStart := fenceStart + len(fenceOpen)
-		if jsonStart < len(p.plannerBuffer) && p.plannerBuffer[jsonStart] == '\n' {
-			jsonStart++
+		// ── Pass 3: decide whether to hold or flush ───────────────────────
+		// Hold if the buffer looks like mid-stream JSON (has quotes/braces)
+		// and is small enough that more content is likely coming.
+		looksLikeJSON := strings.ContainsAny(p.plannerBuffer, `{"`)
+		if looksLikeJSON && len(p.plannerBuffer) < maxHold {
+			return // wait for more batches
 		}
-
-		// Find the closing "```".
-		closeIdx := strings.Index(p.plannerBuffer[jsonStart:], fenceClose)
-		if closeIdx < 0 {
-			// Incomplete fence — keep from the opening marker, wait for more.
-			p.plannerBuffer = p.plannerBuffer[fenceStart:]
-			return
+		// Plain prose or buffer too large — flush as chat and clear.
+		if trimmed := strings.TrimSpace(p.plannerBuffer); trimmed != "" {
+			p.addAIChat(trimmed)
 		}
-
-		jsonStr := p.plannerBuffer[jsonStart : jsonStart+closeIdx]
-		p.plannerBuffer = p.plannerBuffer[jsonStart+closeIdx+len(fenceClose):]
-
-		var resp PlannerResponse
-		if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil {
-			p.applyPlannerResponse(resp)
-		} else {
-			// Malformed JSON — show raw so the problem is visible.
-			p.addAIChat(jsonStr)
-		}
-		// Loop: process any further fences in the remaining buffer.
+		p.plannerBuffer = ""
+		return
 	}
+}
+
+// extractJSONObject finds the first complete JSON object {…} in s using
+// brace counting. Returns the object string and the index just past its
+// closing brace. Returns ("", 0) if no complete object is found.
+func extractJSONObject(s string) (string, int) {
+	depth := 0
+	inStr := false
+	escape := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if c == '\\' && inStr {
+			escape = true
+			continue
+		}
+		if c == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				return s[:i+1], i + 1
+			}
+		}
+	}
+	return "", 0
 }
 
 func (p *PlannerView) addAIChat(text string) {
