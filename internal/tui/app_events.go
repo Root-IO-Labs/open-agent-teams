@@ -208,3 +208,33 @@ func isChatContentLineType(lineType string) bool {
 	}
 	return false
 }
+
+// filterPlannerJSONFences removes ```json...``` fence blocks from the planner
+// agent's stored output lines. The JSON content is parsed separately by
+// ReceiveOutput → drainBuffer for state updates; it should not appear in the
+// viewport where it creates noise. Plain-text planner output is preserved.
+func filterPlannerJSONFences(lines, lineTypes []string) ([]string, []string) {
+	out := make([]string, 0, len(lines))
+	outTypes := make([]string, 0, len(lineTypes))
+	inFence := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !inFence && strings.HasPrefix(trimmed, "```json") {
+			inFence = true
+			continue // drop the opening fence line
+		}
+		if inFence {
+			if strings.TrimSpace(trimmed) == "```" {
+				inFence = false // closing fence — drop it and resume
+			}
+			continue // drop all lines inside a JSON fence
+		}
+		out = append(out, line)
+		lt := ""
+		if i < len(lineTypes) {
+			lt = lineTypes[i]
+		}
+		outTypes = append(outTypes, lt)
+	}
+	return out, outTypes
+}

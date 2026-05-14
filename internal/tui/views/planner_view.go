@@ -65,6 +65,14 @@ const (
 	TaskStatusBlocked
 )
 
+// ConversationEntry is a single message in the clean planner conversation.
+// Unlike the raw PTY viewport, this shows only extracted user messages and
+// planner response text — no JSON, no tool calls, no terminal noise.
+type ConversationEntry struct {
+	Role    string // "user" | "planner" | "system"
+	Text    string
+}
+
 // PlannerResponse is the structured JSON the planner agent emits every turn.
 type PlannerResponse struct {
 	Phase        string              `json:"phase"`
@@ -138,6 +146,10 @@ type PlannerView struct {
 	thinkingText      string
 	plannerBuffer     string // accumulates planner output for JSON detection
 	clarifyingTurns   int   // turns in clarifying phase without advancing
+
+	// Clean conversation: extracted message fields + user messages, shown
+	// instead of raw PTY output in the planner viewport.
+	conversation []ConversationEntry
 	
 	// Enhanced contextual awareness (Overlord integration)
 	context           *PlannerContext
@@ -654,12 +666,11 @@ func (p *PlannerView) refineRequirement() tea.Cmd {
 
 func (p *PlannerView) rejectPlan() tea.Cmd {
 	p.state = StateRefiningRequirement
-	p.feedback = append(p.feedback, FeedbackEntry{
-		Type:    "system",
-		Content: "Plan rejected. Please provide feedback on what needs to change.",
-		Timestamp: time.Now(),
-	})
-	return nil
+	p.isLocked = false
+	p.currentGate = nil
+	// Notify the planner agent so it knows the plan was rejected and can revise.
+	return p.sendToPlanner("The plan has been rejected. Please revise it — " +
+		"what changes would you like to make?")
 }
 
 
@@ -1270,7 +1281,9 @@ func (p *PlannerView) renderHelp() string {
 // It does NOT render anything — rendering is handled by the standard viewport
 // via renderContentForViewport("planner") in app.go.
 func (p *PlannerView) ReceiveOutput(lines []string, lineTypes []string) {
-	p.thinking = false
+	// Only stop the thinking spinner when we receive a closing fence or a
+	// non-empty plain-text line. Stopping on every batch causes the spinner
+	// to flicker off while the planner is still streaming.
 	for i, line := range lines {
 		lt := ""
 		if i < len(lineTypes) {
@@ -1319,7 +1332,8 @@ func (p *PlannerView) drainBuffer() {
 			p.plannerBuffer = p.plannerBuffer[jsonStart+closeIdx+len(fenceClose):]
 			var resp PlannerResponse
 			if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil {
-				p.applyPlannerResponse(resp) // state only — no rendering
+				p.thinking = false // complete response — stop spinner
+				p.applyPlannerResponse(resp)
 			}
 			continue
 		}
@@ -1331,7 +1345,8 @@ func (p *PlannerView) drainBuffer() {
 			if obj != "" {
 				var resp PlannerResponse
 				if err := json.Unmarshal([]byte(obj), &resp); err == nil && resp.Phase != "" {
-					p.applyPlannerResponse(resp) // state only — no rendering
+					p.thinking = false // complete response — stop spinner
+					p.applyPlannerResponse(resp)
 				}
 				p.plannerBuffer = p.plannerBuffer[braceAt+end:]
 				continue
@@ -1461,6 +1476,11 @@ func (p *PlannerView) applyPlannerResponse(resp PlannerResponse) {
 		}
 	}
 
+	// Add the planner's message to the clean conversation log.
+	if resp.Message != "" {
+		p.conversation = append(p.conversation, ConversationEntry{Role: "planner", Text: resp.Message})
+	}
+
 	// Set plan-approval gate when a complete plan lands in StateReviewingPlan.
 	if p.state == StateReviewingPlan && len(p.tasks) > 0 && p.currentGate == nil {
 		gates := p.initPhaseGates()
@@ -1504,47 +1524,94 @@ type plannerTickMsg time.Time
 // test strategy, task waves, conversation, thinking indicator) sized to the
 // given width, with no header/input/help — those come from the host's chrome.
 // Height is informational only; the host viewport handles scrolling.
-// RenderEmbeddedContent returns a thin planning-state strip prepended to the
-// standard agent viewport. It shows only parsed metadata (phase, requirement
-// title, task count) — the actual conversation is the planner agent's raw
-// terminal output rendered by the standard line renderer, same as all agents.
+// RenderEmbeddedContent returns the clean planner conversation display.
+// This replaces the raw PTY viewport for the planner agent — showing only
+// extracted message fields (clean AI responses) and user messages, not raw
+// JSON or terminal noise.
 func (p *PlannerView) RenderEmbeddedContent(width, height int) string {
 	if width <= 0 {
 		width = 80
 	}
 	p.width = width
 
-	// No planning state yet — return empty so the raw output shows directly.
-	hasState := p.requirement != nil && p.requirement.Refined != ""
-	hasTasks := len(p.tasks) > 0
-	if !hasState && !hasTasks {
-		return ""
-	}
+	var out strings.Builder
+	divStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("237"))
+	div := divStyle.Render(strings.Repeat("─", width-2))
 
-	divider := lipgloss.NewStyle().Foreground(lipgloss.Color("237")).
-		Render(strings.Repeat("─", width))
-
-	var parts []string
-
-	if hasState {
+	// ── State header strip ────────────────────────────────────────────────
+	if p.requirement != nil && p.requirement.Refined != "" {
 		phase := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true).
 			Render(p.phaseLabel())
 		req := p.requirement.Refined
-		maxReqW := width - lipgloss.Width(phase) - 4
-		if maxReqW > 0 && len([]rune(req)) > maxReqW {
-			req = string([]rune(req)[:maxReqW-1]) + "…"
+		maxW := width - lipgloss.Width(phase) - 6
+		if maxW > 0 && len([]rune(req)) > maxW {
+			req = string([]rune(req)[:maxW-1]) + "…"
 		}
 		reqText := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render(req)
-		parts = append(parts, "  "+phase+"  "+reqText)
+		out.WriteString("  " + phase + "  " + reqText + "\n")
+
+		if len(p.tasks) > 0 {
+			info := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+				Render(fmt.Sprintf("  %d tasks · %d waves", len(p.tasks), p.getMaxWave()))
+			out.WriteString(info + "\n")
+		}
+		out.WriteString(div + "\n")
 	}
 
-	if hasTasks {
-		info := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
-			Render(fmt.Sprintf("  %d tasks · %d waves", len(p.tasks), p.getMaxWave()))
-		parts = append(parts, info)
+	// ── Compact task status when plan is active ───────────────────────────
+	if len(p.tasks) > 0 && (p.state == StateReviewingPlan || p.state == StatePlanLocked || p.state == StateExecuting) {
+		out.WriteString(p.renderTasksCompact())
+		out.WriteString(div + "\n")
 	}
 
-	return strings.Join(parts, "\n") + "\n" + divider + "\n"
+	// ── Clean conversation ────────────────────────────────────────────────
+	userStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true)
+	plannerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	systemStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+	wrapW := width - 4
+	if wrapW < 20 {
+		wrapW = width
+	}
+
+	if len(p.conversation) == 0 {
+		// Empty state — show onboarding hint
+		hint := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+			Render("  Describe what you want to build.")
+		out.WriteString("\n" + hint + "\n")
+	}
+
+	for _, entry := range p.conversation {
+		switch entry.Role {
+		case "user":
+			line := userStyle.Render("> " + entry.Text)
+			out.WriteString(lipgloss.NewStyle().Width(wrapW).Render(line))
+			out.WriteString("\n\n")
+		case "planner":
+			body := plannerStyle.Render(entry.Text)
+			out.WriteString(lipgloss.NewStyle().Width(wrapW).Padding(0, 0, 0, 2).Render(body))
+			out.WriteString("\n\n")
+		case "system":
+			out.WriteString(systemStyle.Render("  ⋯ " + entry.Text))
+			out.WriteString("\n")
+		}
+	}
+
+	// Gate prompt
+	if p.currentGate != nil {
+		gate := lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true).
+			Render("  ▸ " + p.currentGate.ApprovalPrompt)
+		out.WriteString("\n" + gate + "\n")
+	}
+
+	// Thinking indicator
+	if p.thinking {
+		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		frame := frames[(int(lipgloss.Width("x")*0)%len(frames))]
+		_ = frame
+		out.WriteString(divStyle.Render("  ● thinking…") + "\n")
+	}
+
+	return out.String()
 }
 
 func (p *PlannerView) phaseLabel() string {
@@ -1576,9 +1643,8 @@ func (p *PlannerView) HandleAppInput(text string) tea.Cmd {
 		return nil
 	}
 
-	// No feedback list addition — the user's message shows through the
-	// standard viewport (app.go adds it to outputContent the same way
-	// workspace does, so it appears in the normal agent output stream).
+	// Add user message to clean conversation log.
+	p.conversation = append(p.conversation, ConversationEntry{Role: "user", Text: text})
 
 	if p.requirement == nil {
 		p.requirement = &Requirement{

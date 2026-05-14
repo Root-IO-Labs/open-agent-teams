@@ -407,15 +407,29 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.renderer.InvalidateCacheFromIndex(msg.agent, replacedIdx)
 		}
 
-		// Forward new planner agent lines to the PlannerView conversation panel.
+		// Forward new planner agent lines to the PlannerView for JSON parsing.
+		// Also filter ```json...``` fence blocks OUT of outputContent so the
+		// viewport never shows raw JSON — the parsed message field is the
+		// intended user-facing content.
 		if msg.agent == "planner" && a.planner != nil && len(result) > prevLen {
+			newLines := result[prevLen:]
 			newTypes := types
 			if len(newTypes) > prevLen {
 				newTypes = newTypes[prevLen:]
 			} else {
 				newTypes = nil
 			}
-			a.planner.ReceiveOutput(result[prevLen:], newTypes)
+			a.planner.ReceiveOutput(newLines, newTypes)
+
+			// Strip ```json...``` blocks from stored output so the viewport
+			// shows only plain-text planner output, not raw JSON responses.
+			filtered, filteredTypes := filterPlannerJSONFences(
+				a.outputContent["planner"], a.outputTypes["planner"])
+			if len(filtered) != len(a.outputContent["planner"]) {
+				a.outputContent["planner"] = filtered
+				a.outputTypes["planner"] = filteredTypes
+				a.renderer.InvalidateCacheForAgent("planner")
+			}
 		}
 
 		// Detect activity events from new lines for the activity log
@@ -743,8 +757,13 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// message and bypass the planner state machine.
 			if a.activeAgent == "planner" && a.planner != nil {
 				cmd := a.planner.HandleAppInput(text)
-				if a.planner != nil {
-					a.input.Placeholder = a.planner.PlaceholderText()
+				a.input.Placeholder = a.planner.PlaceholderText()
+				// Suppress PTY echo: add to recentInputs same as other agents
+				now := time.Now()
+				a.pruneRecentInputs(now)
+				a.recentInputs = append(a.recentInputs, recentInput{text: text, sentAt: now})
+				if len(a.recentInputs) > 5 {
+					a.recentInputs = a.recentInputs[len(a.recentInputs)-5:]
 				}
 				a.autoScroll["planner"] = true
 				a.updateViewport()
@@ -1765,31 +1784,16 @@ func (a *App) interruptAgent(agent string) tea.Cmd {
 var thinkingSpinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (a *App) renderContentForViewport(agent string) string {
-	// Planner: prepend a thin planning-state strip (phase, requirement, task count)
-	// then fall through to the standard line renderer below. This gives the
-	// planner view the same look as every other agent — raw terminal output
-	// through the dedup pipeline — while surfacing parsed planning state at top.
+	// Planner: use the clean conversation display from RenderEmbeddedContent.
+	// This shows extracted message fields and user input — not raw PTY output.
+	// The standard viewport still accumulates raw output (for JSON parsing via
+	// ReceiveOutput) but RenderEmbeddedContent is the user-facing display.
 	if agent == "planner" && a.planner != nil {
 		w := a.viewport.Width
 		if w <= 0 {
 			w = a.width
 		}
-		strip := a.planner.RenderEmbeddedContent(w-2, 0)
-		// Fall through: render the actual planner agent output below
-		_ = strip // will be prepended after standard rendering
-		// Use the standard renderer for the actual output, prepend the strip
-		lines, ok := a.outputContent[agent]
-		if !ok || len(lines) == 0 {
-			if strip != "" {
-				return strip
-			}
-		} else {
-			rendered := a.renderer.RenderLines(agent, lines, a.outputTypes[agent])
-			if strip != "" {
-				return strip + rendered
-			}
-			return rendered
-		}
+		return a.planner.RenderEmbeddedContent(w-2, a.viewportHeight())
 	}
 
 	lines, ok := a.outputContent[agent]
