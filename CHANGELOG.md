@@ -48,6 +48,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [oat-browser-agent CHANGELOG](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/CHANGELOG.md)
   for full details. Pull a fresh `oat-browser-agent` build to pick
   these up — no other OAT-side code changes required.
+
+- The same `oat-browser-agent` release also ships a layered set of
+  security mitigations on top of the agent-window architecture.
+  The headline items: input-dispatch tools (`browser_click`,
+  `browser_type`, etc.) refuse to run on tabs outside the dedicated
+  agent window by default, with an opt-in `allowUserTab: true`
+  override that is logged as a security event. `browser_new_tab`
+  enforces a per-agent-window tab cap (env-overridable via
+  `OAT_BROWSER_AGENT_MAX_TABS`, default 20). Visibility transitions
+  via `browser_show_window` / `browser_hide_window` are audit-
+  logged as `window_shown` / `window_hidden` events, and the
+  toolbar badge picks up a hide indicator so the user keeps a
+  visual signal of agent activity even while the agent window is
+  in its own Space. Three additional tools (`browser_tabs`,
+  `browser_navigate`, `browser_file_download`) are now wrapped in
+  the existing `[UNTRUSTED-<nonce>:…]` envelope because their
+  responses carry page- or server-controlled strings, and the
+  `browser_screenshot` MCP response now leads with a text warning
+  block before the image bytes to flag instruction-shaped text
+  rendered inside the screenshot. Operators in sensitive contexts
+  should re-read the `oat-browser-agent` [`docs/THREAT_MODEL.md`](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/docs/THREAT_MODEL.md);
+  the expanded sections cover the agent-window architecture, the
+  hide/show audit events, `chrome.debugger` residual risks, and
+  the deferred research avenues for screenshot prompt injection
+  that we explicitly do NOT ship today. No OAT-side code changes
+  required for any of this — pulling a fresh `oat-browser-agent`
+  build is enough.
 - The `oat-browser-agent` bridge shipped a follow-up tool-correctness
   batch that benefits OAT browser-agents without any OAT-side code
   changes: `browser_go_back` / `browser_go_forward` now resolve the
