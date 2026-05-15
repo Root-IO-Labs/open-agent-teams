@@ -7,6 +7,200 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Updated [`internal/templates/agent-templates/browser.md`](internal/templates/agent-templates/browser.md)
+  to document the dedicated agent window pivot (visible-small
+  default, platform-aware `browser_hide_window`) that the companion
+  `oat-browser-agent` release ships. OAT browser agents now receive
+  prompt guidance about the `isAgentTab` annotation on
+  `browser_tabs` rows, the `browser_show_window` /
+  `browser_hide_window` pair (including the macOS Mission Control
+  Space workflow for hiding), the bridge's auto-activate-before-input
+  behaviour, and the drag-out warning badge.
+
+### Notes
+
+- The `oat-browser-agent` bridge shipped a dedicated agent window
+  pivot that fixes the systemic silent failures of `browser_click`,
+  `browser_type`, and `browser_scroll` on tabs that are not the
+  active tab in their window. Tabs opened by `browser_new_tab` now
+  live in a separate `type: 'normal'` Chrome window managed by the
+  extension, kept visible-small at top-left by default so macOS
+  Chrome does not migrate web tabs out via its window-consolidation
+  pass (which was triggered by the earlier minimize-at-creation
+  attempts). `browser_new_tab` now defaults to `active: true`, and
+  the bridge force-activates the target tab before every
+  input-dispatch tool (`browser_click`, `browser_type`,
+  `browser_scroll`, `browser_press_key`, `browser_hover`,
+  `browser_fill`, `browser_drag`, `browser_scroll_to`) so the
+  target is always the active tab when input is dispatched.
+  `browser_hide_window` is platform-aware — on macOS it transitions
+  to `state: 'fullscreen'` (macOS auto-places fullscreen windows in
+  their own Mission Control Space), on Linux/Windows it minimizes
+  normally; the result includes a `mode` field so callers know
+  which path executed. `browser_show_window` brings the agent
+  window to `state: 'normal', focused: true` regardless of prior
+  state. `browser_tabs` rows gain an `isAgentTab` boolean so the
+  agent can tell its own tabs from the user's. Drag-out detection
+  surfaces a passive amber `!` badge on the extension toolbar when
+  an agent-debugged tab is moved into a user window. See the
+  [oat-browser-agent CHANGELOG](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/CHANGELOG.md)
+  for full details. Pull a fresh `oat-browser-agent` build to pick
+  these up — no other OAT-side code changes required.
+- The `oat-browser-agent` bridge shipped a follow-up tool-correctness
+  batch that benefits OAT browser-agents without any OAT-side code
+  changes: `browser_go_back` / `browser_go_forward` now resolve the
+  correct CDP `NavigationEntry.id` (previously failed with
+  `"No entry with passed id"` on any non-trivial history);
+  `browser_close_tab` is now allowed against any tab the agent ever
+  attached, including ones it has since explicitly detached
+  (cleanup-after-detach was previously blocked by the
+  `TAB_NOT_ATTACHED` guard); `browser_file_download` switched from
+  the unreachable browser-scope CDP `Browser.setDownloadBehavior`
+  path to the native `chrome.downloads` API (the old path always
+  failed at tab-scope attachments); and `browser_handle_dialog`'s
+  "no dialog" error is now a structured, actionable
+  `DIALOG_NOT_PRESENT` instead of the opaque CDP string. See the
+  [oat-browser-agent CHANGELOG](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/CHANGELOG.md)
+  for details. Pull a fresh `oat-browser-agent` build to pick up
+  these fixes.
+- The `oat-browser-agent` bridge shipped a batch of connection-
+  robustness improvements that benefit OAT browser-agents without
+  any OAT-side code changes: WebSocket heartbeat (keeps the Chrome
+  MV3 service worker alive while the bridge is reachable),
+  long-lived NM broker (keeps the SW alive whenever a bridge is
+  reachable, via the documented MV3 NM-port escape hatch), atomic
+  `bridge-runtime.json` discovery file with PID-aware cleanup and
+  a 60-second self-heal heartbeat (fixes a race during Cursor
+  restarts where the old bridge's cleanup would clobber the new
+  bridge's discovery file), and a per-user `npm run doctor` +
+  postinstall script that detects and self-heals a missing Native
+  Messaging host registration. See the
+  [oat-browser-agent CHANGELOG](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/CHANGELOG.md)
+  for details. Pull a fresh `oat-browser-agent` build and re-run
+  `npm run install-host` (or just `npm run doctor:fix` if you've
+  registered before) to pick up the new behaviour.
+- The bridge also now advertises MCP server-side prompts. The
+  canonical `browser_agent_system` prompt covers the generic
+  operating guidance (perception cost hierarchy, click fallback
+  ladder, untrusted-content handling, cross-tab discipline,
+  common failure modes). OAT continues to ship the full
+  agent-template prompt from `internal/templates/agent-templates/browser.md`
+  and does not auto-load MCP server prompts, so OAT agents are
+  not double-fed. The MCP prompt is intended for non-OAT MCP
+  clients (Cursor, Claude Code, Claude Desktop, etc.) that want
+  to bootstrap browser-agent guidance without re-deriving it from
+  tool descriptions.
+
+### Fixed
+
+- Browser-agent prompt template
+  (`internal/templates/agent-templates/browser.md`) flips the
+  `browser_wait_for` selector-vs-text guidance. The previous
+  wording — "Use selectors over text whenever possible" — was the
+  exact pattern that caused the half-rendered-snapshot failure
+  mode the testbed reverify run hit. On SPA route transitions,
+  many apps mount the new route's container element before
+  populating its content, so a selector-only wait resolves the
+  instant the empty container appears. The prompt now leads with
+  `text:` for "wait until content rendered" cases and reserves
+  `selector:` for "wait for a structural element to exist" cases
+  (or as a scoping bound on a `text:` search). Same template now
+  also documents the `browser_get_text mode='full'` shadow-DOM /
+  cross-origin-iframe underreport risk and points at
+  `browser_observe` + `browser_find` as the recovery (they walk
+  the AX tree, which descends into shadow roots). Both updates
+  are prompt-only and ship alongside the oat-browser-agent
+  schema changes that document the same contracts at the tool
+  layer.
+- Browser-agent prompt template
+  (`internal/templates/agent-templates/browser.md`) "Prompt
+  Injection Defense" section now enumerates every read-tool whose
+  result is wrapped in `[UNTRUSTED-<nonce>:…]` delimiters, rather
+  than the previous vague "page-derived text returned by tools".
+  The wrap now covers `browser_find`, `browser_observe`,
+  `browser_console_messages`, `browser_network_requests`,
+  `browser_evaluate`, `browser_cookies_list`, and the outer
+  `browser_batch` envelope in addition to the canonical three
+  (`browser_get_text` / `browser_snapshot` / `browser_extract`).
+  The prompt also explicitly clarifies that action tools
+  (`browser_click`, `browser_navigate`, etc.) return only
+  bridge-issued metadata and are not wrapped. Ships in lockstep
+  with the oat-browser-agent extension to TEXT_TOOLS /
+  REDACT_RESULT_TOOLS.
+- Browser-agent prompt template
+  (`internal/templates/agent-templates/browser.md`) "Cross-Tab
+  Discipline" section now documents `browser_new_tab`'s new
+  `attach: true` default (the oat-browser-agent change auto-attaches
+  the new tab before returning, so the agent does not need a
+  separate `debugger_attach` round-trip for the common
+  "spawn-and-drive" workflow). Adds the `attach: false` opt-out
+  for fire-and-forget tabs and the `attachError` recovery path for
+  restricted-scheme initial URLs. No behaviour change in this repo —
+  the prompt update ships alongside the oat-browser-agent code
+  change so the agent's mental model matches the bridge.
+- Browser-agent prompt template
+  (`internal/templates/agent-templates/browser.md`) now describes
+  `browser_fill` accurately: it commits to React / Vue / Angular
+  controlled inputs (the underlying oat-browser-agent change routes
+  `browser_fill` through CDP `Input.insertText` instead of the legacy
+  DOM-setter path, which silently no-op'd on framework-controlled
+  inputs). The tool list line for `browser_type` also gains a hint
+  about when per-keystroke typing matters (autocomplete that fires on
+  each keypress). No behaviour change in this repo — this is a prompt
+  doc fix that ships alongside the oat-browser-agent code fix so the
+  agent's mental model matches the bridge.
+- Daemon no longer sends periodic status-check nudges to
+  `AgentTypeBrowser`. Browser-agent is a tool, not a worker: it
+  receives tasks via inter-agent messaging from the supervisor /
+  workers and sits silent between tasks. The pre-existing nudge
+  ("Update on your browser task progress?") was a Part 2 miss from
+  the mcp-and-opt-in-browser-agent plan -- it wasted an LLM turn
+  every nudge interval to answer "nothing happening" between tool
+  calls. The `case state.AgentTypeBrowser:` arm in
+  `nudgeAgentsInRepo` is now intentionally absent (commented to
+  prevent future re-additions).
+- Daemon now backs off auto-restarting an unreachable browser-agent
+  after `bridgeUnreachableThreshold=3` consecutive health-check
+  failures inside a `bridgeUnreachableWindow=10m` sliding window.
+  Hit the threshold and the daemon stops respawning until the user
+  explicitly runs `oat agent restart browser-agent`, which also
+  clears the failure counter. Closes the Part 2 miss where the
+  2-min health-check loop would spawn a doomed bridge subprocess
+  every cycle when Chrome was closed or the extension uninstalled,
+  burning tokens on the bridge's startup banner each time. New
+  `recordBridgeUnreachable` / `clearBridgeUnreachable` helpers
+  covered by `TestBridgeUnreachableBackoff`.
+
+### Changed
+
+- Daemon's browser-agent MCP config now pins `OAT_BRIDGE_WS_PORT=19222`
+  AND `OAT_BRIDGE_TRUST_LOCALHOST=1` in the bridge env block, both as
+  back-compat for the bridge's Part 8 / Part 9a flips:
+  - `OAT_BRIDGE_WS_PORT=19222`: the bridge upstream flipped its
+    default to OS-assigned (port 0) so concurrent bridges don't
+    collide on 19222, but the Chrome extension's
+    `chrome.storage.local` fallback is still 19222 until Part 9b's
+    NM-based port delivery channel ships. Without this pin, an
+    OAT-spawned bridge would bind to e.g. :51234 and the extension
+    would silently dial :19222 (the fallback) and never reach it.
+  - `OAT_BRIDGE_TRUST_LOCALHOST=1`: the bridge upstream flipped its
+    `trustLocalhost` default from `true` to `false` (token-required
+    is now the secure default; the pre-flip
+    `OAT_BRIDGE_REQUIRE_TOKEN=1` opt-in env var is retired). Until
+    Part 9b's NM-based token delivery channel ships, an OAT-spawned
+    bridge has no way to seed the extension's
+    `chrome.storage.local.oat_session_token`, so without this
+    escape-hatch the extension would be rejected at the WS handshake.
+
+  Both env entries lift together when Part 9b lands; at that point
+  every OAT-spawned bridge gets its own OS-assigned port and the NM
+  channel teaches the extension the per-launch token (collision-safe
+  thanks to the bridge's new orphan watchdog).
+  `TestBuildBrowserAgentMCPConfig_StructureAndContents` covers both
+  pins so they can't regress silently.
+
 ### Added
 
 - `oat agent add <type> [name] [--repo <repo>]` CLI verb for opt-in
@@ -59,6 +253,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- New user-facing [docs/MCP.md](docs/MCP.md): annotated `.oat/mcp.json`
+  schema, where the daemon writes it, the bridge-resolution order
+  (`OAT_BROWSER_AGENT_BRIDGE_PATH` env > `$PATH` > `~/.oat`
+  bundle), the full env-var contract (including the temporary
+  `OAT_BRIDGE_WS_PORT` / `OAT_BRIDGE_TRUST_LOCALHOST` back-compat
+  pins), the text/image/error result-type semantics returned to the
+  LLM, and a checklist for adding an MCP server to a future agent
+  type. Referenced from `docs/AGENTS.md` in the browser-agent
+  section.
 - Docs canonicalised on the browser-agent audit log path:
   `~/.oat/output/<repo>/browser-agent-actions.jsonl`. The daemon
   already passes `OAT_BROWSER_AGENT_AUDIT_LOG_DIR=<that dir>` in the
@@ -125,16 +328,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token cost on the first read.
 
 - Browser-agent system prompt (`internal/templates/agent-templates/browser.md`)
-  gains a "Deliberate action" section. Production browser-agents are now
+  gains a "One decision at a time" section. Production browser-agents are now
   guided to act like a careful operator: one destructive action at a time per
   domain, re-snapshot before clicking visually close controls, confirm
   intermediate state before the next destructive call, prefer to stop and
   explain on password fields / sensitive pages / unfamiliar UI patterns, and
-  use slower deliberate motion on logged-in or session-bearing pages. End
-  users will see fewer simultaneous clicks and a more measured pace on
-  multi-step flows. The change ships in lockstep with the oat-browser-agent
-  model bench so the same prompt drives both production and benchmark
-  scoring.
+  pace themselves on logged-in or session-bearing pages. End users will see
+  fewer simultaneous clicks and a more measured pace on multi-step flows.
+  The change ships in lockstep with the oat-browser-agent model bench so the
+  same prompt drives both production and benchmark scoring.
 
 ### Added
 
