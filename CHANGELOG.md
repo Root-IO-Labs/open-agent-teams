@@ -7,8 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP child stderr capture.** The agent-runtime's MCP client now
+  redirects each stdio MCP server's stderr to a per-server file
+  under the canonical per-repo output dir
+  (`~/.oat/output/<repo>/mcp-<server-name>.stderr.log`), passed as
+  the SDK's `errlog` argument and registered for close on the same
+  `AsyncExitStack` that owns the session.
+  ([agent-runtime/libs/oat_sdk/oat_sdk/mcp_client.py](agent-runtime/libs/oat_sdk/oat_sdk/mcp_client.py)
+  `_resolve_stderr_log_path`, `_open_stderr_log_for_spec`.) Without
+  this capture the daemon's `OAT_TOOL_LOG` mode silently dropped
+  the MCP child's stderr: the daemon defers to the Python
+  `oat_cli` for conversation logging under that mode, but the
+  conversation log only records LLM/tool events, not the MCP
+  subprocess's startup banner or connection diagnostics. The
+  immediate motivation is the `oat-browser-agent` bridge -- its
+  `[OAT Bridge] BOOT_TOKEN=...` and
+  `[OAT Bridge] WebSocket client connected` lines now reach a
+  durable file the bench's preflight (and any operator triaging
+  a hung browser-agent) can grep. Capture is opt-out via
+  filesystem permission errors (we log a warning and fall back
+  to the SDK's inherit-stderr default; the agent never crashes
+  because stderr capture failed). Path resolution prefers
+  `spec.env["OAT_BROWSER_AGENT_AUDIT_LOG_DIR"]` (set by
+  `buildBrowserAgentMCPConfig` for browser-bridge) and falls back
+  to `<cwd>/.oat/` for hand-authored mcp.json configs.
+
 ### Changed
 
+- `buildBrowserAgentMCPConfig` ([internal/daemon/daemon.go](internal/daemon/daemon.go))
+  no longer pins `OAT_BRIDGE_WS_PORT=19222` or
+  `OAT_BRIDGE_TRUST_LOCALHOST=1` in the bridge env block. Both were
+  back-compat workarounds for the pre-Native-Messaging era of the
+  `oat-browser-agent` plan (Parts 8 / 9a). With the NM broker
+  shipped in `oat-browser-agent` (`bridge/src/nm-broker.ts` +
+  `extension/src/nm-port.ts`) the per-launch (port, token) pair
+  is delivered to the extension via Native Messaging, so the
+  daemon can let the bridge use its post-9b defaults: OS-assigned
+  port + token-required handshake. End-user effect: two bridges
+  running side-by-side (e.g. Cursor MCP + `oat agent add
+  browser-agent`) no longer collide on `bind()`. They still
+  contend for the single Chrome extension client (last NM push
+  wins) -- that's the documented v1 limitation in plan §8a, not
+  a regression.
+- Updated [docs/MCP.md](docs/MCP.md) annotated example, "Where the
+  daemon writes it" walk-through, env-var table, and
+  troubleshooting bullet to match the dropped pins.
 - Updated [`internal/templates/agent-templates/browser.md`](internal/templates/agent-templates/browser.md)
   to document the dedicated agent window pivot (visible-small
   default, platform-aware `browser_hide_window`) that the companion

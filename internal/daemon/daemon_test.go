@@ -2706,21 +2706,18 @@ func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
 	if got := s.Env["OAT_BROWSER_AGENT_AUDIT_LOG_DIR"]; got != expectedAuditDir {
 		t.Errorf("OAT_BROWSER_AGENT_AUDIT_LOG_DIR = %q, want %q (canonical per-repo output dir)", got, expectedAuditDir)
 	}
-	// Part 8 back-compat: until Part 9b's NM-based port delivery ships,
-	// OAT-spawned bridges must pin to the extension's chrome.storage
-	// fallback port (19222) or the extension will silently dial the
-	// wrong port. Drop this assertion (and the env entry) when 9b
-	// lands.
-	if got := s.Env["OAT_BRIDGE_WS_PORT"]; got != "19222" {
-		t.Errorf("OAT_BRIDGE_WS_PORT = %q, want %q (Part 8 back-compat pin)", got, "19222")
+	// Post-Part-9b: the back-compat pins are GONE. Each OAT-spawned
+	// bridge gets an OS-assigned port (no port-19222 collision when
+	// another bridge is already running) and the NM broker delivers
+	// the per-launch (port, token) pair to the extension's
+	// chrome.storage.local. If either pin reappears in the env block
+	// it's a regression -- those were workarounds for the
+	// pre-NM-broker era.
+	if got, ok := s.Env["OAT_BRIDGE_WS_PORT"]; ok {
+		t.Errorf("OAT_BRIDGE_WS_PORT = %q present; expected absent (Part 9b dropped the back-compat pin)", got)
 	}
-	// Part 9a back-compat: until Part 9b's NM-based token delivery ships,
-	// OAT-spawned bridges must keep the legacy trust-localhost path
-	// enabled or the extension (which has no way to discover the
-	// per-launch token without NM yet) will be rejected at the WS
-	// handshake. Drop this assertion (and the env entry) when 9b lands.
-	if got := s.Env["OAT_BRIDGE_TRUST_LOCALHOST"]; got != "1" {
-		t.Errorf("OAT_BRIDGE_TRUST_LOCALHOST = %q, want %q (Part 9a back-compat)", got, "1")
+	if got, ok := s.Env["OAT_BRIDGE_TRUST_LOCALHOST"]; ok {
+		t.Errorf("OAT_BRIDGE_TRUST_LOCALHOST = %q present; expected absent (Part 9b dropped the back-compat pin)", got)
 	}
 }
 

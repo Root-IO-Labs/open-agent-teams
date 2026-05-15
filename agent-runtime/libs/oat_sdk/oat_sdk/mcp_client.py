@@ -42,7 +42,7 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, TextIO
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
@@ -75,11 +75,98 @@ class McpServerSpec(BaseModel):
 
 
 def _expand_path(value: str) -> str:
-    """Apply ``~`` + env-var expansion. Used on every command/arg/env
-    value before we hand it to the stdio spawner. Without this, configs
-    written by the daemon (``~/.oat/...``) wouldn't resolve when the
-    agent's CWD is the worktree."""
-    return os.path.expandvars(os.path.expanduser(value))
+    """Apply ``~`` + env-var expansion on a string path.
+
+    Used on every command/arg/env value before we hand it to the
+    stdio spawner. Without this, configs written by the daemon
+    (``~/.oat/...``) wouldn't resolve when the agent's CWD is the
+    worktree. Uses ``Path.expanduser`` for the tilde-expansion arm
+    (Pathlib-ish) but falls back to ``os.path.expandvars`` for
+    the ``$VAR`` arm since pathlib lacks a Path-native equivalent.
+    """
+    return os.path.expandvars(str(Path(value).expanduser()))
+
+
+def _resolve_stderr_log_path(spec: McpServerSpec) -> Path | None:
+    """Decide where to capture a stdio MCP server's stderr.
+
+    Resolution order:
+
+    1. ``spec.env["OAT_BROWSER_AGENT_AUDIT_LOG_DIR"]`` if set -- the
+       OAT daemon sets this to the canonical per-repo output dir
+       (``~/.oat/output/<repo>``) for the browser_bridge spec, so
+       co-locating the stderr capture there keeps every per-run log
+       in one place (matches Part 4 canonicalization).
+    2. ``<cwd>/.oat/`` -- the agent's worktree's hidden config dir,
+       which already exists (it's where ``mcp.json`` lives). Used
+       when the daemon didn't provide an explicit audit dir, e.g.
+       hand-authored ``mcp.json`` configs for non-browser MCP
+       servers or local development.
+
+    File name is ``mcp-<spec.name>.stderr.log`` so two MCP servers in
+    the same config don't collide. Append mode is used so a daemon
+    restart of an opted-in agent preserves the prior boot's lines
+    until the operator chooses to rotate.
+
+    Returns ``None`` if the path can't be created -- caller falls back
+    to the SDK default (inherit-stderr) rather than crashing the
+    agent. Stderr capture is operator observability, not a correctness
+    requirement.
+    """
+    audit_dir = spec.env.get("OAT_BROWSER_AGENT_AUDIT_LOG_DIR") if spec.env else None
+    base = Path(_expand_path(audit_dir)) if audit_dir else Path.cwd() / ".oat"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning(
+            "Could not create MCP stderr log dir %s for server %r (%s); "
+            "subprocess stderr will be inherited (PTY-dropped under OAT_TOOL_LOG)",
+            base,
+            spec.name,
+            e,
+        )
+        return None
+    return base / f"mcp-{spec.name}.stderr.log"
+
+
+def _open_stderr_log_for_spec(
+    spec: McpServerSpec, stack: AsyncExitStack
+) -> TextIO | None:
+    """Open the per-server stderr log file and register its close on ``stack``.
+
+    Returns the open file (suitable for passing as ``errlog`` to
+    ``stdio_client``) or ``None`` if path resolution or open failed --
+    caller then falls back to the SDK default (inherit-stderr from
+    the Python parent).
+
+    Path is computed by ``_resolve_stderr_log_path``. We register
+    cleanup via ``stack.callback`` instead of using a ``with`` block
+    because the file needs to stay open for the lifetime of the MCP
+    session: the subprocess writes to it asynchronously, and the
+    session shares the same exit stack we're building here.
+    """
+    log_path = _resolve_stderr_log_path(spec)
+    if log_path is None:
+        return None
+    try:
+        # Line-buffered append text mode. Append so a daemon-restart of
+        # an opted-in browser-agent preserves the prior session's
+        # diagnostics; an operator who wants a clean slate can rotate
+        # or truncate the file out-of-band. We intentionally don't
+        # wrap this in a ``with`` block (the file's lifetime is the
+        # MCP session's, owned by ``stack`` via the callback below).
+        errlog_file = log_path.open("a", encoding="utf-8", buffering=1)
+    except OSError as e:
+        logger.warning(
+            "Could not open MCP stderr log %s for server %r (%s); "
+            "subprocess stderr will be inherited",
+            log_path,
+            spec.name,
+            e,
+        )
+        return None
+    stack.callback(errlog_file.close)
+    return errlog_file
 
 
 def load_mcp_config(config_path: Path) -> list[McpServerSpec]:
@@ -125,7 +212,12 @@ def load_mcp_config(config_path: Path) -> list[McpServerSpec]:
     for idx, raw in enumerate(raw_servers):
         try:
             spec = McpServerSpec.model_validate(raw)
-        except Exception as e:  # pydantic raises various exception classes
+        # pydantic raises several distinct exception classes for
+        # validation failures (ValidationError, plus various
+        # ValueError subclasses depending on field type). We collapse
+        # them all here because the "skip this bad spec and keep the
+        # rest" policy doesn't depend on which kind of failure it was.
+        except Exception as e:  # noqa: BLE001
             logger.warning("MCP config entry %d invalid: %s -- skipping", idx, e)
             continue
         if spec.transport != "stdio":
@@ -151,26 +243,31 @@ def load_mcp_config(config_path: Path) -> list[McpServerSpec]:
 
 
 def _emit_sidecar_tool_call(name: str, args: dict[str, Any], call_id: str) -> None:
-    """Wrap the sidecar emitter import + call in a try/except so a missing
-    or broken sidecar never crashes the MCP tool execution path."""
+    """Wrap the sidecar emitter import + call in a try/except.
+
+    A missing or broken sidecar never crashes the MCP tool execution
+    path. The deferred import keeps a hard dependency on ``oat_cli``
+    out of this module's import graph; the blind-Exception catch is
+    intentional because any sidecar failure is non-fatal.
+    """
     try:
-        from oat_cli.sidecar_emitter import emit_tool_call
+        from oat_cli.sidecar_emitter import emit_tool_call  # noqa: PLC0415
 
         emit_tool_call(name, args, call_id)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug("sidecar emit_tool_call failed (non-fatal)", exc_info=True)
 
 
-def _emit_sidecar_tool_result(call_id: str, content: str, error: Optional[str] = None) -> None:
+def _emit_sidecar_tool_result(call_id: str, content: str, error: str | None = None) -> None:
     try:
-        from oat_cli.sidecar_emitter import emit_tool_result
+        from oat_cli.sidecar_emitter import emit_tool_result  # noqa: PLC0415
 
         emit_tool_result(call_id, content, error)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug("sidecar emit_tool_result failed (non-fatal)", exc_info=True)
 
 
-def _stringify_mcp_result(result: Any) -> tuple[str, Optional[list[dict[str, Any]]]]:
+def _stringify_mcp_result(result: Any) -> tuple[str, list[dict[str, Any]] | None]:  # noqa: ANN401
     """Canonicalise an MCP ``CallToolResult`` to LangChain-friendly types.
 
     Returns ``(text_repr, multimodal_blocks_or_None)``.
@@ -235,7 +332,7 @@ def _stringify_mcp_result(result: Any) -> tuple[str, Optional[list[dict[str, Any
     return (text_repr, multimodal if has_image else None)
 
 
-def _build_input_schema(mcp_tool: Any) -> Optional[dict[str, Any]]:
+def _build_input_schema(mcp_tool: Any) -> dict[str, Any] | None:  # noqa: ANN401
     """Pull the MCP tool's JSON Schema into a LangChain-compatible dict.
 
     LangChain's ``StructuredTool.from_function(args_schema=...)`` accepts
@@ -253,10 +350,10 @@ def _build_input_schema(mcp_tool: Any) -> Optional[dict[str, Any]]:
 
 async def _make_tool_wrapper(
     *,
-    session: Any,
+    session: Any,  # noqa: ANN401
     session_lock: asyncio.Lock,
     server_name: str,
-    mcp_tool: Any,
+    mcp_tool: Any,  # noqa: ANN401
     public_name: str,
 ) -> StructuredTool:
     """Build a LangChain ``StructuredTool`` that proxies into an MCP session.
@@ -288,19 +385,35 @@ async def _make_tool_wrapper(
                 elapsed_ms = int((time.monotonic() - start) * 1000)
                 err_msg = f"{text_repr} (after {elapsed_ms}ms)"
                 _emit_sidecar_tool_result(call_id, text_repr, error=err_msg)
-                raise RuntimeError(f"MCP tool '{public_name}' failed: {err_msg}")
+                # Raising inside the try is intentional: the outer
+                # `except RuntimeError: raise` arm re-propagates this
+                # unmodified, while the `except Exception` arm wraps
+                # other failures. Moving this raise outside the try
+                # (TRY301) would skip that ordering. The matching
+                # return below stays in the try for the same reason
+                # (TRY300 would move it to an `else:` block, but that
+                # forces a re-indent of the entire happy-path body).
+                wrapped = f"MCP tool '{public_name}' failed: {err_msg}"
+                raise RuntimeError(wrapped)  # noqa: TRY301
             _emit_sidecar_tool_result(call_id, text_repr, error=None)
-            return text_repr
+            return text_repr  # noqa: TRY300
         except RuntimeError:
             # Already wrapped (isError branch above). Don't re-wrap.
             raise
+        # Catching `Exception` is intentional: MCP tool dispatch is a
+        # plugin boundary -- any failure here must surface to the
+        # LLM as a tool error, not crash the agent process. Narrowing
+        # would let SDK-version-specific exception classes leak out.
+        # (ruff's BLE001 does not fire here because of the explicit
+        # `raise ... from e` re-wrap below.)
         except Exception as e:
             elapsed_ms = int((time.monotonic() - start) * 1000)
             err_msg = f"{type(e).__name__}: {e} (after {elapsed_ms}ms)"
             _emit_sidecar_tool_result(call_id, "", error=err_msg)
             # Re-raise as a tool-call error LangChain can surface to the
             # model. Do NOT crash the agent process.
-            raise RuntimeError(f"MCP tool '{public_name}' failed: {err_msg}") from e
+            wrapped = f"MCP tool '{public_name}' failed: {err_msg}"
+            raise RuntimeError(wrapped) from e
 
     if args_schema is not None:
         try:
@@ -310,7 +423,12 @@ async def _make_tool_wrapper(
                 coroutine=_coroutine,
                 args_schema=args_schema,
             )
-        except Exception:
+        # Blind Exception catch is intentional: LangChain versions
+        # vary on what they raise for unsupported JSON Schema shapes
+        # (TypeError, ValueError, jsonschema-specific errors, pydantic
+        # validation failures...). The fallback path is the same
+        # regardless, so we don't gain anything by enumerating types.
+        except Exception:  # noqa: BLE001
             # Older LangChain versions choke on raw JSON Schema dicts;
             # fall through to the schema-less variant.
             logger.debug(
@@ -361,9 +479,10 @@ async def load_mcp_tools(
         # Deferred import: the SDK pulls in pydantic-settings, starlette,
         # sse_starlette, ... we don't want every oat_sdk import path to
         # pay that cost. Bringing it in here means agents without an
-        # ``mcp.json`` skip the cost entirely.
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        # ``mcp.json`` skip the cost entirely. PLC0415 is suppressed
+        # for the same reason: top-level would defeat the deferral.
+        from mcp import ClientSession, StdioServerParameters  # noqa: PLC0415
+        from mcp.client.stdio import stdio_client  # noqa: PLC0415
     except ImportError as e:
         logger.warning("MCP client SDK not importable (%s); skipping all MCP servers", e)
         return (out_tools, stack)
@@ -375,16 +494,38 @@ async def load_mcp_tools(
                 args=list(spec.args),
                 env={**os.environ, **spec.env} if spec.env else None,
             )
+            # Capture the subprocess's stderr to a file so the bridge
+            # (or any other MCP server) has somewhere to emit
+            # connection-level diagnostics. Without this, stderr
+            # flows up to the Python parent's PTY, where the OAT
+            # daemon drops it because OAT_TOOL_LOG is set (the
+            # daemon defers to Python for log writing under that
+            # mode, but Python's conversation log only captures
+            # LLM/tool events -- not the MCP child's startup banner,
+            # WebSocket-client-connected events, token-handshake
+            # rejections, etc.). The MCP SDK's stdio_client accepts
+            # an `errlog: TextIO`; we provide a per-server file when
+            # we can compute one, else fall back to the SDK default.
+            errlog_file = _open_stderr_log_for_spec(spec, stack)
+            stdio_kwargs = {"errlog": errlog_file} if errlog_file is not None else {}
             # Enter the stdio_client context (spawns the subprocess +
             # opens stdin/stdout streams) on the exit stack so the
             # subprocess is reaped when the stack closes.
-            read_stream, write_stream = await stack.enter_async_context(stdio_client(params))
+            read_stream, write_stream = await stack.enter_async_context(
+                stdio_client(params, **stdio_kwargs)
+            )
             session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
             await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT_SECONDS)
 
             list_response = await session.list_tools()
             mcp_tools = getattr(list_response, "tools", []) or []
-        except Exception as e:
+        # Blind Exception catch is intentional: an MCP server is a
+        # third-party plugin and the failure modes are unbounded
+        # (subprocess spawn errors, transport-level disconnects,
+        # SDK-version-specific exception classes, asyncio timeouts).
+        # Policy is "one bad server doesn't break the agent"; we log
+        # and move on so the remaining specs still load.
+        except Exception as e:  # noqa: BLE001
             logger.warning(
                 "MCP server '%s' failed to start (%s: %s); continuing without it",
                 spec.name,

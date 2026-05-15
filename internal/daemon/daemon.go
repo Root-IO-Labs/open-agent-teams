@@ -5108,6 +5108,30 @@ func (d *Daemon) buildBrowserAgentMCPConfig(repoName string) (string, error) {
 		return "", err
 	}
 	auditLogDir := d.paths.RepoOutputDir(repoName)
+	// Bridge env is intentionally minimal. We pass only the
+	// per-repo audit-log directory and let the bridge use its own
+	// defaults for everything else:
+	//
+	//   - WS sidecar port: OS-assigned (port 0). The bridge writes
+	//     the assigned port + per-launch session token to
+	//     ~/.oat/output/<repo>/bridge-runtime.json, and the
+	//     extension's NM broker (extension/src/nm-port.ts +
+	//     bridge/src/nm-broker.ts) pushes them into
+	//     chrome.storage.local so the SW reconnects to the right
+	//     port with the right token.
+	//   - Token handshake: required (the bridge's default since
+	//     Part 9a). The NM broker is what makes this work for
+	//     OAT-spawned bridges -- no need for the legacy
+	//     trust-localhost escape hatch anymore.
+	//
+	// Side-effect of OS-assigned ports: two simultaneous bridges
+	// (e.g. Cursor + OAT) no longer collide on bind(). They do
+	// still contend for the single Chrome extension though -- the
+	// last bridge to push its (port, token) to chrome.storage wins,
+	// and the previous bridge loses its WS client until the next
+	// NM handshake. That's the documented v1 limitation from plan
+	// 8a; true concurrency is a Chrome-multi-profile or
+	// extension-multi-tenant follow-up.
 	server := map[string]any{
 		"name":      "browser_bridge",
 		"command":   bridge.Command,
@@ -5115,28 +5139,6 @@ func (d *Daemon) buildBrowserAgentMCPConfig(repoName string) (string, error) {
 		"transport": "stdio",
 		"env": map[string]string{
 			"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": auditLogDir,
-			// Pin the bridge's WS sidecar to its legacy port 19222.
-			// The bridge defaults to OS-assigned (Part 8 of the
-			// mcp-and-opt-in-browser-agent plan) so unrelated
-			// bridges on the same host don't collide on 19222, but
-			// the Chrome extension's chrome.storage.local fallback
-			// is still 19222 until Part 9b's NM-based port delivery
-			// ships. Without this pin, an OAT-spawned browser-agent
-			// would bind to e.g. :51234 and the extension would
-			// connect to :19222 (the fallback) and never reach the
-			// agent. Once Part 9b lands, drop this entry so each
-			// OAT-spawned bridge gets its own OS-assigned port and
-			// the NM channel teaches the extension which one to dial.
-			"OAT_BRIDGE_WS_PORT": "19222",
-			// Restore the bridge's legacy trust-localhost path.
-			// Token-required is the bridge's default post-Part 9a,
-			// but until Part 9b ships the NM-based token-delivery
-			// channel there's no way for an OAT-spawned bridge to
-			// seed chrome.storage.local with the per-launch
-			// sessionToken -- the extension would always present
-			// no-token and get rejected. Drop this entry (and
-			// OAT_BRIDGE_WS_PORT above) when 9b lands.
-			"OAT_BRIDGE_TRUST_LOCALHOST": "1",
 		},
 	}
 	cfg := map[string]any{

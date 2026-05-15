@@ -58,16 +58,25 @@ def build_server() -> Server:
         if name == "echo":
             return [TextContent(type="text", text=args.get("text", ""))]
         if name == "boom":
-            raise RuntimeError("intentional stub failure")
+            boom_msg = "intentional stub failure"
+            raise RuntimeError(boom_msg)
         if name == "slow_echo":
             await asyncio.sleep(float(args.get("ms", 50)) / 1000.0)
             return [TextContent(type="text", text=args.get("text", ""))]
-        raise ValueError(f"unknown tool: {name}")
+        unknown_msg = f"unknown tool: {name}"
+        raise ValueError(unknown_msg)
 
     return server
 
 
 async def _main() -> None:
+    # Print a stable banner to stderr at startup. The agent-runtime's
+    # MCP client captures the subprocess's stderr to a per-server log
+    # file (`mcp-<name>.stderr.log`) so operators have somewhere to
+    # look for connection-level diagnostics. The integration test
+    # `test_load_mcp_tools_captures_subprocess_stderr_to_file` greps
+    # for this exact prefix to confirm the wiring works end-to-end.
+    print("[STUB MCP] boot banner", file=sys.stderr, flush=True)  # noqa: T201
     server = build_server()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())

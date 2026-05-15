@@ -38,9 +38,7 @@ is no error.
       "args": ["/Users/you/.oat/oat-browser-agent/dist/bridge/index.js"],
       "transport": "stdio",
       "env": {
-        "OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "~/.oat/output/my-repo",
-        "OAT_BRIDGE_WS_PORT": "19222",
-        "OAT_BRIDGE_TRUST_LOCALHOST": "1"
+        "OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "~/.oat/output/my-repo"
       }
     }
   ]
@@ -79,10 +77,16 @@ which:
    directory `~/.oat/output/<repo>` so the bridge writes its audit log
    alongside `supervisor.log` / `default.log` without bridge-side repo
    awareness.
-3. Pins `OAT_BRIDGE_WS_PORT=19222` and `OAT_BRIDGE_TRUST_LOCALHOST=1` as
-   back-compat measures (see below).
-4. Marshals the config and writes it to `<worktree>/.oat/mcp.json` with
+3. Marshals the config and writes it to `<worktree>/.oat/mcp.json` with
    `0644` permissions.
+
+The env block is intentionally minimal: the WS sidecar port is
+OS-assigned and the per-launch session token is delivered to the
+extension via Native Messaging (`extension/src/nm-port.ts` +
+`bridge/src/nm-broker.ts`), so OAT no longer needs to pin a port
+or trust localhost. Two bridges running side-by-side no longer
+collide on `bind()`, though they still contend for the single
+extension client (last NM push wins; documented v1 limitation).
 
 The Python agent-runtime resolves `<worktree>/.oat/mcp.json` from the
 agent's CWD on startup. The same file is regenerated on every
@@ -117,17 +121,10 @@ servers define their own:
 | Var | Set by daemon? | Purpose |
 |---|---|---|
 | `OAT_BROWSER_AGENT_AUDIT_LOG_DIR` | yes (`~/.oat/output/<repo>`) | Highest-precedence override for the bridge audit-log directory. The bridge falls back to `<repo-root>/.oat-logs/` only when no env var is set (legacy path; see [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md)). |
-| `OAT_BRIDGE_WS_PORT` | yes (`19222`) | Pin the WS sidecar to a fixed port. Default is OS-assigned (port 0). The daemon pins to 19222 as back-compat with the extension's `chrome.storage.local` fallback until Native-Messaging port delivery is verified end-to-end. |
-| `OAT_BRIDGE_TRUST_LOCALHOST` | yes (`1`) | Accept anonymous localhost WS opens. Default is token-required. The daemon sets this until NM-based token delivery is verified, because an OAT-spawned bridge has no other way to seed `chrome.storage.local` with the per-launch session token. |
+| `OAT_BRIDGE_WS_PORT` | no | Pin the WS sidecar to a fixed port. Default is OS-assigned (port 0). Useful for debugging when you want a predictable port; otherwise leave unset and let the bridge publish its assigned port via Native Messaging. |
+| `OAT_BRIDGE_TRUST_LOCALHOST` | no | Accept anonymous localhost WS opens. Default is token-required (since plan Part 9a). Only set this if you are running the bridge in an isolated VM where localhost is trusted by construction; production end-user installs should leave it unset and let the Native-Messaging broker deliver the per-launch session token. |
 | `OAT_BRIDGE_ALLOW_MULTI` | no | Opt back in to the pre-1.0 multi-client WS fan-out. Default is single-client (one extension per bridge). |
 | `OAT_BRIDGE_STRICT_MODE` | no | Schema-runtime drift telemetry mode: `warn` (default) / `reject` / `off`. See `oat-browser-agent` CHANGELOG. |
-
-Both back-compat pins (`OAT_BRIDGE_WS_PORT`, `OAT_BRIDGE_TRUST_LOCALHOST`)
-are scheduled to drop once the Native Messaging channel
-(`oat-browser-agent`'s `bridge/src/nm-broker.ts`) is verified end-to-end
-on real Chrome. After that, every OAT-spawned bridge gets its own
-OS-assigned port and the NM channel teaches the extension which one to
-dial.
 
 ## Result-type semantics
 
@@ -186,9 +183,14 @@ daemon's per-type spawn path.
   checkout's `dist/bridge/index.js`, or `npm install -g oat-browser-agent`
   to put the shim on `$PATH`.
 - **Tools load but every call returns "trustLocalhost disabled".** The
-  bridge in your `.oat/mcp.json` is newer than the daemon that generated
-  the config. Re-run `oat agent restart browser-agent` so the daemon
-  re-emits the config with the current back-compat pins.
+  Chrome extension is not getting the per-launch session token. Confirm
+  that `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.oat.browser_agent.json`
+  exists (on macOS; analogous paths on Linux / Windows). If it does not,
+  run `npm run install-host` in `oat-browser-agent` and reload Chrome.
+  If it does, check the bridge log for `nm-broker` lines -- if the
+  broker isn't pushing `oat_session_init`, the extension's first-run
+  badge in the side panel will surface the failure with a more specific
+  reason.
 - **The browser audit log isn't where I expect.** Check
   `OAT_BROWSER_AGENT_AUDIT_LOG_DIR` in `.oat/mcp.json`. The daemon
   always sets it to `~/.oat/output/<repo>`; an older config that
