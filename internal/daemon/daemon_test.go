@@ -2706,6 +2706,64 @@ func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
 	if got := s.Env["OAT_BROWSER_AGENT_AUDIT_LOG_DIR"]; got != expectedAuditDir {
 		t.Errorf("OAT_BROWSER_AGENT_AUDIT_LOG_DIR = %q, want %q (canonical per-repo output dir)", got, expectedAuditDir)
 	}
+	// Part 8 back-compat: until Part 9b's NM-based port delivery ships,
+	// OAT-spawned bridges must pin to the extension's chrome.storage
+	// fallback port (19222) or the extension will silently dial the
+	// wrong port. Drop this assertion (and the env entry) when 9b
+	// lands.
+	if got := s.Env["OAT_BRIDGE_WS_PORT"]; got != "19222" {
+		t.Errorf("OAT_BRIDGE_WS_PORT = %q, want %q (Part 8 back-compat pin)", got, "19222")
+	}
+	// Part 9a back-compat: until Part 9b's NM-based token delivery ships,
+	// OAT-spawned bridges must keep the legacy trust-localhost path
+	// enabled or the extension (which has no way to discover the
+	// per-launch token without NM yet) will be rejected at the WS
+	// handshake. Drop this assertion (and the env entry) when 9b lands.
+	if got := s.Env["OAT_BRIDGE_TRUST_LOCALHOST"]; got != "1" {
+		t.Errorf("OAT_BRIDGE_TRUST_LOCALHOST = %q, want %q (Part 9a back-compat)", got, "1")
+	}
+}
+
+// Part 2: bridge-unreachable back-off. Captures the contract that the
+// daemon's auto-restart loop stops respawning a doomed browser-agent
+// after `bridgeUnreachableThreshold` failures within
+// `bridgeUnreachableWindow`. Without this, the 2-min health-check
+// loop spins a doomed bridge subprocess every cycle when Chrome is
+// closed.
+func TestBridgeUnreachableBackoff(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	key := "my-repo/browser-agent"
+	base := time.Now()
+
+	// Sub-threshold failures inside the window — caller should keep restarting.
+	for i := 1; i < bridgeUnreachableThreshold; i++ {
+		got := d.recordBridgeUnreachable(key, base.Add(time.Duration(i)*time.Second))
+		if got != i {
+			t.Fatalf("recordBridgeUnreachable failure #%d returned %d, want %d", i, got, i)
+		}
+	}
+
+	// Threshold failure trips back-off.
+	if got := d.recordBridgeUnreachable(key, base.Add(time.Duration(bridgeUnreachableThreshold)*time.Second)); got < bridgeUnreachableThreshold {
+		t.Errorf("at threshold, recordBridgeUnreachable returned %d, want >= %d", got, bridgeUnreachableThreshold)
+	}
+
+	// Failure outside the window prunes old entries; a fresh failure should
+	// return 1 (only the new one is inside the window).
+	outsideWindow := base.Add(bridgeUnreachableWindow + time.Minute)
+	if got := d.recordBridgeUnreachable(key, outsideWindow); got != 1 {
+		t.Errorf("after window expiry, recordBridgeUnreachable returned %d, want 1 (old entries should be pruned)", got)
+	}
+
+	// clearBridgeUnreachable resets the counter immediately — used by
+	// the user-initiated `oat agent restart` path so the next failure
+	// starts the window over.
+	d.clearBridgeUnreachable(key)
+	if got := d.recordBridgeUnreachable(key, time.Now()); got != 1 {
+		t.Errorf("after clearBridgeUnreachable, recordBridgeUnreachable returned %d, want 1", got)
+	}
 }
 
 // TestBuildBrowserAgentMCPConfig_PerRepoAuditDir documents that two

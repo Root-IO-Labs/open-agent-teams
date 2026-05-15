@@ -340,7 +340,7 @@ Run `oat --help` for the full command tree. See [Commands Reference](docs/COMMAN
 | **Worker** | Executes a task on its own branch. Verify, PR, dormant, complete. | Ephemeral |
 | **Reviewer** | Reviews PRs before merge. Posts blocking or non-blocking feedback. | Ephemeral |
 | **Verification** | Independent quality gate. Reviews diff, runs tests, delivers approve/reject. | Ephemeral |
-| **Browser Agent** | Controls Chrome via MCP tools for web tasks: scraping, form filling, research. [Repo](https://github.com/Root-IO-Labs/oat-browser-agent). | Persistent |
+| **Browser Agent** | Controls Chrome via MCP tools for web tasks: scraping, form filling, research. [Repo](https://github.com/Root-IO-Labs/oat-browser-agent). | Opt-in, persistent |
 
 Agent definitions: [supervisor](internal/prompts/supervisor.md) | [merge-queue](internal/templates/agent-templates/merge-queue.md) | [pr-shepherd](internal/templates/agent-templates/pr-shepherd.md) | [workspace](internal/prompts/workspace.md) | [worker](internal/templates/agent-templates/worker.md) | [reviewer](internal/templates/agent-templates/reviewer.md) | [verification](internal/templates/agent-templates/verification.md) | [browser](internal/templates/agent-templates/browser.md)
 

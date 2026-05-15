@@ -145,6 +145,19 @@ type Daemon struct {
 	restartCooldown   map[string]time.Time // "repo/agent" -> last restart attempt time
 	restartCooldownMu sync.Mutex
 
+	// bridgeUnreachable tracks consecutive health-check failures for
+	// browser-agent so the daemon can stop respawning a doomed bridge
+	// subprocess every 2-min cycle when Chrome is closed or the
+	// extension is uninstalled. Each entry is a sliding window of
+	// recent failure timestamps for "<repo>/<agent>"; once the window
+	// holds >= bridgeUnreachableThreshold entries within
+	// bridgeUnreachableWindow, the daemon disables auto-restart for
+	// that agent until the user explicitly re-engages via
+	// `oat agent restart`. See Part 2 of
+	// mcp-and-opt-in-browser-agent_a10544be.plan.md.
+	bridgeUnreachable   map[string][]time.Time
+	bridgeUnreachableMu sync.Mutex
+
 	modelProfiles     *routing.ProfileStore    // loaded model capability profiles for routing
 	outcomeLogger     *routing.OutcomeLogger   // appends per-completion records to routing-history.jsonl
 	prBackfiller      *routing.PRBackfiller    // observes PR state at lag buckets after completion (sidecar writer)
@@ -225,6 +238,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		verificationTimeoutNotified: make(map[string]time.Time),
 		mainCIAlertTime:             make(map[string]time.Time),
 		restartCooldown:             make(map[string]time.Time),
+		bridgeUnreachable:           make(map[string][]time.Time),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -941,6 +955,30 @@ func (d *Daemon) checkAgentHealth() {
 				// prevent restart storms when startup is unstable.
 				if agent.Type.IsPersistent() {
 					cooldownKey := fmt.Sprintf("%s/%s", repoName, agentName)
+
+					// Browser-agent back-off: if the bridge has been
+					// found dead repeatedly within a 10-min window
+					// (typically: Chrome closed, extension
+					// uninstalled, NM host missing), stop
+					// auto-restarting. The user re-engages via
+					// `oat agent restart browser-agent`, which both
+					// restarts the agent and clears this counter.
+					// Without this guard, the 2-min health-check
+					// loop spawns a doomed bridge subprocess every
+					// cycle and burns tokens on its startup banner.
+					if agent.Type == state.AgentTypeBrowser {
+						failures := d.recordBridgeUnreachable(cooldownKey, time.Now())
+						if failures >= bridgeUnreachableThreshold {
+							d.logger.Warn(
+								"Browser-agent %s/%s unreachable %d times in last %s; auto-restart disabled. "+
+									"Run `oat agent restart browser-agent --repo %s` after the bridge is reachable.",
+								repoName, agentName, failures, bridgeUnreachableWindow, repoName,
+							)
+							appendToSliceMap(deadAgents, repoName, agentName)
+							continue
+						}
+					}
+
 					d.restartCooldownMu.Lock()
 					lastRestart := d.restartCooldown[cooldownKey]
 					d.restartCooldownMu.Unlock()
@@ -958,6 +996,12 @@ func (d *Daemon) checkAgentHealth() {
 						appendToSliceMap(deadAgents, repoName, agentName)
 					} else {
 						d.logger.Info("Successfully restarted agent %s", agentName)
+						// Browser-agent: a successful restart clears
+						// the failure window. The next dead-check
+						// starts the counter over.
+						if agent.Type == state.AgentTypeBrowser {
+							d.clearBridgeUnreachable(cooldownKey)
+						}
 					}
 				} else {
 					// For transient agents (workers, review), mark for cleanup
@@ -1476,8 +1520,12 @@ func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now 
 			message = "[daemon] Status check: Update on your review progress?"
 		case state.AgentTypeVerification:
 			message = "[daemon] Status check: Update on your verification progress? Deliver your verdict soon."
-		case state.AgentTypeBrowser:
-			message = "[daemon] Status check: Update on your browser task progress?"
+		// AgentTypeBrowser is intentionally NOT nudged. Per Part 2 of
+		// the mcp-and-opt-in-browser-agent plan: browser-agent is a
+		// tool, not a worker. It receives tasks via inter-agent
+		// messaging (supervisor / worker → browser-agent) and sits
+		// silent between tasks. A "status check" nudge would waste an
+		// LLM turn to answer "nothing happening" between tool calls.
 		case state.AgentTypeGenericPersistent:
 			message = "[daemon] Status check: Update on your progress?"
 		default:
@@ -3657,6 +3705,14 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 		return socket.ErrorResponse("failed to restart agent: %v", err)
 	}
 
+	// Browser-agent: a user-initiated restart clears the
+	// bridge-unreachable back-off window so the next failure starts
+	// the counter over rather than instantly tripping the threshold.
+	// Per Part 2 of mcp-and-opt-in-browser-agent_a10544be.plan.md.
+	if agent.Type == state.AgentTypeBrowser {
+		d.clearBridgeUnreachable(fmt.Sprintf("%s/%s", repoName, agentName))
+	}
+
 	// Get updated PID from state
 	updatedAgent, _ := d.state.GetAgent(repoName, agentName)
 	return socket.SuccessResponse(map[string]interface{}{
@@ -5059,6 +5115,28 @@ func (d *Daemon) buildBrowserAgentMCPConfig(repoName string) (string, error) {
 		"transport": "stdio",
 		"env": map[string]string{
 			"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": auditLogDir,
+			// Pin the bridge's WS sidecar to its legacy port 19222.
+			// The bridge defaults to OS-assigned (Part 8 of the
+			// mcp-and-opt-in-browser-agent plan) so unrelated
+			// bridges on the same host don't collide on 19222, but
+			// the Chrome extension's chrome.storage.local fallback
+			// is still 19222 until Part 9b's NM-based port delivery
+			// ships. Without this pin, an OAT-spawned browser-agent
+			// would bind to e.g. :51234 and the extension would
+			// connect to :19222 (the fallback) and never reach the
+			// agent. Once Part 9b lands, drop this entry so each
+			// OAT-spawned bridge gets its own OS-assigned port and
+			// the NM channel teaches the extension which one to dial.
+			"OAT_BRIDGE_WS_PORT": "19222",
+			// Restore the bridge's legacy trust-localhost path.
+			// Token-required is the bridge's default post-Part 9a,
+			// but until Part 9b ships the NM-based token-delivery
+			// channel there's no way for an OAT-spawned bridge to
+			// seed chrome.storage.local with the per-launch
+			// sessionToken -- the extension would always present
+			// no-token and get rejected. Drop this entry (and
+			// OAT_BRIDGE_WS_PORT above) when 9b lands.
+			"OAT_BRIDGE_TRUST_LOCALHOST": "1",
 		},
 	}
 	cfg := map[string]any{
@@ -5690,6 +5768,49 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 	}
 
 	return promptPath, nil
+}
+
+// bridgeUnreachableThreshold and bridgeUnreachableWindow define the
+// back-off policy for browser-agent auto-restart. Per Part 2 of
+// mcp-and-opt-in-browser-agent_a10544be.plan.md: if the health check
+// finds the browser-agent dead this many times within the window, stop
+// respawning and require the user to manually `oat agent restart
+// browser-agent`. Prevents the 2-min health-check loop from spinning a
+// doomed bridge subprocess every cycle when Chrome is closed or the
+// extension is uninstalled.
+const (
+	bridgeUnreachableThreshold = 3
+	bridgeUnreachableWindow    = 10 * time.Minute
+)
+
+// recordBridgeUnreachable appends now to the sliding window for key
+// ("<repo>/<agent>"), prunes entries older than bridgeUnreachableWindow,
+// and returns the resulting window length. Callers use the return value
+// to decide whether to give up on auto-restarting the agent.
+func (d *Daemon) recordBridgeUnreachable(key string, now time.Time) int {
+	d.bridgeUnreachableMu.Lock()
+	defer d.bridgeUnreachableMu.Unlock()
+	cutoff := now.Add(-bridgeUnreachableWindow)
+	timestamps := d.bridgeUnreachable[key]
+	pruned := timestamps[:0]
+	for _, t := range timestamps {
+		if t.After(cutoff) {
+			pruned = append(pruned, t)
+		}
+	}
+	pruned = append(pruned, now)
+	d.bridgeUnreachable[key] = pruned
+	return len(pruned)
+}
+
+// clearBridgeUnreachable drops the failure window for key. Called when
+// a browser-agent restart succeeds OR when the user explicitly issues
+// `oat agent restart` (the latter so the next failure restarts the
+// counter rather than instantly hitting the threshold again).
+func (d *Daemon) clearBridgeUnreachable(key string) {
+	d.bridgeUnreachableMu.Lock()
+	defer d.bridgeUnreachableMu.Unlock()
+	delete(d.bridgeUnreachable, key)
 }
 
 // restartAgent restarts an agent that has exited.

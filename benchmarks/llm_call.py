@@ -57,7 +57,7 @@ from typing import Any
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 _AGENT_RUNTIME = os.path.join(_REPO_ROOT, "agent-runtime")
-for _subdir in ("libs/cli", "libs/deepagents", "libs/acp"):
+for _subdir in ("libs/cli", "libs/oat_sdk"):
     _path = os.path.join(_AGENT_RUNTIME, _subdir)
     if _path not in sys.path:
         sys.path.insert(0, _path)

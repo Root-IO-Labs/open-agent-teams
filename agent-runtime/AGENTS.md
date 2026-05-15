@@ -80,7 +80,7 @@ Suggest PR titles that follow Conventional Commits format. Refer to .github/work
 ```txt
 feat(sdk): add new chat completion feature
 fix(cli): resolve type hinting issue
-chore(harbor): update infrastructure dependencies
+chore(sdk): update infrastructure dependencies
 ```
 
 - Do NOT use Sphinx-style double backtick formatting (` ``code`` `). Use single backticks (`code`) for inline code references in docstrings and comments.

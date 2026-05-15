@@ -186,9 +186,17 @@ The Agent Builder generates agent definition files for new agent types. It:
 
 **Role**: Controls a Chrome browser through MCP tools for web-based tasks
 **Worktree**: Main repository
-**Lifecycle**: Persistent
+**Lifecycle**: Opt-in, persistent
 
-The Browser Agent interacts with web pages through the OAT Browser Agent extension and MCP bridge. It:
+The Browser Agent is opt-in per repository: `oat agent add browser-agent` writes
+`<worktree>/.oat/mcp.json` pointing at the bridge and starts the agent. Without
+that step the daemon never spawns it and the rest of the team operates without
+browser tools. MCP configuration details — what `.oat/mcp.json` looks like,
+which env vars the agent-runtime honours, image/error result semantics, and
+how a future agent can declare its own MCP servers — live in
+[MCP.md](MCP.md).
+
+It interacts with web pages through the OAT Browser Agent extension and MCP bridge. It:
 - Navigates websites, clicks elements, fills forms using 44 MCP tools.
 - Reads page content via accessibility tree snapshots (primary) or screenshots (fallback).
 - Works within authenticated sessions (leverages the user's existing Chrome login state).
