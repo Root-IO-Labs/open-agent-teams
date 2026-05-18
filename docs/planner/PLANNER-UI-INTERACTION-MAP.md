@@ -291,7 +291,7 @@ Gates require explicit user approval before advancing. Currently only Gate 3 is 
 | Ctrl+A approve + dispatch | approvePlan() + dispatchToWorkspace() | ✓ |
 | Workspace fallback | spawn_agent for Wave 1 tasks | ✓ |
 | Plan persistence | persistPlan() → ~/.oat/plans/ | ✓ (silent on error) |
-| Model selection (sonnet for planner) | cli.go:2348, routing.GetModelForTask | ✓ |
+| Model selection | daemon model router, planner uses orchestrator-eligible model | ✓ |
 | Workspace gets all completion events | daemon.go:2698+ | ✓ |
 | Agent restart on crash | daemon restoreRepoAgents() fixed | ✓ |
 | Sidebar shows planner summary + thinking | SummaryForList() called by app.go:1030 | ✓ |
@@ -302,7 +302,6 @@ Gates require explicit user approval before advancing. Currently only Gate 3 is 
 |---------|-----------|--------|
 | Raw JSON shows in viewport | Planner streams JSON without fences; drainBuffer discards it but viewport shows raw output | User sees `"phase": "clarifying",` in output |
 | `[planner-tui]` prefix echoes back | Removed but still: send_agent_input echoes back user text to PTY | User text shows twice in viewport |
-| Ctrl+X doesn't notify planner | `rejectPlan()` returns nil — no message sent | Planner keeps going on the old plan |
 | Gates 1 + 2 never activate | `initPhaseGates()` defined but never called to SET p.currentGate | Users can't gate on requirements clarity or architecture approval |
 | Intent detection false positives | "looks wrong" detects rejection; "api works" detects approval | Unpredictable state transitions on normal conversation |
 | `completeCurrentPhase()` broken in StateDecomposing | Only handles Defining/Refining states | "done" doesn't work in all phases |

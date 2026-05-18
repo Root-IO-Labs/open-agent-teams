@@ -299,9 +299,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Sync worker completions to planner view so execution progress shows.
 		if a.planner != nil && msg.daemonOK {
 			for _, ag := range msg.agents {
-				if ag.Type == "worker" && ag.Waiting {
-					// Worker submitted a PR — update task status
-					a.planner.UpdateWorkerStatus(ag.Name, 0, false)
+				if ag.Type == "worker" {
+					a.planner.TrackWorkerAssignment(ag.Name, ag.Task)
+					if ag.Waiting {
+						// Worker submitted a PR — update task status
+						a.planner.UpdateWorkerStatus(ag.Name, 0, false)
+					}
 				}
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -44,10 +45,10 @@ type Task struct {
 	ID                 string
 	Title              string
 	Description        string
-	Type               string   // test|implementation|documentation (Overlord)
+	Type               string // test|implementation|documentation (Overlord)
 	Dependencies       []string
 	AcceptanceCriteria []string
-	Wave               int // Execution wave (parallel tasks have same wave, Wave 0 = foundation)
+	Wave               int    // Execution wave (parallel tasks have same wave, Wave 0 = foundation)
 	SpecReference      string // Reference to operational spec section (Overlord)
 	TestFirst          bool   // TDD flag for implementation tasks (Overlord)
 	Status             TaskStatus
@@ -69,8 +70,8 @@ const (
 // Unlike the raw PTY viewport, this shows only extracted user messages and
 // planner response text — no JSON, no tool calls, no terminal noise.
 type ConversationEntry struct {
-	Role    string // "user" | "planner" | "system"
-	Text    string
+	Role string // "user" | "planner" | "system"
+	Text string
 }
 
 // PlannerResponse is the structured JSON the planner agent emits every turn.
@@ -98,10 +99,10 @@ type PlannerRequirement struct {
 
 // TestStrategy defines the testing approach (Overlord methodology)
 type TestStrategy struct {
-	Unit       string `json:"unit"`
+	Unit        string `json:"unit"`
 	Integration string `json:"integration"`
-	Blackbox   string `json:"blackbox"`
-	GateScript string `json:"gate_script"`
+	Blackbox    string `json:"blackbox"`
+	GateScript  string `json:"gate_script"`
 }
 
 // PlannerTask is a single task inside a PlannerResponse.
@@ -109,11 +110,11 @@ type PlannerTask struct {
 	ID                 string   `json:"id"`
 	Title              string   `json:"title"`
 	Description        string   `json:"description"`
-	Type               string   `json:"type"`           // test|implementation|documentation
+	Type               string   `json:"type"` // test|implementation|documentation
 	Wave               int      `json:"wave"`
 	Dependencies       []string `json:"dependencies"`
-	SpecReference      string   `json:"spec_reference"`  // Reference to operational spec section
-	TestFirst          bool     `json:"test_first"`      // TDD flag for implementation tasks
+	SpecReference      string   `json:"spec_reference"` // Reference to operational spec section
+	TestFirst          bool     `json:"test_first"`     // TDD flag for implementation tasks
 	AcceptanceCriteria []string `json:"acceptance_criteria"`
 }
 
@@ -126,26 +127,26 @@ type PlannerView struct {
 	tasks        []Task
 	isLocked     bool
 	thinking     bool
-	
+
 	// Input handling
 	input       textinput.Model
 	inputPrompt string
-	
+
 	// UI state
-	width       int
-	height      int
-	scrollY     int
+	width        int
+	height       int
+	scrollY      int
 	selectedTask int
-	
+
 	// Communication
-	client      *socket.Client
-	repoName    string
-	
+	client   *socket.Client
+	repoName string
+
 	// Feedback and collaboration
-	feedback          []FeedbackEntry
-	thinkingText      string
-	plannerBuffer     string // accumulates planner output for JSON detection
-	clarifyingTurns   int   // turns in clarifying phase without advancing
+	feedback        []FeedbackEntry
+	thinkingText    string
+	plannerBuffer   string // accumulates planner output for JSON detection
+	clarifyingTurns int    // turns in clarifying phase without advancing
 
 	// Clean conversation: extracted message fields + user messages, shown
 	// instead of raw PTY output in the planner viewport.
@@ -156,19 +157,19 @@ type PlannerView struct {
 	taskWorkers map[string]string // task.ID → worker agent name
 	taskPRs     map[string]int    // task.ID → PR number (0 = no PR yet)
 	wavesDone   map[int]bool      // wave → all tasks complete
-	
+
 	// Enhanced contextual awareness (Overlord integration)
-	context           *PlannerContext
-	currentGate       *PhaseGate
-	pendingQuestions  []string
-	brainstormThemes  []BrainstormTheme
-	
+	context          *PlannerContext
+	currentGate      *PhaseGate
+	pendingQuestions []string
+	brainstormThemes []BrainstormTheme
+
 	// Key bindings
 	keyMap PlannerKeyMap
 }
 
 type FeedbackEntry struct {
-	Type      string    // "user", "ai", "system"
+	Type      string // "user", "ai", "system"
 	Content   string
 	Timestamp time.Time
 }
@@ -198,25 +199,25 @@ func NewPlannerView(client *socket.Client, repoName string) *PlannerView {
 	ti.Width = 80
 
 	p := &PlannerView{
-		state:       StateDefiningRequirement,
-		input:       ti,
-		inputPrompt: "Requirement",
-		client:      client,
-		repoName:    repoName,
+		state:        StateDefiningRequirement,
+		input:        ti,
+		inputPrompt:  "Requirement",
+		client:       client,
+		repoName:     repoName,
 		selectedTask: -1,
-		keyMap:      defaultPlannerKeys(),
-		feedback:    []FeedbackEntry{
+		keyMap:       defaultPlannerKeys(),
+		feedback: []FeedbackEntry{
 			{
-				Type:      "system", 
+				Type:      "system",
 				Content:   "Welcome to the OAT Planner! Describe your requirements and I'll help break them down into executable tasks.",
 				Timestamp: time.Now(),
 			},
 		},
 	}
-	
+
 	// Initialize enhanced fields
 	p.initializeEnhancements()
-	
+
 	return p
 }
 
@@ -295,6 +296,7 @@ func (p *PlannerView) Update(msg tea.Msg) (*PlannerView, tea.Cmd) {
 	case plannerDispatchedMsg:
 		p.thinking = false
 		p.state = StateExecuting
+		p.applyWorkerAssignments(msg.assignments)
 		target := msg.target
 		if target == "" {
 			target = "workspace"
@@ -463,11 +465,11 @@ func (p *PlannerView) stopAndPullPlan() tea.Cmd {
 	client := p.client
 	repoName := p.repoName
 	extractMsg := fmt.Sprintf(
-		"[planner-tui phase=ready_for_review]\n"+
-			"STOP all implementation work immediately. You are the PLANNER, not the implementer. "+
-			"Output your complete current plan as a single JSON code block (```json ... ```) "+
-			"in the required format with phase, message, requirement, and tasks fields. "+
-			"Include wave numbers, dependencies, and acceptance_criteria for every task. "+
+		"[planner-tui phase=ready_for_review]\n" +
+			"STOP all implementation work immediately. You are the PLANNER, not the implementer. " +
+			"Output your complete current plan as a single JSON code block (```json ... ```) " +
+			"in the required format with phase, message, requirement, and tasks fields. " +
+			"Include wave numbers, dependencies, and acceptance_criteria for every task. " +
 			"Do NOT create files, run commands, or implement anything.",
 	)
 
@@ -539,27 +541,31 @@ func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
 
 		// Fallback: workspace not running — spawn Wave 1 workers directly.
 		var errs []string
+		assignments := make(map[string]string)
 		for _, task := range wave1Tasks {
+			workerName := fmt.Sprintf("worker-%s", task.ID)
 			wr, werr := client.Send(socket.Request{
 				Command: "spawn_agent",
 				Args: map[string]interface{}{
 					"repo":   repoName,
-					"name":   fmt.Sprintf("worker-%s", task.ID),
+					"name":   workerName,
 					"class":  "ephemeral",
 					"prompt": buildWorkerPrompt(task, req),
-					"task":   task.Title + ": " + task.Description,
+					"task":   plannerTaskMarker(task.ID) + " " + task.Title + ": " + task.Description,
 				},
 			})
 			if werr != nil {
 				errs = append(errs, task.ID+": "+werr.Error())
 			} else if !wr.Success {
 				errs = append(errs, task.ID+": "+wr.Error)
+			} else {
+				assignments[task.ID] = workerName
 			}
 		}
 		if len(errs) > 0 {
 			return plannerErrorMsg{err: fmt.Errorf("direct dispatch errors: %s", strings.Join(errs, "; "))}
 		}
-		return plannerDispatchedMsg{target: "direct"}
+		return plannerDispatchedMsg{target: "direct", assignments: assignments}
 	}
 }
 
@@ -574,12 +580,17 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 		sb.WriteString(p.requirement.Refined)
 		sb.WriteString("\n\n")
 	}
+	sb.WriteString("## Execution Contract\n")
+	sb.WriteString("- Workspace owns worker creation, wave advancement, and PR/issue coordination.\n")
+	sb.WriteString("- Preserve each task ID exactly as written below.\n")
+	sb.WriteString("- When spawning a worker, include the marker `[planner-task:<task-id>]` at the start of the worker task text so planner progress can be mapped back deterministically.\n")
+	sb.WriteString("- Do not start a wave until every dependency and every task in the previous wave is complete.\n\n")
 
 	waves := make(map[int][]Task)
 	for _, t := range p.tasks {
 		waves[t.Wave] = append(waves[t.Wave], t)
 	}
-	for wave := 1; wave <= p.getMaxWave(); wave++ {
+	for _, wave := range sortedWaveKeys(waves) {
 		tasks := waves[wave]
 		if len(tasks) == 0 {
 			continue
@@ -591,6 +602,7 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 		}
 		for _, t := range tasks {
 			sb.WriteString(fmt.Sprintf("### %s: %s\n", t.ID, t.Title))
+			sb.WriteString("Task marker: " + plannerTaskMarker(t.ID) + "\n")
 			sb.WriteString(t.Description + "\n")
 			if len(t.Dependencies) > 0 {
 				sb.WriteString("Depends on: " + strings.Join(t.Dependencies, ", ") + "\n")
@@ -606,6 +618,19 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 	}
 	sb.WriteString("Spawn Wave 1 workers immediately. Advance to the next wave when all tasks in the current wave are complete.")
 	return sb.String()
+}
+
+func plannerTaskMarker(taskID string) string {
+	return "[planner-task:" + taskID + "]"
+}
+
+func sortedWaveKeys(waves map[int][]Task) []int {
+	keys := make([]int, 0, len(waves))
+	for wave := range waves {
+		keys = append(keys, wave)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 func (p *PlannerView) lockPlan() {
@@ -690,7 +715,6 @@ func (p *PlannerView) rejectPlan() tea.Cmd {
 		"what changes would you like to make?")
 }
 
-
 // persistPlan saves the current approved plan to ~/.oat/plans/<repo>/ so it
 // survives TUI restarts and can be referenced later.
 func (p *PlannerView) persistPlan() {
@@ -708,7 +732,7 @@ func (p *PlannerView) persistPlan() {
 		Version:   p.requirement.Iteration,
 		CreatedAt: p.requirement.LastUpdated,
 		UpdatedAt: time.Now(),
-		Status:    "approved",
+		Status:    plannerStatusForState(p.state),
 		Requirement: planner.RequirementDoc{
 			Title:           p.requirement.Refined,
 			Original:        p.requirement.Original,
@@ -717,7 +741,19 @@ func (p *PlannerView) persistPlan() {
 			LastUpdated:     p.requirement.LastUpdated,
 		},
 	}
+	if p.testStrategy != nil {
+		doc.TestStrategy = planner.TestStrategyDoc{
+			Unit:        p.testStrategy.Unit,
+			Integration: p.testStrategy.Integration,
+			Blackbox:    p.testStrategy.Blackbox,
+			GateScript:  p.testStrategy.GateScript,
+		}
+	}
 	for _, t := range p.tasks {
+		prNumber := 0
+		if p.taskPRs != nil {
+			prNumber = p.taskPRs[t.ID]
+		}
 		doc.Tasks = append(doc.Tasks, planner.TaskDoc{
 			ID:                 t.ID,
 			Title:              t.Title,
@@ -728,9 +764,38 @@ func (p *PlannerView) persistPlan() {
 			SpecReference:      t.SpecReference,
 			TestFirst:          t.TestFirst,
 			AcceptanceCriteria: t.AcceptanceCriteria,
+			Status:             taskStatusString(t.Status),
+			AssignedTo:         t.AssignedTo,
+			PRNumber:           prNumber,
 		})
 	}
 	_ = storage.SavePlan(doc) // best-effort; failure is non-fatal
+}
+
+func plannerStatusForState(state PlannerState) string {
+	switch state {
+	case StateExecuting:
+		return "executing"
+	case StatePlanLocked:
+		return "approved"
+	default:
+		return "draft"
+	}
+}
+
+func taskStatusString(status TaskStatus) string {
+	switch status {
+	case TaskStatusInProgress:
+		return "in_progress"
+	case TaskStatusCompleted:
+		return "completed"
+	case TaskStatusFailed:
+		return "failed"
+	case TaskStatusBlocked:
+		return "blocked"
+	default:
+		return "pending"
+	}
 }
 
 // tasksForWave returns all tasks with the given wave number.
@@ -806,7 +871,6 @@ func (p *PlannerView) tickThinking() tea.Cmd {
 	})
 }
 
-
 func (p *PlannerView) getMaxWave() int {
 	maxWave := 0
 	for _, task := range p.tasks {
@@ -881,7 +945,7 @@ func (p *PlannerView) View() string {
 
 func (p *PlannerView) renderHeader() string {
 	title := "🚀 OAT Planner - Collaborative Task Planning"
-	
+
 	stateInfo := ""
 	switch p.state {
 	case StateDefiningRequirement:
@@ -966,7 +1030,7 @@ func (p *PlannerView) renderMainContent() string {
 	content.WriteString(p.renderFeedback())
 
 	return lipgloss.NewStyle().
-		Width(p.width - 2).
+		Width(p.width-2).
 		Height(contentHeight).
 		Padding(0, 1).
 		Render(content.String())
@@ -989,15 +1053,15 @@ func (p *PlannerView) renderRequirement() string {
 		Render(fmt.Sprintf("Requirement (v%d)", p.requirement.Iteration))
 
 	content := fmt.Sprintf("%s\n\n%s", title, p.requirement.Refined)
-	
+
 	if p.requirement.Original != p.requirement.Refined {
-		content += fmt.Sprintf("\n\nOriginal: %s", 
+		content += fmt.Sprintf("\n\nOriginal: %s",
 			lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(p.requirement.Original))
 	}
 
 	// Add operational spec if present
 	if p.requirement.OperationalSpec != "" {
-		content += fmt.Sprintf("\n\nOperational Spec: %s", 
+		content += fmt.Sprintf("\n\nOperational Spec: %s",
 			lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(p.requirement.OperationalSpec))
 	}
 
@@ -1024,7 +1088,7 @@ func (p *PlannerView) renderTestStrategy() string {
 	content += fmt.Sprintf("Unit Tests: %s\n", p.testStrategy.Unit)
 	content += fmt.Sprintf("Integration Tests: %s\n", p.testStrategy.Integration)
 	content += fmt.Sprintf("Blackbox Tests: %s\n", p.testStrategy.Blackbox)
-	content += fmt.Sprintf("Gate Script: %s", 
+	content += fmt.Sprintf("Gate Script: %s",
 		lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(p.testStrategy.GateScript))
 
 	return style.Render(content)
@@ -1036,12 +1100,12 @@ func (p *PlannerView) renderTasks() string {
 	}
 
 	var content strings.Builder
-	
+
 	title := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("34")).
 		Render("📋 Task Breakdown")
-	
+
 	content.WriteString(title)
 	content.WriteString("\n\n")
 
@@ -1107,10 +1171,10 @@ func (p *PlannerView) renderTasks() string {
 				if task.EstimatedDuration > 0 {
 					taskLine += fmt.Sprintf(" (%s)", task.EstimatedDuration)
 				}
-				
+
 				content.WriteString(taskStyle.Render(taskLine))
 				content.WriteString("\n")
-				
+
 				if task.Description != "" {
 					desc := lipgloss.NewStyle().
 						Foreground(lipgloss.Color("8")).
@@ -1167,7 +1231,7 @@ func (p *PlannerView) renderFeedback() string {
 			// AI messages: plain white text, no prefix, indented slightly
 			body := aiStyle.Render(entry.Content)
 			if wrapWidth > 0 {
-				body = lipgloss.NewStyle().Width(wrapWidth - 2).Padding(0, 0, 0, 2).Render(body)
+				body = lipgloss.NewStyle().Width(wrapWidth-2).Padding(0, 0, 0, 2).Render(body)
 			}
 			content.WriteString(body)
 			content.WriteString("\n\n")
@@ -1229,7 +1293,7 @@ func (p *PlannerView) renderTasksCompact() string {
 func (p *PlannerView) renderThinking() string {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	frame := frames[(int(time.Now().UnixMilli()/200))%len(frames)]
-	
+
 	return lipgloss.NewStyle().
 		Foreground(lipgloss.Color("8")).
 		Render(fmt.Sprintf("%s %s", frame, p.thinkingText))
@@ -1241,7 +1305,7 @@ func (p *PlannerView) renderInputBar() string {
 		Render(p.inputPrompt + ": ")
 
 	input := p.input.View()
-	
+
 	return lipgloss.NewStyle().
 		Width(p.width).
 		Padding(0, 1).
@@ -1554,7 +1618,10 @@ type plannerSentMsg struct{}
 
 type plannerErrorMsg struct{ err error }
 
-type plannerDispatchedMsg struct{ target string } // "workspace" or "direct"
+type plannerDispatchedMsg struct {
+	target      string // "workspace" or "direct"
+	assignments map[string]string
+}
 
 type plannerTickMsg time.Time
 
@@ -1838,6 +1905,7 @@ func (p *PlannerView) HandleStreamMsg(msg tea.Msg) tea.Cmd {
 	case plannerDispatchedMsg:
 		p.thinking = false
 		p.state = StateExecuting
+		p.applyWorkerAssignments(m.assignments)
 		target := m.target
 		if target == "" {
 			target = "workspace"
@@ -1903,9 +1971,60 @@ func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, comple
 			break
 		}
 	}
+	p.persistPlan()
 
 	// Check if the current wave is complete and note it in conversation.
 	p.checkWaveCompletion()
+}
+
+func (p *PlannerView) TrackWorkerAssignment(workerName, taskText string) {
+	if workerName == "" || taskText == "" {
+		return
+	}
+	taskID := taskIDFromPlannerMarker(taskText)
+	if taskID == "" {
+		return
+	}
+	p.applyWorkerAssignments(map[string]string{taskID: workerName})
+}
+
+func (p *PlannerView) applyWorkerAssignments(assignments map[string]string) {
+	if len(assignments) == 0 {
+		return
+	}
+	if p.taskWorkers == nil {
+		p.taskWorkers = make(map[string]string)
+	}
+	for taskID, workerName := range assignments {
+		if taskID == "" || workerName == "" {
+			continue
+		}
+		p.taskWorkers[taskID] = workerName
+		for i := range p.tasks {
+			if p.tasks[i].ID == taskID {
+				p.tasks[i].AssignedTo = workerName
+				if p.tasks[i].Status == TaskStatusPending {
+					p.tasks[i].Status = TaskStatusInProgress
+				}
+				break
+			}
+		}
+	}
+	p.persistPlan()
+}
+
+func taskIDFromPlannerMarker(text string) string {
+	const prefix = "[planner-task:"
+	start := strings.Index(text, prefix)
+	if start < 0 {
+		return ""
+	}
+	start += len(prefix)
+	end := strings.Index(text[start:], "]")
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[start : start+end])
 }
 
 // checkWaveCompletion checks if all tasks in the current execution wave are
@@ -1948,4 +2067,3 @@ func IsPlannerMsg(msg tea.Msg) bool {
 	}
 	return false
 }
-

@@ -277,6 +277,30 @@ func TestBuildWorkspaceHandoff(t *testing.T) {
 	if !strings.Contains(msg, "runs without error") {
 		t.Error("acceptance criteria missing")
 	}
+	if !strings.Contains(msg, "[planner-task:T1]") || !strings.Contains(msg, "[planner-task:T2]") {
+		t.Error("handoff should include stable planner task markers")
+	}
+	if !strings.Contains(msg, "Workspace owns worker creation") {
+		t.Error("handoff should define the execution contract")
+	}
+}
+
+func TestTrackWorkerAssignmentFromPlannerMarker(t *testing.T) {
+	p := newTestPlanner()
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	p.TrackWorkerAssignment("worker-alpha", "[planner-task:T1] Scaffold the project")
+	p.UpdateWorkerStatus("worker-alpha", 0, false)
+
+	if got := p.taskWorkers["T1"]; got != "worker-alpha" {
+		t.Fatalf("taskWorkers[T1] = %q, want worker-alpha", got)
+	}
+	if p.tasks[0].AssignedTo != "worker-alpha" {
+		t.Fatalf("AssignedTo = %q, want worker-alpha", p.tasks[0].AssignedTo)
+	}
+	if p.tasks[0].Status != TaskStatusInProgress {
+		t.Fatalf("Status = %v, want TaskStatusInProgress", p.tasks[0].Status)
+	}
 }
 
 // tasksForWave must return only tasks in the given wave.
