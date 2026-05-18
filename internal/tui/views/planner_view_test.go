@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func newTestPlanner() *PlannerView {
@@ -332,6 +334,38 @@ func TestSummaryForList_Thinking(t *testing.T) {
 	p.state = StateDecomposingTasks
 	if !strings.Contains(p.SummaryForList(), "decomposing") {
 		t.Errorf("expected decomposing in summary, got %q", p.SummaryForList())
+	}
+}
+
+func TestHelpHintsExposeRefineAndBrainstormDuringDecomposition(t *testing.T) {
+	p := newTestPlanner()
+	p.state = StateDecomposingTasks
+	p.requirement = &Requirement{Refined: "Build calculator"}
+	p.brainstormThemes = []BrainstormTheme{{Name: "Tech Stack"}}
+
+	hints := p.HelpHints()
+	if !strings.Contains(hints, "^r:refine") {
+		t.Fatalf("expected refine hint in decomposing state, got %q", hints)
+	}
+	if !strings.Contains(hints, "^b:brainstorm") {
+		t.Fatalf("expected brainstorm hint in decomposing state, got %q", hints)
+	}
+}
+
+func TestRenderPlannerMarkdownFormatsCommonMarkdown(t *testing.T) {
+	rendered := renderPlannerMarkdown("## Title\n1. **UI Framework**: use `shadcn`\n- Save formulas", 80, lipgloss.NewStyle())
+
+	if strings.Contains(rendered, "**UI Framework**") {
+		t.Fatalf("bold markdown marker should be rendered, got %q", rendered)
+	}
+	if strings.Contains(rendered, "`shadcn`") {
+		t.Fatalf("inline code marker should be rendered, got %q", rendered)
+	}
+	if strings.Contains(rendered, "## Title") {
+		t.Fatalf("heading marker should be rendered, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "Title") || !strings.Contains(rendered, "UI Framework") || !strings.Contains(rendered, "shadcn") {
+		t.Fatalf("rendered output lost content: %q", rendered)
 	}
 }
 

@@ -703,6 +703,10 @@ func (p *PlannerView) buildPlannerMessage(userText string) string {
 }
 
 func (p *PlannerView) refineRequirement() tea.Cmd {
+	p.conversation = append(p.conversation, ConversationEntry{
+		Role: "system",
+		Text: "Asking planner to refine the current requirement.",
+	})
 	return p.sendToPlanner("Please refine the current requirement further.")
 }
 
@@ -1228,8 +1232,8 @@ func (p *PlannerView) renderFeedback() string {
 			content.WriteString("\n\n")
 
 		case "ai":
-			// AI messages: plain white text, no prefix, indented slightly
-			body := aiStyle.Render(entry.Content)
+			// AI messages: markdown-ish text, no prefix, indented slightly
+			body := renderPlannerMarkdown(entry.Content, wrapWidth-2, aiStyle)
 			if wrapWidth > 0 {
 				body = lipgloss.NewStyle().Width(wrapWidth-2).Padding(0, 0, 0, 2).Render(body)
 			}
@@ -1253,6 +1257,142 @@ func (p *PlannerView) renderFeedback() string {
 	}
 
 	return content.String()
+}
+
+func renderPlannerMarkdown(text string, width int, base lipgloss.Style) string {
+	if width < 20 {
+		width = 80
+	}
+
+	headingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+	boldStyle := lipgloss.NewStyle().Bold(true)
+	codeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	listStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	quoteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+
+	var out strings.Builder
+	lines := strings.Split(text, "\n")
+	inFence := false
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out.WriteString("\n")
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			out.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Width(width).Render(line))
+			out.WriteString("\n")
+			continue
+		}
+
+		if headingText, ok := markdownHeadingText(trimmed); ok {
+			out.WriteString(headingStyle.Width(width).Render(headingText))
+			out.WriteString("\n")
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, ">") {
+			out.WriteString(quoteStyle.Width(width).Render(strings.TrimSpace(strings.TrimPrefix(trimmed, ">"))))
+			out.WriteString("\n")
+			continue
+		}
+
+		prefix, body := markdownListParts(line)
+		renderedBody := renderInlineMarkdown(body, base, boldStyle, codeStyle)
+		if prefix != "" {
+			out.WriteString(listStyle.Render(prefix))
+			out.WriteString(lipgloss.NewStyle().Width(width - lipgloss.Width(prefix)).Render(renderedBody))
+			out.WriteString("\n")
+			continue
+		}
+
+		out.WriteString(lipgloss.NewStyle().Width(width).Render(renderInlineMarkdown(line, base, boldStyle, codeStyle)))
+		out.WriteString("\n")
+	}
+
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func markdownHeadingText(line string) (string, bool) {
+	level := 0
+	for level < len(line) && line[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level >= len(line) || line[level] != ' ' {
+		return "", false
+	}
+	return strings.TrimSpace(line[level:]), true
+}
+
+func markdownListParts(line string) (string, string) {
+	indentLen := len(line) - len(strings.TrimLeft(line, " "))
+	trimmed := strings.TrimLeft(line, " ")
+	indent := strings.Repeat(" ", indentLen)
+	for _, marker := range []string{"- ", "* ", "+ "} {
+		if strings.HasPrefix(trimmed, marker) {
+			return indent + "• ", strings.TrimSpace(trimmed[len(marker):])
+		}
+	}
+	if dot := strings.Index(trimmed, ". "); dot > 0 && allDigits(trimmed[:dot]) {
+		return indent + trimmed[:dot+2], strings.TrimSpace(trimmed[dot+2:])
+	}
+	return "", line
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func renderInlineMarkdown(text string, base, boldStyle, codeStyle lipgloss.Style) string {
+	var out strings.Builder
+	for len(text) > 0 {
+		nextBold := strings.Index(text, "**")
+		nextCode := strings.Index(text, "`")
+		switch {
+		case nextCode >= 0 && (nextBold < 0 || nextCode < nextBold):
+			if nextCode > 0 {
+				out.WriteString(base.Render(text[:nextCode]))
+			}
+			rest := text[nextCode+1:]
+			end := strings.Index(rest, "`")
+			if end < 0 {
+				out.WriteString(base.Render("`" + rest))
+				return out.String()
+			}
+			out.WriteString(codeStyle.Render(rest[:end]))
+			text = rest[end+1:]
+		case nextBold >= 0:
+			if nextBold > 0 {
+				out.WriteString(base.Render(text[:nextBold]))
+			}
+			rest := text[nextBold+2:]
+			end := strings.Index(rest, "**")
+			if end < 0 {
+				out.WriteString(base.Render("**" + rest))
+				return out.String()
+			}
+			out.WriteString(boldStyle.Render(rest[:end]))
+			text = rest[end+2:]
+		default:
+			out.WriteString(base.Render(text))
+			return out.String()
+		}
+	}
+	return out.String()
 }
 
 // renderTasksCompact shows tasks as a dense single-line list by wave,
@@ -1324,12 +1464,18 @@ func (p *PlannerView) renderHelp() string {
 			helps = append(helps, "^b: brainstorm")
 		}
 	case StateDecomposingTasks:
-		helps = []string{"Enter: reply", "^p: extract plan", "^n: restart", "esc: back"}
+		helps = []string{"Enter: reply", "^p: extract plan", "^r: refine", "^n: restart", "esc: back"}
+		if len(p.brainstormThemes) > 0 {
+			helps = append(helps, "^b: brainstorm")
+		}
 	case StateReviewingPlan:
 		if len(p.tasks) > 0 {
-			helps = []string{"^a: approve & dispatch", "^x: reject", "^p: re-extract", "Enter: feedback", "^n: restart", "esc: back"}
+			helps = []string{"^a: approve & dispatch", "^x: reject", "^p: re-extract", "^r: refine", "Enter: feedback", "^n: restart", "esc: back"}
 		} else {
-			helps = []string{"^p: extract plan as JSON", "^x: reject", "Enter: feedback", "^n: restart", "esc: back"}
+			helps = []string{"^p: extract plan as JSON", "^x: reject", "^r: refine", "Enter: feedback", "^n: restart", "esc: back"}
+		}
+		if len(p.brainstormThemes) > 0 {
+			helps = append(helps, "^b: brainstorm")
 		}
 	case StatePlanLocked:
 		helps = []string{"^a: dispatch to workspace", "Enter: feedback", "esc: back"}
@@ -1699,7 +1845,7 @@ func (p *PlannerView) RenderEmbeddedContent(width, height int) string {
 			out.WriteString(lipgloss.NewStyle().Width(wrapW).Render(line))
 			out.WriteString("\n\n")
 		case "planner":
-			body := plannerStyle.Render(entry.Text)
+			body := renderPlannerMarkdown(entry.Text, wrapW-2, plannerStyle)
 			out.WriteString(lipgloss.NewStyle().Width(wrapW).Padding(0, 0, 0, 2).Render(body))
 			out.WriteString("\n\n")
 		case "system":
@@ -1846,18 +1992,27 @@ func (p *PlannerView) HelpHints() string {
 	switch p.state {
 	case StateDefiningRequirement:
 		hints = []string{"^n:restart"}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
+		}
 	case StateRefiningRequirement:
 		hints = []string{"^p:extract", "^r:refine", "^n:restart"}
 		if len(p.brainstormThemes) > 0 {
 			hints = append(hints, "^b:brainstorm")
 		}
 	case StateDecomposingTasks:
-		hints = []string{"^p:extract", "^n:restart"}
+		hints = []string{"^p:extract", "^r:refine", "^n:restart"}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
+		}
 	case StateReviewingPlan:
 		if len(p.tasks) > 0 {
-			hints = []string{"^a:approve", "^x:reject", "^p:re-extract", "^n:restart"}
+			hints = []string{"^a:approve", "^x:reject", "^p:re-extract", "^r:refine", "^n:restart"}
 		} else {
-			hints = []string{"^p:extract", "^n:restart"}
+			hints = []string{"^p:extract", "^r:refine", "^n:restart"}
+		}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
 		}
 	case StatePlanLocked:
 		hints = []string{"^a:dispatch"}
