@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`agent_input` socket verb + `SanitizePTYInput` helper (Part 2b).** New
+  daemon socket verb that lets the oat-browser-agent bridge inject text into
+  the browser-agent's PTY on behalf of a side-panel chat message. The verb
+  addresses the agent by `(session, agent_name)` — matching the
+  `OAT_BROWSER_AGENT_SESSION` + `OAT_BROWSER_AGENT_NAME` env vars from
+  Part 2a — rather than by `(repo, agent)`, so the bridge does not need to
+  reverse-resolve the repo name. Restricted to `AgentTypeBrowser` agents
+  (rejected with a structured error for any other type), so a misconfigured
+  or malicious bridge cannot spray text into the supervisor/worker PTY via
+  this verb. Optional `interrupt: true` argument delivers a single `0x03`
+  (Ctrl-C) for the side-panel's 60-second-stall interrupt button.
+  ([internal/daemon/daemon.go](internal/daemon/daemon.go) `handleAgentInput`,
+  [docs/extending/SOCKET_API.md](docs/extending/SOCKET_API.md).)
+
+  All input is filtered through the new `internal/socket.SanitizePTYInput`
+  helper to mitigate control-character prompt injection
+  ([Dropbox 2024](https://dropbox.tech/machine-learning/prompt-injection-with-control-characters-openai-chatgpt-llm),
+  [OWASP LLM cheat sheet](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html)).
+  The sanitizer strips C0 controls (except `\n`/`\t`), C1 controls (even when
+  encoded as multi-byte UTF-8), ANSI escape sequences (CSI/OSC/single-byte),
+  and bare `\r`; collapses `\r\n` to `\n`; and rejects inputs larger than
+  32 KiB, invalid UTF-8, or inputs where more than 5 % of the bytes were
+  *injection-class* C0 controls (counting backspace/NUL/etc. but excluding
+  ESC consumed by a legitimate ANSI sequence and CR consumed by line-ending
+  normalization). Interrupt mode opens a single-byte carve-out for `0x03`
+  but rejects any other input shape — padding the request with extra bytes
+  cannot smuggle prompt text past the C0 filter under cover of the
+  interrupt flag.
+  ([internal/socket/sanitize.go](internal/socket/sanitize.go),
+  19 unit-test cases in [internal/socket/sanitize_test.go](internal/socket/sanitize_test.go).)
+
 - **Browser-agent identity plumbing for side-panel chat (Part 2a).**
   `buildBrowserAgentMCPConfig` now sets `OAT_BROWSER_AGENT_SESSION` (the repo's
   session name) and `OAT_BROWSER_AGENT_NAME` (the browser-agent's window/agent

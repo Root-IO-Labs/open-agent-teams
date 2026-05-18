@@ -1887,6 +1887,9 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 	case "send_agent_input":
 		return d.handleSendAgentInput(req)
 
+	case "agent_input":
+		return d.handleAgentInput(req)
+
 	case "interrupt_agent":
 		return d.handleInterruptAgent(req)
 
@@ -2386,6 +2389,112 @@ func (d *Daemon) handleSendAgentInput(req socket.Request) socket.Response {
 
 	d.logger.Debug("Sent direct input to %s/%s", repoName, agentName)
 	return socket.SuccessResponse(nil)
+}
+
+// handleAgentInput is the side-panel chat path's PTY-injection verb.
+// Distinct from handleSendAgentInput because the caller (the
+// oat-browser-agent bridge) addresses agents by (session, agent_name)
+// instead of (repo, agent) — the bridge only knows the env vars set
+// by buildBrowserAgentMCPConfig (Part 2a) and can't trivially derive
+// the repo name. The verb is restricted to AgentTypeBrowser so a
+// malicious bridge can't use it to inject text into the supervisor's
+// or a worker's PTY.
+//
+// Input sanitization runs at this entry point so EVERY caller gets
+// the same filter applied (including the synthetic 95 % compaction
+// inject in Part 5e, which will route through here too). See
+// internal/socket/sanitize.go for the rule set.
+func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
+	sessionName, errResp, ok := getRequiredStringArg(req.Args, "session", "session name is required")
+	if !ok {
+		return errResp
+	}
+	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
+	if !ok {
+		return errResp
+	}
+	// `text` is required when interrupt is false, AND when interrupt is
+	// true (the only valid value is "\x03"). Either way the field must
+	// be present; getRequiredStringArg already returns a structured
+	// error if it's missing.
+	text, errResp, ok := getRequiredStringArg(req.Args, "text", "text is required")
+	if !ok {
+		return errResp
+	}
+
+	// `interrupt` is optional and bool. Default false. We accept either
+	// JSON bool or "true"/"false" string (some socket clients stringify
+	// args; the existing dispatch table is forgiving about this).
+	interrupt := false
+	if raw, present := req.Args["interrupt"]; present {
+		switch v := raw.(type) {
+		case bool:
+			interrupt = v
+		case string:
+			interrupt = strings.EqualFold(v, "true")
+		}
+	}
+
+	// Look up the repo whose SessionName matches. Linear scan because
+	// repos are typically O(1–3) per daemon and adding an index would
+	// add a sync invariant we don't need yet. If repo-count grows we
+	// can promote this to a map in a follow-up.
+	repoName, repo, found := d.findRepoBySession(sessionName)
+	if !found {
+		return socket.ErrorResponse("no repository is bound to session %q", sessionName)
+	}
+	agent, exists := d.state.GetAgent(repoName, agentName)
+	if !exists {
+		return socket.ErrorResponse("agent '%s' not found in session %q", agentName, sessionName)
+	}
+	// Security boundary: agent_input is the side-panel chat path and
+	// is allowed to address browser agents ONLY. Restricting at the
+	// daemon edge means a misconfigured bridge or a malicious WS
+	// peer can't escalate to "inject prompt text into the supervisor."
+	if agent.Type != state.AgentTypeBrowser {
+		return socket.ErrorResponse("agent_input is restricted to browser-agent type; %s/%s is %s", repoName, agentName, agent.Type)
+	}
+
+	sanitized, sErr := socket.SanitizePTYInput(text, socket.SanitizeOpts{AllowInterrupt: interrupt})
+	if sErr != nil {
+		// Log the unsafe input length so the operator can correlate
+		// rejections with bridge-side issues, but don't echo the
+		// content (we just declared it suspect).
+		d.logger.Warn("agent_input rejected for %s/%s (len=%d, interrupt=%v): %v", repoName, agentName, len(text), interrupt, sErr)
+		return socket.ErrorResponse("input rejected by sanitizer: %v", sErr)
+	}
+	if sanitized == "" && !interrupt {
+		// All bytes stripped (e.g. input was a lone ANSI escape with
+		// no payload). Surface to the caller so the side panel can
+		// keep the user's draft visible instead of optimistically
+		// rendering an empty bubble.
+		return socket.ErrorResponse("input was empty after sanitization")
+	}
+
+	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, sanitized); err != nil {
+		if errors.Is(err, backend_pkg.ErrAgentAdopted) {
+			return socket.ErrorResponse("agent '%s' was re-adopted after daemon restart and needs to be restarted before it can accept input", agentName)
+		}
+		return socket.ErrorResponse("failed to send input to agent '%s': %v", agentName, err)
+	}
+	d.logger.Debug("agent_input delivered to %s/%s (interrupt=%v, len=%d)", repoName, agentName, interrupt, len(sanitized))
+	return socket.SuccessResponse(nil)
+}
+
+// findRepoBySession returns (repoName, *repository, true) for the
+// repo whose SessionName matches; (_, nil, false) otherwise. Linear
+// scan over d.state.Repos under the state mutex.
+func (d *Daemon) findRepoBySession(sessionName string) (string, *state.Repository, bool) {
+	for _, name := range d.state.ListRepos() {
+		r, ok := d.state.GetRepo(name)
+		if !ok {
+			continue
+		}
+		if r.SessionName == sessionName {
+			return name, r, true
+		}
+	}
+	return "", nil, false
 }
 
 func (d *Daemon) handleInterruptAgent(req socket.Request) socket.Response {

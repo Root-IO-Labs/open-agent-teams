@@ -30,6 +30,7 @@ reset_nudge
 start_repo_agents
 start_worker
 send_agent_input
+agent_input
 interrupt_agent
 escape_agent
 start_verification
@@ -73,6 +74,7 @@ Each command below matches a `case` in `handleRequest`.
 | `spawn_agent` | Create a new agent worktree | `repo`, `type`, `task`, `name` (optional) |
 | `start_verification` | Mark a worker as awaiting verification, pin `worker.BaseSHA` (from CLI-provided `base_sha` or daemon-side snapshot), and pin the verifier agent name. Called by `oat worker request-review` before `start_verification_agent`. | `repo`, `worker`, `verifier`, `commit_sha`, `base_sha` (optional) |
 | `start_verification_agent` | Start a verification agent process via daemon backend (auto-retires completed verifiers on re-request) | `repo`, `agent`, `worktree_path` |
+| `agent_input` | Side-panel chat PTY-injection. Identifies the agent by `session` (matched against `repo.SessionName`) rather than by `repo` so the oat-browser-agent bridge can use the `OAT_BROWSER_AGENT_SESSION` env var directly. Input is sanitized via `internal/socket.SanitizePTYInput` to mitigate control-character prompt injection (Dropbox 2024); rejected with a structured error if it strips more than 5% injection-class C0 bytes, exceeds 32 KiB, contains invalid UTF-8, or — in interrupt mode — is anything other than the single byte `0x03`. **Restricted to `AgentTypeBrowser` agents only**; other types return an error so a misconfigured or malicious bridge cannot reach the supervisor/worker PTY through this verb. | `session` (string, matched against `repo.SessionName`), `agent` (string, agent name within the session), `text` (string, raw text — sanitized at the daemon edge), `interrupt` (bool, optional; when `true` the text must be exactly `\x03` and the input bypasses the C0 strip rules) |
 
 ## Minimal client examples
 
