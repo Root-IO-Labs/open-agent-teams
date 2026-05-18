@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Browser-agent prompt: documented `browser_emit_to_user` and
+  side-panel chat (Part 2f).** Adds two pieces to
+  `internal/templates/agent-templates/browser.md`:
+  - A new bullet under the "Available Tools" list calling out
+    `browser_emit_to_user` as a user-facing chat side-channel that
+    does NOT touch the browser (so the model doesn't mistake it
+    for a browser action).
+  - A new "Real-Time User Chat (side panel)" section between
+    "Receiving Tasks from Other Agents" and "Task Completion".
+    Tells the agent:
+    - User messages arrive on stdin (same channel as inter-agent
+      messages, no special handling required).
+    - Reply via `browser_emit_to_user(text, kind?)`, not free-form
+      stdout. Stdout reaches debug-mode viewers and other agents
+      but does NOT render as a chat bubble.
+    - `kind: 'final'` (default) → bubble + clears activity
+      indicator; `'progress'` → activity-indicator line only, keeps
+      conversation history clean; `'question'` → dotted-border
+      bubble; agent should then stop and wait for the user's next
+      stdin message.
+    - 64 KiB text cap (matches the bridge sanitizer in Part 2d).
+    - The tool does NOT count toward `oat agent complete` — when
+      the chat task is done, the agent still emits a final summary
+      via `browser_emit_to_user(kind:'final')` AND runs
+      `oat agent complete`. Prevents silent task-mode drift where
+      the supervisor never sees the completion signal.
+    - When the user's message is "do something on the web",
+      acknowledge with `progress`, do the browser work, then
+      `final` — same shape as a task from another agent.
+
+  Sequencing: this update sits on top of Part 0a's prompt
+  corrections (fetch_url framing, `oat agent complete` shell-
+  command vs tool-name disambiguation). The new section is a
+  sibling of the existing "Receiving Tasks from Other Agents" —
+  no duplicated text. Mode-independent: assistant-mode (Part 5)
+  also wants `browser_emit_to_user` for user-facing replies, so
+  Part 5's prompt refactor won't need to change this section.
+
+  Verification: `go test ./internal/templates/` passes (the
+  embed validates that `browser.md` exists and is non-empty;
+  there's no automated content check, but the markdown change
+  is plain text inside the `//go:embed` glob — nothing about the
+  edit could break the embed).
+
 ### Added
 
 - **`stream_agent_output` socket verb + raw byte chunk broadcaster (Part 2c).**

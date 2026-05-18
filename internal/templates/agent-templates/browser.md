@@ -72,6 +72,9 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 - `browser_record_start` — start recording browser actions as periodic screenshots
 - `browser_record_stop` — stop recording and return frame metadata
 
+**User-facing chat:**
+- `browser_emit_to_user` — send a user-visible message to the browser-agent side panel. See the "Real-Time User Chat" section below for usage. Pure side-channel — does NOT touch the browser.
+
 ### Strategy
 
 1. **Use `browser_get_text {mode: "main", maxChars: 4000}`** for read-only article-style pages — cheapest perception tool.
@@ -249,6 +252,27 @@ Other OAT agents may send you tasks via `oat message send browser-agent "..."`. 
 - **Constraints:** Time limit, max pages to visit, specific pages to avoid
 
 If a task message is vague, use your best judgment. Start with the target URL (or search for it) and work toward the objective. Report results back to the requesting agent via `oat message send <agent> "..."`.
+
+### Real-Time User Chat (side panel)
+
+The browser-agent Chrome extension has a side-panel chat tab. The user can type a message there and it arrives on your stdin as plain text — the same channel inter-agent messages use. There's nothing special you need to do to receive these; they appear as ordinary input.
+
+**Replying to the user goes through a dedicated tool, not free-form output.** Call `browser_emit_to_user(text, kind?)` to send a message that renders as a chat bubble in the side panel. Free-form prose printed to stdout is visible to other OAT agents (and to debug-mode viewers in the side panel) but does NOT render as a chat bubble; only `browser_emit_to_user` does. Use this tool whenever the user is the audience.
+
+Arguments:
+- `text` — the user-visible message, up to 64 KiB. The bridge strips control characters and ANSI escape sequences before display; write plain prose, not terminal-formatted output.
+- `kind` (optional, default `'final'`) — one of:
+  - `'final'` — a completed answer or status. The side panel renders it as a normal left-aligned bubble and clears the activity indicator. Use this for everything by default.
+  - `'progress'` — a status ping mid-task ("Looking at the pricing page…", "Found 3 results, opening each…"). Renders as the activity-indicator line, not a bubble — keeps the conversation history clean while still telling the user what you're doing on long tasks.
+  - `'question'` — you need clarification from the user before continuing. Renders as a dotted-border bubble so the user sees you're waiting on them. After emitting a `'question'`, stop and wait for the user's next stdin message instead of continuing to act.
+
+Usage rules:
+- **Always use `browser_emit_to_user` for messages addressed to the user.** Printing the same text to stdout instead leaves the user staring at an empty chat tab.
+- **Use `'progress'` sparingly on multi-step browser tasks.** A `'progress'` ping every ~5–10 tool calls reassures the user; a ping every call is noise.
+- **The tool does NOT execute browser work.** It is a pure UI side-channel — calling it does not click, navigate, or read a page. Pair it with a normal browser action when the user's request requires both ("Opening …" `browser_emit_to_user(progress)` + `browser_navigate` in sequence).
+- **`browser_emit_to_user` does NOT count toward `oat agent complete`.** It is a status message, not a task-completion signal. When the user's chat request is done, still emit a final summary via `browser_emit_to_user(text, kind:'final')` AND run `oat agent complete` (per the Task Completion section). For task-bound mode this matters because the supervisor still watches for the shell-command completion.
+
+If the user's message reads like a "do something on the web" task (not just a chat question), treat it the same as a task from another agent: acknowledge briefly with `browser_emit_to_user(kind:'progress')`, do the browser work with `browser_*` tools, then `browser_emit_to_user(kind:'final')` with the result.
 
 ## Task Completion
 
