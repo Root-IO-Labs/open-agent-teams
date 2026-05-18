@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/tui/views"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
 )
 
@@ -86,6 +87,7 @@ type App struct {
 	input    textinput.Model
 	filter   *OutputFilter
 	renderer *LineRenderer
+	planner  *views.PlannerView
 
 	// Output streaming
 	streams        map[string]OutputStreamI
@@ -129,15 +131,17 @@ func NewApp(socketPath, repoName string, paths *config.Paths) *App {
 	ti.Width = 80
 
 	filter := NewOutputFilter(DefaultFilterConfig())
+	client := socket.NewClient(socketPath)
 	return &App{
 		socketPath:     socketPath,
 		repoName:       repoName,
 		paths:          paths,
-		client:         socket.NewClient(socketPath),
+		client:         client,
 		filter:         filter,
 		renderer:       NewLineRenderer(filter, 80),
 		filterEnabled:  true,
 		input:          ti,
+		planner:        views.NewPlannerView(client, repoName),
 		streams:        make(map[string]OutputStreamI),
 		streamMode:     make(map[string]string),
 		eventStreams:   make(map[string]*EventStream),
@@ -189,6 +193,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.width = msg.Width
 		a.height = msg.Height
 		a.recalcLayout()
+		// Forward to PlannerView so its width/height get set; otherwise
+		// PlannerView.View() returns the "Initializing planner..." placeholder
+		// because its size check (width<=0 || height<=0) never passes.
+		if a.planner != nil {
+			a.planner, _ = a.planner.Update(msg)
+		}
 		return a, nil
 
 	case tickMsg:
@@ -286,6 +296,16 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Sync worker completions to planner view so execution progress shows.
+		if a.planner != nil && msg.daemonOK {
+			for _, ag := range msg.agents {
+				if ag.Type == "worker" && ag.Waiting {
+					// Worker submitted a PR — update task status
+					a.planner.UpdateWorkerStatus(ag.Name, 0, false)
+				}
+			}
+		}
+
 		// If no active agent set, default to workspace/supervisor (the primary agent)
 		if a.activeAgent == "" {
 			for _, ag := range a.agents {
@@ -397,6 +417,41 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.renderer.InvalidateCacheFromIndex(msg.agent, replacedIdx)
 		}
 
+		// When workspace receives daemon worker-completion events, also update
+		// the planner's execution progress view.
+		if msg.agent == "workspace" || msg.agent == "default" {
+			if a.planner != nil {
+				for _, line := range msg.lines {
+					a.notifyPlannerOfDaemonEvent(line)
+				}
+			}
+		}
+
+		// Forward new planner agent lines to the PlannerView for JSON parsing.
+		// Also filter ```json...``` fence blocks OUT of outputContent so the
+		// viewport never shows raw JSON — the parsed message field is the
+		// intended user-facing content.
+		if msg.agent == "planner" && a.planner != nil && len(result) > prevLen {
+			newLines := result[prevLen:]
+			newTypes := types
+			if len(newTypes) > prevLen {
+				newTypes = newTypes[prevLen:]
+			} else {
+				newTypes = nil
+			}
+			a.planner.ReceiveOutput(newLines, newTypes)
+
+			// Strip ```json...``` blocks from stored output so the viewport
+			// shows only plain-text planner output, not raw JSON responses.
+			filtered, filteredTypes := filterPlannerJSONFences(
+				a.outputContent["planner"], a.outputTypes["planner"])
+			if len(filtered) != len(a.outputContent["planner"]) {
+				a.outputContent["planner"] = filtered
+				a.outputTypes["planner"] = filteredTypes
+				a.renderer.InvalidateCacheForAgent("planner")
+			}
+		}
+
 		// Detect activity events from new lines for the activity log
 		activities := detectActivity(msg.agent, msg.lines)
 		if len(activities) > 0 {
@@ -471,7 +526,24 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.handleKey(msg)
 	}
 
-	// Update sub-components
+	// Dispatch planner-originated async messages (sent/dispatched/error/tick)
+	// so the planner can drive its thinking-spinner state without owning the
+	// full bubbletea Update loop.
+	if a.planner != nil && views.IsPlannerMsg(msg) {
+		if cmd := a.planner.HandleStreamMsg(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		// When the planner is the active agent, redraw the viewport so the
+		// thinking spinner / new feedback entries appear immediately.
+		if a.activeAgent == "planner" {
+			a.updateViewport()
+		}
+		return a, tea.Batch(cmds...)
+	}
+
+	// Update text input only when it owns the focus. In agent-list mode the
+	// cursor is in the sidebar; for the planner the standard input bar is
+	// still used (no separate view).
 	if a.mode != ViewAgentList {
 		var cmd tea.Cmd
 		a.input, cmd = a.input.Update(msg)
@@ -482,12 +554,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// Global keys that always work
-	switch {
-	case key.Matches(msg, keys.Quit):
+	// Quit takes absolute priority so the user can always exit.
+	if key.Matches(msg, keys.Quit) {
 		a.cleanup()
 		return a, tea.Quit
+	}
 
+	// Planner-specific shortcuts. Intercepted BEFORE the global handler so
+	// keys like ^x (which is otherwise the global Interrupt binding) and
+	// ^r (otherwise ToggleReadOnly) can drive planner actions when the
+	// planner is active. The planner returns handled=false for keys it has
+	// no current use for (e.g., ^x outside StateReviewingPlan), letting the
+	// global handler take over and preserving Interrupt-while-thinking.
+	if a.activeAgent == "planner" && a.planner != nil && a.mode != ViewAgentList {
+		if handled, cmd := a.planner.HandleAppShortcut(msg); handled {
+			a.updateViewport()
+			return a, cmd
+		}
+	}
+
+	// Global keys that always work
+	switch {
 	case key.Matches(msg, keys.TogglePanel):
 		a.showAgentList = !a.showAgentList
 		if a.showAgentList {
@@ -590,6 +677,24 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, keys.NewWorker):
 		a.statusMsg = "Use: oat work \"task description\" (from CLI)"
 		return a, nil
+
+	case key.Matches(msg, keys.OpenPlanner):
+		// Route through the same path as selecting the planner row from the
+		// sidebar list so activeAgent and agentIndex stay consistent. The
+		// planner now uses the shared chrome (ViewWorkspace mode), so esc
+		// returns to the workspace agent just like for any primary agent.
+		a.switchToAgent("planner")
+		a.mode = a.modeForAgent("planner")
+		a.showAgentList = false
+		a.input.Focus()
+		for i, ag := range a.agents {
+			if ag.Name == "planner" {
+				a.agentIndex = i
+				break
+			}
+		}
+		a.recalcLayout()
+		return a, nil
 	}
 
 	// Agent list navigation
@@ -664,6 +769,26 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		text := strings.TrimSpace(a.input.Value())
 		if text != "" {
 			a.input.SetValue("")
+			// Planner gets a distinct path: it owns its own conversation
+			// buffer and contextual-intent detection, and the daemon planner
+			// agent receives a phase-prefixed message via sendToPlanner.
+			// We must NOT also push the raw text through the standard
+			// outputContent / sendInput pipeline — that would duplicate the
+			// message and bypass the planner state machine.
+			if a.activeAgent == "planner" && a.planner != nil {
+				cmd := a.planner.HandleAppInput(text)
+				a.input.Placeholder = a.planner.PlaceholderText()
+				// Suppress PTY echo: add to recentInputs same as other agents
+				now := time.Now()
+				a.pruneRecentInputs(now)
+				a.recentInputs = append(a.recentInputs, recentInput{text: text, sentAt: now})
+				if len(a.recentInputs) > 5 {
+					a.recentInputs = a.recentInputs[len(a.recentInputs)-5:]
+				}
+				a.autoScroll["planner"] = true
+				a.updateViewport()
+				return a, cmd
+			}
 			// Track input for PTY echo suppression (keep last 5)
 			now := time.Now()
 			a.pruneRecentInputs(now)
@@ -936,9 +1061,13 @@ func (a *App) renderAgentList(width, height int) string {
 			typeLine = string(typeRunes[:width-5]) + "..."
 		}
 
-		// Build summary line
+		// Build summary line — for the planner row, use the PlannerView's own
+		// live summary (state machine + thinking indicator) instead of the
+		// stale daemon-provided TaskSummary.
 		summary := ag.TaskSummary
-		if summary == "" && ag.Task != "" {
+		if ag.Name == "planner" && a.planner != nil {
+			summary = a.planner.SummaryForList()
+		} else if summary == "" && ag.Task != "" {
 			summary = ag.Task
 			summaryRunes := []rune(summary)
 			if len(summaryRunes) > 50 {
@@ -1099,6 +1228,28 @@ func (a *App) renderInputBar() string {
 }
 
 func (a *App) renderHelp() string {
+	// When the planner is the active agent its phase-specific shortcuts
+	// (^p extract, ^a approve, etc.) take priority over the generic help
+	// line so the user sees what they can actually do right now.
+	if a.activeAgent == "planner" && a.planner != nil && a.mode != ViewAgentList {
+		hints := a.planner.HelpHints()
+		var help string
+		if a.width < 80 {
+			if hints != "" {
+				help = hints + "  •  tab:agents  esc:back"
+			} else {
+				help = "tab:agents  esc:back  ^c:quit"
+			}
+		} else {
+			if hints != "" {
+				help = hints + "  •  tab:agents  esc:workspace  ^c:quit"
+			} else {
+				help = "tab:agents  esc:workspace  ^l:planner  ^c:quit"
+			}
+		}
+		return styleHelp.Width(a.width).MaxWidth(a.width).MaxHeight(1).Render("  " + help)
+	}
+
 	// Full and short variants for narrow terminals
 	var help string
 	switch a.mode {
@@ -1116,9 +1267,9 @@ func (a *App) renderHelp() string {
 		}
 	default:
 		if a.width < 70 {
-			help = "tab:agents  esc:back  ^e:expand  ^f:filter  ^c:quit"
+			help = "tab:agents  ^l:planner  ^e:expand  ^f:filter  ^c:quit"
 		} else {
-			help = "tab:agents  esc:workspace  ^o:log  ^e:expand  ^f:filter  ^x:interrupt  ^c:quit"
+			help = "tab:agents  esc:workspace  ^l:planner  ^o:log  ^e:expand  ^f:filter  ^x:interrupt  ^c:quit"
 		}
 	}
 	return styleHelp.Width(a.width).MaxWidth(a.width).MaxHeight(1).Render("  " + help)
@@ -1211,17 +1362,24 @@ func (a *App) switchToAgent(name string) {
 		a.autoScroll[name] = true
 	}
 
-	// Update input placeholder
-	for _, ag := range a.agents {
-		if ag.Name == name {
-			if isPrimaryAgent(ag.Type) {
-				a.input.Placeholder = fmt.Sprintf("Talk to %s agent...", ag.Type)
-				a.readOnly = false
-			} else {
-				a.input.Placeholder = fmt.Sprintf("Talk to %s...", name)
-				a.readOnly = false
+	// Update input placeholder. The planner has its own phase-aware
+	// placeholder (e.g. "Reply, or say 'done' to advance...") supplied
+	// by PlaceholderText so the input bar reflects the current state.
+	if name == "planner" && a.planner != nil {
+		a.input.Placeholder = a.planner.PlaceholderText()
+		a.readOnly = false
+	} else {
+		for _, ag := range a.agents {
+			if ag.Name == name {
+				if isPrimaryAgent(ag.Type) {
+					a.input.Placeholder = fmt.Sprintf("Talk to %s agent...", ag.Type)
+					a.readOnly = false
+				} else {
+					a.input.Placeholder = fmt.Sprintf("Talk to %s...", name)
+					a.readOnly = false
+				}
+				break
 			}
-			break
 		}
 	}
 
@@ -1240,6 +1398,14 @@ func (a *App) syncViewportWithAutoScroll(agentName string) {
 }
 
 func (a *App) modeForAgent(name string) ViewMode {
+	// Planner uses the shared chrome (status bar, sidebar, viewport, input),
+	// with planner-specific content rendered inside the viewport and planner
+	// shortcuts intercepted before the global key handler. Treat it as a
+	// primary agent here so the input bar stays focused and tab/sidebar
+	// navigation works without first pressing Escape.
+	if name == "planner" {
+		return ViewWorkspace
+	}
 	for _, ag := range a.agents {
 		if ag.Name == name && isPrimaryAgent(ag.Type) {
 			return ViewWorkspace
@@ -1274,7 +1440,7 @@ func (a *App) activityPanelWidth() int {
 // isPrimaryAgent returns true for agent types that act as the main orchestrator.
 func isPrimaryAgent(agentType string) bool {
 	switch agentType {
-	case "workspace", "supervisor":
+	case "workspace", "supervisor", "planner":
 		return true
 	}
 	return false
@@ -1285,6 +1451,8 @@ func isPrimaryAgent(agentType string) bool {
 // primary agents at top, infrastructure next, then workers and transient agents.
 func agentTypePriority(agentType string) int {
 	switch agentType {
+	case "planner":
+		return -1
 	case "workspace":
 		return 0
 	case "supervisor":
@@ -1636,6 +1804,18 @@ func (a *App) interruptAgent(agent string) tea.Cmd {
 var thinkingSpinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 func (a *App) renderContentForViewport(agent string) string {
+	// Planner: use the clean conversation display from RenderEmbeddedContent.
+	// This shows extracted message fields and user input — not raw PTY output.
+	// The standard viewport still accumulates raw output (for JSON parsing via
+	// ReceiveOutput) but RenderEmbeddedContent is the user-facing display.
+	if agent == "planner" && a.planner != nil {
+		w := a.viewport.Width
+		if w <= 0 {
+			w = a.width
+		}
+		return a.planner.RenderEmbeddedContent(w-2, a.viewportHeight())
+	}
+
 	lines, ok := a.outputContent[agent]
 	if !ok || len(lines) == 0 {
 		msg := fmt.Sprintf("\n  %s  %s\n\n  Waiting for output from %s...\n",
@@ -1669,6 +1849,50 @@ func (a *App) renderContentForViewport(agent string) string {
 // thinkingIndicator returns a subtle "processing..." line when the agent is alive
 // and actively working but hasn't produced output recently. Returns empty string
 // if the agent is dead, waiting, or has been idle too long.
+// notifyPlannerOfDaemonEvent scans a daemon message line for worker completion
+// or PR submission events and updates the planner's execution progress.
+func (a *App) notifyPlannerOfDaemonEvent(line string) {
+	if a.planner == nil {
+		return
+	}
+	// Match: [daemon] Worker 'gentle-whale' has completed...
+	// Match: [daemon] Worker 'gentle-whale' has submitted PR #3...
+	if !strings.Contains(line, "[daemon] Worker") {
+		return
+	}
+
+	// Extract worker name between single quotes
+	start := strings.Index(line, "'")
+	end := strings.LastIndex(line, "'")
+	if start < 0 || end <= start {
+		return
+	}
+	workerName := line[start+1 : end]
+	if workerName == "" {
+		return
+	}
+
+	prNum := 0
+	completed := strings.Contains(line, "has completed") || strings.Contains(line, "auto-completed")
+
+	// Extract PR number if present
+	if idx := strings.Index(line, "PR #"); idx >= 0 {
+		rest := line[idx+4:]
+		for i, c := range rest {
+			if c < '0' || c > '9' {
+				if i > 0 {
+					if n, err := fmt.Sscanf(rest[:i], "%d", &prNum); err == nil && n == 1 {
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+
+	a.planner.UpdateWorkerStatus(workerName, prNum, completed)
+}
+
 func (a *App) thinkingIndicator(agent string) string {
 	// Only show for alive, non-waiting agents
 	var agentInfo *AgentInfo
@@ -1739,6 +1963,12 @@ func (a *App) thinkingIndicator(agent string) string {
 func (a *App) updateViewport() {
 	a.viewport.SetContent(a.renderContentForViewport(a.activeAgent))
 	a.syncViewportWithAutoScroll(a.activeAgent)
+	// Keep the input bar placeholder in sync with the planner's current
+	// phase so the hint ("Type 'approve'...", "Reply, or say 'done'...")
+	// reflects state advanced by the most recent stream batch.
+	if a.activeAgent == "planner" && a.planner != nil {
+		a.input.Placeholder = a.planner.PlaceholderText()
+	}
 }
 
 // --- Helpers ---

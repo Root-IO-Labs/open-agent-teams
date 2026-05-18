@@ -2692,6 +2692,15 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 			} else {
 				d.logger.Info("Sent completion notification to merge-queue for worker %s", agentName)
 			}
+
+			workspaceMessage := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Worker '%s' has completed. Supervisor and merge-queue have been notified.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMessage); err != nil {
+				d.logger.Warn("Failed to send completion message to workspace (may not be running): %v", err)
+			} else {
+				d.logger.Info("Sent completion notification to workspace for worker %s", agentName)
+			}
+
 		case state.AgentTypeReview:
 			mergeQueueMessage := d.withRepoSnapshot(repoName, state.AgentTypeMergeQueue,
 				fmt.Sprintf("[daemon] Review agent '%s' has completed its review. Check the review summary and decide on next steps.", agentName))
@@ -2700,6 +2709,13 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 			} else {
 				d.logger.Info("Sent completion notification to merge-queue for review agent %s", agentName)
 			}
+
+			workspaceMessage := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Review agent '%s' has completed its review.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMessage); err != nil {
+				d.logger.Warn("Failed to send completion message to workspace (may not be running): %v", err)
+			}
+
 		case state.AgentTypeVerification:
 			// Notify supervisor that verification completed
 			supervisorMessage := d.withRepoSnapshot(repoName, state.AgentTypeSupervisor,
@@ -2708,6 +2724,12 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 				d.logger.Error("Failed to send completion message to supervisor: %v", err)
 			} else {
 				d.logger.Info("Sent completion notification to supervisor for verification agent %s", agentName)
+			}
+
+			workspaceMessage := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Verification agent '%s' has completed. The worker has received its verdict.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMessage); err != nil {
+				d.logger.Warn("Failed to send completion message to workspace (may not be running): %v", err)
 			}
 		}
 
@@ -3233,16 +3255,27 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 
 		args := []string{"--auto-approve"}
 
-		// Re-validate the model against the current profile store and repo
-		// allowlist. Without this, startRegisteredAgent restored agents with
-		// models that may since have been un-onboarded or disallowed — the
-		// "silent bypass" identified in the routing live-test audit.
-		// Validation errors are non-fatal here: the agent still starts with
-		// its historical model (operator visibility wins over refusal for
-		// restore paths), but the WARN gives the operator a trail.
+		// Resolve model for this agent. Priority:
+		//   1. agent.Model (explicit model stored at registration)
+		//   2. repo.Model  (repo-wide default)
+		//   3. auto-routing via profile store (same logic as startAgentWithConfig)
+		//
+		// Without step 3, core agents (workspace, supervisor, merge-queue,
+		// planner) with no stored model receive no -M flag and Claude Code
+		// falls back to whatever its own default is — which may be a local or
+		// unavailable model on this machine. Auto-routing always picks the
+		// best onboarded, eligible model.
 		resolvedModel := agent.Model
 		if resolvedModel == "" {
 			resolvedModel = repo.Model
+		}
+		if resolvedModel == "" {
+			// No stored model — auto-select via routing so core agents always
+			// get a known-good model rather than Claude Code's own default.
+			if bestModel, _, routeErr := d.resolveAndValidateModelWithSource("", "", agent.Type, repo.AllowedWorkerModels); routeErr == nil && bestModel != "" {
+				resolvedModel = bestModel
+				d.logger.Info("Model routing: auto-selected %s for %s/%s (no stored model)", resolvedModel, repoName, agentName)
+			}
 		}
 		if resolvedModel != "" {
 			if vErr := d.validateModelForAgentType(resolvedModel, agent.Type, repo.AllowedWorkerModels); vErr != nil {
@@ -3454,6 +3487,11 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 			if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mergeQueueMsg); err != nil {
 				d.logger.Error("Failed to send auto-complete notification to merge-queue: %v", err)
 			}
+			workspaceMsg := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+				fmt.Sprintf("[daemon] Worker '%s' auto-completed without a PR.", agentName))
+			if _, err := msgMgr.Send(repoName, "daemon", "workspace", workspaceMsg); err != nil {
+				d.logger.Warn("Failed to send auto-complete notification to workspace: %v", err)
+			}
 			d.triggerRouteMessages()
 		}
 		d.safeGo("health-check-auto-complete", d.checkAgentHealth)
@@ -3568,6 +3606,11 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 			fmt.Sprintf("[daemon] Worker '%s' has submitted PR #%d. Please check and merge when CI is green.", agentName, agent.PRNumber))
 		if _, err := msgMgr.Send(repoName, "daemon", "merge-queue", mqMsg); err != nil {
 			d.logger.Error("Failed to notify merge-queue about dormant worker %s/%s: %v", repoName, agentName, err)
+		}
+		wsMsg := d.withRepoSnapshot(repoName, state.AgentTypeWorkspace,
+			fmt.Sprintf("[daemon] Worker '%s' has submitted PR #%d and is waiting for CI + merge.", agentName, agent.PRNumber))
+		if _, err := msgMgr.Send(repoName, "daemon", "workspace", wsMsg); err != nil {
+			d.logger.Warn("Failed to notify workspace about PR submission for worker %s/%s: %v", repoName, agentName, err)
 		}
 		d.triggerRouteMessages()
 	}
@@ -4714,15 +4757,26 @@ func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) erro
 		mqConfig = state.DefaultMergeQueueConfig()
 	}
 
-	// Start supervisor agent — do this BEFORE clearing stale agents so we
-	// don't leave the repo with zero agents if supervisor startup fails.
+	// Clear ALL stale agents from state before restarting them. startAgent
+	// calls AddAgent internally, which fails with "already exists" if the
+	// agent is still registered from before the session died. Removing first
+	// lets startAgent register fresh entries.
+	for agentName := range repo.Agents {
+		d.logger.Debug("Removing stale agent %s/%s from state before restore", repoName, agentName)
+		if err := d.state.RemoveAgent(repoName, agentName); err != nil {
+			d.logger.Warn("Failed to remove stale agent %s/%s: %v", repoName, agentName, err)
+		}
+	}
+
+	// Start supervisor first — if it fails, abort so we don't end up with
+	// a repo that has merge-queue/workspace but no supervisor.
 	if err := d.startAgent(repoName, repo, "supervisor", state.AgentTypeSupervisor, supervisorWtPath); err != nil {
-		d.logger.Error("Failed to start supervisor for %s: %v (keeping stale agents in state for retry)", repoName, err)
+		d.logger.Error("Failed to start supervisor for %s: %v", repoName, err)
 		return fmt.Errorf("failed to start supervisor: %w", err)
 	}
 
-	// Supervisor started successfully — now safe to clear stale agents
-	// (the new supervisor was already added to state by startAgent).
+	// Supervisor started successfully — clear any residual agents that
+	// startAgent may have left in a partial state (defensive).
 	for agentName := range repo.Agents {
 		if agentName == "supervisor" {
 			continue // just started this one
@@ -5080,7 +5134,9 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 	var modelErr error
 
 	v2Enabled := os.Getenv("OAT_ROUTER_VERSION") == "v2"
-	v1Enabled := os.Getenv("OAT_ROUTING_V1") == "1" || v2Enabled // V2 requires the V1 stack
+	// V1 complexity routing is ON by default for workers. Opt out with OAT_ROUTING_V1=0.
+	// V2 (historical lookup) is still opt-in via OAT_ROUTER_VERSION=v2.
+	v1Enabled := os.Getenv("OAT_ROUTING_V1") != "0" || v2Enabled
 	routerEligible := v1Enabled &&
 		cfg.agentType == state.AgentTypeWorker &&
 		cfg.model == "" &&
@@ -5839,7 +5895,8 @@ func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoMod
 
 	role := routing.RoleWorker
 	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace ||
-		agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd {
+		agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd ||
+		agentType == state.AgentTypePlanner {
 		role = routing.RoleOrchestrator
 	}
 

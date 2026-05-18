@@ -31,9 +31,9 @@ func TestGenerateModelRoster(t *testing.T) {
 		t.Error("restricted model should not appear in roster")
 	}
 
-	// Should contain guidelines
-	if !strings.Contains(roster, "MUST distribute") {
-		t.Error("missing distribution directive in guidelines")
+	// Should contain guidelines with key restriction notice
+	if !strings.Contains(roster, "Only use models in the table above") {
+		t.Error("missing key restriction notice in guidelines")
 	}
 }
 

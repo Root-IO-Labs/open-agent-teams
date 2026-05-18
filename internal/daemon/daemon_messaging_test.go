@@ -125,7 +125,6 @@ func TestWithRepoSnapshot_NonTarget_Passthrough(t *testing.T) {
 
 	for _, target := range []state.AgentType{
 		state.AgentTypeWorker,
-		state.AgentTypeWorkspace,
 		state.AgentTypeVerification,
 		state.AgentTypePRShepherd,
 		state.AgentTypeReview,
@@ -462,12 +461,12 @@ func TestFormatPRLineMergeQueue_NewlineInFieldDoesNotEscapeSection(t *testing.T)
 }
 
 func TestIsSnapshotTarget(t *testing.T) {
-	// Whitelist check: sup + mq only.
+	// Whitelist check: supervisor, merge-queue, and workspace get snapshots.
 	cases := map[state.AgentType]bool{
 		state.AgentTypeSupervisor:        true,
 		state.AgentTypeMergeQueue:        true,
+		state.AgentTypeWorkspace:         true,
 		state.AgentTypeWorker:            false,
-		state.AgentTypeWorkspace:         false,
 		state.AgentTypeVerification:      false,
 		state.AgentTypePRShepherd:        false,
 		state.AgentTypeReview:            false,

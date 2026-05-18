@@ -2320,6 +2320,45 @@ func (c *CLI) initRepo(args []string) error {
 		return fmt.Errorf("failed to register default workspace: %s", resp.Error)
 	}
 
+	// Create planner worktree
+	plannerWtPath := c.paths.AgentWorktree(repoName, "planner")
+	fmt.Printf("Creating planner worktree at: %s\n", plannerWtPath)
+	if err := wtMgr.CreateDetached(plannerWtPath, "HEAD"); err != nil {
+		return fmt.Errorf("failed to create planner worktree: %w", err)
+	}
+	// Match supervisor/merge-queue/pr-shepherd: a missing "main" branch is a
+	// warning, not fatal. Repos using "master" (or other default branch names)
+	// still get a working planner worktree at the detached HEAD.
+	if err := wtMgr.CheckoutBranch(plannerWtPath, "main"); err != nil {
+		fmt.Printf("Warning: failed to checkout main in planner worktree: %v\n", err)
+	}
+
+	// Select the best available model for the planner (prefers Anthropic for
+	// reasoning quality). Falls back silently so init never fails on this.
+	plannerModel, _ := routing.GetModelForTask("planner")
+
+	// Add planner agent
+	addPlannerArgs := map[string]interface{}{
+		"repo":          repoName,
+		"agent":         "planner",
+		"type":          "planner",
+		"worktree_path": plannerWtPath,
+		"window_name":   "planner",
+	}
+	if plannerModel != "" {
+		addPlannerArgs["model"] = plannerModel
+	}
+	resp, err = client.Send(socket.Request{
+		Command: "add_agent",
+		Args:    addPlannerArgs,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to register planner: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("failed to register planner: %s", resp.Error)
+	}
+
 	// Ask the daemon to create the backend session and start all agents.
 	// The daemon owns the backend, so agent processes survive CLI exit.
 	// Forward relevant env vars so agents inherit tokens even when the
@@ -2360,9 +2399,9 @@ func (c *CLI) initRepo(args []string) error {
 	fmt.Println("✓ Repository initialized successfully!")
 	fmt.Printf("  Session: %s\n", sessionName)
 	if mqEnabled {
-		fmt.Printf("  Agents: supervisor, merge-queue, default (workspace)\n")
+		fmt.Printf("  Agents: supervisor, merge-queue, planner, default (workspace)\n")
 	} else {
-		fmt.Printf("  Agents: supervisor, default (workspace)\n")
+		fmt.Printf("  Agents: supervisor, planner, default (workspace)\n")
 	}
 	fmt.Printf("\nMonitor agents: oat ui --repo %s\n", repoName)
 	fmt.Printf("Or tail one agent: oat attach <agent-name> --repo %s\n", repoName)
@@ -8929,9 +8968,45 @@ func (c *CLI) printOnboardSummary(modelStr, probeSet, stderr string) {
 func (c *CLI) modelList(args []string) error {
 	profileDirs := c.modelProfileDirs()
 
+	// Use directory origin as the availability signal.
+	//
+	// The daemon only loads profiles from ~/.oat/model-profiles/ — models
+	// there have been explicitly onboarded on THIS machine (oat model onboard
+	// actually tested them, so they definitely work). Profiles from the
+	// bundled model-routing/profiles/ directory are reference templates for
+	// other setups and have NOT been validated here.
+	//
+	// This avoids brittle env-var name guessing that breaks when users store
+	// credentials differently (e.g. ANTHROPIC_API_KEY vs CLAUDE_API_KEY vs
+	// set via a credentials helper).
+	home, _ := os.UserHomeDir()
+	userProfileDir := ""
+	if home != "" {
+		userProfileDir = filepath.Join(home, ".oat", "model-profiles")
+	}
+
+	// First pass: collect which models are in the user's onboarded dir.
+	onboarded := make(map[string]bool)
+	if userProfileDir != "" {
+		if entries, err := os.ReadDir(userProfileDir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() && strings.HasSuffix(e.Name(), ".yaml") {
+					data, err := os.ReadFile(filepath.Join(userProfileDir, e.Name()))
+					if err == nil {
+						fields := parseYAMLFlat(string(data))
+						if id := fields["model_id"]; id != "" {
+							onboarded[id] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
 	seen := make(map[string]bool)
-	fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n", "MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR")
-	fmt.Println(strings.Repeat("─", 84))
+	fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-12s\n",
+		"MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR", "AVAILABLE")
+	fmt.Println(strings.Repeat("─", 99))
 
 	for _, profileDir := range profileDirs {
 		entries, err := os.ReadDir(profileDir)
@@ -8956,18 +9031,35 @@ func (c *CLI) modelList(args []string) error {
 			if orchEligible == "" {
 				orchEligible = fields["supervisor_eligible"]
 			}
-			fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n",
+
+			// A model is available if it has been onboarded on this machine.
+			// Onboarding runs actual capability probes, so if it succeeded the
+			// credentials and endpoint are confirmed working.
+			avail := "✓ onboarded"
+			if !onboarded[modelID] {
+				avail = "— not onboarded"
+			}
+
+			fmt.Printf("%-40s %-12s %-8s %-10s %-12s %-12s\n",
 				modelID,
 				fields["status"],
 				fields["overall_score"],
 				fields["worker_eligible"],
 				orchEligible,
+				avail,
 			)
 		}
 	}
 
 	if len(seen) == 0 {
-		fmt.Println("No model profiles found. Run: oat model onboard <provider:model>")
+		fmt.Println("No model profiles found.")
+	}
+
+	if len(onboarded) == 0 {
+		fmt.Println("\nNo models onboarded yet. Run: oat model onboard <provider:model>")
+		fmt.Println("Example: oat model onboard anthropic:claude-haiku-4-5")
+	} else {
+		fmt.Printf("\n%d model(s) onboarded on this machine (✓). Others require onboarding before use.\n", len(onboarded))
 	}
 	return nil
 }

@@ -16,6 +16,7 @@ func TestListAgentTemplates(t *testing.T) {
 	expected := map[string]bool{
 		"agent-builder.md": true,
 		"merge-queue.md":   true,
+		"overlord.md":      true,
 		"pr-shepherd.md":   true,
 		"worker.md":        true,
 		"reviewer.md":      true,
