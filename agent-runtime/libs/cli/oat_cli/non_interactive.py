@@ -28,6 +28,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -793,6 +794,7 @@ async def run_non_interactive(
     profile_override: dict[str, Any] | None = None,
     quiet: bool = False,
     stream: bool = True,
+    excluded_tools: set[str] | None = None,
 ) -> int:
     """Run a single task non-interactively and exit.
 
@@ -902,9 +904,34 @@ async def run_non_interactive(
 
     try:
         async with get_checkpointer() as checkpointer:
-            tools = [http_request, fetch_url]
+            # Normalize the deny set. See the symmetric block in
+            # oat_cli/main.py:run_textual_cli_async for the full
+            # rationale; the OAT daemon's browser-agent spawn appends
+            # --deny-tool task/http_request/fetch_url/compact_conversation.
+            denied: frozenset[str] = (
+                frozenset(excluded_tools) if excluded_tools else frozenset()
+            )
+            if denied:
+                logger.warning(
+                    "Tool deny list active for this agent: %s",
+                    sorted(denied),
+                )
+
+            def _name_of(t: Any) -> str | None:
+                name = getattr(t, "name", None)
+                if isinstance(name, str) and name:
+                    return name
+                if isinstance(t, dict):
+                    n = t.get("name")
+                    if isinstance(n, str) and n:
+                        return n
+                fn_name = getattr(t, "__name__", None)
+                return fn_name if isinstance(fn_name, str) and fn_name else None
+
+            builtin_candidates: list[Any] = [http_request, fetch_url]
             if settings.has_tavily:
-                tools.append(web_search)
+                builtin_candidates.append(web_search)
+            tools = [t for t in builtin_candidates if _name_of(t) not in denied]
 
             # Discover MCP servers declared in <cwd>/.oat/mcp.json. The
             # daemon writes this file at agent spawn time when MCPConfig
@@ -915,13 +942,16 @@ async def run_non_interactive(
             mcp_specs = load_mcp_config(Path.cwd() / ".oat" / "mcp.json")
             builtin_tool_names: set[str] = set()
             for t in tools:
-                name = getattr(t, "name", None) or getattr(t, "__name__", None)
+                name = _name_of(t)
                 if isinstance(name, str):
                     builtin_tool_names.add(name)
             mcp_tools, mcp_stack = await load_mcp_tools(
                 mcp_specs, builtin_tool_names=builtin_tool_names
             )
-            tools = [*tools, *mcp_tools]
+            # Filter MCP tools by the same deny set so a misbehaving
+            # MCP-served tool can be denied without removing its server.
+            filtered_mcp_tools = [t for t in mcp_tools if _name_of(t) not in denied]
+            tools = [*tools, *filtered_mcp_tools]
 
             # SIGTERM handler: the daemon sends SIGTERM when stopping an
             # agent. Cancelling the running task propagates CancelledError
@@ -965,6 +995,7 @@ async def run_non_interactive(
                     enable_shell=enable_shell,
                     enable_skills=not oat_spawned,
                     checkpointer=checkpointer,
+                    excluded_tools=set(denied) if denied else None,
                 )
 
                 file_op_tracker = FileOpTracker(

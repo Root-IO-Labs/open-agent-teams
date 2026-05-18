@@ -105,6 +105,9 @@ def show_help() -> None:
     console.print(
         "  --shell-allow-list CMDS    Comma-separated local shell commands to allow"
     )
+    console.print(
+        "  --deny-tool NAME           Hide a tool from the agent (repeatable; e.g. task)"
+    )
     console.print("  --default-model [MODEL]    Set, show, or manage the default model")
     console.print("  --clear-default-model      Clear the default model")
     console.print("  -v, --version              Show oat-agent CLI and SDK versions")

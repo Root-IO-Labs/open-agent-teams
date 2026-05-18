@@ -131,7 +131,30 @@ def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
     return init_chat_model(model)
 
 
-def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic with many conditional branches
+def _tool_name(tool: Any) -> str | None:
+    """Return the canonical name of a tool, for excluded_tools matching.
+
+    Tools come in three flavours in this SDK:
+      - `BaseTool` instances (have `.name`)
+      - bare Python callables (use `__name__`)
+      - tool spec dicts from LangChain (have a `name` key)
+    Returns ``None`` for shapes we cannot classify; the caller treats
+    unknown shapes as "not on the deny list" rather than dropping them.
+    """
+    name = getattr(tool, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    if isinstance(tool, dict):
+        n = tool.get("name")
+        if isinstance(n, str) and n:
+            return n
+    fn_name = getattr(tool, "__name__", None)
+    if isinstance(fn_name, str) and fn_name:
+        return fn_name
+    return None
+
+
+def create_oat_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly logic with many conditional branches
     model: str | BaseChatModel | None = None,
     tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
     *,
@@ -146,6 +169,7 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
     store: BaseStore | None = None,
     backend: BackendProtocol | BackendFactory | None = None,
     interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
+    excluded_tools: set[str] | None = None,
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache | None = None,
@@ -227,6 +251,28 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
             Pass to pause agent execution at specified tool calls for human approval or modification.
 
             Example: `interrupt_on={"edit_file": True}` pauses before every edit.
+        excluded_tools: Optional set of tool names to remove from the agent's catalog.
+
+            Filters the `tools` parameter by name, and additionally gates:
+
+            - ``"task"`` skips `SubAgentMiddleware` and the synthesized
+              `general_purpose_spec`, removing the subagent-delegation
+              tool entirely. (Mirrors the upstream
+              `GeneralPurposeSubagentProfile(enabled=False)` knob that
+              the oat_sdk fork dropped.)
+
+            Other names match against the `tools` list only (a bare
+            callable's ``__name__``, a `BaseTool`'s ``.name``, or a tool
+            spec dict's ``"name"`` key). The CLI-level
+            ``compact_conversation`` exclusion is handled in
+            ``oat_cli/agent.py`` because that's where
+            `SummarizationToolMiddleware` (which exposes the tool to the
+            LLM) is added — this SDK function only adds the *automatic*
+            summarizer, which stays enabled regardless.
+
+            Used by the OAT daemon's browser-agent and assistant spawn
+            paths to strip tools that don't make sense for those agent
+            types; defense in depth alongside prompt-level guards.
         debug: Whether to enable debug mode. Passed through to `create_agent`.
         name: The name of the agent. Passed through to `create_agent`.
         cache: The cache to use for the agent. Passed through to `create_agent`.
@@ -238,27 +284,61 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
 
     backend = backend if backend is not None else (StateBackend)
 
-    # Build general-purpose subagent with default middleware stack
-    gp_middleware: list[AgentMiddleware[Any, Any, Any]] = [
-        TodoListMiddleware(),
-        FilesystemMiddleware(backend=backend),
-        create_summarization_middleware(model, backend),
-    ]
-    # Only add Anthropic prompt caching middleware for Anthropic models
-    if _is_anthropic_model(model):
-        gp_middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
-    gp_middleware.append(PatchToolCallsMiddleware())
-    if skills is not None:
-        gp_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
-    if interrupt_on is not None:
-        gp_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+    # Normalize the deny set once. Empty set and None are equivalent;
+    # the rest of the function reads `excluded` directly. Keeping a
+    # local var (rather than mutating the argument) makes the gating
+    # branches readable and the function side-effect-free on the input.
+    #
+    # NOTE: only `task` is gated at this layer. `compact_conversation`
+    # gating happens in `oat_cli/agent.py` because the tool that
+    # exposes `compact_conversation` to the LLM is
+    # `SummarizationToolMiddleware`, which is added by the CLI — not
+    # by this SDK function. `create_summarization_middleware` here
+    # adds the *automatic* summarizer (no tool surface) and stays
+    # enabled regardless of `excluded_tools` so context limits still
+    # get managed in long sessions.
+    excluded: frozenset[str] = (
+        frozenset(excluded_tools) if excluded_tools else frozenset()
+    )
+    task_excluded: bool = "task" in excluded
 
-    general_purpose_spec: SubAgent = {  # ty: ignore[missing-typed-dict-key]
-        **GENERAL_PURPOSE_SUBAGENT,
-        "model": model,
-        "tools": tools or [],
-        "middleware": gp_middleware,
-    }
+    # Filter user-provided tools by name. We retain anything whose
+    # name we cannot determine (defensive: an unknown shape is more
+    # likely a third-party tool we should not silently drop than a
+    # smuggled `task`/`compact_conversation` we should).
+    filtered_tools: list[BaseTool | Callable | dict[str, Any]] = []
+    if tools:
+        for t in tools:
+            n = _tool_name(t)
+            if n is None or n not in excluded:
+                filtered_tools.append(t)
+
+    # Build general-purpose subagent with default middleware stack.
+    # Skipped entirely when `task` is excluded: the GP subagent only
+    # exists so the SubAgentMiddleware (also gated below) has something
+    # to dispatch to.
+    general_purpose_spec: SubAgent | None = None
+    if not task_excluded:
+        gp_middleware: list[AgentMiddleware[Any, Any, Any]] = [
+            TodoListMiddleware(),
+            FilesystemMiddleware(backend=backend),
+            create_summarization_middleware(model, backend),
+        ]
+        # Only add Anthropic prompt caching middleware for Anthropic models
+        if _is_anthropic_model(model):
+            gp_middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+        gp_middleware.append(PatchToolCallsMiddleware())
+        if skills is not None:
+            gp_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+        if interrupt_on is not None:
+            gp_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
+
+        general_purpose_spec = {  # ty: ignore[missing-typed-dict-key]
+            **GENERAL_PURPOSE_SUBAGENT,
+            "model": model,
+            "tools": filtered_tools,
+            "middleware": gp_middleware,
+        }
 
     # Process user-provided subagents to fill in defaults for model, tools, and middleware
     processed_subagents: list[SubAgent | CompiledSubAgent] = []
@@ -271,7 +351,7 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
             subagent_model = spec.get("model", model)
             subagent_model = resolve_model(subagent_model)
 
-            # Build middleware: base stack + skills (if specified) + user's middleware
+            # Build middleware: base stack + skills (if specified) + user's middleware.
             subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = [
                 TodoListMiddleware(),
                 FilesystemMiddleware(backend=backend),
@@ -285,18 +365,34 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
                 subagent_middleware.append(SkillsMiddleware(backend=backend, sources=subagent_skills))
             subagent_middleware.extend(spec.get("middleware", []))
 
+            # Filter the per-subagent tools list too (each spec can
+            # override `tools` independently of the main `tools` arg).
+            spec_tools_raw = spec.get("tools", filtered_tools)
+            spec_tools: list[BaseTool | Callable | dict[str, Any]] = []
+            for t in spec_tools_raw or []:
+                n = _tool_name(t)
+                if n is None or n not in excluded:
+                    spec_tools.append(t)
+
             processed_spec: SubAgent = {  # ty: ignore[missing-typed-dict-key]
                 **spec,
                 "model": subagent_model,
-                "tools": spec.get("tools", tools or []),
+                "tools": spec_tools,
                 "middleware": subagent_middleware,
             }
             processed_subagents.append(processed_spec)
 
-    # Combine GP with processed user-provided subagents
-    all_subagents: list[SubAgent | CompiledSubAgent] = [general_purpose_spec, *processed_subagents]
+    # Combine GP (if present) with processed user-provided subagents.
+    all_subagents: list[SubAgent | CompiledSubAgent] = (
+        [general_purpose_spec, *processed_subagents]
+        if general_purpose_spec is not None
+        else list(processed_subagents)
+    )
 
-    # Build main agent middleware stack
+    # Build main agent middleware stack. `SubAgentMiddleware` is the
+    # source of the `task` tool, so we skip it entirely when `task`
+    # is excluded — otherwise it would still register `task` even
+    # with an empty subagent list.
     oat_sdk_middleware: list[AgentMiddleware[Any, Any, Any]] = [
         TodoListMiddleware(),
     ]
@@ -306,12 +402,15 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
         oat_sdk_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
     main_stack: list[AgentMiddleware[Any, Any, Any]] = [
         FilesystemMiddleware(backend=backend),
-        SubAgentMiddleware(
-            backend=backend,
-            subagents=all_subagents,
-        ),
-        create_summarization_middleware(model, backend),
     ]
+    if not task_excluded:
+        main_stack.append(
+            SubAgentMiddleware(
+                backend=backend,
+                subagents=all_subagents,
+            )
+        )
+    main_stack.append(create_summarization_middleware(model, backend))
     if _is_anthropic_model(model):
         main_stack.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
     main_stack.append(PatchToolCallsMiddleware())
@@ -334,7 +433,7 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
     return create_agent(
         model,
         system_prompt=final_system_prompt,
-        tools=tools,
+        tools=filtered_tools,
         middleware=oat_sdk_middleware,
         response_format=response_format,
         context_schema=context_schema,

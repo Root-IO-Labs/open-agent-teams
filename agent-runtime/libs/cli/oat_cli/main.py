@@ -413,6 +413,24 @@ def parse_args() -> argparse.Namespace:
         "Applies to both -n and interactive modes.",
     )
 
+    parser.add_argument(
+        "--deny-tool",
+        action="append",
+        dest="deny_tools",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Remove a tool from the agent's catalog by name (repeatable). "
+            "Filters built-in tools (http_request, fetch_url, web_search), "
+            "MCP tools loaded from .oat/mcp.json, and SDK-baked tools "
+            "(task, compact_conversation). The OAT daemon passes "
+            "'--deny-tool task --deny-tool http_request --deny-tool fetch_url "
+            "--deny-tool compact_conversation' for browser-agents so they "
+            "cannot delegate or escape the browser context, even if the "
+            "agent prompt is bypassed."
+        ),
+    )
+
     try:
         from importlib.metadata import (
             PackageNotFoundError,
@@ -454,6 +472,7 @@ async def run_textual_cli_async(
     thread_id: str | None = None,
     is_resumed: bool = False,
     initial_prompt: str | None = None,
+    excluded_tools: set[str] | None = None,
 ) -> "AppResult":
     """Run the Textual CLI interface (async version).
 
@@ -515,10 +534,46 @@ async def run_textual_cli_async(
 
     # Use async context manager for checkpointer
     async with get_checkpointer() as checkpointer:
-        # Create agent with conditional tools
-        tools: list[Callable[..., Any] | dict[str, Any]] = [http_request, fetch_url]
+        # Normalize the deny set once. The OAT daemon passes four names
+        # for browser-agent: task, http_request, fetch_url,
+        # compact_conversation. Other agent types pass no deny list.
+        # The `task` and `compact_conversation` names are gated inside
+        # the SDK and the CLI's SummarizationToolMiddleware
+        # (oat_cli/agent.py) respectively; the other two are filtered
+        # right here, against the built-in tool functions imported above.
+        denied: frozenset[str] = (
+            frozenset(excluded_tools) if excluded_tools else frozenset()
+        )
+        if denied:
+            logger.warning(
+                "Tool deny list active for this agent: %s",
+                sorted(denied),
+            )
+
+        def _name_of(t: Any) -> str | None:
+            name = getattr(t, "name", None)
+            if isinstance(name, str) and name:
+                return name
+            if isinstance(t, dict):
+                n = t.get("name")
+                if isinstance(n, str) and n:
+                    return n
+            fn_name = getattr(t, "__name__", None)
+            return fn_name if isinstance(fn_name, str) and fn_name else None
+
+        # Build the built-in tool catalog, then drop denied names
+        # before MCP discovery runs (denied names must NOT appear in
+        # `builtin_tool_names` either, or MCP-server tools with the
+        # same name will be incorrectly suppressed for collision).
+        builtin_candidates: list[Callable[..., Any] | dict[str, Any]] = [
+            http_request,
+            fetch_url,
+        ]
         if settings.has_tavily:
-            tools.append(web_search)
+            builtin_candidates.append(web_search)
+        tools: list[Callable[..., Any] | dict[str, Any]] = [
+            t for t in builtin_candidates if _name_of(t) not in denied
+        ]
 
         # Discover MCP servers declared in <cwd>/.oat/mcp.json. The daemon
         # writes this file at agent spawn time when MCPConfig is non-empty
@@ -529,13 +584,16 @@ async def run_textual_cli_async(
         mcp_specs = load_mcp_config(Path.cwd() / ".oat" / "mcp.json")
         builtin_tool_names: set[str] = set()
         for t in tools:
-            name = getattr(t, "name", None) or getattr(t, "__name__", None)
+            name = _name_of(t)
             if isinstance(name, str):
                 builtin_tool_names.add(name)
         mcp_tools, mcp_stack = await load_mcp_tools(
             mcp_specs, builtin_tool_names=builtin_tool_names
         )
-        tools = [*tools, *mcp_tools]
+        # Filter MCP tools by the same deny set. Lets ops deny a
+        # misbehaving MCP tool without having to remove its whole server.
+        filtered_mcp_tools = [t for t in mcp_tools if _name_of(t) not in denied]
+        tools = [*tools, *filtered_mcp_tools]
 
         # SIGTERM handler: the daemon sends SIGTERM when stopping an agent.
         # We want the AsyncExitStack to close cleanly so each MCP server's
@@ -585,6 +643,7 @@ async def run_textual_cli_async(
                     sandbox_type=sandbox_type if sandbox_type != "none" else None,
                     auto_approve=auto_approve,
                     checkpointer=checkpointer,
+                    excluded_tools=set(denied) if denied else None,
                 )
             except Exception as e:  # broad catch for friendly CLI errors
                 logger.debug("Failed to create agent", exc_info=True)
@@ -963,6 +1022,11 @@ def cli_main() -> None:
                     sandbox_setup=getattr(args, "sandbox_setup", None),
                     quiet=args.quiet,
                     stream=not args.no_stream,
+                    excluded_tools=(
+                        set(getattr(args, "deny_tools", None) or [])
+                        if getattr(args, "deny_tools", None)
+                        else None
+                    ),
                 )
             )
             sys.exit(exit_code)
@@ -1053,6 +1117,14 @@ def cli_main() -> None:
             # Run Textual CLI
             return_code = 0
             try:
+                # `--deny-tool` is repeatable; argparse gives us a list.
+                # The CLI is the only place that knows about argparse
+                # shapes, so normalize to a set right at the boundary
+                # and pass that to internal entrypoints.
+                deny_tools_arg = getattr(args, "deny_tools", None) or []
+                excluded_tools_set: set[str] | None = (
+                    set(deny_tools_arg) if deny_tools_arg else None
+                )
                 result = asyncio.run(
                     run_textual_cli_async(
                         assistant_id=args.agent,
@@ -1066,6 +1138,7 @@ def cli_main() -> None:
                         thread_id=thread_id,
                         is_resumed=is_resumed,
                         initial_prompt=getattr(args, "initial_prompt", None),
+                        excluded_tools=excluded_tools_set,
                     )
                 )
                 return_code = result.return_code

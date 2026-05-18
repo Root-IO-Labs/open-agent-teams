@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--deny-tool` CLI flag and `excluded_tools` SDK kwarg for runtime tool
+  filtering.** The `oat-agent` CLI now accepts `--deny-tool NAME` (repeatable)
+  to hide a named tool from the LLM. Built-in tools (`http_request`,
+  `fetch_url`, `web_search`), MCP-provided tools, and the subagent `task` tool
+  are all filterable. The SDK's `create_oat_agent` and the CLI's
+  `create_cli_agent` accept the same set via the `excluded_tools` parameter.
+  Excluding `"task"` skips `SubAgentMiddleware` entirely (no general-purpose
+  subagent spawn path); excluding `"compact_conversation"` skips
+  `SummarizationToolMiddleware`. The daemon
+  ([internal/daemon/daemon.go](internal/daemon/daemon.go) `denyToolArgs`)
+  unconditionally appends `--deny-tool task --deny-tool http_request
+  --deny-tool fetch_url --deny-tool compact_conversation` to every
+  `AgentTypeBrowser` argv (other agent types keep the full catalog). This
+  closes the leak that caused the "iana mystery" — a browser-agent calling
+  `task` to spawn a subagent that hit the CDP timeout and left the parent
+  agent stuck "processing…" with no recovery. The deny list is enforced at
+  every spawn site (`startAgentWithConfig`, `startRegisteredAgent`, and the
+  restart path), so daemon-restart-restored browser agents inherit the same
+  filter as freshly-spawned ones.
+
 - **MCP child stderr capture.** The agent-runtime's MCP client now
   redirects each stdio MCP server's stderr to a per-server file
   under the canonical per-repo output dir

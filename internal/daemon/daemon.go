@@ -89,6 +89,38 @@ func (d *Daemon) modelParamsJSON(modelID string) string {
 	return fmt.Sprintf(`{"max_tokens":%d}`, maxTokens)
 }
 
+// denyToolArgs returns the `--deny-tool NAME` argv pairs that must be appended
+// to the oat-agent CLI invocation for the given agent type.
+//
+// The browser-agent gets a hardcoded deny list:
+//   - task: spawns long-running subagents that hit the CDP timeout and leave
+//     the parent stuck "processing" with no recovery path (the "iana mystery"
+//     bug). Browser agents have no need for subagents — they delegate to the
+//     extension, not to other LLMs.
+//   - http_request / fetch_url: bypass the MCP bridge entirely and grab HTML
+//     directly via the Python process. That defeats the whole point of a
+//     browser agent (cookies, JS execution, login state) and routes around
+//     the side-panel activity log.
+//   - compact_conversation: manual compaction tool is exposed via
+//     SummarizationToolMiddleware; gating it here keeps the browser-agent's
+//     short-session model from offering a destructive command users can't
+//     undo from inside the side panel.
+//
+// Other agent types (worker, supervisor, merge-queue, review, verification,
+// pr-shepherd) keep the full tool catalog. Returns nil for those so callers
+// can `append(args, denyToolArgs(t)...)` unconditionally.
+func denyToolArgs(agentType state.AgentType) []string {
+	if agentType != state.AgentTypeBrowser {
+		return nil
+	}
+	return []string{
+		"--deny-tool", "task",
+		"--deny-tool", "http_request",
+		"--deny-tool", "fetch_url",
+		"--deny-tool", "compact_conversation",
+	}
+}
+
 // Daemon represents the main daemon process
 type Daemon struct {
 	paths   *config.Paths
@@ -3367,6 +3399,8 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 			}
 		}
 		args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
+		// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
+		args = append(args, denyToolArgs(agent.Type)...)
 
 		isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
 		logFile := d.paths.AgentLogFile(repoName, agentName, isWorker)
@@ -5382,6 +5416,8 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 			args = append(args, "-M", resolvedModel)
 		}
 		args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
+		// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
+		args = append(args, denyToolArgs(cfg.agentType)...)
 
 		// Determine log file path
 		isWorker := cfg.agentType == state.AgentTypeWorker || cfg.agentType == state.AgentTypeReview || cfg.agentType == state.AgentTypeVerification
@@ -5976,6 +6012,8 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		args = append(args, "-M", resolvedModel)
 	}
 	args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
+	// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
+	args = append(args, denyToolArgs(agent.Type)...)
 
 	envPrefix := buildAgentEnvPrefix(d.paths, repoName)
 	isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification

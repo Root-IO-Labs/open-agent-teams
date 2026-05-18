@@ -398,6 +398,7 @@ def create_cli_agent(
     enable_skills: bool = True,
     enable_shell: bool = True,
     checkpointer: BaseCheckpointSaver | None = None,
+    excluded_tools: set[str] | None = None,
 ) -> tuple[Pregel, CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -432,6 +433,14 @@ def create_cli_agent(
 
             If `None`, uses `InMemorySaver` (no persistence across
             CLI invocations).
+        excluded_tools: Optional set of tool names to strip from the agent.
+
+            Forwarded to ``create_oat_agent``, and additionally gates
+            this CLI's local `SummarizationToolMiddleware` (which
+            exposes the ``compact_conversation`` tool) when that name
+            is in the set. The OAT daemon's browser-agent spawn path
+            passes ``{"task", "http_request", "fetch_url", "compact_conversation"}``;
+            other agent types pass ``None``.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -598,11 +607,18 @@ def create_cli_agent(
         create_summarization_middleware,
     )
 
-    agent_middleware.append(
-        SummarizationToolMiddleware(
-            create_summarization_middleware(model, composite_backend)
+    # The `compact_conversation` tool is registered by
+    # `SummarizationToolMiddleware`; gate it on the deny set so the
+    # browser-agent / assistant agent types can opt out. Defense in
+    # depth alongside the prompt-level guards: even if the prompt
+    # tells the model not to call it, removing the tool from the
+    # catalog makes that impossible at the runtime layer too.
+    if not excluded_tools or "compact_conversation" not in excluded_tools:
+        agent_middleware.append(
+            SummarizationToolMiddleware(
+                create_summarization_middleware(model, composite_backend)
+            )
         )
-    )
 
     # Create the agent
     # Use provided checkpointer or fallback to InMemorySaver
@@ -616,5 +632,6 @@ def create_cli_agent(
         interrupt_on=interrupt_on,
         checkpointer=final_checkpointer,
         subagents=custom_subagents or None,
+        excluded_tools=excluded_tools,
     ).with_config(config)
     return agent, composite_backend
