@@ -68,53 +68,46 @@ type RouterEvent struct {
 	InputPriceUS float64 // USD per million input tokens
 }
 
-// AgentEvent records an agent lifecycle. Returned Span is ended on exit.
+// AgentEvent records an agent spawn. Fire-and-forget — the daemon already
+// has its own lifetime tracking, so we don't need a Span handle.
 type AgentEvent struct {
 	AgentID       string // e.g. worker name
 	AgentType     string // "worker" / "supervisor" / ...
 	RepoName      string
 	Model         string
 	RoutingSource string
-	ParentTraceID string // optional — for nested agents
 }
 
-// AgentExit is the terminal state of an agent. Passed to Span.End via attrs.
+// AgentExit records an agent's terminal state. Paired with AgentStart by
+// trace ID; Langfuse computes duration from event timestamps.
 type AgentExit struct {
-	Reason       string // "success" / "crashed" / "timeout" / "cancelled" / "killed"
+	AgentID      string
+	Reason       string // "success" / "crashed" / "timeout" / "cancelled" / "killed" / "removed"
 	ExitCode     int
-	Signal       string
 	InputTokens  int64
 	OutputTokens int64
-}
-
-// Span is a started, not-yet-ended operation. Callers must call End exactly
-// once. End is safe against double-call; subsequent calls are no-ops.
-type Span interface {
-	// TraceID returns the underlying trace ID. The daemon uses this to wire
-	// OAT_TRACE_ID into spawned agent processes so Python spans nest into the
-	// same trace.
-	TraceID() string
-
-	// End finalizes the span. err != nil marks the span as errored. attrs are
-	// merged into the span's payload. Must be safe to call once.
-	End(err error, attrs map[string]any)
 }
 
 // Tracer is the telemetry sink.
 //
 // All methods must be safe to call on a nil-or-disabled Tracer (the Nop
-// implementation handles that). The router decision span is fire-and-forget;
-// the agent span returns a handle the caller closes when the agent terminates.
+// implementation handles that). Every event is fire-and-forget — the hot path
+// only ever does an atomic enqueue.
 type Tracer interface {
 	// NewTrace allocates a new trace ID and returns ctx + the id. Use this at
-	// the top of a logical session (e.g. one agent task).
-	NewTrace(ctx context.Context, name string) (context.Context, string)
+	// the top of a logical unit of work (e.g. one agent task). The trace ID
+	// also propagates to the Python runtime via OAT_TRACE_ID so LLM/tool
+	// spans nest under the same trace.
+	NewTrace(ctx context.Context, name string, metadata map[string]any) (context.Context, string)
 
-	// Router records a routing decision. Fire-and-forget.
+	// Router records a routing decision on the trace from ctx.
 	Router(ctx context.Context, ev RouterEvent)
 
-	// AgentStart records an agent spawn. Caller invokes Span.End on exit.
-	AgentStart(ctx context.Context, ev AgentEvent) Span
+	// AgentStart records an agent spawn.
+	AgentStart(ctx context.Context, ev AgentEvent)
+
+	// AgentEnd records an agent's terminal state.
+	AgentEnd(ctx context.Context, ev AgentExit)
 
 	// Flush drains the in-memory queue. Bounded by timeout. Used at daemon
 	// shutdown to avoid dropping the last batch.

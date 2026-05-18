@@ -27,6 +27,7 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/telemetry"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/templates"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/version"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/worktree"
@@ -159,6 +160,17 @@ type Daemon struct {
 	// the periodic refresher.
 	corpusIndex   *routing.CorpusIndex
 	corpusIndexMu sync.RWMutex
+
+	// Telemetry sink. Always non-nil — telemetry.New returns a Nop tracer when
+	// disabled or unconfigured, so callers never need to branch. Initialized
+	// once at daemon start from state.GetTelemetry(); operators must restart
+	// the daemon after `oat telemetry setup` for changes to take effect.
+	tracer telemetry.Tracer
+	// agentTraces tracks live agent trace IDs so child events (router
+	// decisions, agent exit, and Python-side LLM/tool spans propagated via
+	// OAT_TRACE_ID) all land on the same trace. Keyed by "repo/agent".
+	agentTraces   map[string]string
+	agentTracesMu sync.Mutex
 }
 
 // corpusIndexRefreshInterval — how often the daemon rebuilds the V2
@@ -226,6 +238,14 @@ func New(paths *config.Paths) (*Daemon, error) {
 		verificationTimeoutNotified: make(map[string]time.Time),
 		mainCIAlertTime:             make(map[string]time.Time),
 		restartCooldown:             make(map[string]time.Time),
+		agentTraces:                 make(map[string]string),
+	}
+
+	// Initialize telemetry from persisted config. Nop on missing/disabled —
+	// safe to call all tracer methods unconditionally afterwards.
+	d.tracer = telemetry.New(telemetryConfigFromState(st))
+	if tcfg := st.GetTelemetry(); tcfg.Enabled {
+		logger.Info("Telemetry: langfuse enabled (host=%s)", tcfg.Host)
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -539,6 +559,15 @@ func (d *Daemon) Stop() error {
 		d.logger.Error("Failed to save state: %v", err)
 	}
 
+	// Flush + close telemetry. Bounded by a short timeout so a slow Langfuse
+	// endpoint can't stall daemon shutdown.
+	if d.tracer != nil {
+		if err := d.tracer.Flush(2 * time.Second); err != nil {
+			d.logger.Warn("Telemetry flush: %v", err)
+		}
+		_ = d.tracer.Close()
+	}
+
 	// Remove PID file
 	if err := d.pidFile.Remove(); err != nil {
 		d.logger.Error("Failed to remove PID file: %v", err)
@@ -546,6 +575,46 @@ func (d *Daemon) Stop() error {
 
 	d.logger.Info("Daemon stopped")
 	return nil
+}
+
+// telemetryConfigFromState bridges state.TelemetryConfig (persisted) →
+// telemetry.Config (runtime). Kept in this file so the routing/telemetry
+// boundary stays clean — the telemetry package does not import state.
+func telemetryConfigFromState(st *state.State) telemetry.Config {
+	cfg := st.GetTelemetry()
+	return telemetry.Config{
+		Enabled:    cfg.Enabled,
+		Host:       cfg.Host,
+		PublicKey:  cfg.PublicKey,
+		SecretKey:  cfg.SecretKey,
+		RedactArgs: cfg.RedactArgs,
+		SampleRate: cfg.SampleRate,
+		Release:    version.Version,
+	}
+}
+
+// endAgentTelemetry emits an agent_end event on the trace that was opened at
+// agent spawn, then clears the agentTraces entry so re-calls are no-ops. Safe
+// to call from any exit path (removal, completion, over-budget kill). If the
+// trace was never opened (telemetry was off at spawn time), this is a no-op.
+func (d *Daemon) endAgentTelemetry(repoName, agentName string, agent state.Agent, reason string) {
+	key := repoName + "/" + agentName
+	d.agentTracesMu.Lock()
+	traceID, ok := d.agentTraces[key]
+	if ok {
+		delete(d.agentTraces, key)
+	}
+	d.agentTracesMu.Unlock()
+	if !ok || traceID == "" {
+		return
+	}
+	ctx := telemetry.WithTraceID(d.ctx, traceID)
+	d.tracer.AgentEnd(ctx, telemetry.AgentExit{
+		AgentID:      agentName,
+		Reason:       reason,
+		InputTokens:  agent.InputTokens,
+		OutputTokens: agent.OutputTokens,
+	})
 }
 
 // getRequiredStringArg extracts a required string argument from request Args.
@@ -2370,6 +2439,14 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 		}
 	}
 
+	// Emit agent_end telemetry before clearing trace state. Reason source
+	// priority matches the outcome-log path above: explicit `reason` arg →
+	// "removed". Skipped silently when telemetry is off.
+	if agentExists {
+		reason := getOptionalStringArg(req.Args, "reason", "removed")
+		d.endAgentTelemetry(repoName, agentName, agent, reason)
+	}
+
 	if err := d.state.RemoveAgent(repoName, agentName); err != nil {
 		return socket.ErrorResponse("%s", err.Error())
 	}
@@ -2637,6 +2714,11 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 	}
 
 	d.logger.Info("Agent %s/%s marked as ready for cleanup", repoName, agentName)
+
+	// Telemetry: emit the terminal agent_end on the trace. Reason "success"
+	// here matches the routing-outcome log below. Cleanup-driven removal that
+	// follows is idempotent (endAgentTelemetry deletes the trace mapping).
+	d.endAgentTelemetry(repoName, agentName, agent, "success")
 
 	// Append to routing-history.jsonl for offline replay analysis. Outcome is
 	// "completed" here; the PR merge-status backfill happens separately.
@@ -5106,6 +5188,16 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		return fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
+	// Allocate a telemetry trace for this agent up front so the router
+	// decision, agent_start event, and (later) Python-side LLM/tool spans
+	// all share one trace. Nop tracer returns "" and the trace ID becomes
+	// inert — no env var leaked to the child process below.
+	traceCtx, traceID := d.tracer.NewTrace(d.ctx, fmt.Sprintf("agent:%s", cfg.agentType), map[string]any{
+		"repo":       repoName,
+		"agent_id":   cfg.agentName,
+		"agent_type": string(cfg.agentType),
+	})
+
 	// Copy hooks config if needed
 	repoPath := d.paths.RepoDir(repoName)
 	if err := hooks.CopyConfig(repoPath, cfg.workDir); err != nil {
@@ -5176,6 +5268,19 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 				routingDecisionReason = decision.Reason
 				routingCandidates = decision.Candidates
 			}
+			// Emit the routing decision to Langfuse on the agent's trace.
+			// Fire-and-forget; Nop when telemetry is disabled.
+			hash, n := telemetry.HashAndLen(taskText)
+			d.tracer.Router(traceCtx, telemetry.RouterEvent{
+				TaskTextHash: hash,
+				TaskTextLen:  n,
+				Complexity:   string(decision.Complexity),
+				Candidates:   decision.Candidates,
+				ChosenModel:  decision.ChosenModel,
+				Reason:       decision.Reason,
+				FloorMet:     !strings.HasPrefix(decision.Reason, "floor_violated"),
+				InputPriceUS: d.pricing.InputPrice(decision.ChosenModel),
+			})
 		}
 	}
 
@@ -5248,6 +5353,38 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 			envVars = append(envVars, fmt.Sprintf("OAT_BACKEND=%s", backend))
 		}
 		envVars = append(envVars, fmt.Sprintf("OAT_TOOL_LOG=%s", logFile))
+
+		// Telemetry env propagation. If telemetry is enabled, the Python
+		// runtime needs (a) the trace ID to attach its LLM/tool spans to the
+		// daemon-side trace, and (b) Langfuse credentials so the official
+		// Langfuse Python SDK can call the same project. Skipped entirely
+		// when telemetry is off (traceID == "") — no leak to child env.
+		if traceID != "" {
+			tcfg := d.state.GetTelemetry()
+			envVars = append(envVars,
+				fmt.Sprintf("OAT_TRACE_ID=%s", traceID),
+				fmt.Sprintf("LANGFUSE_PUBLIC_KEY=%s", tcfg.PublicKey),
+				fmt.Sprintf("LANGFUSE_SECRET_KEY=%s", tcfg.SecretKey),
+				fmt.Sprintf("LANGFUSE_HOST=%s", tcfg.Host),
+			)
+		}
+
+		// Record the agent_start event on the trace before the backend spawns
+		// the process. Stored trace ID lets agent_end fire on the same trace
+		// when the agent terminates (handleRemoveAgent / handleCompleteAgent
+		// / stopAgentOverBudget).
+		d.tracer.AgentStart(traceCtx, telemetry.AgentEvent{
+			AgentID:       cfg.agentName,
+			AgentType:     string(cfg.agentType),
+			RepoName:      repoName,
+			Model:         resolvedModel,
+			RoutingSource: routingSource,
+		})
+		if traceID != "" {
+			d.agentTracesMu.Lock()
+			d.agentTraces[repoName+"/"+cfg.agentName] = traceID
+			d.agentTracesMu.Unlock()
+		}
 		// Sidecar socket path (empty when OAT_USE_SIDECAR != 1). Must be
 		// wired at every StartAgent call site or the feature flag is
 		// partial — agents created through this path would silently skip
@@ -5536,6 +5673,10 @@ func (d *Daemon) stopAgentOverBudget(repoName, agentName string, agent state.Age
 	if err := d.state.UpdateAgent(repoName, agentName, agent); err != nil {
 		d.logger.Warn("Failed to update over-budget agent state %s/%s: %v", repoName, agentName, err)
 	}
+
+	// Telemetry: terminal event on the agent's trace. Idempotent so the
+	// subsequent cleanup-driven removal won't double-emit.
+	d.endAgentTelemetry(repoName, agentName, agent, "killed:over-budget")
 
 	// Notify workspace about the budget kill
 	msgMgr := d.getMessageManager()

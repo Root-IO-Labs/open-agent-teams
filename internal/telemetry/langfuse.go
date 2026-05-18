@@ -71,20 +71,24 @@ type ingestionEvent struct {
 	Body      map[string]any `json:"body"`
 }
 
-func (t *langfuseTracer) NewTrace(ctx context.Context, name string) (context.Context, string) {
+func (t *langfuseTracer) NewTrace(ctx context.Context, name string, metadata map[string]any) (context.Context, string) {
 	if t.closed.Load() {
 		return ctx, ""
 	}
 	id := newID()
+	body := map[string]any{
+		"id":      id,
+		"name":    name,
+		"release": t.cfg.Release,
+	}
+	if metadata != nil {
+		body["metadata"] = metadata
+	}
 	t.enqueue(ingestionEvent{
 		ID:        newID(),
 		Type:      "trace-create",
 		Timestamp: nowISO(),
-		Body: map[string]any{
-			"id":      id,
-			"name":    name,
-			"release": t.cfg.Release,
-		},
+		Body:      body,
 	})
 	return WithTraceID(ctx, id), id
 }
@@ -116,43 +120,21 @@ func (t *langfuseTracer) Router(ctx context.Context, ev RouterEvent) {
 	})
 }
 
-func (t *langfuseTracer) AgentStart(ctx context.Context, ev AgentEvent) Span {
+func (t *langfuseTracer) AgentStart(ctx context.Context, ev AgentEvent) {
 	if t.closed.Load() || !t.sample() {
-		return nopSpan{}
+		return
 	}
-	traceID := TraceIDFromContext(ctx)
-	if traceID == "" {
-		traceID = ev.ParentTraceID
-	}
-	if traceID == "" {
-		// Allocate a new trace for an orphan agent — happens for top-level spawns.
-		traceID = newID()
-		t.enqueue(ingestionEvent{
-			ID:        newID(),
-			Type:      "trace-create",
-			Timestamp: nowISO(),
-			Body: map[string]any{
-				"id":      traceID,
-				"name":    fmt.Sprintf("agent:%s", ev.AgentType),
-				"release": t.cfg.Release,
-				"metadata": map[string]any{
-					"repo": ev.RepoName,
-				},
-			},
-		})
-	}
-	spanID := newID()
-	startedAt := nowISO()
+	trace := TraceIDFromContext(ctx)
 	t.enqueue(ingestionEvent{
 		ID:        newID(),
-		Type:      "span-create",
-		Timestamp: startedAt,
+		Type:      "event-create",
+		Timestamp: nowISO(),
 		Body: map[string]any{
-			"id":        spanID,
-			"traceId":   traceID,
-			"name":      ev.AgentID,
-			"startTime": startedAt,
+			"id":      newID(),
+			"traceId": trace,
+			"name":    "agent_start",
 			"metadata": map[string]any{
+				"agent_id":       ev.AgentID,
 				"agent_type":     ev.AgentType,
 				"repo":           ev.RepoName,
 				"model":          ev.Model,
@@ -160,10 +142,43 @@ func (t *langfuseTracer) AgentStart(ctx context.Context, ev AgentEvent) Span {
 			},
 		},
 	})
-	return &langfuseSpan{
-		tracer:  t,
-		traceID: traceID,
-		spanID:  spanID,
+}
+
+func (t *langfuseTracer) AgentEnd(ctx context.Context, ev AgentExit) {
+	if t.closed.Load() || !t.sample() {
+		return
+	}
+	trace := TraceIDFromContext(ctx)
+	t.enqueue(ingestionEvent{
+		ID:        newID(),
+		Type:      "event-create",
+		Timestamp: nowISO(),
+		Body: map[string]any{
+			"id":      newID(),
+			"traceId": trace,
+			"name":    "agent_end",
+			"level":   levelForExit(ev.Reason),
+			"metadata": map[string]any{
+				"agent_id":      ev.AgentID,
+				"reason":        ev.Reason,
+				"exit_code":     ev.ExitCode,
+				"input_tokens":  ev.InputTokens,
+				"output_tokens": ev.OutputTokens,
+			},
+		},
+	})
+}
+
+func levelForExit(reason string) string {
+	switch reason {
+	case "success", "removed":
+		return "DEFAULT"
+	case "crashed", "timeout":
+		return "ERROR"
+	case "killed", "cancelled":
+		return "WARNING"
+	default:
+		return "DEFAULT"
 	}
 }
 
@@ -285,42 +300,6 @@ func (t *langfuseTracer) send(batch []ingestionEvent) {
 		return
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
-}
-
-type langfuseSpan struct {
-	tracer  *langfuseTracer
-	traceID string
-	spanID  string
-	ended   atomic.Bool
-}
-
-func (s *langfuseSpan) TraceID() string { return s.traceID }
-
-func (s *langfuseSpan) End(err error, attrs map[string]any) {
-	if !s.ended.CompareAndSwap(false, true) {
-		return
-	}
-	if s.tracer.closed.Load() {
-		return
-	}
-	body := map[string]any{
-		"id":      s.spanID,
-		"traceId": s.traceID,
-		"endTime": nowISO(),
-	}
-	if err != nil {
-		body["level"] = "ERROR"
-		body["statusMessage"] = Scrub(err.Error())
-	}
-	if attrs != nil {
-		body["metadata"] = attrs
-	}
-	s.tracer.enqueue(ingestionEvent{
-		ID:        newID(),
-		Type:      "span-update",
-		Timestamp: nowISO(),
-		Body:      body,
-	})
 }
 
 // Ping verifies that cfg can authenticate against the configured Langfuse

@@ -29,13 +29,13 @@ func TestNew_MissingKeysReturnsNop(t *testing.T) {
 
 func TestNop_IsSafeAndZeroEffect(t *testing.T) {
 	tr := Nop{}
-	ctx, id := tr.NewTrace(context.Background(), "session")
+	ctx, id := tr.NewTrace(context.Background(), "session", nil)
 	if id != "" {
 		t.Errorf("Nop NewTrace should return empty id, got %q", id)
 	}
 	tr.Router(ctx, RouterEvent{ChosenModel: "x"})
-	sp := tr.AgentStart(ctx, AgentEvent{AgentID: "w"})
-	sp.End(nil, map[string]any{"k": "v"})
+	tr.AgentStart(ctx, AgentEvent{AgentID: "w"})
+	tr.AgentEnd(ctx, AgentExit{AgentID: "w", Reason: "success"})
 	if err := tr.Flush(time.Second); err != nil {
 		t.Errorf("Nop Flush returned %v", err)
 	}
@@ -131,7 +131,7 @@ func TestLangfuse_RouterAndAgentRoundTrip(t *testing.T) {
 	})
 	defer tr.Close()
 
-	ctx, traceID := tr.NewTrace(context.Background(), "test-session")
+	ctx, traceID := tr.NewTrace(context.Background(), "test-session", map[string]any{"repo": "demo"})
 	if traceID == "" {
 		t.Fatal("expected non-empty trace id")
 	}
@@ -147,13 +147,18 @@ func TestLangfuse_RouterAndAgentRoundTrip(t *testing.T) {
 		InputPriceUS: 0.80,
 	})
 
-	sp := tr.AgentStart(ctx, AgentEvent{
+	tr.AgentStart(ctx, AgentEvent{
 		AgentID:   "worker-foo",
 		AgentType: "worker",
 		RepoName:  "demo",
 		Model:     "anthropic:claude-haiku-4-5",
 	})
-	sp.End(nil, map[string]any{"exit_reason": "success"})
+	tr.AgentEnd(ctx, AgentExit{
+		AgentID:      "worker-foo",
+		Reason:       "success",
+		InputTokens:  1000,
+		OutputTokens: 500,
+	})
 
 	// Allow background worker to flush.
 	deadline := time.Now().Add(2 * time.Second)
@@ -190,10 +195,14 @@ func TestLangfuse_RouterAndAgentRoundTrip(t *testing.T) {
 			seenTypes[ev.Type]++
 		}
 	}
-	for _, want := range []string{"trace-create", "event-create", "span-create", "span-update"} {
+	for _, want := range []string{"trace-create", "event-create"} {
 		if seenTypes[want] == 0 {
 			t.Errorf("expected at least one %q event, got %+v", want, seenTypes)
 		}
+	}
+	// Router + AgentStart + AgentEnd = 3 events on the trace.
+	if seenTypes["event-create"] < 3 {
+		t.Errorf("expected ≥3 event-create payloads (router + agent_start + agent_end), got %d", seenTypes["event-create"])
 	}
 }
 
@@ -209,7 +218,7 @@ func TestLangfuse_NetworkFailureIsSilent(t *testing.T) {
 	})
 	defer tr.Close()
 
-	ctx, _ := tr.NewTrace(context.Background(), "doomed")
+	ctx, _ := tr.NewTrace(context.Background(), "doomed", nil)
 	for i := 0; i < 100; i++ {
 		tr.Router(ctx, RouterEvent{ChosenModel: "x"})
 	}
