@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Browser-agent identity plumbing for side-panel chat (Part 2a).**
+  `buildBrowserAgentMCPConfig` now sets `OAT_BROWSER_AGENT_SESSION` (the repo's
+  session name) and `OAT_BROWSER_AGENT_NAME` (the browser-agent's window/agent
+  name) in the bridge's env block, alongside the existing
+  `OAT_BROWSER_AGENT_AUDIT_LOG_DIR`. The Part 2b/2c daemon socket verbs
+  (`agent_input` and `agent_output_subscribe`, landing next) need these to
+  scope PTY relays to the right agent. Bridges spawned outside OAT (Cursor /
+  Claude Code) will see these vars absent and the side panel will surface the
+  Part 4 disabled-state banner.
+  ([internal/daemon/daemon.go](internal/daemon/daemon.go) `buildBrowserAgentMCPConfig`,
+  [docs/MCP.md](docs/MCP.md) env-var table.)
+
 - **`--deny-tool` CLI flag and `excluded_tools` SDK kwarg for runtime tool
   filtering.** The `oat-agent` CLI now accepts `--deny-tool NAME` (repeatable)
   to hide a named tool from the LLM. Built-in tools (`http_request`,

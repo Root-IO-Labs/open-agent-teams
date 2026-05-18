@@ -2649,12 +2649,16 @@ func TestRestoreDeadAgentsIncludesWorkspace(t *testing.T) {
 // shape contract is:
 //
 //	{"servers": [{"name", "command", "args", "transport": "stdio",
-//	              "env": {"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "..."}}]}
+//	              "env": {"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "...",
+//	                       "OAT_BROWSER_AGENT_SESSION": "...",
+//	                       "OAT_BROWSER_AGENT_NAME":    "..."}}]}
 //
 // We assert structure + that the audit-log dir is per-repo (so two
-// browser-agents on the same daemon don't cross-contaminate logs)
-// and that the bridge resolution agrees with what
-// internal/agents.ResolveBrowserBridge would have returned.
+// browser-agents on the same daemon don't cross-contaminate logs),
+// that the bridge resolution agrees with what
+// internal/agents.ResolveBrowserBridge would have returned, and that
+// the Part 2a identity vars are present (so the bridge can scope
+// agent_input / agent_output_subscribe to the right PTY).
 func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
@@ -2667,7 +2671,7 @@ func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
 	}
 	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
 
-	cfg, err := d.buildBrowserAgentMCPConfig("my-repo")
+	cfg, err := d.buildBrowserAgentMCPConfig("my-repo", "my-session", "browser-agent")
 	if err != nil {
 		t.Fatalf("buildBrowserAgentMCPConfig failed: %v", err)
 	}
@@ -2705,6 +2709,17 @@ func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
 	expectedAuditDir := d.paths.RepoOutputDir("my-repo")
 	if got := s.Env["OAT_BROWSER_AGENT_AUDIT_LOG_DIR"]; got != expectedAuditDir {
 		t.Errorf("OAT_BROWSER_AGENT_AUDIT_LOG_DIR = %q, want %q (canonical per-repo output dir)", got, expectedAuditDir)
+	}
+	// Part 2a identity plumbing. The bridge depends on these vars
+	// being present to know which agent's PTY to address via the
+	// daemon's agent_input / agent_output_subscribe socket verbs
+	// (added in Part 2b / 2c). When absent the bridge treats the
+	// side-panel chat path as disabled (Part 4 host-disambiguation).
+	if got := s.Env["OAT_BROWSER_AGENT_SESSION"]; got != "my-session" {
+		t.Errorf("OAT_BROWSER_AGENT_SESSION = %q, want %q", got, "my-session")
+	}
+	if got := s.Env["OAT_BROWSER_AGENT_NAME"]; got != "browser-agent" {
+		t.Errorf("OAT_BROWSER_AGENT_NAME = %q, want %q", got, "browser-agent")
 	}
 	// Post-Part-9b: the back-compat pins are GONE. Each OAT-spawned
 	// bridge gets an OS-assigned port (no port-19222 collision when
@@ -2763,6 +2778,54 @@ func TestBridgeUnreachableBackoff(t *testing.T) {
 	}
 }
 
+// TestBuildBrowserAgentMCPConfig_IdentityVarsAreFaithfullyPlumbed
+// asserts the Part 2a contract that the session + agent name passed to
+// buildBrowserAgentMCPConfig land verbatim in the env block. Without
+// this, a renamed agent (e.g. browser-agent-2 after the first one is
+// removed and a new one is added) would still report the old name to
+// the bridge and the side-panel chat would address the wrong PTY.
+func TestBuildBrowserAgentMCPConfig_IdentityVarsAreFaithfullyPlumbed(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	scriptPath := filepath.Join(t.TempDir(), "bridge.js")
+	if err := os.WriteFile(scriptPath, []byte("// stub"), 0644); err != nil {
+		t.Fatalf("write stub bridge: %v", err)
+	}
+	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
+
+	cases := []struct {
+		repo, session, agent string
+	}{
+		{"r1", "weather-app", "browser-agent"},
+		{"r1", "weather-app", "browser-agent-2"}, // renamed
+		{"r2", "todo-list", "frontend-checker"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.agent, func(t *testing.T) {
+			cfg, err := d.buildBrowserAgentMCPConfig(tc.repo, tc.session, tc.agent)
+			if err != nil {
+				t.Fatalf("buildBrowserAgentMCPConfig: %v", err)
+			}
+			var parsed struct {
+				Servers []struct {
+					Env map[string]string `json:"env"`
+				} `json:"servers"`
+			}
+			if err := json.Unmarshal([]byte(cfg), &parsed); err != nil {
+				t.Fatalf("unmarshal: %v\ncfg=%s", err, cfg)
+			}
+			env := parsed.Servers[0].Env
+			if got := env["OAT_BROWSER_AGENT_SESSION"]; got != tc.session {
+				t.Errorf("OAT_BROWSER_AGENT_SESSION = %q, want %q", got, tc.session)
+			}
+			if got := env["OAT_BROWSER_AGENT_NAME"]; got != tc.agent {
+				t.Errorf("OAT_BROWSER_AGENT_NAME = %q, want %q", got, tc.agent)
+			}
+		})
+	}
+}
+
 // TestBuildBrowserAgentMCPConfig_PerRepoAuditDir documents that two
 // repos get distinct audit-log dirs even though they share the same
 // bridge command -- the audit-log isolation is repo-scoped.
@@ -2776,11 +2839,11 @@ func TestBuildBrowserAgentMCPConfig_PerRepoAuditDir(t *testing.T) {
 	}
 	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
 
-	cfgA, err := d.buildBrowserAgentMCPConfig("repo-a")
+	cfgA, err := d.buildBrowserAgentMCPConfig("repo-a", "session-a", "browser-agent")
 	if err != nil {
 		t.Fatalf("repo-a: %v", err)
 	}
-	cfgB, err := d.buildBrowserAgentMCPConfig("repo-b")
+	cfgB, err := d.buildBrowserAgentMCPConfig("repo-b", "session-b", "browser-agent")
 	if err != nil {
 		t.Fatalf("repo-b: %v", err)
 	}
@@ -2809,7 +2872,7 @@ func TestBuildBrowserAgentMCPConfig_BridgeMissingError(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PATH", t.TempDir())
 
-	_, err := d.buildBrowserAgentMCPConfig("my-repo")
+	_, err := d.buildBrowserAgentMCPConfig("my-repo", "my-session", "browser-agent")
 	if err == nil {
 		t.Fatal("expected resolution error when no bridge is installed, got nil")
 	}

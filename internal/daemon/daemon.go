@@ -3439,7 +3439,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// add-time so users get the actionable error earlier.
 		var mcpConfig string
 		if agent.Type == state.AgentTypeBrowser {
-			cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName)
+			cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName, repo.SessionName, agentName)
 			if mcpErr != nil {
 				d.logger.Warn("Browser agent %s/%s starting without MCP tools: %v", repoName, agentName, mcpErr)
 			} else {
@@ -5187,7 +5187,15 @@ func (d *Daemon) getAgentBinaryPath() (string, error) {
 // bridge's tools as LangChain tools. Returns "" if the bridge cannot be
 // resolved -- the caller logs and continues without MCP rather than
 // failing the agent spawn.
-func (d *Daemon) buildBrowserAgentMCPConfig(repoName string) (string, error) {
+//
+// `sessionName` and `agentName` are surfaced to the bridge process via
+// `OAT_BROWSER_AGENT_SESSION` / `OAT_BROWSER_AGENT_NAME` so it can ask
+// the daemon to address PTY input/output to the correct agent (Part 2b/2c
+// — `agent_input` and `agent_output_subscribe` socket verbs). When the
+// bridge runs outside of OAT (e.g. directly under Cursor or Claude
+// Code), these vars are absent and the side-panel chat path stays
+// disabled per Part 4.
+func (d *Daemon) buildBrowserAgentMCPConfig(repoName, sessionName, agentName string) (string, error) {
 	bridge, err := agents.ResolveBrowserBridge()
 	if err != nil {
 		return "", err
@@ -5224,6 +5232,14 @@ func (d *Daemon) buildBrowserAgentMCPConfig(repoName string) (string, error) {
 		"transport": "stdio",
 		"env": map[string]string{
 			"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": auditLogDir,
+			// Identity plumbing (Part 2a). The bridge uses these to
+			// scope `agent_input` / `agent_output_subscribe` socket
+			// calls to the right PTY. Empty values are a deliberate
+			// signal that the bridge is not OAT-spawned (e.g. ran
+			// directly under Cursor) -- the bridge treats them as
+			// "chat path disabled".
+			"OAT_BROWSER_AGENT_SESSION": sessionName,
+			"OAT_BROWSER_AGENT_NAME":    agentName,
 		},
 	}
 	cfg := map[string]any{
@@ -5454,7 +5470,7 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		// still spawns so the operator can attach and diagnose.
 		var mcpConfig string
 		if cfg.agentType == state.AgentTypeBrowser {
-			mc, mcpErr := d.buildBrowserAgentMCPConfig(repoName)
+			mc, mcpErr := d.buildBrowserAgentMCPConfig(repoName, repo.SessionName, cfg.agentName)
 			if mcpErr != nil {
 				d.logger.Warn("Browser agent %s/%s starting without MCP tools: %v", repoName, cfg.agentName, mcpErr)
 			} else {
@@ -6042,7 +6058,7 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// always want to write the freshest .oat/mcp.json.
 	var mcpConfig string
 	if agent.Type == state.AgentTypeBrowser {
-		cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName)
+		cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName, repo.SessionName, agentName)
 		if mcpErr != nil {
 			d.logger.Warn("Browser agent %s/%s restarting without MCP tools: %v", repoName, agentName, mcpErr)
 		} else {

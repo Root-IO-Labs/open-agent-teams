@@ -38,7 +38,9 @@ is no error.
       "args": ["/Users/you/.oat/oat-browser-agent/dist/bridge/index.js"],
       "transport": "stdio",
       "env": {
-        "OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "~/.oat/output/my-repo"
+        "OAT_BROWSER_AGENT_AUDIT_LOG_DIR": "~/.oat/output/my-repo",
+        "OAT_BROWSER_AGENT_SESSION": "my-repo",
+        "OAT_BROWSER_AGENT_NAME": "browser-agent"
       }
     }
   ]
@@ -77,7 +79,13 @@ which:
    directory `~/.oat/output/<repo>` so the bridge writes its audit log
    alongside `supervisor.log` / `default.log` without bridge-side repo
    awareness.
-3. Marshals the config and writes it to `<worktree>/.oat/mcp.json` with
+3. Sets `OAT_BROWSER_AGENT_SESSION` (the repo's session name) and
+   `OAT_BROWSER_AGENT_NAME` (the browser-agent's window/agent name) so the
+   bridge can address the right PTY when relaying side-panel chat through
+   the daemon's `agent_input` / `agent_output_subscribe` socket verbs.
+   Bridges spawned outside OAT (e.g. directly under Cursor or Claude
+   Code) will see these vars absent and treat the chat path as disabled.
+4. Marshals the config and writes it to `<worktree>/.oat/mcp.json` with
    `0644` permissions.
 
 The env block is intentionally minimal: the WS sidecar port is
@@ -121,6 +129,8 @@ servers define their own:
 | Var | Set by daemon? | Purpose |
 |---|---|---|
 | `OAT_BROWSER_AGENT_AUDIT_LOG_DIR` | yes (`~/.oat/output/<repo>`) | Highest-precedence override for the bridge audit-log directory. The bridge falls back to `<repo-root>/.oat-logs/` only when no env var is set (legacy path; see [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md)). |
+| `OAT_BROWSER_AGENT_SESSION` | yes (repo session name) | Identity for Part 2 side-panel chat. The bridge uses this to scope `agent_input` socket calls to the right session when relaying user messages from the side panel. Absent when the bridge runs outside OAT (Cursor/Claude Code) — the bridge then disables the chat path and the side panel shows the disabled-state banner from Part 4. |
+| `OAT_BROWSER_AGENT_NAME` | yes (e.g. `browser-agent`) | Companion to `OAT_BROWSER_AGENT_SESSION`. Identifies which agent within the session owns the PTY. Same absence semantics. |
 | `OAT_BRIDGE_WS_PORT` | no | Pin the WS sidecar to a fixed port. Default is OS-assigned (port 0). Useful for debugging when you want a predictable port; otherwise leave unset and let the bridge publish its assigned port via Native Messaging. |
 | `OAT_BRIDGE_TRUST_LOCALHOST` | no | Accept anonymous localhost WS opens. Default is token-required (since plan Part 9a). Only set this if you are running the bridge in an isolated VM where localhost is trusted by construction; production end-user installs should leave it unset and let the Native-Messaging broker deliver the per-launch session token. |
 | `OAT_BRIDGE_ALLOW_MULTI` | no | Opt back in to the pre-1.0 multi-client WS fan-out. Default is single-client (one extension per bridge). |
