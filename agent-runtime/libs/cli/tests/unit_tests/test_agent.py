@@ -402,7 +402,7 @@ class TestListAgents:
         (other_dir / "AGENTS.md").touch()
 
         mock_settings = Mock()
-        mock_settings.user_oat_sdk_dir = agents_dir
+        mock_settings.user_oat_dir = tmp_path
 
         output: list[str] = []
 
@@ -439,7 +439,7 @@ class TestListAgents:
         (custom_dir / "AGENTS.md").touch()
 
         mock_settings = Mock()
-        mock_settings.user_oat_sdk_dir = agents_dir
+        mock_settings.user_oat_dir = tmp_path
 
         output: list[str] = []
 

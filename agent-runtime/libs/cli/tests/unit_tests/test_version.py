@@ -40,11 +40,11 @@ def test_cli_version_flag() -> None:
     )
     # argparse exits with 0 for --version
     assert result.returncode == 0
-    assert f"oat_sdk-cli {__version__}" in result.stdout
+    assert f"oat-cli {__version__}" in result.stdout
     from importlib.metadata import version as pkg_version
 
     sdk_version = pkg_version("oat_sdk")
-    assert f"oat_sdk (SDK) {sdk_version}" in result.stdout
+    assert f"oat_sdk {sdk_version}" in result.stdout
 
 
 async def test_version_slash_command_message_format() -> None:
@@ -62,7 +62,7 @@ async def test_version_slash_command_message_format() -> None:
 
         app_msgs = app.query(AppMessage)
         content = str(app_msgs[-1]._content)
-        assert f"oat_sdk-cli version: {__version__}" in content
+        assert f"oat-cli version: {__version__}" in content
         assert f"oat_sdk (SDK) version: {sdk_version}" in content
 
 
@@ -87,7 +87,7 @@ async def test_version_slash_command_sdk_unavailable() -> None:
 
         app_msgs = app.query(AppMessage)
         content = str(app_msgs[-1]._content)
-        assert f"oat_sdk-cli version: {__version__}" in content
+        assert f"oat-cli version: {__version__}" in content
         assert "oat_sdk (SDK) version: unknown" in content
 
 
@@ -106,7 +106,7 @@ async def test_version_slash_command_cli_version_unavailable() -> None:
 
         app_msgs = app.query(AppMessage)
         content = str(app_msgs[-1]._content)
-        assert "oat_sdk-cli version: unknown" in content
+        assert "oat-cli version: unknown" in content
 
 
 def test_help_mentions_version_flag() -> None:

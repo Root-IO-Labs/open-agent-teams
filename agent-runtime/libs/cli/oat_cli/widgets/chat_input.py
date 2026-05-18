@@ -774,6 +774,14 @@ class ChatInput(Vertical):
         self._current_suggestions: list[tuple[str, str]] = []
         self._current_selected_index = 0
 
+        # One-shot guard: when set, the very next TextChanged event from the
+        # text area is treated as coming from a programmatic history recall
+        # and skips completion mode detection. The flag must outlast the
+        # `_navigating_history` field on the text area, which is reset
+        # synchronously inside `set_text_from_history` but the TextChanged
+        # event fires asynchronously after that returns.
+        self._suppress_next_completion = False
+
         # Set up history manager
         if history_file is None:
             history_file = Path.home() / ".oat" / "history.jsonl"
@@ -818,9 +826,15 @@ class ChatInput(Vertical):
 
         # History handlers explicitly decide mode and stripped display text.
         # Skip mode detection here so recalled entries don't inherit stale mode.
-        if self._text_area and self._text_area._navigating_history:
+        if (
+            self._text_area and self._text_area._navigating_history
+        ) or self._suppress_next_completion:
+            self._suppress_next_completion = False
             if self._completion_manager:
                 self._completion_manager.reset()
+            # A recalled history entry must not auto-open completions even
+            # though the underlying text may contain `@` or `/`.
+            self._current_suggestions = []
             self.scroll_visible()
             return
 
@@ -1107,6 +1121,12 @@ class ChatInput(Vertical):
         if entry is not None and self._text_area:
             mode, display_text = self._history_entry_mode_and_text(entry)
             self.mode = mode
+            # Recalled entries (e.g. `tell me about @package.json`) must not
+            # immediately re-open the file picker. The TextChanged event
+            # produced by `set_text_from_history` fires asynchronously, so
+            # we set a one-shot guard the next handler invocation reads.
+            self._suppress_next_completion = True
+            self._current_suggestions = []
             self._text_area.set_text_from_history(display_text)
         elif self._text_area:
             self._text_area._navigating_history = False
@@ -1123,6 +1143,8 @@ class ChatInput(Vertical):
         if entry is not None and self._text_area:
             mode, display_text = self._history_entry_mode_and_text(entry)
             self.mode = mode
+            self._suppress_next_completion = True
+            self._current_suggestions = []
             self._text_area.set_text_from_history(display_text)
         elif self._text_area:
             self._text_area._navigating_history = False

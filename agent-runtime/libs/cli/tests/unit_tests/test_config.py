@@ -79,14 +79,13 @@ class TestProjectAgentMdFinding:
     """Test finding project-specific AGENTS.md files."""
 
     def test_find_agent_md_in_oat_sdk_dir(self, tmp_path: Path) -> None:
-        """Test finding AGENTS.md in .oat_sdk/ directory."""
+        """Test finding AGENTS.md in .oat/ directory."""
         project_root = tmp_path / "project"
         project_root.mkdir()
 
-        # Create .oat_sdk/AGENTS.md
-        oat_sdk_dir = project_root / ".oat_sdk"
-        oat_sdk_dir.mkdir()
-        agent_md = oat_sdk_dir / "AGENTS.md"
+        oat_dir = project_root / ".oat"
+        oat_dir.mkdir()
+        agent_md = oat_dir / "AGENTS.md"
         agent_md.write_text("Project instructions")
 
         result = _find_project_agent_md(project_root)
@@ -111,19 +110,18 @@ class TestProjectAgentMdFinding:
         project_root = tmp_path / "project"
         project_root.mkdir()
 
-        # Create both locations
-        oat_sdk_dir = project_root / ".oat_sdk"
-        oat_sdk_dir.mkdir()
-        oat_sdk_md = oat_sdk_dir / "AGENTS.md"
-        oat_sdk_md.write_text("In .oat_sdk/")
+        oat_dir = project_root / ".oat"
+        oat_dir.mkdir()
+        oat_md = oat_dir / "AGENTS.md"
+        oat_md.write_text("In .oat/")
 
         root_md = project_root / "AGENTS.md"
         root_md.write_text("In root")
 
-        # Should return both, with .oat_sdk/ first
+        # Should return both, with .oat/ first
         result = _find_project_agent_md(project_root)
         assert len(result) == 2
-        assert result[0] == oat_sdk_md
+        assert result[0] == oat_md
         assert result[1] == root_md
 
     def test_find_agent_md_not_found(self, tmp_path: Path) -> None:
@@ -168,10 +166,10 @@ class TestSettingsGetProjectAgentMdPath:
 
     def test_returns_existing_paths(self, tmp_path: Path) -> None:
         """Should return existing AGENTS.md paths from project root."""
-        oat_sdk_dir = tmp_path / ".oat_sdk"
-        oat_sdk_dir.mkdir()
-        oat_sdk_md = oat_sdk_dir / "AGENTS.md"
-        oat_sdk_md.write_text("inner")
+        oat_dir = tmp_path / ".oat"
+        oat_dir.mkdir()
+        oat_md = oat_dir / "AGENTS.md"
+        oat_md.write_text("inner")
 
         root_md = tmp_path / "AGENTS.md"
         root_md.write_text("root")
@@ -180,7 +178,7 @@ class TestSettingsGetProjectAgentMdPath:
         s.project_root = tmp_path
 
         result = s.get_project_agent_md_path()
-        assert result == [oat_sdk_md, root_md]
+        assert result == [oat_md, root_md]
 
     def test_returns_empty_when_no_agents_md_files(self, tmp_path: Path) -> None:
         """Should return [] when project exists but has no AGENTS.md."""
@@ -1004,7 +1002,7 @@ class TestBuildLangsmithThreadUrl:
 
         assert (
             result
-            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=oat_sdk-cli"
+            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=oat-cli"
         )
 
     def test_strips_trailing_slash(self) -> None:
@@ -1025,7 +1023,7 @@ class TestBuildLangsmithThreadUrl:
 
         assert (
             result
-            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=oat_sdk-cli"
+            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=oat-cli"
         )
 
     def test_returns_none_when_no_project_name(self) -> None:
@@ -1224,7 +1222,7 @@ class TestOpenRouterHeaders:
         assert kwargs["default_headers"]["HTTP-Referer"] == (
             "https://github.com/Root-IO-Labs/open-agent-teams"
         )
-        assert kwargs["default_headers"]["X-Title"] == "OAT Agents CLI"
+        assert kwargs["default_headers"]["X-Title"] == "OAT CLI"
 
     def test_per_model_headers_override_defaults(self, tmp_path: Path) -> None:
         """Per-model default_headers override built-in defaults."""
@@ -1553,8 +1551,8 @@ class TestDetectProvider:
             ("claude-sonnet-4-5", "anthropic"),
             ("claude-opus-4-5", "anthropic"),
             ("gemini-3.1-pro-preview", "google_genai"),
-            ("llama3", None),
-            ("mistral-large", None),
+            ("llama3", "groq"),
+            ("mistral-large", "mistralai"),
             ("some-unknown-model", None),
         ],
     )

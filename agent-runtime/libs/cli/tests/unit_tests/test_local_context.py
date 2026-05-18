@@ -698,9 +698,9 @@ class TestSectionFiles:
         assert "keep.py" in out
 
     def test_includes_oat_sdk(self, tmp_path: Path) -> None:
-        (tmp_path / ".oat_sdk").mkdir()
+        (tmp_path / ".oat").mkdir()
         out = _run_section(_section_files(), tmp_path)
-        assert ".oat_sdk" in out
+        assert ".oat" in out
 
 
 class TestSectionTree:
