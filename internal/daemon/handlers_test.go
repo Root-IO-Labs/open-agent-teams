@@ -24,17 +24,18 @@ func setupTestDaemonWithState(t *testing.T, setupFn func(*state.State)) (*Daemon
 	}
 
 	paths := &config.Paths{
-		Root:         tmpDir,
-		BinDir:       filepath.Join(tmpDir, "bin"),
-		DaemonPID:    filepath.Join(tmpDir, "daemon.pid"),
-		DaemonSock:   filepath.Join(tmpDir, "daemon.sock"),
-		DaemonLog:    filepath.Join(tmpDir, "daemon.log"),
-		StateFile:    filepath.Join(tmpDir, "state.json"),
-		ReposDir:     filepath.Join(tmpDir, "repos"),
-		WorktreesDir: filepath.Join(tmpDir, "wts"),
-		MessagesDir:  filepath.Join(tmpDir, "messages"),
-		OutputDir:    filepath.Join(tmpDir, "output"),
-		ArchiveDir:   filepath.Join(tmpDir, "archive"),
+		Root:             tmpDir,
+		BinDir:           filepath.Join(tmpDir, "bin"),
+		DaemonPID:        filepath.Join(tmpDir, "daemon.pid"),
+		DaemonSock:       filepath.Join(tmpDir, "daemon.sock"),
+		DaemonLog:        filepath.Join(tmpDir, "daemon.log"),
+		StateFile:        filepath.Join(tmpDir, "state.json"),
+		ReposDir:         filepath.Join(tmpDir, "repos"),
+		WorktreesDir:     filepath.Join(tmpDir, "wts"),
+		MessagesDir:      filepath.Join(tmpDir, "messages"),
+		OutputDir:        filepath.Join(tmpDir, "output"),
+		ArchiveDir:       filepath.Join(tmpDir, "archive"),
+		ModelProfilesDir: filepath.Join(tmpDir, "model-profiles"),
 	}
 
 	if err := paths.EnsureDirectories(); err != nil {
@@ -294,6 +295,160 @@ func TestHandleAddAgentTableDriven(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHandleAddAgentWithModelFlag verifies the `oat agent add --model <id>`
+// CLI path (Part 0d). The daemon receives the model in the add_agent socket
+// request and:
+//  1. Passes it through verbatim when no profiles are loaded.
+//  2. Canonicalizes the prefix when profiles ARE loaded and the input is
+//     unprefixed (claude-sonnet-4-6 → anthropic:claude-sonnet-4-6).
+//  3. Rejects up-front when the model isn't onboarded — so the typo doesn't
+//     spawn a misconfigured agent that the next restart silently swaps.
+func TestHandleAddAgentWithModelFlag(t *testing.T) {
+	// Pass-through path (no profiles loaded): preserves the raw input.
+	t.Run("passthrough_when_no_profiles", func(t *testing.T) {
+		d, cleanup := setupTestDaemonWithState(t, func(s *state.State) {
+			s.AddRepo("test-repo", &state.Repository{
+				GithubURL:   "https://github.com/test/repo",
+				SessionName: "test-session",
+				Agents:      make(map[string]state.Agent),
+			})
+		})
+		defer cleanup()
+
+		resp := d.handleAddAgent(socket.Request{
+			Command: "add_agent",
+			Args: map[string]interface{}{
+				"repo":          "test-repo",
+				"agent":         "browser-agent",
+				"type":          "browser",
+				"worktree_path": "/tmp/ba",
+				"window_name":   "browser-agent",
+				"model":         "claude-sonnet-4-6",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("handleAddAgent() failed: %s", resp.Error)
+		}
+		got, ok := d.state.GetAgent("test-repo", "browser-agent")
+		if !ok {
+			t.Fatal("agent missing from state")
+		}
+		if got.Model != "claude-sonnet-4-6" {
+			t.Errorf("Model = %q, want passthrough %q", got.Model, "claude-sonnet-4-6")
+		}
+	})
+
+	// Canonicalize + accept: profile registered as anthropic:claude-sonnet-4-6,
+	// CLI submitted the unprefixed form. State must persist the canonical form.
+	t.Run("canonicalize_unprefixed_when_profile_present", func(t *testing.T) {
+		d, cleanup := setupTestDaemonWithState(t, nil)
+		defer cleanup()
+
+		// Drop a minimal profile into the daemon's model-profiles dir and
+		// reload so the validation path picks it up.
+		profileYAML := `model_id: "anthropic:claude-sonnet-4-6"
+status: known
+provider:
+  name: anthropic
+routing:
+  autonomy_tier: full
+  overall_score: 99
+contract:
+  onboarding_passed: true
+  worker_eligible: true
+  orchestrator_eligible: true
+`
+		profilePath := filepath.Join(d.paths.ModelProfilesDir, "anthropic__claude-sonnet-4-6.yaml")
+		if err := os.WriteFile(profilePath, []byte(profileYAML), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.modelProfiles.Reload(); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.state.AddRepo("test-repo", &state.Repository{
+			GithubURL:   "https://github.com/test/repo",
+			SessionName: "test-session",
+			Agents:      make(map[string]state.Agent),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		resp := d.handleAddAgent(socket.Request{
+			Command: "add_agent",
+			Args: map[string]interface{}{
+				"repo":          "test-repo",
+				"agent":         "browser-agent",
+				"type":          "browser",
+				"worktree_path": "/tmp/ba",
+				"window_name":   "browser-agent",
+				"model":         "claude-sonnet-4-6",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("handleAddAgent() failed: %s", resp.Error)
+		}
+		got, _ := d.state.GetAgent("test-repo", "browser-agent")
+		if got.Model != "anthropic:claude-sonnet-4-6" {
+			t.Errorf("Model = %q, want canonical %q", got.Model, "anthropic:claude-sonnet-4-6")
+		}
+	})
+
+	// Reject: profiles loaded, model not onboarded — fail at registration so
+	// the operator sees the error immediately rather than discovering it
+	// when the daemon silently swaps on first restart.
+	t.Run("reject_unknown_model_when_profiles_present", func(t *testing.T) {
+		d, cleanup := setupTestDaemonWithState(t, nil)
+		defer cleanup()
+
+		profileYAML := `model_id: "anthropic:claude-sonnet-4-6"
+status: known
+provider:
+  name: anthropic
+routing:
+  autonomy_tier: full
+  overall_score: 99
+contract:
+  onboarding_passed: true
+  worker_eligible: true
+  orchestrator_eligible: true
+`
+		if err := os.WriteFile(filepath.Join(d.paths.ModelProfilesDir, "p.yaml"), []byte(profileYAML), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.modelProfiles.Reload(); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.state.AddRepo("test-repo", &state.Repository{
+			GithubURL:   "https://github.com/test/repo",
+			SessionName: "test-session",
+			Agents:      make(map[string]state.Agent),
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		resp := d.handleAddAgent(socket.Request{
+			Command: "add_agent",
+			Args: map[string]interface{}{
+				"repo":          "test-repo",
+				"agent":         "browser-agent",
+				"type":          "browser",
+				"worktree_path": "/tmp/ba",
+				"window_name":   "browser-agent",
+				"model":         "openai:gpt-typo",
+			},
+		})
+		if resp.Success {
+			t.Errorf("handleAddAgent() succeeded with bogus model, want failure")
+		}
+		if !strings.Contains(resp.Error, "not onboarded") {
+			t.Errorf("error %q does not mention 'not onboarded'", resp.Error)
+		}
+		if _, exists := d.state.GetAgent("test-repo", "browser-agent"); exists {
+			t.Error("agent should NOT be registered when model validation fails")
+		}
+	})
 }
 
 // TestHandleAddAgentWithIssueNumber verifies that issue_number and issue_url are stored when provided

@@ -852,7 +852,7 @@ func (c *CLI) registerCommands() {
 	agentCmd.Subcommands["add"] = &Command{
 		Name:        "add",
 		Description: "Add an opt-in persistent agent to a repo (currently: browser-agent)",
-		Usage: "oat agent add <type> [name] [--repo <repo>]\n\n" +
+		Usage: "oat agent add <type> [name] [--repo <repo>] [--model <id>]\n\n" +
 			"Types:\n" +
 			"  browser-agent   Add the browser-agent (MCP bridge to Chrome).\n" +
 			"                  Requires oat-browser-agent installed; the daemon\n" +
@@ -860,6 +860,14 @@ func (c *CLI) registerCommands() {
 			"                  `oat-browser-agent`, then ~/.oat/oat-browser-agent/\n" +
 			"                  dist/bridge/index.js. See:\n" +
 			"                  https://github.com/Root-IO-Labs/oat-browser-agent\n\n" +
+			"Flags:\n" +
+			"  --model <id>    Pin this agent to a specific onboarded model\n" +
+			"                  (e.g. anthropic:claude-sonnet-4-6). Accepts both\n" +
+			"                  prefixed and unprefixed forms; canonical form is\n" +
+			"                  persisted. Validated against loaded profiles up\n" +
+			"                  front so typos fail at registration rather than\n" +
+			"                  silently triggering a swap on the first restart.\n" +
+			"                  When omitted the agent inherits the repo default.\n\n" +
 			"Idempotency: re-adding a healthy browser-agent is a no-op. If a\n" +
 			"previous browser-agent record exists but the process is dead, it\n" +
 			"is respawned (rather than failing).",
@@ -6976,15 +6984,19 @@ func (c *CLI) addAgentCmd(args []string) error {
 	}
 
 	if !alreadyRegistered {
+		addArgs := map[string]interface{}{
+			"repo":          repoName,
+			"agent":         agentName,
+			"type":          string(agentType),
+			"worktree_path": worktreePath,
+			"window_name":   agentName,
+		}
+		if model := strings.TrimSpace(flags["model"]); model != "" {
+			addArgs["model"] = model
+		}
 		addResp, err := client.Send(socket.Request{
 			Command: "add_agent",
-			Args: map[string]interface{}{
-				"repo":          repoName,
-				"agent":         agentName,
-				"type":          string(agentType),
-				"worktree_path": worktreePath,
-				"window_name":   agentName,
-			},
+			Args:    addArgs,
 		})
 		if err != nil {
 			return errors.DaemonCommunicationFailed("registering agent", err)

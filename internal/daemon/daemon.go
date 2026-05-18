@@ -2175,8 +2175,43 @@ func (d *Daemon) handleAddAgent(req socket.Request) socket.Response {
 	agent.IssueNumber = getOptionalStringArg(req.Args, "issue_number", "")
 	agent.IssueURL = getOptionalStringArg(req.Args, "issue_url", "")
 
-	// Optional model override for this specific agent
-	agent.Model = getOptionalStringArg(req.Args, "model", "")
+	// Optional model override for this specific agent. Validated against
+	// loaded profiles before persisting so a typo here doesn't spawn a
+	// misconfigured agent that the next restart silently auto-swaps.
+	// The canonical (always-prefixed) form is what gets persisted so state
+	// converges on the same shape as `oat model onboard` registrations.
+	if rawModel := getOptionalStringArg(req.Args, "model", ""); rawModel != "" {
+		repo, _ := d.state.GetRepo(repoName)
+		role := routing.RoleWorker
+		switch agent.Type {
+		case state.AgentTypeSupervisor, state.AgentTypeWorkspace, state.AgentTypeMergeQueue, state.AgentTypePRShepherd:
+			role = routing.RoleOrchestrator
+		}
+		if d.modelProfiles != nil && d.modelProfiles.Count() > 0 {
+			canonical, vErr := d.modelProfiles.ValidateAndCanonicalize(rawModel, role)
+			if vErr != nil {
+				return socket.ErrorResponse("model %q rejected: %s", rawModel, vErr.Error())
+			}
+			if role == routing.RoleWorker && len(repo.AllowedWorkerModels) > 0 {
+				found := false
+				for _, m := range repo.AllowedWorkerModels {
+					if m == rawModel || m == canonical {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return socket.ErrorResponse("model %q is not in the allowed worker models for repo %q — update with: oat config %s worker-models add %s", canonical, repoName, repoName, canonical)
+				}
+			}
+			agent.Model = canonical
+		} else {
+			// No profiles loaded — passthrough (matches existing behavior
+			// elsewhere in the daemon). Operator can still onboard later
+			// and the next restart will canonicalize.
+			agent.Model = rawModel
+		}
+	}
 
 	if err := d.state.AddAgent(repoName, agentName, agent); err != nil {
 		return socket.ErrorResponse("%s", err.Error())
