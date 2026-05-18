@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,12 @@ import (
 	"strings"
 	"sync"
 )
+
+// ErrAmbiguousModel is returned by LookupNormalized when a bare (unprefixed)
+// model name matches profiles registered under multiple providers. Callers
+// must disambiguate by passing the prefixed form (e.g.
+// "anthropic:claude-sonnet-4-6" instead of "claude-sonnet-4-6").
+var ErrAmbiguousModel = errors.New("ambiguous model name matches multiple onboarded profiles")
 
 // minimumProbeSetPenalty is the score deduction applied to profiles that were
 // onboarded with --probe-set minimum. Untested probes in the minimum set default
@@ -244,21 +251,86 @@ func (ps *ProfileStore) EligibleFiltered(role AgentRole, allowed []string) []*Mo
 	return result
 }
 
-// Validate checks that a model is onboarded and eligible for the given role.
-// Returns nil if valid, or a descriptive error.
-func (ps *ProfileStore) Validate(modelID string, role AgentRole) error {
+// LookupNormalized resolves a model identifier to an onboarded profile,
+// accepting both prefixed ("provider:model") and unprefixed ("model") inputs.
+//
+// Resolution order:
+//  1. Exact match on the input.
+//  2. If the input lacks a colon: walk profiles whose bare suffix
+//     (strings.SplitN(ModelID, ":", 2)[1]) equals the input. Match if
+//     exactly one profile is found; return ErrAmbiguousModel if multiple
+//     profiles across different providers share the same bare name.
+//  3. If the input contains a colon but missed step 1: try the bare suffix
+//     against profiles registered without prefix (rare).
+//
+// Returns (profile, canonicalModelID, nil) on success, where canonicalModelID
+// is the profile's stored ModelID (always the prefixed form when normalization
+// promoted an unprefixed input).
+// Returns (nil, "", nil) on a clean miss (no profile matches).
+// Returns (nil, "", ErrAmbiguousModel) when a bare input is ambiguous.
+func (ps *ProfileStore) LookupNormalized(modelID string) (*ModelProfile, string, error) {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
-	p, ok := ps.profiles[modelID]
-	if !ok {
-		return fmt.Errorf("model %q is not onboarded — run: oat model onboard %s", modelID, modelID)
+	if p, ok := ps.profiles[modelID]; ok {
+		return p, modelID, nil
+	}
+
+	if !strings.Contains(modelID, ":") {
+		var matches []*ModelProfile
+		for _, p := range ps.profiles {
+			parts := strings.SplitN(p.ModelID, ":", 2)
+			if len(parts) == 2 && parts[1] == modelID {
+				matches = append(matches, p)
+			} else if len(parts) == 1 && parts[0] == modelID {
+				matches = append(matches, p)
+			}
+		}
+		if len(matches) == 0 {
+			return nil, "", nil
+		}
+		if len(matches) > 1 {
+			return nil, "", ErrAmbiguousModel
+		}
+		return matches[0], matches[0].ModelID, nil
+	}
+
+	bare := strings.SplitN(modelID, ":", 2)[1]
+	if p, ok := ps.profiles[bare]; ok {
+		return p, p.ModelID, nil
+	}
+	return nil, "", nil
+}
+
+// Validate checks that a model is onboarded and eligible for the given role.
+// Accepts both prefixed and unprefixed model IDs via LookupNormalized.
+// Returns nil if valid, or a descriptive error.
+func (ps *ProfileStore) Validate(modelID string, role AgentRole) error {
+	_, err := ps.ValidateAndCanonicalize(modelID, role)
+	return err
+}
+
+// ValidateAndCanonicalize is Validate plus the canonical (always-prefixed)
+// ModelID. Callers that need to update persisted state with the normalized
+// form (e.g. agent state after a daemon restart with an unprefixed model)
+// should prefer this variant. Returns the canonical ID on success and a
+// descriptive error otherwise.
+func (ps *ProfileStore) ValidateAndCanonicalize(modelID string, role AgentRole) (string, error) {
+	p, canonical, err := ps.LookupNormalized(modelID)
+	if errors.Is(err, ErrAmbiguousModel) {
+		return "", fmt.Errorf("model %q matches multiple onboarded profiles across providers — use the prefixed form (e.g. provider:%s)", modelID, modelID)
+	}
+	if err != nil {
+		return "", err
+	}
+	if p == nil {
+		return "", fmt.Errorf("model %q is not onboarded — run: oat model onboard %s", modelID, modelID)
 	}
 	if !p.IsEligible(role) {
-		return fmt.Errorf("model %q is not eligible as %s (status=%s, tier=%s, worker=%v, orchestrator=%v)",
-			modelID, role, p.Status, p.AutonomyTier, p.WorkerEligible, p.OrchestratorEligible)
+		return "", fmt.Errorf("model %q is not eligible as %s (status=%s, tier=%s, worker=%v, orchestrator=%v)",
+			canonical, role, p.Status, p.AutonomyTier, p.WorkerEligible, p.OrchestratorEligible)
 	}
-	return nil
+	return canonical, nil
 }
 
 // BestEligible returns the highest-scoring eligible model for the given role.

@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -252,6 +253,150 @@ func TestProfileStore_Validate(t *testing.T) {
 				t.Errorf("Validate(%q, %s) error = %v, wantErr = %v", tc.modelID, tc.role, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestProfileStore_LookupNormalized(t *testing.T) {
+	dir := setupTestProfiles(t)
+	ps, _ := NewProfileStore(dir)
+
+	tests := []struct {
+		name          string
+		input         string
+		wantCanonical string
+		wantNil       bool
+		wantErr       bool
+	}{
+		{
+			name:          "prefixed exact match",
+			input:         "anthropic:claude-sonnet-4-6",
+			wantCanonical: "anthropic:claude-sonnet-4-6",
+		},
+		{
+			name:          "unprefixed promotes to canonical",
+			input:         "claude-sonnet-4-6",
+			wantCanonical: "anthropic:claude-sonnet-4-6",
+		},
+		{
+			name:          "unprefixed flash promotes to canonical",
+			input:         "gemini-2.5-flash",
+			wantCanonical: "google_genai:gemini-2.5-flash",
+		},
+		{
+			name:    "unknown prefixed clean miss",
+			input:   "openai:gpt-99",
+			wantNil: true,
+		},
+		{
+			name:    "unknown bare clean miss",
+			input:   "totally-fake",
+			wantNil: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p, canonical, err := ps.LookupNormalized(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("LookupNormalized(%q) error = nil, want non-nil", tc.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LookupNormalized(%q) unexpected error: %v", tc.input, err)
+			}
+			if tc.wantNil {
+				if p != nil {
+					t.Fatalf("LookupNormalized(%q) returned profile %q, expected nil", tc.input, p.ModelID)
+				}
+				if canonical != "" {
+					t.Fatalf("LookupNormalized(%q) returned canonical %q, expected empty", tc.input, canonical)
+				}
+				return
+			}
+			if p == nil {
+				t.Fatalf("LookupNormalized(%q) returned nil profile, want %q", tc.input, tc.wantCanonical)
+			}
+			if canonical != tc.wantCanonical {
+				t.Errorf("LookupNormalized(%q) canonical = %q, want %q", tc.input, canonical, tc.wantCanonical)
+			}
+		})
+	}
+}
+
+// TestProfileStore_LookupNormalized_Ambiguous verifies that a bare model name
+// shared by profiles under multiple providers is rejected explicitly rather
+// than silently picking one.
+func TestProfileStore_LookupNormalized_Ambiguous(t *testing.T) {
+	dir := t.TempDir()
+
+	// Two providers both onboarding "gpt-5" — the bare name "gpt-5" must be
+	// ambiguous.
+	makeProfile := func(modelID string) string {
+		return fmt.Sprintf(`model_id: "%s"
+status: known
+provider:
+  name: test
+routing:
+  autonomy_tier: full
+  overall_score: 90
+contract:
+  onboarding_passed: true
+  worker_eligible: true
+  orchestrator_eligible: true
+`, modelID)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.yaml"), []byte(makeProfile("alpha:gpt-5")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.yaml"), []byte(makeProfile("beta:gpt-5")), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ps, err := NewProfileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = ps.LookupNormalized("gpt-5")
+	if !errors.Is(err, ErrAmbiguousModel) {
+		t.Fatalf("LookupNormalized(\"gpt-5\") error = %v, want ErrAmbiguousModel", err)
+	}
+
+	// Prefixed forms must still resolve cleanly.
+	if _, canonical, err := ps.LookupNormalized("alpha:gpt-5"); err != nil || canonical != "alpha:gpt-5" {
+		t.Errorf("prefixed alpha lookup: canonical=%q err=%v", canonical, err)
+	}
+	if _, canonical, err := ps.LookupNormalized("beta:gpt-5"); err != nil || canonical != "beta:gpt-5" {
+		t.Errorf("prefixed beta lookup: canonical=%q err=%v", canonical, err)
+	}
+
+	// ValidateAndCanonicalize must surface the ambiguous error with a
+	// helpful hint.
+	if _, err := ps.ValidateAndCanonicalize("gpt-5", RoleWorker); err == nil ||
+		!strings.Contains(err.Error(), "matches multiple onboarded profiles") {
+		t.Errorf("ValidateAndCanonicalize ambiguous err = %v, want hint", err)
+	}
+}
+
+// TestProfileStore_Validate_AcceptsUnprefixed verifies the 2026-05-15
+// regression fix: an unprefixed model name in state.json no longer fails
+// validation with a confusing "not onboarded" error and no longer triggers
+// a silent swap to whatever auto-select would pick.
+func TestProfileStore_Validate_AcceptsUnprefixed(t *testing.T) {
+	dir := setupTestProfiles(t)
+	ps, _ := NewProfileStore(dir)
+
+	if err := ps.Validate("claude-sonnet-4-6", RoleWorker); err != nil {
+		t.Errorf("Validate(unprefixed) returned %v, expected nil", err)
+	}
+	canonical, err := ps.ValidateAndCanonicalize("claude-sonnet-4-6", RoleWorker)
+	if err != nil {
+		t.Fatalf("ValidateAndCanonicalize(unprefixed) returned %v", err)
+	}
+	if canonical != "anthropic:claude-sonnet-4-6" {
+		t.Errorf("canonical = %q, want %q", canonical, "anthropic:claude-sonnet-4-6")
 	}
 }
 

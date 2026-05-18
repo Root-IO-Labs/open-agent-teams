@@ -6017,21 +6017,25 @@ func (d *Daemon) validateModelForAgentType(model string, agentType state.AgentTy
 		role = routing.RoleOrchestrator
 	}
 
-	if err := d.modelProfiles.Validate(model, role); err != nil {
+	canonical, err := d.modelProfiles.ValidateAndCanonicalize(model, role)
+	if err != nil {
 		return err
 	}
 
 	// Allowlist check only applies to workers (matches resolveAndValidateModel semantics).
+	// The allowlist is checked against BOTH the original input and the canonical form, so
+	// operators who configured the repo with an unprefixed entry still match. Operators are
+	// encouraged to canonicalize their allowed-models entries when they next edit them.
 	if role == routing.RoleWorker && len(allowedModels) > 0 {
 		found := false
 		for _, m := range allowedModels {
-			if m == model {
+			if m == model || m == canonical {
 				found = true
 				break
 			}
 		}
 		if !found {
-			return fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", model, model)
+			return fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", canonical, canonical)
 		}
 	}
 	return nil
@@ -6090,18 +6094,25 @@ func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoMod
 		}
 	}
 
-	// If a model was explicitly specified, validate it
+	// If a model was explicitly specified, validate it (accepting prefixed or
+	// unprefixed). The canonical form is returned so downstream code and
+	// persisted state converge on the prefixed shape.
 	if explicitModel != "" {
-		if err := d.modelProfiles.Validate(explicitModel, role); err != nil {
+		canonical, err := d.modelProfiles.ValidateAndCanonicalize(explicitModel, role)
+		if err != nil {
 			d.logger.Warn("Model routing: rejected %s for %s: %v", explicitModel, role, err)
 			return "", "", err
 		}
-		if allowSet != nil && !allowSet[explicitModel] {
-			d.logger.Warn("Model routing: %s not in allowed worker models for this repo", explicitModel)
-			return "", "", fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", explicitModel, explicitModel)
+		if allowSet != nil && !allowSet[explicitModel] && !allowSet[canonical] {
+			d.logger.Warn("Model routing: %s not in allowed worker models for this repo", canonical)
+			return "", "", fmt.Errorf("model %q is not in the allowed worker models for this repo — update with: oat config <repo> worker-models add %s", canonical, canonical)
 		}
-		d.logger.Info("Model routing: validated %s for %s", explicitModel, role)
-		return explicitModel, RoutingSourceOperatorExplicit, nil
+		if canonical != explicitModel {
+			d.logger.Info("Model routing: normalized %q -> %q for %s", explicitModel, canonical, role)
+		} else {
+			d.logger.Info("Model routing: validated %s for %s", canonical, role)
+		}
+		return canonical, RoutingSourceOperatorExplicit, nil
 	}
 
 	// No explicit model — try auto-select from allowed subset (or all eligible)
