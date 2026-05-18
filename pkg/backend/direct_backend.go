@@ -40,6 +40,7 @@ type managedProcess struct {
 	adopted          bool              // true if re-adopted after daemon restart (no PTY)
 	startedAt        time.Time         // when the process was originally started (persisted for PID reuse guard)
 	broadcaster      *rawBroadcaster   // live ANSI-stripped output stream (nil for adopted processes)
+	chunkBroadcaster *chunkBroadcaster // raw byte chunks (no strip/dedup) for side-panel debug + bridge heartbeat; nil for adopted processes
 	sidecarServer    *sidecar.Server   // optional structured-event socket; nil when OAT_USE_SIDECAR is off
 	eventBroadcaster *eventBroadcaster // per-agent sidecar.Event pub/sub — always non-nil, fires only when sidecar is on
 }
@@ -306,6 +307,7 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 		done:             make(chan struct{}),
 		startedAt:        time.Now().UTC(),
 		broadcaster:      newRawBroadcaster(),
+		chunkBroadcaster: newChunkBroadcaster(),
 		sidecarServer:    sidecarSrv,
 		eventBroadcaster: eventBc,
 	}
@@ -366,6 +368,11 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 				if proc.broadcaster != nil {
 					_, _ = proc.broadcaster.Write(chunk) // fanout; subscribers handle drops
 				}
+				if proc.chunkBroadcaster != nil {
+					// Raw-byte fanout for the side-panel debug view + bridge
+					// heartbeat. Copies internally so reusing `buf` is fine.
+					proc.chunkBroadcaster.Write(chunk)
+				}
 			}
 			if err != nil {
 				break // EIO on child exit, or ptmx closed
@@ -377,6 +384,9 @@ func (b *DirectBackend) StartAgent(ctx context.Context, cfg AgentConfig) (*Agent
 		}
 		if proc.broadcaster != nil {
 			proc.broadcaster.Close()
+		}
+		if proc.chunkBroadcaster != nil {
+			proc.chunkBroadcaster.Close()
 		}
 	}()
 
@@ -1344,5 +1354,36 @@ func (b *DirectBackend) subscribeOutput(session, agentName string, liveOnly bool
 		return id, ch, cancel, nil
 	}
 	id, ch, cancel := proc.broadcaster.Subscribe()
+	return id, ch, cancel, nil
+}
+
+// SubscribeRawOutput subscribes to the raw byte chunk stream from the given
+// agent's PTY. Unlike SubscribeOutput, this feed preserves ANSI escapes,
+// has no dedup/line buffering, and delivers chunks (not lines) — exactly
+// what the side-panel debug view needs to render an authentic terminal.
+//
+// Returns ChunkFrame values: each frame is either a chunk (raw bytes) or
+// a gap marker (bytes_dropped > 0) when the subscriber fell behind. The
+// channel is closed on the agent exiting or the broadcaster being torn
+// down. Re-adopted processes have no chunk broadcaster — the caller gets
+// a clean error rather than a silent empty channel, so the daemon stream
+// handler can report "agent was re-adopted; restart to enable streaming"
+// instead of hanging.
+func (b *DirectBackend) SubscribeRawOutput(session, agentName string) (uint64, <-chan ChunkFrame, func(), error) {
+	b.mu.RLock()
+	agents, ok := b.sessions[session]
+	if !ok {
+		b.mu.RUnlock()
+		return 0, nil, nil, fmt.Errorf("session %q not found", session)
+	}
+	proc, ok := agents[agentName]
+	b.mu.RUnlock()
+	if !ok {
+		return 0, nil, nil, fmt.Errorf("agent %q not found in session %q", agentName, session)
+	}
+	if proc.chunkBroadcaster == nil {
+		return 0, nil, nil, fmt.Errorf("agent %q has no raw output stream (adopted or dead)", agentName)
+	}
+	id, ch, cancel := proc.chunkBroadcaster.Subscribe()
 	return id, ch, cancel, nil
 }

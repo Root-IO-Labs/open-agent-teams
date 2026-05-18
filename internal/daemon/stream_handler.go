@@ -1,12 +1,14 @@
 package daemon
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net"
 	"strings"
 	"time"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 	backend_pkg "github.com/Root-IO-Labs/open-agent-teams/pkg/backend"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/sidecar"
 )
@@ -72,6 +74,8 @@ func (sh *streamHandler) HandleStream(req socket.Request, conn net.Conn) {
 		sh.handleStreamOutput(req, conn)
 	case "stream_events":
 		sh.handleStreamEvents(req, conn)
+	case "stream_agent_output":
+		sh.handleStreamAgentOutput(req, conn)
 	default:
 		// Unknown streaming command — send error and close
 		resp := socket.Response{Success: false, Error: "unknown stream command: " + req.Command}
@@ -278,6 +282,216 @@ func (sh *streamHandler) handleStreamEvents(req socket.Request, conn net.Conn) {
 			}
 		case <-connDead:
 			sh.d.logger.Debug("Event stream client disconnected for %s/%s", repoName, agentName)
+			return
+		}
+	}
+}
+
+// agentOutputBatchInterval is the minimum wall-clock gap between flushes
+// to a stream_agent_output client. The first chunk after an idle period
+// is delivered immediately, then the handler accumulates any further
+// chunks for up to this interval and batches them into a single frame.
+//
+// 16 ms is the plan's target — fast enough to feel "live" in a debug
+// console (~60 Hz), slow enough that a chatty agent emitting many tiny
+// chunks doesn't pin the WS connection. Tuning note: smaller values
+// increase WS frame count linearly; larger values increase perceived
+// latency. The cap mostly matters during streaming token output, which
+// is by far the chattiest source of bytes.
+const agentOutputBatchInterval = 16 * time.Millisecond
+
+// streamAgentChunkFrame is the wire format for stream_agent_output. Each
+// frame is either:
+//   - a chunk frame (Chunk set, Gap == 0): base64-encoded bytes from the
+//     PTY, optionally batched across multiple PTY reads.
+//   - a gap frame (Gap > 0): N bytes were dropped because this subscriber
+//     fell behind. Debug view renders this as "[N bytes dropped]"; pretty
+//     mode ignores it.
+//   - the terminal frame (Done: true): agent exited or broadcaster closed.
+//   - an error frame (Err set): unrecoverable problem.
+//
+// TS is RFC3339 UTC so the client can compute latency without negotiating
+// a clock format.
+type streamAgentChunkFrame struct {
+	Chunk string `json:"chunk,omitempty"`
+	Gap   int64  `json:"gap,omitempty"`
+	TS    string `json:"ts,omitempty"`
+	Done  bool   `json:"done,omitempty"`
+	Err   string `json:"error,omitempty"`
+}
+
+// handleStreamAgentOutput is the Part-2c side-panel chat output stream.
+//
+// Identifies the agent by (session, agent_name) — matching the
+// OAT_BROWSER_AGENT_SESSION and OAT_BROWSER_AGENT_NAME env vars from
+// Part 2a — so the oat-browser-agent bridge doesn't have to reverse-
+// resolve the repository name. We still need a state lookup to translate
+// agent_name → window_name for the backend's session map (they happen
+// to match for browser agents today, but the daemon's contract pins
+// state.Agent.WindowName as the canonical key, so we follow it).
+//
+// Throttling: the daemon batches chunks at agentOutputBatchInterval (16 ms)
+// before flushing a frame. This is enforced on the daemon socket boundary
+// per the plan, so both the bridge's pretty-mode heartbeat and the
+// debug-view raw render benefit from the same backpressure profile.
+//
+// Backpressure: ChunkFrame.Gap markers surface to the client when the
+// subscriber's channel fills — already handled by the chunkBroadcaster.
+// The handler re-encodes them as gap frames on the wire so the side
+// panel can render an explicit "bytes dropped" indicator.
+//
+// Protocol:
+//  1. Server sends handshake: {"success":true,"stream":true}
+//  2. Server streams JSON lines: {"chunk":"<base64>","ts":"..."} or
+//     {"gap":N,"ts":"..."} as they arrive (batched at 16 ms minimum).
+//  3. On agent exit / cancel: {"done":true}
+//  4. On error: {"error":"msg"} then close.
+func (sh *streamHandler) handleStreamAgentOutput(req socket.Request, conn net.Conn) {
+	defer conn.Close()
+	enc := json.NewEncoder(conn)
+
+	sessionName, _ := req.Args["session"].(string)
+	agentName, _ := req.Args["agent"].(string)
+	if sessionName == "" || agentName == "" {
+		enc.Encode(socket.Response{Success: false, Error: "session and agent are required"}) //nolint:errcheck
+		return
+	}
+
+	directBackend, ok := sh.d.backend.(*backend_pkg.DirectBackend)
+	if !ok {
+		enc.Encode(socket.Response{Success: false, Error: "raw output streaming not supported for this backend"}) //nolint:errcheck
+		return
+	}
+
+	// Translate (session, agent_name) → (session, window_name). The bridge
+	// addresses agents by the state agent-name; the backend's session map
+	// is keyed by window-name. They normally match for browser agents
+	// but we don't rely on that invariant here.
+	repoName, _, found := sh.d.findRepoBySession(sessionName)
+	if !found {
+		enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
+		return
+	}
+	agent, exists := sh.d.state.GetAgent(repoName, agentName)
+	if !exists {
+		enc.Encode(socket.Response{Success: false, Error: "agent '" + agentName + "' not found in session " + sessionName}) //nolint:errcheck
+		return
+	}
+	// Defense in depth: stream_agent_output is intended for the side-panel
+	// chat path. Restricting to AgentTypeBrowser matches the agent_input
+	// restriction (Part 2b) and prevents a curious or malicious socket
+	// client from siphoning raw PTY bytes (which include ANSI / TUI state
+	// that other agent types don't expect to be readable in real time)
+	// out of the supervisor or a worker. Line-level subscription via the
+	// existing stream_output verb stays available for those agent types.
+	if agent.Type != state.AgentTypeBrowser {
+		enc.Encode(socket.Response{Success: false, Error: "stream_agent_output is restricted to browser-agent type; " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
+		return
+	}
+
+	_, ch, cancel, err := directBackend.SubscribeRawOutput(sessionName, agent.WindowName)
+	if err != nil {
+		enc.Encode(socket.Response{Success: false, Error: err.Error()}) //nolint:errcheck
+		return
+	}
+	defer cancel()
+
+	// Handshake.
+	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+	if err := enc.Encode(socket.Response{Success: true, Stream: true}); err != nil {
+		return
+	}
+
+	// Disconnect detector — Unix socket reads return when the remote end
+	// closes. Same pattern as the existing stream_output handler.
+	connDead := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		conn.Read(buf) //nolint:errcheck
+		close(connDead)
+	}()
+
+	// Pump frames with 16 ms minimum batching. Implementation: on the
+	// first frame after an idle period, start a timer; subsequent frames
+	// arriving before the timer fires accumulate into a batch; on timer
+	// fire, flush the batch as one or more wire frames. Chunk batches
+	// concatenate raw bytes (preserves PTY ordering); gap markers stay
+	// as separate frames so the client can render them distinctly.
+	var pendingBytes []byte
+	var pendingChunkTS time.Time
+	var pendingGap int64
+	var pendingGapTS time.Time
+	flushTimer := time.NewTimer(0)
+	if !flushTimer.Stop() {
+		<-flushTimer.C
+	}
+	timerArmed := false
+
+	flush := func() bool {
+		if len(pendingBytes) > 0 {
+			frame := streamAgentChunkFrame{
+				Chunk: base64.StdEncoding.EncodeToString(pendingBytes),
+				TS:    pendingChunkTS.Format(time.RFC3339Nano),
+			}
+			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+			if err := enc.Encode(frame); err != nil {
+				sh.d.logger.Debug("stream_agent_output write failed for %s/%s: %v", sessionName, agentName, err)
+				return false
+			}
+			pendingBytes = nil
+			pendingChunkTS = time.Time{}
+		}
+		if pendingGap > 0 {
+			frame := streamAgentChunkFrame{
+				Gap: pendingGap,
+				TS:  pendingGapTS.Format(time.RFC3339Nano),
+			}
+			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+			if err := enc.Encode(frame); err != nil {
+				sh.d.logger.Debug("stream_agent_output gap write failed for %s/%s: %v", sessionName, agentName, err)
+				return false
+			}
+			pendingGap = 0
+			pendingGapTS = time.Time{}
+		}
+		timerArmed = false
+		return true
+	}
+
+	for {
+		select {
+		case frame, ok := <-ch:
+			if !ok {
+				// Broadcaster closed (agent exited). Flush anything
+				// queued, then send done.
+				if !flush() {
+					return
+				}
+				conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+				enc.Encode(streamAgentChunkFrame{Done: true})             //nolint:errcheck
+				return
+			}
+			if frame.Gap > 0 {
+				pendingGap += frame.Gap
+				if pendingGapTS.IsZero() {
+					pendingGapTS = frame.TS
+				}
+			} else if len(frame.Chunk) > 0 {
+				pendingBytes = append(pendingBytes, frame.Chunk...)
+				if pendingChunkTS.IsZero() {
+					pendingChunkTS = frame.TS
+				}
+			}
+			if !timerArmed {
+				flushTimer.Reset(agentOutputBatchInterval)
+				timerArmed = true
+			}
+		case <-flushTimer.C:
+			if !flush() {
+				return
+			}
+		case <-connDead:
+			sh.d.logger.Debug("stream_agent_output client disconnected for %s/%s", sessionName, agentName)
 			return
 		}
 	}

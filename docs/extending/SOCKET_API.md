@@ -31,6 +31,7 @@ start_repo_agents
 start_worker
 send_agent_input
 agent_input
+stream_agent_output
 interrupt_agent
 escape_agent
 start_verification
@@ -75,6 +76,7 @@ Each command below matches a `case` in `handleRequest`.
 | `start_verification` | Mark a worker as awaiting verification, pin `worker.BaseSHA` (from CLI-provided `base_sha` or daemon-side snapshot), and pin the verifier agent name. Called by `oat worker request-review` before `start_verification_agent`. | `repo`, `worker`, `verifier`, `commit_sha`, `base_sha` (optional) |
 | `start_verification_agent` | Start a verification agent process via daemon backend (auto-retires completed verifiers on re-request) | `repo`, `agent`, `worktree_path` |
 | `agent_input` | Side-panel chat PTY-injection. Identifies the agent by `session` (matched against `repo.SessionName`) rather than by `repo` so the oat-browser-agent bridge can use the `OAT_BROWSER_AGENT_SESSION` env var directly. Input is sanitized via `internal/socket.SanitizePTYInput` to mitigate control-character prompt injection (Dropbox 2024); rejected with a structured error if it strips more than 5% injection-class C0 bytes, exceeds 32 KiB, contains invalid UTF-8, or — in interrupt mode — is anything other than the single byte `0x03`. **Restricted to `AgentTypeBrowser` agents only**; other types return an error so a misconfigured or malicious bridge cannot reach the supervisor/worker PTY through this verb. | `session` (string, matched against `repo.SessionName`), `agent` (string, agent name within the session), `text` (string, raw text — sanitized at the daemon edge), `interrupt` (bool, optional; when `true` the text must be exactly `\x03` and the input bypasses the C0 strip rules) |
+| `stream_agent_output` | **(streaming verb — handshake then long-lived JSON-line stream.)** Side-panel chat PTY-output stream. Fans out raw, unmodified PTY byte chunks (including ANSI escapes — unlike the existing line-based `stream_output`) to the oat-browser-agent bridge so the side panel can render both a pretty activity indicator (bytes-flowed heartbeat) and an authentic debug terminal. Throttled at the daemon socket boundary to 16 ms minimum batch interval. Backpressure: if the subscriber's frame channel fills (~256 KiB worth of in-flight chunks at typical chunk sizes), additional bytes are dropped and surface as a `{"gap": N, "ts": "..."}` frame on the next successful flush. Identifies the agent by `(session, agent)` to match the bridge's `OAT_BROWSER_AGENT_*` env vars. **Restricted to `AgentTypeBrowser` agents only**, same boundary as `agent_input`. Frame schema: `{"chunk": "<base64>", "ts": "<rfc3339nano>"}` for raw bytes, `{"gap": N, "ts": "..."}` for drops, `{"done": true}` on agent exit, `{"error": "..."}` on unrecoverable failure. | `session` (string, matched against `repo.SessionName`), `agent` (string, agent name within the session) |
 
 ## Minimal client examples
 

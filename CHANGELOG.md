@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`stream_agent_output` socket verb + raw byte chunk broadcaster (Part 2c).**
+  New long-lived streaming verb that fans out unmodified PTY byte chunks
+  from a browser-agent to the oat-browser-agent bridge. The bridge uses
+  this stream for two purposes simultaneously: (1) pretty-mode activity
+  indicator — a heartbeat showing "the agent is doing something" derived
+  from byte-flow timing alone, and (2) debug-mode terminal rendering —
+  the side panel's optional power-user view that renders ANSI exactly
+  as the agent's TUI emits it.
+
+  Why a new broadcaster instead of reusing the existing `rawBroadcaster`?
+  `rawBroadcaster` does ANSI stripping, dedup, and line buffering for the
+  oat-attach / line-based `stream_output` consumers — all the wrong
+  primitives for the side-panel debug view (which wants the ANSI back
+  and doesn't want lines coalesced) and for the heartbeat use (which
+  just needs to observe byte timing without paying for the line-level
+  processing). The new `chunkBroadcaster` in `pkg/backend/chunk_broadcast.go`
+  is a pure byte fan-out: copies its input, non-blocking sends to a
+  64-slot per-subscriber channel, accumulates dropped bytes into a
+  `pendingGap` counter when the channel fills, and surfaces the gap as
+  a `{Gap: N, TS: t}` frame the next time the channel drains. Race-detector
+  smoke test covers concurrent subscribe/cancel/write under load.
+
+  The daemon stream handler batches chunk frames at 16 ms minimum interval
+  before writing to the socket — both the bridge's pretty-mode and the
+  debug-mode path get the same throttle envelope, so a chatty agent
+  emitting many tiny chunks can't pin the WS connection. Frame schema:
+  `{"chunk": "<base64>", "ts": "<rfc3339nano>"}` for bytes,
+  `{"gap": N, "ts": "..."}` for backpressure drops, `{"done": true}`
+  on agent exit. Restricted to `AgentTypeBrowser` agents to mirror the
+  `agent_input` security boundary from Part 2b — siphoning raw PTY
+  bytes from the supervisor or a worker through this verb is the kind
+  of escalation a misconfigured or malicious bridge could attempt, so
+  the daemon refuses at the edge.
+  ([pkg/backend/chunk_broadcast.go](pkg/backend/chunk_broadcast.go),
+  [internal/daemon/stream_handler.go](internal/daemon/stream_handler.go)
+  `handleStreamAgentOutput`,
+  [docs/extending/SOCKET_API.md](docs/extending/SOCKET_API.md);
+  7 broadcaster unit tests in
+  [pkg/backend/chunk_broadcast_test.go](pkg/backend/chunk_broadcast_test.go)
+  plus 7 handler tests (19 cases with the agent-type-matrix sub-tests) in
+  [internal/daemon/stream_agent_output_test.go](internal/daemon/stream_agent_output_test.go).)
+
 - **`agent_input` socket verb + `SanitizePTYInput` helper (Part 2b).** New
   daemon socket verb that lets the oat-browser-agent bridge inject text into
   the browser-agent's PTY on behalf of a side-panel chat message. The verb
