@@ -17,6 +17,12 @@ import (
 // Telemetry is enabled only on a successful ping; a failed ping leaves the
 // previous config untouched so a typo doesn't break a working setup.
 func (c *CLI) telemetrySetup(args []string) error {
+	// Ensure ~/.oat/ exists so the first-ever state write doesn't fail.
+	// EnsureDirectories is idempotent — safe to call on every setup.
+	if err := c.paths.EnsureDirectories(); err != nil {
+		return fmt.Errorf("ensure ~/.oat directories: %w", err)
+	}
+
 	st, err := state.Load(c.paths.StateFile)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
@@ -111,6 +117,9 @@ func (c *CLI) telemetryStatus(_ []string) error {
 // telemetryDisable is `oat telemetry disable` — turns off without deleting
 // keys, so re-enabling later is one command away.
 func (c *CLI) telemetryDisable(_ []string) error {
+	if err := c.paths.EnsureDirectories(); err != nil {
+		return fmt.Errorf("ensure ~/.oat directories: %w", err)
+	}
 	st, err := state.Load(c.paths.StateFile)
 	if err != nil {
 		return fmt.Errorf("load state: %w", err)
