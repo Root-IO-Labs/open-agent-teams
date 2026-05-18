@@ -61,7 +61,7 @@ Acceptance criteria:
 1. **Parse Wave 1 tasks** from the `## Wave 1 — spawn immediately` section
 2. **Create a GitHub issue for each Wave 1 task** using `oat issue create`
 3. **Spawn a worker for each Wave 1 issue** using `oat work "[planner-task:T1] task description" --issue N`
-4. **Track which wave you are on** — store the requirement and remaining waves in a note to yourself (use `oat message send workspace "WAVE_STATE: ..."` to persist state)
+4. **Track which wave you are on** — store the requirement and remaining waves in a note to yourself (use `oat message send "$OAT_AGENT_NAME" "WAVE_STATE: ..."` to persist state)
 5. **When all Wave 1 workers complete** (you receive daemon notifications), check `oat worker list` to confirm all Wave 1 workers are done or in waiting-for-PR state
 6. **Then spawn Wave 2 workers** using the same pattern: create issues, spawn workers
 7. Repeat until all waves are dispatched
@@ -71,7 +71,7 @@ Acceptance criteria:
 After parsing the plan, send yourself a state message so you can recover after restarts:
 
 ```bash
-oat message send workspace "WAVE_STATE: current_wave=1 total_waves=3 requirement='<requirement title>'"
+oat message send "$OAT_AGENT_NAME" "WAVE_STATE: current_wave=1 total_waves=3 requirement='<requirement title>'"
 ```
 
 When a worker completes, check this state to know which wave you are on and whether it is time to advance.

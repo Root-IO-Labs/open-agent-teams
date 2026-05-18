@@ -285,6 +285,28 @@ func TestBuildWorkspaceHandoff(t *testing.T) {
 	if !strings.Contains(msg, "Workspace owns worker creation") {
 		t.Error("handoff should define the execution contract")
 	}
+	if !strings.Contains(msg, "The planner must not spawn workers") {
+		t.Error("handoff should explicitly forbid planner worker spawning")
+	}
+	if !strings.Contains(msg, "WAVE_STATE: current_wave=1 total_waves=2") {
+		t.Error("handoff should include persisted wave state")
+	}
+	if !strings.Contains(msg, `oat message send "$OAT_AGENT_NAME"`) {
+		t.Error("handoff should tell workspace to persist state to itself")
+	}
+}
+
+func TestWorkspaceDispatchTargetsPreferDefaultWorkspace(t *testing.T) {
+	targets := workspaceDispatchTargets()
+	if len(targets) < 2 {
+		t.Fatalf("expected default and legacy workspace targets, got %v", targets)
+	}
+	if targets[0] != "default" {
+		t.Fatalf("first workspace dispatch target = %q, want default", targets[0])
+	}
+	if targets[1] != "workspace" {
+		t.Fatalf("second workspace dispatch target = %q, want workspace", targets[1])
+	}
 }
 
 func TestTrackWorkerAssignmentFromPlannerMarker(t *testing.T) {

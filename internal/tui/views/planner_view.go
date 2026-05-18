@@ -501,14 +501,12 @@ func (p *PlannerView) stopAndPullPlan() tea.Cmd {
 }
 
 // dispatchToWorkspace sends the approved plan to the workspace agent so it
-// can spawn workers in the correct waves. Falls back to direct spawn_agent
-// calls for Wave 1 if the workspace agent is unreachable.
+// can spawn workers in the correct waves. The planner must never spawn
+// workers directly; workspace owns execution and wave advancement.
 func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
 	client := p.client
 	repoName := p.repoName
 	handoffMsg := p.buildWorkspaceHandoff()
-	wave1Tasks := p.tasksForWave(1)
-	req := p.requirement
 
 	// Initialize execution tracking maps.
 	p.taskWorkers = make(map[string]string)
@@ -526,47 +524,34 @@ func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
 			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
 		}
 
-		// Primary path: hand off to workspace agent.
-		resp, err := client.Send(socket.Request{
-			Command: "send_agent_input",
-			Args: map[string]interface{}{
-				"repo":    repoName,
-				"agent":   "workspace",
-				"message": handoffMsg,
-			},
-		})
-		if err == nil && resp.Success {
-			return plannerDispatchedMsg{target: "workspace"}
-		}
-
-		// Fallback: workspace not running — spawn Wave 1 workers directly.
-		var errs []string
-		assignments := make(map[string]string)
-		for _, task := range wave1Tasks {
-			workerName := fmt.Sprintf("worker-%s", task.ID)
-			wr, werr := client.Send(socket.Request{
-				Command: "spawn_agent",
+		var lastErr string
+		for _, target := range workspaceDispatchTargets() {
+			resp, err := client.Send(socket.Request{
+				Command: "send_agent_input",
 				Args: map[string]interface{}{
-					"repo":   repoName,
-					"name":   workerName,
-					"class":  "ephemeral",
-					"prompt": buildWorkerPrompt(task, req),
-					"task":   plannerTaskMarker(task.ID) + " " + task.Title + ": " + task.Description,
+					"repo":    repoName,
+					"agent":   target,
+					"message": handoffMsg,
 				},
 			})
-			if werr != nil {
-				errs = append(errs, task.ID+": "+werr.Error())
-			} else if !wr.Success {
-				errs = append(errs, task.ID+": "+wr.Error)
-			} else {
-				assignments[task.ID] = workerName
+			if err == nil && resp.Success {
+				return plannerDispatchedMsg{target: target}
+			}
+			if err != nil {
+				lastErr = err.Error()
+			} else if !resp.Success {
+				lastErr = resp.Error
 			}
 		}
-		if len(errs) > 0 {
-			return plannerErrorMsg{err: fmt.Errorf("direct dispatch errors: %s", strings.Join(errs, "; "))}
+		if lastErr == "" {
+			lastErr = "workspace agent was not reachable"
 		}
-		return plannerDispatchedMsg{target: "direct", assignments: assignments}
+		return plannerErrorMsg{err: fmt.Errorf("could not hand off plan to workspace/default; planner did not spawn workers directly: %s", lastErr)}
 	}
+}
+
+func workspaceDispatchTargets() []string {
+	return []string{"default", "workspace"}
 }
 
 // buildWorkspaceHandoff formats the approved plan as a structured message the
@@ -581,10 +566,15 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 		sb.WriteString("\n\n")
 	}
 	sb.WriteString("## Execution Contract\n")
-	sb.WriteString("- Workspace owns worker creation, wave advancement, and PR/issue coordination.\n")
+	sb.WriteString("- Workspace owns worker creation, wave advancement, and PR/issue coordination. The planner must not spawn workers.\n")
 	sb.WriteString("- Preserve each task ID exactly as written below.\n")
 	sb.WriteString("- When spawning a worker, include the marker `[planner-task:<task-id>]` at the start of the worker task text so planner progress can be mapped back deterministically.\n")
 	sb.WriteString("- Do not start a wave until every dependency and every task in the previous wave is complete.\n\n")
+	sb.WriteString("## Workspace State\n")
+	sb.WriteString("Before spawning any workers, persist this execution state to yourself using your actual workspace agent name, usually `default`:\n")
+	sb.WriteString("```bash\n")
+	sb.WriteString(fmt.Sprintf("oat message send \"$OAT_AGENT_NAME\" %q\n", p.waveStateMessage()))
+	sb.WriteString("```\n\n")
 
 	waves := make(map[int][]Task)
 	for _, t := range p.tasks {
@@ -618,6 +608,18 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 	}
 	sb.WriteString("Spawn Wave 1 workers immediately. Advance to the next wave when all tasks in the current wave are complete.")
 	return sb.String()
+}
+
+func (p *PlannerView) waveStateMessage() string {
+	requirement := ""
+	if p.requirement != nil {
+		requirement = p.requirement.Refined
+	}
+	var taskIDs []string
+	for _, task := range p.tasks {
+		taskIDs = append(taskIDs, fmt.Sprintf("%s:wave%d", task.ID, task.Wave))
+	}
+	return fmt.Sprintf("WAVE_STATE: current_wave=1 total_waves=%d tasks=%s requirement=%q", p.getMaxWave(), strings.Join(taskIDs, ","), requirement)
 }
 
 func plannerTaskMarker(taskID string) string {
