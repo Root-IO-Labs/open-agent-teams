@@ -211,6 +211,25 @@ type Agent struct {
 	// their own tier-based dedup in stuck_worker.go.
 	LastNudgeHash  string `json:"last_nudge_hash,omitempty"`
 	NudgeSkipCount int    `json:"nudge_skip_count,omitempty"`
+
+	// ModelSwappedOnRestart records that the daemon could not validate the
+	// agent's previously-configured Model on the most recent restart and
+	// fell through to an auto-selected substitute. Operators want this to
+	// be visible — the previous INFO-level "switched from X to Y" log line
+	// was easily missed, and the agent silently ran on the wrong model.
+	// Reset to false when the operator sets a model explicitly via
+	// `oat agent set-model` or when a restart resolves the configured
+	// model cleanly. Surfaced in `oat agent ls` and `oat agent show`.
+	ModelSwappedOnRestart bool `json:"model_swapped_on_restart,omitempty"`
+	// ModelSwapReason is a human-readable explanation of why the swap
+	// happened (e.g. `validate "claude-sonnet-4-6" failed: not onboarded`
+	// or `previous model "..." became ineligible: ...`). Only meaningful
+	// when ModelSwappedOnRestart is true.
+	ModelSwapReason string `json:"model_swap_reason,omitempty"`
+	// ModelSwapPrevious captures the model ID that was rejected, so the
+	// operator can decide whether to re-onboard it or pick a permanent
+	// replacement via `oat agent set-model`.
+	ModelSwapPrevious string `json:"model_swap_previous,omitempty"`
 }
 
 // IsDormant returns true if the agent is in any dormancy state (waiting for

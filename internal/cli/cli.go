@@ -1560,6 +1560,12 @@ func (c *CLI) systemStatus(args []string) error {
 		}
 		fmt.Printf("      Agents: %d core, %d workers\n", coreAgents, workerCount)
 
+		// Surface silent model-swaps loudly — operators need to see when an
+		// auto-resolved restart left an agent running on the wrong model.
+		if v, ok := repoMap["swapped_model_count"].(float64); ok && v > 0 {
+			format.Yellow.Printf("      ⚠ %d agent(s) running on auto-swapped model — run `oat worker list --repo %s` for details\n", int(v), name)
+		}
+
 		// Show fork info if applicable
 		if isFork, _ := repoMap["is_fork"].(bool); isFork {
 			upstreamOwner, _ := repoMap["upstream_owner"].(string)
@@ -3458,7 +3464,17 @@ func (c *CLI) listWorkers(args []string) error {
 		// Truncate task
 		truncTask := format.Truncate(task, 40)
 
-		modelCell := format.ColorCell(shortenModelID(model), format.Dim)
+		modelDisplay := shortenModelID(model)
+		modelCellColor := format.Dim
+		if swapped, _ := worker["model_swapped_on_restart"].(bool); swapped {
+			previous, _ := worker["model_swap_previous"].(string)
+			if previous == "" {
+				previous = "previous"
+			}
+			modelDisplay = fmt.Sprintf("%s !swapped (was %s)", modelDisplay, shortenModelID(previous))
+			modelCellColor = format.Yellow
+		}
+		modelCell := format.ColorCell(modelDisplay, modelCellColor)
 
 		table.AddRow(
 			format.Cell(name),
@@ -3470,6 +3486,26 @@ func (c *CLI) listWorkers(args []string) error {
 		)
 	}
 	table.Print()
+
+	// If any worker carries a swap marker, follow up with the reason and the
+	// remediation command. Operators were silently running on the wrong model
+	// before — keep this loud.
+	for _, worker := range workers {
+		swapped, _ := worker["model_swapped_on_restart"].(bool)
+		if !swapped {
+			continue
+		}
+		name, _ := worker["name"].(string)
+		reason, _ := worker["model_swap_reason"].(string)
+		previous, _ := worker["model_swap_previous"].(string)
+		current, _ := worker["model"].(string)
+		fmt.Println()
+		format.Yellow.Printf("⚠ Model swapped for %s: %q is now running %q\n", name, previous, current)
+		if reason != "" {
+			format.Dimmed("  Reason: %s", reason)
+		}
+		format.Dimmed("  Clear with: `oat agent restart %s` once the original model is onboarded again", name)
+	}
 
 	return nil
 }

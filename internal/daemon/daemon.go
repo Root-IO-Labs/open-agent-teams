@@ -1982,10 +1982,14 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 	for repoName, repo := range repos {
 		// Count agents by type
 		workerCount := 0
+		swappedModelCount := 0
 		totalAgents := len(repo.Agents)
 		for _, agent := range repo.Agents {
 			if agent.Type == state.AgentTypeWorker {
 				workerCount++
+			}
+			if agent.ModelSwappedOnRestart {
+				swappedModelCount++
 			}
 		}
 
@@ -2011,8 +2015,9 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 			"is_fork":            repo.ForkConfig.IsFork,
 			"upstream_owner":     repo.ForkConfig.UpstreamOwner,
 			"upstream_repo":      repo.ForkConfig.UpstreamRepo,
-			"pr_management_mode": prManagementMode,
-			"idle_mode":          repo.IdleMode,
+			"pr_management_mode":  prManagementMode,
+			"idle_mode":           repo.IdleMode,
+			"swapped_model_count": swappedModelCount,
 		})
 	}
 
@@ -2540,6 +2545,17 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 			// Dormancy status
 			detail["waiting_for_pr"] = agent.WaitingForPR
 			detail["waiting_for_verification"] = agent.WaitingForVerification
+
+			// Model-swap marker (set when the daemon auto-selected a
+			// replacement model on restart because the configured one
+			// failed validation). Surfaced in CLI tables so the operator
+			// notices and can either re-onboard the original or pick a
+			// permanent replacement with `oat agent set-model`.
+			detail["model_swapped_on_restart"] = agent.ModelSwappedOnRestart
+			if agent.ModelSwappedOnRestart {
+				detail["model_swap_reason"] = agent.ModelSwapReason
+				detail["model_swap_previous"] = agent.ModelSwapPrevious
+			}
 
 			// Log file path — so TUI doesn't have to compute it client-side
 			isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
@@ -5890,16 +5906,35 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		d.logger.Warn("Model routing failed on restart for %s: %v — attempting auto-select from pool", agentName, modelErr)
 		autoResolved, autoErr := d.resolveAndValidateModel("", repo.Model, agent.Type, repo.AllowedWorkerModels)
 		if autoErr == nil && autoResolved != "" && autoResolved != agent.Model {
-			d.logger.Info("Model routing: %s switched from %q to %q on restart (auto-selected)", agentName, agent.Model, autoResolved)
+			// Persist so next restart starts from the validated model AND
+			// the swap is loudly visible. Operators were missing this
+			// before — the INFO log line is easy to scroll past and the
+			// agent record didn't carry the marker.
+			d.logger.Warn("Model routing: %s SWAPPED from %q to %q on restart (auto-selected; original reason: %v)", agentName, agent.Model, autoResolved, modelErr)
+			previous := agent.Model
 			resolvedModel = autoResolved
-			// Persist so next restart starts from the validated model.
 			if _, ok := d.state.GetAgent(repoName, agentName); ok {
+				agent.ModelSwapPrevious = previous
 				agent.Model = autoResolved
+				agent.ModelSwappedOnRestart = true
+				agent.ModelSwapReason = modelErr.Error()
 				_ = d.state.UpdateAgent(repoName, agentName, agent)
 			}
 		} else {
 			d.logger.Error("Model routing: no valid model for %s/%s after auto-select (primary err=%v, auto err=%v) — restarting with previous model %q anyway", repoName, agentName, modelErr, autoErr, agent.Model)
 			resolvedModel = resolveAgentModel(agent, repo)
+		}
+	} else if agent.ModelSwappedOnRestart {
+		// The agent's stored model validated cleanly this time around —
+		// the underlying registry issue must have been fixed (operator
+		// onboarded the model, fixed the prefix in state.json, etc.).
+		// Clear the swap marker so it doesn't keep haunting `oat agent ls`.
+		if _, ok := d.state.GetAgent(repoName, agentName); ok {
+			d.logger.Info("Model routing: %s previous swap cleared (model %q now validates)", agentName, agent.Model)
+			agent.ModelSwappedOnRestart = false
+			agent.ModelSwapReason = ""
+			agent.ModelSwapPrevious = ""
+			_ = d.state.UpdateAgent(repoName, agentName, agent)
 		}
 	}
 	if resolvedModel != "" {

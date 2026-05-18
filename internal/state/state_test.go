@@ -615,6 +615,79 @@ func TestStateAgentReadyForCleanupAtAndIssueRoundTrip(t *testing.T) {
 	}
 }
 
+// TestStateAgentModelSwapMarkerRoundTrip verifies that the silent-model-swap
+// surfacing fields persist across state save/load. Operators need to see these
+// markers across daemon restarts, not just the one that did the swap.
+func TestStateAgentModelSwapMarkerRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	statePath := filepath.Join(tmpDir, "state.json")
+
+	s := New(statePath)
+	repo := &Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "oat-test-repo",
+		Agents:      make(map[string]Agent),
+	}
+	if err := s.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo() failed: %v", err)
+	}
+
+	agent := Agent{
+		Type:                  AgentTypeBrowser,
+		WorktreePath:          "/path/to/worktree",
+		WindowName:            "browser-agent",
+		SessionID:             "test-session",
+		PID:                   12345,
+		CreatedAt:             time.Now(),
+		Model:                 "google_genai:gemini-2.5-flash",
+		ModelSwappedOnRestart: true,
+		ModelSwapPrevious:     "claude-sonnet-4-6",
+		ModelSwapReason:       "model \"claude-sonnet-4-6\" is not onboarded",
+	}
+	if err := s.AddAgent("test-repo", "browser-agent", agent); err != nil {
+		t.Fatalf("AddAgent() failed: %v", err)
+	}
+
+	loaded, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	got, exists := loaded.GetAgent("test-repo", "browser-agent")
+	if !exists {
+		t.Fatal("Agent not found after load")
+	}
+	if !got.ModelSwappedOnRestart {
+		t.Error("ModelSwappedOnRestart did not persist")
+	}
+	if got.ModelSwapPrevious != "claude-sonnet-4-6" {
+		t.Errorf("ModelSwapPrevious = %q, want %q", got.ModelSwapPrevious, "claude-sonnet-4-6")
+	}
+	if got.ModelSwapReason == "" {
+		t.Error("ModelSwapReason did not persist")
+	}
+
+	// Clearing the markers (e.g. operator re-onboards original model and
+	// next restart resolves cleanly) must also round-trip — the JSON tags
+	// use omitempty so the absence of the field is the "clean" state.
+	got.ModelSwappedOnRestart = false
+	got.ModelSwapPrevious = ""
+	got.ModelSwapReason = ""
+	if err := loaded.UpdateAgent("test-repo", "browser-agent", got); err != nil {
+		t.Fatalf("UpdateAgent() failed: %v", err)
+	}
+	reloaded, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("second Load() failed: %v", err)
+	}
+	cleared, _ := reloaded.GetAgent("test-repo", "browser-agent")
+	if cleared.ModelSwappedOnRestart {
+		t.Error("ModelSwappedOnRestart did not clear")
+	}
+	if cleared.ModelSwapPrevious != "" {
+		t.Errorf("ModelSwapPrevious did not clear, got %q", cleared.ModelSwapPrevious)
+	}
+}
+
 func TestRemoveAgent(t *testing.T) {
 	tmpDir := t.TempDir()
 	statePath := filepath.Join(tmpDir, "state.json")
