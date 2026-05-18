@@ -98,6 +98,37 @@ func DefaultPRShepherdConfig() PRShepherdConfig {
 	}
 }
 
+// TelemetryConfig holds installation-wide telemetry settings. Lives on the
+// top-level State (not per-repo) because telemetry credentials are scoped to
+// the user/machine, not the repo.
+//
+// Empty PublicKey/SecretKey or Enabled=false means telemetry is off; the
+// internal/telemetry package will return a Nop tracer in either case.
+type TelemetryConfig struct {
+	Enabled    bool    `json:"enabled"`
+	Provider   string  `json:"provider,omitempty"`    // "langfuse" — only value today; reserved
+	Host       string  `json:"host,omitempty"`        // default cloud.langfuse.com when empty
+	PublicKey  string  `json:"public_key,omitempty"`  // pk-lf-...
+	SecretKey  string  `json:"secret_key,omitempty"`  // sk-lf-...
+	RedactArgs bool    `json:"redact_args"`           // default true; redact tool args + prompt bodies
+	SampleRate float64 `json:"sample_rate,omitempty"` // 0.0–1.0; empty/0 treated as 1.0
+	// HintShown gets set to true the first time `oat init` surfaces the
+	// telemetry tip so we don't keep nagging on every init.
+	HintShown bool `json:"hint_shown,omitempty"`
+}
+
+// DefaultTelemetryConfig returns telemetry-off with safe redaction defaults.
+// `oat telemetry setup` is the only path that flips Enabled to true.
+func DefaultTelemetryConfig() TelemetryConfig {
+	return TelemetryConfig{
+		Enabled:    false,
+		Provider:   "langfuse",
+		Host:       "https://cloud.langfuse.com",
+		RedactArgs: true,
+		SampleRate: 1.0,
+	}
+}
+
 // ForkConfig holds fork-related configuration for a repository
 type ForkConfig struct {
 	// IsFork is true if the repository is detected as a fork
@@ -247,8 +278,42 @@ type Repository struct {
 type State struct {
 	Repos       map[string]*Repository `json:"repos"`
 	CurrentRepo string                 `json:"current_repo,omitempty"`
+	Telemetry   *TelemetryConfig       `json:"telemetry,omitempty"`
 	mu          sync.RWMutex
 	path        string
+}
+
+// GetTelemetry returns the current telemetry config, or defaults if none has
+// been set. The returned value is a copy; mutations must go through
+// SetTelemetry to persist.
+func (s *State) GetTelemetry() TelemetryConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Telemetry == nil {
+		return DefaultTelemetryConfig()
+	}
+	return *s.Telemetry
+}
+
+// SetTelemetry replaces the telemetry config and persists to disk.
+func (s *State) SetTelemetry(cfg TelemetryConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Telemetry = &cfg
+	return s.saveUnlocked()
+}
+
+// MarkTelemetryHintShown sets HintShown=true and persists. Used by `oat init`
+// to make sure the discoverability tip prints exactly once.
+func (s *State) MarkTelemetryHintShown() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Telemetry == nil {
+		cfg := DefaultTelemetryConfig()
+		s.Telemetry = &cfg
+	}
+	s.Telemetry.HintShown = true
+	return s.saveUnlocked()
 }
 
 // New creates a new empty state

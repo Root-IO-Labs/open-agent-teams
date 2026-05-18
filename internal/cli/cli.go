@@ -730,6 +730,35 @@ func (c *CLI) registerCommands() {
 	}
 	c.rootCmd.Subcommands["routing"] = routingCmd
 
+	// Telemetry commands. Opt-in Langfuse instrumentation for LLM calls, agent
+	// lifecycle, tool calls, and router decisions. Disabled by default; one
+	// command (`oat telemetry setup`) enables it.
+	telemetryCmd := &Command{
+		Name:        "telemetry",
+		Description: "Configure Langfuse telemetry (opt-in trace export)",
+		Usage:       "oat telemetry <setup|status|disable>",
+		Subcommands: make(map[string]*Command),
+	}
+	telemetryCmd.Subcommands["setup"] = &Command{
+		Name:        "setup",
+		Description: "Interactively configure Langfuse keys and verify the connection",
+		Usage:       "oat telemetry setup",
+		Run:         c.telemetrySetup,
+	}
+	telemetryCmd.Subcommands["status"] = &Command{
+		Name:        "status",
+		Description: "Show current telemetry configuration (keys masked)",
+		Usage:       "oat telemetry status",
+		Run:         c.telemetryStatus,
+	}
+	telemetryCmd.Subcommands["disable"] = &Command{
+		Name:        "disable",
+		Description: "Turn off telemetry without deleting saved keys",
+		Usage:       "oat telemetry disable",
+		Run:         c.telemetryDisable,
+	}
+	c.rootCmd.Subcommands["telemetry"] = telemetryCmd
+
 	// Workspace commands
 	workspaceCmd := &Command{
 		Name:        "workspace",
@@ -2405,6 +2434,17 @@ func (c *CLI) initRepo(args []string) error {
 	}
 	fmt.Printf("\nMonitor agents: oat ui --repo %s\n", repoName)
 	fmt.Printf("Or tail one agent: oat attach <agent-name> --repo %s\n", repoName)
+
+	// Discoverability hint for opt-in telemetry. Shown exactly once across all
+	// inits — MarkTelemetryHintShown persists the flag so we don't nag.
+	if st, err := state.Load(c.paths.StateFile); err == nil {
+		t := st.GetTelemetry()
+		if !t.Enabled && !t.HintShown {
+			fmt.Println()
+			fmt.Println("Tip: enable Langfuse telemetry with `oat telemetry setup` to see traces of your sessions.")
+			_ = st.MarkTelemetryHintShown()
+		}
+	}
 
 	return nil
 }

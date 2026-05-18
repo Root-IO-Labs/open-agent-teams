@@ -315,6 +315,11 @@ def create_oat_agent(  # noqa: C901, PLR0912  # Complex graph assembly logic wit
     if _is_anthropic_model(model):
         main_stack.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
     main_stack.append(PatchToolCallsMiddleware())
+    # Langfuse instrumentation. No-op when OAT_TRACE_ID / LANGFUSE_* env vars
+    # aren't set, so this is safe to add unconditionally. The daemon injects
+    # those env vars only when `oat telemetry setup` has been run.
+    from oat_sdk.middleware.telemetry import LangfuseMiddleware  # local import: avoids cycle
+    main_stack.append(LangfuseMiddleware())
     oat_sdk_middleware.extend(main_stack)
 
     if middleware:
