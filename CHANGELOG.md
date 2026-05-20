@@ -87,6 +87,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Browser-agent prompt: teach `truncated: true` handling for very
+  long pages (Part 4.F.7).** Pairs with the
+  [oat-browser-agent Part 4.F.6](https://github.com/Root-IO-Labs/oat-browser-agent)
+  hotfix that clips full-page screenshots at a 25-megapixel pixel
+  budget to keep Chrome's `Page.captureScreenshot` path from
+  CHECK-failing on Wikipedia-class long articles. Adds a "Long-page
+  clipping (`truncated: true`)" subsection to the
+  `browser_screenshot — defaults to full-page` block in
+  `internal/templates/agent-templates/browser.md` that:
+  - Explains the cap in concrete terms (~19,500 px ≈ 10
+    viewport-heights on a typical 1280-px-wide page).
+  - Documents the new result fields the bridge surfaces when the
+    cap fires: `truncated`, `contentHeight`, `captureHeight`,
+    `contentWidth`.
+  - Spells out the three correct next-moves when the agent sees
+    `truncated: true`: switch to `browser_get_text {mode:"main"}`
+    for substantive prose, scope to a ref-bounded snapshot for
+    "look at one section" reads, or accept the partial image if
+    the content of interest is above the cap.
+  - Explicitly forbids the loop-and-retry pattern (taking another
+    full-page screenshot won't reveal more content; the cap is
+    per-capture).
+
+  Why the agent needs this in prose: the alternative
+  (silently clip and hope the model figures it out from
+  `contentHeight ≠ captureHeight`) is exactly the behaviour that
+  caused the original full-page-screenshot footgun. Teaching the
+  agent in advance is cheaper than re-debugging the same failure
+  shape later.
+
 - **Browser-agent prompt: `browser_screenshot` now full-page by
   default (Part 4.F.2).** Tightens
   `internal/templates/agent-templates/browser.md` to reflect the
