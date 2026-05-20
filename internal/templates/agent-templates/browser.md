@@ -124,20 +124,39 @@ The hierarchy is **preference, not law**. If a specific task genuinely needs ful
 
 Pass `fullPage: false` only when you specifically need a viewport-sized image — e.g. confirming a single control's rendered pixel state above the fold, or debugging a layout issue at the user's actual viewport dimensions. In any other case the default is what you want.
 
-**Long-page clipping (`truncated: true`).** Very long pages (Wikipedia-class articles, long news pieces, infinite-scroll feeds, deep comment threads) are clipped at a fixed pixel budget (~25 megapixels — on a typical 1280-px-wide page that's roughly 19,500 px of vertical content, or ~10 viewport-heights). When the page exceeds the budget the result carries:
+**Long-page clipping (`truncated: true`).** Very long pages (Wikipedia-class articles, long news pieces, infinite-scroll feeds, deep comment threads) are clipped at a fixed per-call pixel budget (~25 megapixels — on a typical 1280-px-wide page that's roughly 19,500 px of vertical content, or ~10 viewport-heights). When the page exceeds the budget the result carries:
 
 - `truncated: true`
 - `contentHeight` — the page's actual height in pixels
 - `captureHeight` — what the image you got is (the budgeted height)
 - `contentWidth` — the page's width
+- `nextOffsetY` — the y-pixel offset where the next slice should start
+- `remaining` — how much vertical content is left below this slice
 
-When you see `truncated: true`, the right next move is almost never "take another full-page screenshot." Instead:
+You have three correct responses, in order of preference:
 
-1. **For substantive text reads** (Wikipedia article, news article, docs page, long-form prose), switch to `browser_get_text {mode: "main", maxChars: 4000}` — it gives you the article body in a fraction of the tokens a screenshot costs and doesn't have a height cap.
+1. **For substantive text reads** (Wikipedia article, news article, docs page, long-form prose), switch to `browser_get_text {mode: "main", maxChars: 4000}` — it gives you the article body in a fraction of the tokens a screenshot costs, has no height cap, and the model sees the text at full fidelity (no API downscaling). This is the cheap, correct answer for "what does the article say?" / "extract the prices" / "summarize this dashboard's text".
 2. **For "look at one section"** (e.g. "what does the references list at the bottom say?"), take a `browser_snapshot {interactiveOnly: false}`, find the ref for that section, then `browser_get_text {ref: <ref>, maxChars: 4000}` to scope the read.
-3. **For visual content below the budget cap** (canvas/SVG/charts that fall below the first 19,500 px), the image you got is fine — `truncated: true` only means there was MORE content below, not that what you got is wrong.
+3. **For visual content past the cap** (a chart at y=22,000 on a 50,000-px page, a canvas-rendered diagram below the fold, a graphical element you specifically need pixels of), call `browser_screenshot` again with `offsetY: <nextOffsetY>` to capture the next slice. Repeat until `truncated` is no longer present in the result. This is the only legitimate "scroll-and-screenshot" pattern — and you do it by passing `offsetY`, **not** by physically scrolling the page (scrolling can break lazy-load and SPA loaders, and you'd still hit the same per-call cap).
 
-Do NOT loop full-page screenshots hoping to "scroll to" the cut content — the cap is on a single capture, and repeating the call just re-clips at the same place.
+Worked example (Wikipedia "New York City", contentHeight ≈ 50,000):
+
+```
+1. browser_screenshot { tabId: <id> }
+   → result: { truncated: true, captureHeight: 19531, nextOffsetY: 19531, remaining: 30469 }
+2. If you only needed prose: stop here, call browser_get_text { mode: "main" }.
+3. If you need pixels of a chart at y ≈ 22k:
+     browser_screenshot { tabId: <id>, offsetY: 19531 }
+     → result: { captureOffsetY: 19531, truncated: true, nextOffsetY: 39062 }
+```
+
+The slice you ask for on call 3 is positioned in page coordinates — the chart at y=22k will appear roughly 2,500 px down from the top of the second image (22000 - 19531).
+
+What NOT to do:
+
+- Do NOT loop `browser_screenshot { tabId }` with no `offsetY` hoping the cap will move — it will re-clip from y=0 every time.
+- Do NOT call `browser_show_window` or resize the window as a "fix" for `truncated` — the cap is independent of window size.
+- Do NOT use `offsetY` for prose reads when `browser_get_text` would work — slicing wastes tokens on image downscaling that the API does anyway.
 
 ### One decision at a time
 

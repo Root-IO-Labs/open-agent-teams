@@ -87,6 +87,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Browser-agent prompt: slice-by-slice screenshot pattern for
+  long pages (Part 4.F.8 prompt half).** Replaces the Part 4.F.7
+  "if you see `truncated: true`, switch to `browser_get_text` or
+  accept the partial" three-option list with a fuller four-mode
+  guidance: the same text/ref preferences PLUS the new
+  `offsetY: <nextOffsetY>` slice-and-resume pattern for visual
+  content past the cap, with an end-to-end Wikipedia worked
+  example and an explicit "don't physically scroll" warning
+  (Anthropic's documented Claude-in-Chrome breakage on tall pages
+  after scroll: [anthropics/claude-code#46676](https://github.com/anthropics/claude-code/issues/46676)).
+  Aligned with the new `oat-browser-agent` Part 4.F.8 schema that
+  adds the `offsetY` input parameter and `nextOffsetY` / `remaining`
+  / `captureOffsetY` result hints. Synced to the per-repo copy
+  manually pending Part 4.H.
+
 - **Browser-agent prompt: teach `truncated: true` handling for very
   long pages (Part 4.F.7).** Pairs with the
   [oat-browser-agent Part 4.F.6](https://github.com/Root-IO-Labs/oat-browser-agent)
