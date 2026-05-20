@@ -828,6 +828,23 @@ func (c *CLI) registerCommands() {
 		Run:         c.restartAgentCmd,
 	}
 
+	agentCmd.Subcommands["refresh-prompts"] = &Command{
+		Name:        "refresh-prompts",
+		Description: "Re-sync ~/.oat/repos/<repo>/agents/*.md from the embedded templates",
+		Usage: "oat agent refresh-prompts [--repo <repo>]\n\n" +
+			"Force-refreshes per-repo agent prompt files from the embedded\n" +
+			"templates baked into the oat binary. Use after editing an\n" +
+			"`internal/templates/agent-templates/*.md` template if you want\n" +
+			"the change to land in a running repo without restarting the\n" +
+			"agent (writePromptFile also auto-syncs on next agent start;\n" +
+			"this command is the explicit handle for the agent-already-\n" +
+			"running case).\n\n" +
+			"With --repo, refreshes only that repo. Without --repo, refreshes\n" +
+			"every repo registered in state.json. Idempotent — files that\n" +
+			"already match the embedded content are left untouched.",
+		Run: c.refreshAgentPrompts,
+	}
+
 	agentCmd.Subcommands["attach"] = &Command{
 		Name:        "attach",
 		Description: "Watch an agent work in real-time",
@@ -6826,6 +6843,54 @@ func detectWaveFromIssue(ghRepo, issueNumber string) string {
 		}
 	}
 	return ""
+}
+
+// Part 4.H: `oat agent refresh-prompts [--repo <repo>]` force-syncs
+// per-repo agent prompt files (`~/.oat/repos/<repo>/agents/*.md`) with
+// the embedded agent templates. Used to push template edits into a
+// running repo without having to restart the agent. Idempotent — the
+// underlying templates.SyncAgentTemplates only rewrites files that
+// drift from the embedded content. Without --repo, walks every repo
+// in state.json.
+func (c *CLI) refreshAgentPrompts(args []string) error {
+	flags, _ := ParseFlags(args)
+	scopeRepo := flags["repo"]
+
+	var repoNames []string
+	if scopeRepo != "" {
+		repoNames = []string{scopeRepo}
+	} else {
+		st, err := state.Load(c.paths.StateFile)
+		if err != nil {
+			return errors.InvalidUsage("failed to load state: " + err.Error())
+		}
+		repoNames = st.ListRepos()
+		if len(repoNames) == 0 {
+			fmt.Println("No repositories registered. Nothing to refresh.")
+			return nil
+		}
+	}
+
+	totalRefreshed := 0
+	for _, name := range repoNames {
+		agentsDir := c.paths.RepoAgentsDir(name)
+		refreshed, err := templates.SyncAgentTemplates(agentsDir)
+		if err != nil {
+			fmt.Printf("  %s: error: %v\n", name, err)
+			continue
+		}
+		if len(refreshed) == 0 {
+			fmt.Printf("  %s: up to date\n", name)
+			continue
+		}
+		fmt.Printf("  %s: refreshed %d file(s): %v\n", name, len(refreshed), refreshed)
+		totalRefreshed += len(refreshed)
+	}
+	if totalRefreshed > 0 {
+		fmt.Printf("\nRefreshed %d prompt file(s) across %d repo(s).\n", totalRefreshed, len(repoNames))
+		fmt.Println("Note: running agents will pick up the new prompt on their next restart.")
+	}
+	return nil
 }
 
 func (c *CLI) restartAgentCmd(args []string) error {

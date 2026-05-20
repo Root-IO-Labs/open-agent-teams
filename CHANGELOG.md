@@ -85,6 +85,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TestDirectBackend_StopAgentKillsProcessTree` locks in the
   whole-subtree behavior with a portable `sh → sleep` pipeline.
 
+### Added
+
+- **`oat agent refresh-prompts [--repo <name>]` + auto-sync of
+  per-repo agent templates on every prompt write (Part 4.H).**
+  Closes a long-standing footgun: `~/.oat/repos/<repo>/agents/*.md`
+  is a per-repo mirror of the embedded
+  `internal/templates/agent-templates/*.md` templates, but the old
+  copy logic only fired on first-time clone setup. After that, any
+  edit to an embedded template silently failed to reach the running
+  agent — discovered 2026-05-20 when a Part 4.F.2 browser.md
+  update was 2 days stale on the running agent. Two coordinated
+  pieces:
+  - `internal/templates/templates.go`: new
+    `SyncAgentTemplates(destDir)` that walks the embedded
+    filesystem and overwrites any per-repo file that drifts from
+    its embedded counterpart. Idempotent (byte-for-byte compare
+    before rewrite, mtime preserved when in sync). New
+    `ReadEmbeddedAgentTemplate(name)` helper for one-shot lookups.
+    Both used by daemon + CLI.
+  - `internal/daemon/daemon.go::writePromptFileWithPrefix`:
+    replaces the old `if os.IsNotExist { CopyAgentTemplates }`
+    branch with an unconditional `SyncAgentTemplates` call.
+    Refreshes per-repo prompts on every agent start. User-facing
+    `Repository-specific instructions:` customization continues
+    to flow through `prompts.LoadCustomPrompt` (separate path, not
+    in `agents/`), so the sync is non-destructive for legitimate
+    customization.
+  - `internal/cli/cli.go`: new `oat agent refresh-prompts` verb
+    for the explicit refresh case (agent already running, you just
+    edited a template, want to force-push without restarting).
+    Without `--repo`, walks every repo registered in `state.json`.
+    Reports which files were refreshed and reminds the operator
+    that running agents pick up the new content on restart.
+
+  Tests:
+  [`internal/templates/templates_test.go`](internal/templates/templates_test.go)
+  (4 new cases: refreshes stale file, no-op when in sync with
+  preserved mtime, fresh dir creates all files, embedded-template
+  lookup with and without .md extension). All existing template
+  + daemon + CLI tests still pass.
+
 ### Changed
 
 - **Browser-agent prompt: slice-by-slice screenshot pattern for

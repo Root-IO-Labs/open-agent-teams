@@ -6025,6 +6025,22 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 	switch agentType {
 	case state.AgentTypeMergeQueue, state.AgentTypeWorker, state.AgentTypeReview, state.AgentTypeVerification, state.AgentTypeBrowser:
 		localAgentsDir := d.paths.RepoAgentsDir(repoName)
+		// Part 4.H: keep the per-repo agents/ dir in sync with the
+		// embedded templates on EVERY prompt-write call, not just on
+		// first-time clone setup. Without this, edits to
+		// internal/templates/agent-templates/*.md only land on fresh
+		// repos and silently stale on every existing one. Idempotent:
+		// only files that drift from the embedded content are
+		// rewritten. User customization lives under a separate
+		// `Repository-specific instructions:` heading appended
+		// later via prompts.LoadCustomPrompt — overwriting
+		// agents/*.md here is non-destructive for that flow.
+		if refreshed, syncErr := templates.SyncAgentTemplates(localAgentsDir); syncErr != nil {
+			d.logger.Warn("Failed to sync agent templates for %s: %v", agentType, syncErr)
+		} else if len(refreshed) > 0 {
+			d.logger.Info("Refreshed %d agent template(s) in %s: %v", len(refreshed), localAgentsDir, refreshed)
+		}
+
 		reader := agents.NewReader(localAgentsDir, repoPath)
 		definitions, err := reader.ReadAllDefinitions()
 		if err != nil {
@@ -6036,22 +6052,6 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 			if def.Name == defName {
 				promptText = def.Content
 				break
-			}
-		}
-
-		if promptText == "" {
-			if _, statErr := os.Stat(localAgentsDir); os.IsNotExist(statErr) {
-				if copyErr := templates.CopyAgentTemplates(localAgentsDir); copyErr != nil {
-					d.logger.Warn("Failed to copy agent templates: %v", copyErr)
-				} else {
-					definitions, _ = reader.ReadAllDefinitions()
-					for _, def := range definitions {
-						if def.Name == defName {
-							promptText = def.Content
-							break
-						}
-					}
-				}
 			}
 		}
 

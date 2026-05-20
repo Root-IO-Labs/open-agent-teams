@@ -65,6 +65,81 @@ func CopyAgentTemplates(destDir string) error {
 	return nil
 }
 
+// ReadEmbeddedAgentTemplate returns the byte content of the embedded
+// `agent-templates/<name>.md` template, or `(nil, os.ErrNotExist)` if
+// no such template is embedded. The `.md` suffix is added if absent.
+// Used by the daemon's prompt-refresh logic (Part 4.H) so a per-repo
+// agents/ dir can be reconciled with the embedded template content
+// without re-walking the entire embedded filesystem.
+func ReadEmbeddedAgentTemplate(name string) ([]byte, error) {
+	if filepath.Ext(name) != ".md" {
+		name += ".md"
+	}
+	content, err := agentTemplates.ReadFile(filepath.Join("agent-templates", name))
+	if err != nil {
+		return nil, os.ErrNotExist
+	}
+	return content, nil
+}
+
+// SyncAgentTemplates ensures every .md file in destDir matches its
+// embedded counterpart byte-for-byte; any drift is overwritten with
+// the embedded content. Returns the list of basenames that were
+// refreshed (empty when nothing changed) plus any walk error.
+//
+// Part 4.H: this is the embedded-newer-wins refresh that
+// CopyAgentTemplates used to only fire on first-time creation (when
+// destDir didn't exist). Now an idempotent diff-and-write per call,
+// safe to invoke on every agent start AND from the `oat agent
+// refresh-prompts` CLI verb.
+//
+// Non-destructive: only touches files that have an embedded
+// counterpart, leaves user-authored files alone (e.g. anything
+// not named like one of the embedded templates is ignored).
+// Repository-specific customization is handled separately via
+// prompts.LoadCustomPrompt, which the daemon appends under a
+// dedicated heading — it does NOT live in this dir.
+func SyncAgentTemplates(destDir string) ([]string, error) {
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create agents directory: %w", err)
+	}
+	var refreshed []string
+	walkErr := fs.WalkDir(agentTemplates, "agent-templates", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == "agent-templates" || d.IsDir() || filepath.Ext(path) != ".md" {
+			return nil
+		}
+		embedded, err := agentTemplates.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("failed to read embedded template %s: %w", path, err)
+		}
+		filename := filepath.Base(path)
+		destPath := filepath.Join(destDir, filename)
+		onDisk, readErr := os.ReadFile(destPath)
+		if readErr != nil {
+			if !os.IsNotExist(readErr) {
+				return fmt.Errorf("failed to read on-disk template %s: %w", destPath, readErr)
+			}
+			// Treat "does not exist" as "drift" so the first-run
+			// fresh-clone path lands in the same branch as a stale-file
+			// refresh — one code path instead of two.
+		} else if string(onDisk) == string(embedded) {
+			return nil
+		}
+		if err := os.WriteFile(destPath, embedded, 0644); err != nil {
+			return fmt.Errorf("failed to write template %s: %w", destPath, err)
+		}
+		refreshed = append(refreshed, filename)
+		return nil
+	})
+	if walkErr != nil {
+		return refreshed, fmt.Errorf("failed to sync agent templates: %w", walkErr)
+	}
+	return refreshed, nil
+}
+
 // ListAgentTemplates returns the names of all available agent templates.
 func ListAgentTemplates() ([]string, error) {
 	var templates []string

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestListAgentTemplates(t *testing.T) {
@@ -182,6 +183,143 @@ func TestCopyAgentTemplatesErrorHandling(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestSyncAgentTemplates_RefreshesStaleFile(t *testing.T) {
+	// Part 4.H regression: a per-repo agents/ dir that already exists
+	// with stale content used to silently shadow embedded-template
+	// edits. SyncAgentTemplates is the embedded-newer-wins refresh
+	// that fixes it.
+	tmpDir, err := os.MkdirTemp("", "templates-sync-stale-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	staleContent := []byte("STALE CONTENT — should be overwritten\n")
+	stalePath := filepath.Join(tmpDir, "browser.md")
+	if err := os.WriteFile(stalePath, staleContent, 0644); err != nil {
+		t.Fatalf("Failed to seed stale file: %v", err)
+	}
+
+	refreshed, err := SyncAgentTemplates(tmpDir)
+	if err != nil {
+		t.Fatalf("SyncAgentTemplates failed: %v", err)
+	}
+
+	// Browser.md should be in the refreshed list (it drifted from embedded).
+	foundBrowser := false
+	for _, name := range refreshed {
+		if name == "browser.md" {
+			foundBrowser = true
+			break
+		}
+	}
+	if !foundBrowser {
+		t.Errorf("Expected browser.md to be refreshed, got: %v", refreshed)
+	}
+
+	// Content on disk should now match the embedded template.
+	embedded, err := ReadEmbeddedAgentTemplate("browser.md")
+	if err != nil {
+		t.Fatalf("ReadEmbeddedAgentTemplate failed: %v", err)
+	}
+	got, err := os.ReadFile(stalePath)
+	if err != nil {
+		t.Fatalf("Read back stale file failed: %v", err)
+	}
+	if string(got) != string(embedded) {
+		t.Errorf("On-disk content did not match embedded after sync")
+	}
+}
+
+func TestSyncAgentTemplates_NoOpWhenInSync(t *testing.T) {
+	// Idempotency: a freshly-synced dir should not be re-written on
+	// the next call (returns empty refreshed list, mtime preserved).
+	tmpDir, err := os.MkdirTemp("", "templates-sync-noop-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if _, err := SyncAgentTemplates(tmpDir); err != nil {
+		t.Fatalf("First sync failed: %v", err)
+	}
+
+	// Capture mtime of browser.md after the first sync.
+	browserPath := filepath.Join(tmpDir, "browser.md")
+	info1, err := os.Stat(browserPath)
+	if err != nil {
+		t.Fatalf("Stat after first sync failed: %v", err)
+	}
+
+	// Sleep briefly so any rewrite would produce a distinguishable mtime.
+	// (On filesystems with second-granularity mtime, even an unconditional
+	// rewrite would change the timestamp on subsequent calls in this test.)
+	time.Sleep(10 * time.Millisecond)
+
+	refreshed, err := SyncAgentTemplates(tmpDir)
+	if err != nil {
+		t.Fatalf("Second sync failed: %v", err)
+	}
+	if len(refreshed) != 0 {
+		t.Errorf("Expected no files refreshed on idempotent sync, got: %v", refreshed)
+	}
+
+	info2, err := os.Stat(browserPath)
+	if err != nil {
+		t.Fatalf("Stat after second sync failed: %v", err)
+	}
+	if !info1.ModTime().Equal(info2.ModTime()) {
+		t.Errorf("mtime changed on no-op sync: before=%v after=%v", info1.ModTime(), info2.ModTime())
+	}
+}
+
+func TestSyncAgentTemplates_FreshDirCreatesAllFiles(t *testing.T) {
+	// First-run behaviour: empty (or non-existent) destination should
+	// get the full set of embedded files written, same as CopyAgentTemplates.
+	tmpDir, err := os.MkdirTemp("", "templates-sync-fresh-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	destDir := filepath.Join(tmpDir, "agents")
+	refreshed, err := SyncAgentTemplates(destDir)
+	if err != nil {
+		t.Fatalf("SyncAgentTemplates failed: %v", err)
+	}
+	embeddedList, err := ListAgentTemplates()
+	if err != nil {
+		t.Fatalf("ListAgentTemplates failed: %v", err)
+	}
+	if len(refreshed) != len(embeddedList) {
+		t.Errorf("Fresh sync should refresh all %d embedded files, got %d: %v", len(embeddedList), len(refreshed), refreshed)
+	}
+}
+
+func TestReadEmbeddedAgentTemplate(t *testing.T) {
+	// Sanity: helper returns bytes for known templates, ErrNotExist
+	// for unknown, and tolerates the `.md` suffix being absent.
+	content, err := ReadEmbeddedAgentTemplate("browser.md")
+	if err != nil {
+		t.Fatalf("ReadEmbeddedAgentTemplate(browser.md) failed: %v", err)
+	}
+	if len(content) == 0 {
+		t.Error("Expected non-empty browser.md content")
+	}
+
+	contentNoExt, err := ReadEmbeddedAgentTemplate("browser")
+	if err != nil {
+		t.Fatalf("ReadEmbeddedAgentTemplate(browser) (no .md) failed: %v", err)
+	}
+	if string(contentNoExt) != string(content) {
+		t.Error("Helper should treat 'browser' and 'browser.md' identically")
+	}
+
+	if _, err := ReadEmbeddedAgentTemplate("no-such-template-doesnt-exist.md"); err != os.ErrNotExist {
+		t.Errorf("Expected ErrNotExist for unknown template, got: %v", err)
+	}
 }
 
 func TestListAgentTemplatesConsistency(t *testing.T) {
