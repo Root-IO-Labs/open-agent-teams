@@ -137,7 +137,9 @@ You have three correct responses, in order of preference:
 
 1. **For substantive text reads** (Wikipedia article, news article, docs page, long-form prose), switch to `browser_get_text {mode: "main", maxChars: 4000}` — it gives you the article body in a fraction of the tokens a screenshot costs, has no height cap, and the model sees the text at full fidelity (no API downscaling). This is the cheap, correct answer for "what does the article say?" / "extract the prices" / "summarize this dashboard's text".
 2. **For "look at one section"** (e.g. "what does the references list at the bottom say?"), take a `browser_snapshot {interactiveOnly: false}`, find the ref for that section, then `browser_get_text {ref: <ref>, maxChars: 4000}` to scope the read.
-3. **For visual content past the cap** (a chart at y=22,000 on a 50,000-px page, a canvas-rendered diagram below the fold, a graphical element you specifically need pixels of), call `browser_screenshot` again with `offsetY: <nextOffsetY>` to capture the next slice. Repeat until `truncated` is no longer present in the result. This is the only legitimate "scroll-and-screenshot" pattern — and you do it by passing `offsetY`, **not** by physically scrolling the page (scrolling can break lazy-load and SPA loaders, and you'd still hit the same per-call cap).
+3. **For visual content past the cap** (a chart at y=22,000 on a 50,000-px page, a canvas-rendered diagram below the fold, a graphical element you specifically need pixels of), you have two slicing strategies:
+   - **By element (preferred when you can name the element):** `browser_snapshot {interactiveOnly: false}` → find the ref for the chart / figure / specific section → `browser_screenshot {ref: <that-ref>}`. The ref-bounded path captures exactly that element with ~10 px padding, no `truncated` cap unless the element ITSELF is huge (a giant `<canvas>`). Mutually exclusive with `offsetY` and `fullPage: false` — the ref is the framing.
+   - **By y-offset (when you only know roughly where it is):** call `browser_screenshot` again with `offsetY: <nextOffsetY>` to capture the next slice. Repeat until `truncated` is no longer present in the result. This is the only legitimate "scroll-and-screenshot" pattern — and you do it by passing `offsetY`, **not** by physically scrolling the page (scrolling can break lazy-load and SPA loaders, and you'd still hit the same per-call cap).
 
 Worked example (Wikipedia "New York City", contentHeight ≈ 50,000):
 
@@ -145,18 +147,25 @@ Worked example (Wikipedia "New York City", contentHeight ≈ 50,000):
 1. browser_screenshot { tabId: <id> }
    → result: { truncated: true, captureHeight: 19531, nextOffsetY: 19531, remaining: 30469 }
 2. If you only needed prose: stop here, call browser_get_text { mode: "main" }.
-3. If you need pixels of a chart at y ≈ 22k:
+3. If you need pixels of the "References" section specifically:
+     browser_snapshot { tabId: <id>, interactiveOnly: false }
+     → find ref for the references heading or container
+     browser_screenshot { tabId: <id>, ref: <that-ref> }
+     → result: { boundingBox: {...}, capturedBox: {...} }  // no truncated:true, fits under the cap
+4. If you need pixels of a chart at roughly y ≈ 22k but can't name an element:
      browser_screenshot { tabId: <id>, offsetY: 19531 }
      → result: { captureOffsetY: 19531, truncated: true, nextOffsetY: 39062 }
 ```
 
-The slice you ask for on call 3 is positioned in page coordinates — the chart at y=22k will appear roughly 2,500 px down from the top of the second image (22000 - 19531).
+For the offset variant, the slice is positioned in page coordinates — the chart at y=22k will appear roughly 2,500 px down from the top of the second image (22000 - 19531).
 
 What NOT to do:
 
 - Do NOT loop `browser_screenshot { tabId }` with no `offsetY` hoping the cap will move — it will re-clip from y=0 every time.
 - Do NOT call `browser_show_window` or resize the window as a "fix" for `truncated` — the cap is independent of window size.
 - Do NOT use `offsetY` for prose reads when `browser_get_text` would work — slicing wastes tokens on image downscaling that the API does anyway.
+- Do NOT pass BOTH `ref` AND (`offsetY` or `fullPage: false`) — they're mutually exclusive framing intents; the call will fail with INVALID_PARAMS. Pick one.
+- Do NOT use `ref` for a section you've never seen — take a `browser_snapshot` first so the ref points at a real, current element. Stale refs return `TARGET_NOT_FOUND`.
 
 ### One decision at a time
 

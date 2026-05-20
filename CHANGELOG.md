@@ -85,6 +85,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TestDirectBackend_StopAgentKillsProcessTree` locks in the
   whole-subtree behavior with a portable `sh → sleep` pipeline.
 
+### Changed
+
+- **Browser-agent prompt: ref-bounded screenshot guidance
+  (Part 4.F.9 prompt half).** Companion to the new
+  `browser_screenshot {ref}` tool in
+  [oat-browser-agent](../oat-browser-agent/CHANGELOG.md). The
+  long-page clipping section's decision tree now leads with
+  ref-bounded capture for "look at one section" cases:
+  `browser_snapshot → find ref → browser_screenshot {ref}` is
+  cheaper than slicing by `offsetY` AND survives the 25 MP per-call
+  cap (a single element almost always fits). Worked example shows
+  the Wikipedia "References" section captured via ref. "What NOT
+  to do" gains entries for the ref+offsetY mutex and stale-ref
+  re-snapshot handling.
+
 ### Added
 
 - **`[active-tab-id: <N>]` injection on side-panel chat input
