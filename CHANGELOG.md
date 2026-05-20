@@ -87,6 +87,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Browser-agent prompt: `browser_screenshot` now full-page by
+  default (Part 4.F.2).** Tightens
+  `internal/templates/agent-templates/browser.md` to reflect the
+  upstream schema flip in `oat-browser-agent` where
+  `browser_screenshot.fullPage` now defaults to `true`. Three
+  coordinated edits:
+  - The tool-list line now explicitly says "Captures the entire
+    scrollable page by default — no scrolling or window resizing
+    needed."
+  - A new short section, `browser_screenshot — defaults to
+    full-page`, lives next to the perception cost hierarchy and
+    spells out the new contract (one screenshot reads the whole
+    page; `fullPage: false` is the rare opt-out).
+  - Dropped the now-obsolete parenthetical in the
+    `browser_show_window` paragraph that previously hand-held the
+    agent toward `fullPage: true`. The replacement copy reinforces
+    that screenshots work regardless of window state, so the agent
+    never has a reason to call `browser_show_window` as a
+    screenshot prerequisite — closes the loop on the 2026-05-20
+    flight-task regression where the agent shrunk a
+    fullscreen-Space window unprompted and then took a viewport-
+    only screenshot that missed the substantive content.
+
 - **Browser-agent prompt: documented `browser_emit_to_user` and
   side-panel chat (Part 2f).** Adds two pieces to
   `internal/templates/agent-templates/browser.md`:
