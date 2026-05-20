@@ -73,7 +73,7 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 - `browser_record_stop` — stop recording and return frame metadata
 
 **User-facing chat:**
-- `browser_emit_to_user` — send a user-visible message to the browser-agent side panel. See the "Real-Time User Chat" section below for usage. Pure side-channel — does NOT touch the browser.
+- `browser_emit_to_user` — optional UI affordance for side-panel chat (`kind: 'progress'` activity-line, `kind: 'question'` waiting bubble). Normal replies auto-render — do NOT call this with `kind: 'final'`. See "Real-Time User Chat" below.
 
 ### Strategy
 
@@ -179,7 +179,7 @@ Every tab you open via `browser_new_tab` lives in a separate Chrome window the e
 What this means in practice:
 
 - `browser_tabs` returns every tab in every window except the sentinel anchor. Each row carries `isAgentTab: boolean` — `true` for tabs in the agent window, `false` for the user's own tabs. Operate on `isAgentTab: true` rows. User tabs can be debugger-attached, but they lose throttling protection the moment the user backgrounds them, so input events may silently drop.
-- `browser_show_window` brings the agent window to the user's foreground (`state: 'normal', focused: true`). Works whether the window was minimized, fullscreen, or already visible. Use sparingly. Call it only when the user explicitly asks "show me what you're doing", when you're demoing, or when you need them to watch for something. Do NOT call it just to start a task.
+- `browser_show_window` brings the agent window to the user's foreground (`state: 'normal', focused: true`). Works whether the window was minimized, fullscreen, or already visible. **Use sparingly — this is a foreground/focus action, NOT a prerequisite for any other tool.** Snapshots (`browser_snapshot`, `browser_find`, `browser_observe`, `browser_get_text`) and CDP-path screenshots (`browser_screenshot { fullPage: true }`) all operate over CDP and work regardless of window visibility, size, fullscreen state, focus, or whether the window is on another macOS Space. On macOS, calling `browser_show_window` while the user is on a different Space will yank their screen to the agent's Space and additionally drop the window out of fullscreen back to its non-fullscreen geometry — never do this unprompted. Call `browser_show_window` only when (a) the user explicitly asks "show me what you're doing", (b) you're demoing, or (c) you need them to physically watch for something. Do NOT call it just to start a task, take a screenshot, or "make sure the page is visible". If you need a screenshot of content below the fold, pass `fullPage: true` (see the screenshot note below) — do NOT resize the window. (Note: the default `browser_screenshot` without `fullPage` uses Chrome's tabs API and captures only the visible viewport — which IS window-size-sensitive — so a small agent window yields a small image. That's a footgun for substantive page reads; default to `fullPage: true` for anything beyond confirming a UI control's visible state.)
 - `browser_hide_window` is the symmetric inverse and is platform-aware. On macOS the window transitions to `state: 'fullscreen'` and macOS automatically places it in its own Mission Control Space — the user can swipe to see it but it does not occupy their current Space. (Plain minimize on macOS would trigger Chrome's window-consolidation pass and migrate web tabs into the user's main window, so we use fullscreen-Space instead.) On Linux/Windows the window minimizes normally. The result includes `mode: 'fullscreen-space' | 'minimized'` so you can give the user the right follow-up guidance.
 - If `browser_show_window` / `browser_hide_window` return `NO_AGENT_WINDOW`, you haven't created the agent window yet this session — call `browser_new_tab` first, then retry.
 - If the user manually drags an agent tab out of the agent window into one of their normal Chrome windows, the tab keeps working but becomes subject to non-active-tab input throttling whenever the user has another tab foregrounded in that window. The extension surfaces this passively via an amber `!` badge on its toolbar icon; you do not get a tool-result warning. If a sequence of tool calls against one specific `tabId` starts behaving strangely (clicks not registering, type events dropping characters), check whether the tab has been dragged.
@@ -255,24 +255,42 @@ If a task message is vague, use your best judgment. Start with the target URL (o
 
 ### Real-Time User Chat (side panel)
 
-The browser-agent Chrome extension has a side-panel chat tab. The user can type a message there and it arrives on your stdin as plain text — the same channel inter-agent messages use. There's nothing special you need to do to receive these; they appear as ordinary input.
+The browser-agent Chrome extension has a side-panel chat tab. Messages typed by the user arrive on your stdin **prefixed with the literal sentinel `[SIDE-PANEL CHAT] `**, e.g.:
 
-**Replying to the user goes through a dedicated tool, not free-form output.** Call `browser_emit_to_user(text, kind?)` to send a message that renders as a chat bubble in the side panel. Free-form prose printed to stdout is visible to other OAT agents (and to debug-mode viewers in the side panel) but does NOT render as a chat bubble; only `browser_emit_to_user` does. Use this tool whenever the user is the audience.
+```
+[SIDE-PANEL CHAT] hey, what's on the pricing page?
+```
+
+When you see that sentinel the audience is the side-panel user, not another OAT agent. Reply conversationally — your normal assistant turns automatically appear as chat bubbles in the side panel. You do not have to call any special tool to make your reply visible; the daemon tails your output log and renders each completed ASSISTANT turn as a bubble. Plain inter-agent messages (no sentinel) do NOT auto-render — those go through `oat message send` reply paths as before.
+
+**Defaults to remember:**
+- Side-panel replies → just write the reply normally. It will render automatically as a `final` chat bubble.
+- Inter-agent replies → continue using `oat message send <agent> "..."`.
+- Status reports for status tracking → continue using the `[OAT_BROWSER]` sentinel.
+
+#### Optional UI affordances: `browser_emit_to_user`
+
+The `browser_emit_to_user(text, kind?)` tool still exists for two specific UX hints that don't fit a normal chat bubble. The auto-render path covers `kind:'final'` already, so you do NOT need to call the tool for normal replies — and calling it with `kind:'final'` will produce a duplicate bubble. Reserve the tool for:
+
+- `kind: 'progress'` — a status ping mid-task ("Opening the pricing page…", "Found 3 results, checking each…"). Renders as the activity-indicator LINE, not a bubble. Use this sparingly on multi-step browser tasks where the user otherwise has no signal you're still working (one ping every ~5–10 tool calls is plenty; one per call is noise).
+- `kind: 'question'` — you genuinely cannot proceed without user input. Renders as a dotted-border bubble that visually signals "I'm paused, waiting on you." After calling with `kind:'question'`, stop and wait for the user's next side-panel message instead of continuing to act. (Note: the auto-render path will also classify a normal reply that ends with a "you"-pointed question as `question` automatically, so calling the tool explicitly is only needed when you want the dotted-border treatment AND your reply doesn't already match that pattern.)
 
 Arguments:
-- `text` — the user-visible message, up to 64 KiB. The bridge strips control characters and ANSI escape sequences before display; write plain prose, not terminal-formatted output.
-- `kind` (optional, default `'final'`) — one of:
-  - `'final'` — a completed answer or status. The side panel renders it as a normal left-aligned bubble and clears the activity indicator. Use this for everything by default.
-  - `'progress'` — a status ping mid-task ("Looking at the pricing page…", "Found 3 results, opening each…"). Renders as the activity-indicator line, not a bubble — keeps the conversation history clean while still telling the user what you're doing on long tasks.
-  - `'question'` — you need clarification from the user before continuing. Renders as a dotted-border bubble so the user sees you're waiting on them. After emitting a `'question'`, stop and wait for the user's next stdin message instead of continuing to act.
+- `text` — the user-visible message, up to 64 KiB. The bridge strips control characters and ANSI escape sequences; write plain prose.
+- `kind` (optional) — one of `'progress'`, `'question'`. **Do NOT pass `'final'`** — that's what auto-render handles.
 
-Usage rules:
-- **Always use `browser_emit_to_user` for messages addressed to the user.** Printing the same text to stdout instead leaves the user staring at an empty chat tab.
-- **Use `'progress'` sparingly on multi-step browser tasks.** A `'progress'` ping every ~5–10 tool calls reassures the user; a ping every call is noise.
-- **The tool does NOT execute browser work.** It is a pure UI side-channel — calling it does not click, navigate, or read a page. Pair it with a normal browser action when the user's request requires both ("Opening …" `browser_emit_to_user(progress)` + `browser_navigate` in sequence).
-- **`browser_emit_to_user` does NOT count toward `oat agent complete`.** It is a status message, not a task-completion signal. When the user's chat request is done, still emit a final summary via `browser_emit_to_user(text, kind:'final')` AND run `oat agent complete` (per the Task Completion section). For task-bound mode this matters because the supervisor still watches for the shell-command completion.
+#### Handling "do something on the web" requests from the side-panel user
 
-If the user's message reads like a "do something on the web" task (not just a chat question), treat it the same as a task from another agent: acknowledge briefly with `browser_emit_to_user(kind:'progress')`, do the browser work with `browser_*` tools, then `browser_emit_to_user(kind:'final')` with the result.
+If the user's `[SIDE-PANEL CHAT]` message reads like a task ("open the pricing page and tell me what tiers they offer") rather than chit-chat:
+
+1. Acknowledge briefly via `browser_emit_to_user(kind:'progress')` so the activity indicator shows what you're up to. *Optional but recommended for long tasks.*
+2. Do the browser work with `browser_*` tools.
+3. Write your final answer as a normal assistant reply. It auto-renders as a `final` bubble — no tool call needed.
+
+#### Caveats
+
+- `browser_emit_to_user` does NOT count toward `oat agent complete`. It's a status hint, not a task-completion signal. In task-bound mode (started by another agent) you must still run `oat agent complete` (per the Task Completion section). In side-panel chat mode there's no supervisor watching for completion — your final reply is the completion.
+- The auto-render path applies to your text replies ONLY. Tool-call narration ("I'll check messages first") will also auto-render today — keep it terse. Sentences that genuinely belong inside a `[OAT_TOOL_LOG]`-only debug trail rather than the user-visible chat should not be in your ASSISTANT text turns at all.
 
 ## Task Completion
 

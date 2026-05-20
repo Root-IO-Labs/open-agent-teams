@@ -190,6 +190,17 @@ type Daemon struct {
 	bridgeUnreachable   map[string][]time.Time
 	bridgeUnreachableMu sync.Mutex
 
+	// assistantTurnTailers maps "<session>/<agent>" → per-agent log
+	// tailer that watches OAT_TOOL_LOG, parses ASSISTANT blocks, and
+	// fans them out to stream_assistant_turns subscribers. Created
+	// when a browser-agent starts (see startRegisteredAgent's
+	// AgentTypeBrowser branch), torn down when the agent exits.
+	// Implements the Option-E auto-emit path from Part 2g so side-panel
+	// chat replies don't depend on the model calling
+	// browser_emit_to_user.
+	assistantTurnTailers   map[string]*assistantTurnTailer
+	assistantTurnTailersMu sync.Mutex
+
 	modelProfiles     *routing.ProfileStore    // loaded model capability profiles for routing
 	outcomeLogger     *routing.OutcomeLogger   // appends per-completion records to routing-history.jsonl
 	prBackfiller      *routing.PRBackfiller    // observes PR state at lag buckets after completion (sidecar writer)
@@ -271,6 +282,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		mainCIAlertTime:             make(map[string]time.Time),
 		restartCooldown:             make(map[string]time.Time),
 		bridgeUnreachable:           make(map[string][]time.Time),
+		assistantTurnTailers:        make(map[string]*assistantTurnTailer),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -567,6 +579,12 @@ func (d *Daemon) logDiagnostics() {
 // Stop stops the daemon
 func (d *Daemon) Stop() error {
 	d.logger.Info("Stopping daemon")
+
+	// Part 2g: tear down assistant-turn tailers before cancelling the
+	// daemon context. Each tailer closes its broadcaster, which lets any
+	// connected stream_assistant_turns subscriber observe a clean Done
+	// frame rather than a socket EOF.
+	d.stopAllAssistantTurnTailers()
 
 	// Cancel context to stop all loops
 	d.cancel()
@@ -1910,6 +1928,8 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 
 	case "restart_agent":
 		return d.handleRestartAgent(req)
+	case "restart_browser_agent":
+		return d.handleRestartBrowserAgent(req)
 
 	case "trigger_cleanup":
 		return d.handleTriggerCleanup(req)
@@ -2471,6 +2491,17 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 		return socket.ErrorResponse("input was empty after sanitization")
 	}
 
+	// Part 2g: prefix non-interrupt user input from the side panel with
+	// a sentinel so the agent's prompt can disambiguate "this is the
+	// side-panel user chatting" from "this is an inter-agent message
+	// via `oat message send`". The sentinel is plain ASCII; the
+	// sanitizer above only ran on the user-supplied bytes so the
+	// prefix is guaranteed not to be re-stripped. Interrupts (\x03)
+	// are passed through unchanged — that path doesn't carry text.
+	if !interrupt {
+		sanitized = sidePanelInputSentinel + sanitized
+	}
+
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, sanitized); err != nil {
 		if errors.Is(err, backend_pkg.ErrAgentAdopted) {
 			return socket.ErrorResponse("agent '%s' was re-adopted after daemon restart and needs to be restarted before it can accept input", agentName)
@@ -2578,6 +2609,12 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 				d.logger.Warn("Failed to stop agent process %s/%s: %v", repoName, agentName, err)
 			} else {
 				d.logger.Info("Stopped agent process %s/%s", repoName, agentName)
+			}
+			// Part 2g: stop the assistant-turn tailer for browser-agents
+			// so the next add+start spins up a fresh tailer rather than
+			// leaking a goroutine and a stale broadcaster.
+			if agent.Type == state.AgentTypeBrowser {
+				d.stopAssistantTurnTailer(repo.SessionName, agentName)
 			}
 		}
 	}
@@ -3556,6 +3593,16 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 			}
 		}
 
+		// Start the assistant-turn tailer BEFORE the agent process so
+		// the broadcaster is registered before the bridge subprocess
+		// connects and calls stream_assistant_turns. See the matching
+		// comment in restartAgent for the race-window post-mortem.
+		// Polling inside tailer.run() handles the "log file does not
+		// exist yet" case until the agent's first write.
+		if agent.Type == state.AgentTypeBrowser {
+			d.startAssistantTurnTailer(repo.SessionName, agentName, logFile)
+		}
+
 		handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
 			SessionName:   repo.SessionName,
 			AgentName:     agentName,
@@ -3848,6 +3895,82 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 	return socket.SuccessResponse(nil)
 }
 
+// handleRestartBrowserAgent is the side-panel "Restart agent" path:
+// the bridge knows its own (session, agent) identity from
+// OAT_BROWSER_AGENT_SESSION / _NAME but does NOT know the repo name
+// — repo lives only on the daemon side. This handler accepts the
+// bridge's identity, resolves the repo via findRepoBySession, then
+// delegates to the same code path as `restart_agent --force`.
+//
+// Security model:
+//
+//   - Restricted to `state.AgentTypeBrowser` agents. Mirrors the
+//     defense-in-depth used by `agent_input` (line 2472): a
+//     misconfigured or malicious bridge MUST NOT be able to kick
+//     the supervisor or merge-queue.
+//   - Always forces. A user clicking "Restart agent" in the side
+//     panel has unambiguously asked for a fresh start; gating on
+//     `force=false` here would just produce a confusing "already
+//     running, use --force" error.
+//
+// Wire format on success: { restarted: true, agent: "<name>",
+// repo: "<repo>" } so the bridge can echo the repo back to the
+// side panel ("Restarted agent in repo X") if it wants.
+func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
+	sessionName, errResp, ok := getRequiredStringArg(req.Args, "session", "session name is required")
+	if !ok {
+		return errResp
+	}
+	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
+	if !ok {
+		return errResp
+	}
+
+	repoName, repo, found := d.findRepoBySession(sessionName)
+	if !found {
+		return socket.ErrorResponse("no repository is bound to session %q", sessionName)
+	}
+	agent, exists := d.state.GetAgent(repoName, agentName)
+	if !exists {
+		return socket.ErrorResponse("agent '%s' not found in session %q", agentName, sessionName)
+	}
+	if agent.Type != state.AgentTypeBrowser {
+		return socket.ErrorResponse("restart_browser_agent is restricted to browser-agent type; %s/%s is %s", repoName, agentName, agent.Type)
+	}
+	if agent.ReadyForCleanup {
+		return socket.ErrorResponse("agent '%s' is marked as complete and pending cleanup", agentName)
+	}
+
+	hasWindow, err := d.backend.IsAgentAlive(d.ctx, repo.SessionName, agentName)
+	if err != nil {
+		return socket.ErrorResponse("failed to check agent window: %v", err)
+	}
+	if !hasWindow {
+		return socket.ErrorResponse("agent window '%s' does not exist - the agent may need to be recreated", agentName)
+	}
+
+	// Always force from this path: see comment above.
+	if agent.PID > 0 && isProcessAlive(agent.PID) {
+		d.logger.Info("Side-panel-driven restart for %s/%s (PID %d was still running)", repoName, agentName, agent.PID)
+		if err := d.backend.StopAgent(d.ctx, repo.SessionName, agent.WindowName); err != nil {
+			d.logger.Warn("Failed to stop prior agent %s/%s before side-panel restart: %v", repoName, agentName, err)
+		}
+	}
+
+	if err := d.restartAgent(repoName, agentName, agent, repo); err != nil {
+		return socket.ErrorResponse("failed to restart agent: %v", err)
+	}
+	if agent.Type == state.AgentTypeBrowser {
+		d.clearBridgeUnreachable(fmt.Sprintf("%s/%s", repoName, agentName))
+	}
+	d.logger.Info("Successfully restarted %s/%s from side-panel request", repoName, agentName)
+	return socket.SuccessResponse(map[string]interface{}{
+		"restarted": true,
+		"agent":     agentName,
+		"repo":      repoName,
+	})
+}
+
 // handleRestartAgent restarts an agent that has crashed or exited
 func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 	repoName, errResp, ok := getRequiredStringArg(req.Args, "repo", "repository name is required")
@@ -3892,6 +4015,16 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 			return socket.ErrorResponse("agent '%s' is already running with PID %d - use --force to restart anyway", agentName, agent.PID)
 		}
 		d.logger.Info("Force restarting agent %s (PID %d was still running)", agentName, agent.PID)
+		// Must kill the prior process tree before calling restartAgent
+		// — otherwise StartAgent overwrites the backend's map entry,
+		// orphaning the old oat-agent + its python child + its bridge
+		// child. The adopted-restart path (line ~967) has done this for
+		// years; the force-restart path was missing the same step and
+		// produced the zombie bridge processes the side-panel chat
+		// smoke test exposed.
+		if err := d.backend.StopAgent(d.ctx, repo.SessionName, agent.WindowName); err != nil {
+			d.logger.Warn("Failed to stop prior agent %s/%s before force-restart: %v", repoName, agentName, err)
+		}
 	}
 
 	// Restart the agent
@@ -6043,15 +6176,18 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		d.logger.Warn("Failed to remove session lock %s: %v", sessionLockDir, err)
 	}
 
-	// Clear pane buffer before restart so accumulated shell errors are not inherited (Bug 1 Option C)
-	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, "clear"); err != nil {
-		d.logger.Warn("Failed to clear pane buffer: %v", err)
-	}
-	select {
-	case <-d.ctx.Done():
-		return d.ctx.Err()
-	case <-time.After(100 * time.Millisecond):
-	}
+	// NOTE: prior code sent the literal string "clear" to the agent
+	// here, claiming to clear the tmux pane buffer ("Bug 1 Option C").
+	// On the tmux backend that ran the `clear` shell builtin in the
+	// agent's pane; on the PTY backend stdin goes directly to the
+	// MODEL, which then dutifully invokes the `clear` *tool* on every
+	// restart — burning tokens and producing the "(Screen cleared —
+	// ready for your next task.)" ASSISTANT line operators kept seeing
+	// after `oat agent restart --force`. The PTY backend allocates a
+	// fresh terminal for the new process anyway, so there is no buffer
+	// to inherit. Leaving this as a comment so the next person who
+	// thinks "I should re-add a clear-on-restart" reads the
+	// archaeology before re-introducing the bug.
 
 	agentProjectsDir := filepath.Join(home, ".claude", "projects")
 	encodedPath := strings.ReplaceAll(agent.WorktreePath, "/", "-")
@@ -6173,6 +6309,24 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		} else {
 			mcpConfig = cfg
 		}
+	}
+
+	// IMPORTANT: start the assistant-turn tailer BEFORE spawning the
+	// agent process. The agent's bridge subprocess connects to the
+	// daemon socket and calls `stream_assistant_turns` almost
+	// immediately after the agent's MCP plumbing is up; if the
+	// tailer registration races behind that subscribe, the bridge's
+	// handler returns "no assistant-turn tailer active" and the
+	// bridge falls into its 1s/2s/... reconnect backoff. The agent's
+	// first ASSISTANT turn often lands inside that backoff window,
+	// and the broadcaster does not replay — turn is lost forever
+	// (smoke-test report: 2026-05-18, post-restart replies invisible
+	// in the side panel while the oat-ui terminal showed them
+	// correctly). The tailer.run() goroutine itself polls until the
+	// log file exists, so registering early when the file may not
+	// yet be created is safe.
+	if os.Getenv("OAT_TEST_MODE") != "1" && agent.Type == state.AgentTypeBrowser {
+		d.startAssistantTurnTailer(repo.SessionName, agentName, logFile)
 	}
 
 	handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{

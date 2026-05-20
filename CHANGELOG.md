@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Daemon socket verb `restart_browser_agent`.** A purpose-built
+  side-panel-driven restart path that mirrors the security model of
+  `agent_input`: it accepts the bridge's own (session, agent)
+  identity (no repo needed, since the bridge has no repo env), and
+  refuses to restart anything other than a browser-type agent. The
+  side panel's "Restart agent" overflow-menu item in the oat-browser-
+  agent extension is the only intended caller. Always forces because
+  a user clicking the menu has unambiguously asked for a fresh start;
+  gating on `force=false` would surface a confusing "use --force"
+  error to a UI that has no `--force` checkbox. Files:
+  [`internal/daemon/daemon.go`](internal/daemon/daemon.go),
+  [`internal/daemon/agent_input_test.go`](internal/daemon/agent_input_test.go)
+  (new `TestHandleRestartBrowserAgent_Validation` covering the
+  type-guard, unknown-session, unknown-agent, and missing-arg
+  branches — the success branch is covered by the e2e suite).
+
+### Fixed
+
+- **`restartAgent` no longer makes the model run `clear` as a shell
+  command.** `restartAgent` was sending the literal string `clear`
+  via `backend.SendMessage` to "clear the pane buffer" (Bug 1 Option
+  C from the tmux era). On the tmux backend that ran the `clear`
+  shell builtin; on the PTY backend, stdin goes directly to the
+  model, which dutifully invoked its `execute` tool with the
+  `clear` command on every restart — surfacing in `oat ui` as the
+  recurring "(Screen cleared — ready for your next task.)"
+  ASSISTANT line operators reported after `oat agent restart
+  --force`. The PTY backend allocates a fresh terminal for the
+  new process anyway, so there is no buffer to inherit. The call
+  is removed and the comment archaeology is preserved as a
+  forward-looking warning for future contributors. File:
+  [`internal/daemon/daemon.go`](internal/daemon/daemon.go).
+- **`oat ui` "processing..." spinner could stick indefinitely.** When
+  the sidecar emits `turn_start` but the corresponding `turn_end`
+  event is lost (sidecar restart, transient network blip, etc.),
+  `turnInFlight` stayed pinned at `true` and the indicator showed
+  "processing... (1869s since last output)" while the model was
+  actually idle waiting for stdin (no API call in flight, no tokens
+  being burned). Added a 5-minute safety cap in `thinkingIndicator`
+  — past that threshold the spinner is suppressed regardless of
+  `turnInFlight`. Also made `Ctrl-X` (interrupt) clear the local
+  flag as a manual recovery path: ESC is the user's natural "shut
+  up, I'm not interested" gesture and now actually flips the UI
+  even when the daemon-side ESC has nothing to interrupt. The
+  `^x:interrupt` binding is also surfaced in the `ViewAgent` help
+  bar (it was only documented in the default-view help, which is
+  rarely visible). Files:
+  [`internal/tui/app.go`](internal/tui/app.go).
+- **Zombie agent processes on force-restart.** `oat agent restart
+  --force` was logging "PID %d was still running" but then calling
+  `restartAgent` without sending any kill signal first, leaving the
+  prior `oat-agent` (and its python wrapper + MCP bridge children)
+  alive while `StartAgent` overwrote the backend's map entry. The
+  comment on the adopted-restart path (`internal/daemon/daemon.go`
+  line 964: "Must kill the adopted process first — restartAgent
+  calls StartAgent which would overwrite the map entry, orphaning
+  the old process forever") was already warning against this exact
+  failure mode; the force-restart path was missing the same step.
+  Surfaced during browser-agent side-panel smoke tests where the
+  side panel reproducibly displayed a "mystery bubble" from the
+  previous session's agent. Now `handleRestartAgent` calls
+  `d.backend.StopAgent(...)` before `restartAgent` whenever the
+  prior PID is alive.
+- **`StopAgent` only signaled the immediate process, not the
+  process tree.** `killProcess` was calling
+  `proc.cmd.Process.Signal(SIGTERM)`, which signals exactly one
+  pid. The agent's child python wrapper kept running (Go binaries
+  don't auto-propagate SIGTERM to children), which in turn kept
+  the MCP bridge alive — the bridge's `ppid=1` orphan check never
+  fired because its immediate parent was still running. Switched
+  to `syscall.Kill(-pid, sig)` (process-group signal) which works
+  because `pty.StartWithSize` installs `setsid`, making the agent
+  its own process-group leader. New regression test
+  `TestDirectBackend_StopAgentKillsProcessTree` locks in the
+  whole-subtree behavior with a portable `sh → sleep` pipeline.
+
 ### Changed
 
 - **Browser-agent prompt: documented `browser_emit_to_user` and

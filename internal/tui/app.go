@@ -534,6 +534,17 @@ func (a *App) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, keys.Interrupt):
 		if a.activeAgent != "" {
+			// Also clear any stuck "processing..." spinner state for
+			// this agent. The sidecar is supposed to emit turn_end
+			// to flip turnInFlight back to false, but a missed event
+			// (network blip, sidecar restart, etc) leaves the
+			// indicator pinned indefinitely. ESC-from-the-keyboard
+			// is the natural "shut up, I'm not interested" gesture
+			// from the user's point of view; clearing the flag locally
+			// here gives the user an immediate recovery path even if
+			// the daemon-side ESC was a no-op (because nothing was
+			// actually in flight to interrupt).
+			a.turnInFlight[a.activeAgent] = false
 			return a, a.interruptAgent(a.activeAgent)
 		}
 		return a, nil
@@ -1110,9 +1121,9 @@ func (a *App) renderHelp() string {
 		}
 	case ViewAgent:
 		if a.width < 70 {
-			help = "tab:agents  esc:back  ^e:expand  ^r:input  ^c:quit"
+			help = "tab:agents  esc:back  ^e:expand  ^r:input  ^x:interrupt  ^c:quit"
 		} else {
-			help = "tab:agents  esc:workspace  ^o:log  ^e:expand  ^r:input  ^f:filter  ^c:quit"
+			help = "tab:agents  esc:workspace  ^o:log  ^e:expand  ^r:input  ^f:filter  ^x:interrupt  ^c:quit"
 		}
 	default:
 		if a.width < 70 {
@@ -1704,6 +1715,20 @@ func (a *App) thinkingIndicator(agent string) string {
 		}
 		elapsed := time.Since(lastOutput)
 		if elapsed < 3*time.Second {
+			return ""
+		}
+		// Safety cap: even though chatFromEvents=true means we have
+		// authoritative turn signals from the sidecar, a missed/dropped
+		// turn_end event will leave turnInFlight pinned at true
+		// forever and the spinner shows indefinitely with elapsed
+		// counters in the thousands of seconds (operator-visible UX
+		// bug reported during browser-agent smoke tests: spinner
+		// stuck at "1869s since last output" while no model call was
+		// actually in flight). 5 minutes of total silence is well
+		// past any realistic in-progress turn — at that point the
+		// process is overwhelmingly likely idle waiting for input,
+		// not actively burning tokens.
+		if elapsed > 5*time.Minute {
 			return ""
 		}
 		frame := thinkingSpinner[(int(elapsed.Milliseconds()/200))%len(thinkingSpinner)]

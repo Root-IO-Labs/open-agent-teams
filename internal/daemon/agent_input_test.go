@@ -257,3 +257,99 @@ func TestFindRepoBySession(t *testing.T) {
 		t.Errorf("findRepoBySession(missing) = (%q, %+v, %v), want (\"\", nil, false)", name, repo, ok)
 	}
 }
+
+// handleRestartBrowserAgent is the daemon side of the side-panel
+// "Restart agent" menu item. It must:
+//
+//  1. Refuse the request when the addressed agent is not type
+//     `browser-agent` (security boundary, mirrors `agent_input`).
+//  2. Error cleanly when session is unknown.
+//  3. Error cleanly when agent is unknown within the resolved repo.
+//
+// Successful restart is exercised by the broader e2e suite; this
+// unit test focuses on the validation/security branches that are
+// easy to regress and impossible to surface from the side-panel UI.
+func TestHandleRestartBrowserAgent_Validation(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	if err := d.state.AddRepo("my-repo", &state.Repository{
+		SessionName: "my-session",
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	// Two agents: one browser (allowed), one supervisor (must be
+	// rejected by the type guard).
+	if err := d.state.AddAgent("my-repo", "browser-agent", state.Agent{
+		Type:       state.AgentTypeBrowser,
+		WindowName: "browser-agent",
+	}); err != nil {
+		t.Fatalf("AddAgent browser: %v", err)
+	}
+	if err := d.state.AddAgent("my-repo", "supervisor", state.Agent{
+		Type:       state.AgentTypeSupervisor,
+		WindowName: "supervisor",
+	}); err != nil {
+		t.Fatalf("AddAgent supervisor: %v", err)
+	}
+
+	t.Run("rejects non-browser agent type", func(t *testing.T) {
+		resp := d.handleRestartBrowserAgent(socket.Request{
+			Command: "restart_browser_agent",
+			Args: map[string]interface{}{
+				"session": "my-session",
+				"agent":   "supervisor",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for supervisor agent, got success")
+		}
+		if !strings.Contains(resp.Error, "restricted to browser-agent type") {
+			t.Errorf("error %q should surface the type-guard message", resp.Error)
+		}
+	})
+
+	t.Run("rejects unknown session", func(t *testing.T) {
+		resp := d.handleRestartBrowserAgent(socket.Request{
+			Command: "restart_browser_agent",
+			Args: map[string]interface{}{
+				"session": "no-such-session",
+				"agent":   "browser-agent",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for unknown session, got success")
+		}
+		if !strings.Contains(resp.Error, "no repository is bound") {
+			t.Errorf("error %q should explain the session lookup failure", resp.Error)
+		}
+	})
+
+	t.Run("rejects unknown agent within resolved repo", func(t *testing.T) {
+		resp := d.handleRestartBrowserAgent(socket.Request{
+			Command: "restart_browser_agent",
+			Args: map[string]interface{}{
+				"session": "my-session",
+				"agent":   "no-such-agent",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for unknown agent, got success")
+		}
+		if !strings.Contains(resp.Error, "not found in session") {
+			t.Errorf("error %q should explain the agent lookup failure", resp.Error)
+		}
+	})
+
+	t.Run("rejects missing session arg", func(t *testing.T) {
+		resp := d.handleRestartBrowserAgent(socket.Request{
+			Command: "restart_browser_agent",
+			Args: map[string]interface{}{
+				"agent": "browser-agent",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for missing session arg, got success")
+		}
+	})
+}

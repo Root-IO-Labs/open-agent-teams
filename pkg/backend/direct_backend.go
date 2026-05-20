@@ -437,15 +437,41 @@ func (b *DirectBackend) StopAgent(ctx context.Context, session, agentName string
 	return b.killProcess(proc)
 }
 
+// signalProcessTree sends `sig` to the process group rooted at `pid`.
+// Falls back to signaling the individual process when the negative-pid
+// (process-group) syscall is rejected (rare in practice — pty.Start
+// installs setsid which makes the agent its own pgid leader). The
+// process-group target is necessary because oat-agent → python →
+// bridge doesn't propagate SIGTERM down the tree: signaling only the
+// Go binary leaves the python wrapper alive, which keeps its bridge
+// child alive too (the bridge's ppid=1 orphan check never fires
+// because its immediate parent — python — is still running).
+func signalProcessTree(pid int, sig syscall.Signal) {
+	if pid <= 0 {
+		return
+	}
+	// macOS/Linux: kill(-pgid, sig) targets every process in the
+	// group. pty.Start calls setsid() so the agent pid IS the pgid.
+	if err := syscall.Kill(-pid, sig); err == nil {
+		return
+	}
+	// Fallback: per-process signal. Worst case we leave python/bridge
+	// children running, but at least the agent itself dies and the
+	// backend map entry is cleared so the next start doesn't collide.
+	_ = syscall.Kill(pid, sig)
+}
+
 // killProcess handles the SIGTERM → wait → SIGKILL sequence.
 func (b *DirectBackend) killProcess(proc *managedProcess) error {
 	if proc.adopted {
-		// Adopted process: no cmd or PTY, use raw signals
-		_ = syscall.Kill(proc.pid, syscall.SIGTERM)
+		// Adopted process: no cmd or PTY, use raw signals. The
+		// adopted-process path takes the same process-group route so
+		// the agent's python+bridge subtree comes down with it.
+		signalProcessTree(proc.pid, syscall.SIGTERM)
 		select {
 		case <-proc.done:
 		case <-time.After(5 * time.Second):
-			_ = syscall.Kill(proc.pid, syscall.SIGKILL)
+			signalProcessTree(proc.pid, syscall.SIGKILL)
 			// Wait briefly for the monitor goroutine to notice
 			select {
 			case <-proc.done:
@@ -463,16 +489,18 @@ func (b *DirectBackend) killProcess(proc *managedProcess) error {
 		return nil
 	}
 
-	// Send SIGTERM
-	_ = proc.cmd.Process.Signal(syscall.SIGTERM)
+	// Send SIGTERM to the whole process group. proc.cmd.Process.Signal
+	// would only signal the immediate process and leave the bridge
+	// child alive (see signalProcessTree comment above).
+	signalProcessTree(proc.cmd.Process.Pid, syscall.SIGTERM)
 
 	// Wait up to 5 seconds for graceful exit
 	select {
 	case <-proc.done:
 		// Process exited gracefully
 	case <-time.After(5 * time.Second):
-		// Force kill
-		_ = proc.cmd.Process.Signal(syscall.SIGKILL)
+		// Force kill the whole group.
+		signalProcessTree(proc.cmd.Process.Pid, syscall.SIGKILL)
 		<-proc.done
 	}
 

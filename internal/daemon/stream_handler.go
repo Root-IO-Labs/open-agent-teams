@@ -76,6 +76,8 @@ func (sh *streamHandler) HandleStream(req socket.Request, conn net.Conn) {
 		sh.handleStreamEvents(req, conn)
 	case "stream_agent_output":
 		sh.handleStreamAgentOutput(req, conn)
+	case "stream_assistant_turns":
+		sh.handleStreamAssistantTurns(req, conn)
 	default:
 		// Unknown streaming command — send error and close
 		resp := socket.Response{Success: false, Error: "unknown stream command: " + req.Command}
@@ -492,6 +494,121 @@ func (sh *streamHandler) handleStreamAgentOutput(req socket.Request, conn net.Co
 			}
 		case <-connDead:
 			sh.d.logger.Debug("stream_agent_output client disconnected for %s/%s", sessionName, agentName)
+			return
+		}
+	}
+}
+
+// handleStreamAssistantTurns is Part 2g's side-panel auto-emit path.
+//
+// Subscribes the caller to the per-agent assistantTurnTailer's
+// broadcaster — every ASSISTANT block the runtime writes to
+// OAT_TOOL_LOG becomes a JSON frame on this stream, with a sanitized
+// body and a heuristic-detected kind ("final" or "question").
+//
+// Why two side-panel streams (stream_agent_output AND
+// stream_assistant_turns)?
+//
+//   - stream_agent_output is the byte-level PTY feed — used by
+//     debug-mode view, activity heartbeat, and any future "is the
+//     model alive?" sensors. It contains TUI repaints, spinners, and
+//     all the noise the side-panel pretty mode does NOT want to render
+//     as chat bubbles.
+//   - stream_assistant_turns is the cleaned, structured turn feed —
+//     used by pretty-mode chat. The bridge subscribes here and emits
+//     chat_response frames to the side panel automatically, regardless
+//     of whether the model called browser_emit_to_user.
+//
+// Identity model matches stream_agent_output: addressed by
+// (session, agent_name) so the bridge doesn't have to reverse-resolve
+// the repository name. Restricted to AgentTypeBrowser for the same
+// reason the byte-level stream is — the parsed turn feed is intended
+// for side-panel chat only and exposing it for other agent types
+// would change the audit-surface of those agents.
+//
+// Protocol:
+//  1. Server sends handshake: {"success":true,"stream":true}
+//  2. Server streams JSON lines: {"text":"...","kind":"final"|"question","ts":"..."}
+//  3. On broadcaster close / daemon shutdown: {"done":true}
+//  4. On error: {"error":"msg"} then close.
+func (sh *streamHandler) handleStreamAssistantTurns(req socket.Request, conn net.Conn) {
+	defer conn.Close()
+	enc := json.NewEncoder(conn)
+
+	sessionName, _ := req.Args["session"].(string)
+	agentName, _ := req.Args["agent"].(string)
+	if sessionName == "" || agentName == "" {
+		enc.Encode(socket.Response{Success: false, Error: "session and agent are required"}) //nolint:errcheck
+		return
+	}
+
+	// Translate (session, agent_name) → state.Agent so we can enforce
+	// the AgentTypeBrowser boundary. The error responses mirror
+	// stream_agent_output for consistency on the client side.
+	repoName, _, found := sh.d.findRepoBySession(sessionName)
+	if !found {
+		enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
+		return
+	}
+	agent, exists := sh.d.state.GetAgent(repoName, agentName)
+	if !exists {
+		enc.Encode(socket.Response{Success: false, Error: "agent '" + agentName + "' not found in session " + sessionName}) //nolint:errcheck
+		return
+	}
+	if agent.Type != state.AgentTypeBrowser {
+		enc.Encode(socket.Response{Success: false, Error: "stream_assistant_turns is restricted to browser-agent type; " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
+		return
+	}
+
+	broadcaster := sh.d.lookupAssistantTurnBroadcaster(sessionName, agentName)
+	if broadcaster == nil {
+		// Agent is registered but the tailer hasn't been started
+		// (or was already stopped). Refuse rather than blocking
+		// forever; the client (bridge) will retry if appropriate.
+		sh.d.logger.Info("stream_assistant_turns: no tailer active for %s/%s — bridge will backoff-retry", sessionName, agentName)
+		enc.Encode(socket.Response{Success: false, Error: "no assistant-turn tailer active for " + agentName + " in session " + sessionName}) //nolint:errcheck
+		return
+	}
+
+	ch, cancel := broadcaster.Subscribe()
+	defer cancel()
+	sh.d.logger.Info("stream_assistant_turns: bridge subscribed for %s/%s", sessionName, agentName)
+
+	// Handshake.
+	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+	if err := enc.Encode(socket.Response{Success: true, Stream: true}); err != nil {
+		return
+	}
+
+	// Detect client disconnect on idle (same pattern as
+	// handleStreamAgentOutput). Without this a side-panel that closes
+	// during a long quiet period would hold the goroutine until the
+	// next turn arrives.
+	connDead := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		conn.Read(buf) //nolint:errcheck
+		close(connDead)
+	}()
+
+	for {
+		select {
+		case frame, ok := <-ch:
+			if !ok {
+				conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+				enc.Encode(assistantTurnFrame{Done: true})                //nolint:errcheck
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+			if err := enc.Encode(frame); err != nil {
+				sh.d.logger.Debug("stream_assistant_turns write failed for %s/%s: %v", sessionName, agentName, err)
+				return
+			}
+			if frame.Done {
+				return
+			}
+		case <-connDead:
+			sh.d.logger.Debug("stream_assistant_turns client disconnected for %s/%s", sessionName, agentName)
 			return
 		}
 	}

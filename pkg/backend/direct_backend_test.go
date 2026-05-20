@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -537,6 +538,101 @@ func TestDirectBackend_SessionPersistence(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if isAlive := (syscall.Kill(pid, 0) == nil); isAlive {
 		t.Fatal("adopted agent should be dead after StopAgent")
+	}
+}
+
+// TestDirectBackend_StopAgentKillsProcessTree locks in the post-smoke
+// fix for the zombie-bridge bug: stopping an agent must reap its
+// entire process tree (oat-agent → python wrapper → MCP bridge
+// children), not just the agent binary itself. The smoke test
+// surfaced this when `oat agent restart --force` was leaving three
+// generations of agent processes alive simultaneously because
+// SIGTERM-to-immediate-pid does not propagate down to grandchildren
+// when the intermediate process (python) does not handle the signal.
+//
+// We simulate the tree with a portable shell pipeline: a parent shell
+// that backgrounds a `sleep 60` grandchild. After StopAgent, BOTH
+// must be dead.
+func TestDirectBackend_StopAgentKillsProcessTree(t *testing.T) {
+	b := NewDirectBackend()
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// Parent shell records its own pid AND the grandchild pid to a
+	// file so the test can inspect them, then waits indefinitely.
+	// "sh -c '...'" → the sh invocation IS the agent process; sleep
+	// is its child (= "bridge analog").
+	pidsFile := filepath.Join(tmpDir, "pids.txt")
+	script := "echo $$ > " + pidsFile + " && (sleep 60 & echo $! >> " + pidsFile + "; wait)"
+
+	handle, err := b.StartAgent(ctx, AgentConfig{
+		SessionName: "tree-test",
+		AgentName:   "tree-agent",
+		WorkDir:     tmpDir,
+		BinaryPath:  "sh",
+		Args:        []string{"-c", script},
+		LogFile:     filepath.Join(tmpDir, "agent.log"),
+	})
+	if err != nil {
+		t.Fatalf("StartAgent failed: %v", err)
+	}
+	if handle.PID == 0 {
+		t.Fatal("expected non-zero pid")
+	}
+
+	// Wait for the script to write both pids. The shell wrapping
+	// (`sh -l -c <wrappedShellCmd>`) means we don't know the inner
+	// sh's pid up front — we read it from the file.
+	deadline := time.Now().Add(3 * time.Second)
+	var data []byte
+	for time.Now().Before(deadline) {
+		data, err = os.ReadFile(pidsFile)
+		if err == nil && len(strings.Fields(string(data))) >= 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		t.Fatalf("script did not write both pids to %s: got %q", pidsFile, string(data))
+	}
+	innerShellPid, sleepPid := 0, 0
+	if _, err := fmt.Sscanf(fields[0], "%d", &innerShellPid); err != nil {
+		t.Fatalf("parse inner shell pid: %v", err)
+	}
+	if _, err := fmt.Sscanf(fields[1], "%d", &sleepPid); err != nil {
+		t.Fatalf("parse sleep pid: %v", err)
+	}
+
+	// Sanity: both processes are alive right now.
+	if syscall.Kill(innerShellPid, 0) != nil {
+		t.Fatalf("inner shell pid %d should be alive before stop", innerShellPid)
+	}
+	if syscall.Kill(sleepPid, 0) != nil {
+		t.Fatalf("sleep grandchild pid %d should be alive before stop", sleepPid)
+	}
+
+	// Stop the agent — the regression: previously only the outer
+	// shell wrapper would die, leaving inner shell + sleep as zombies.
+	if err := b.StopAgent(ctx, "tree-test", "tree-agent"); err != nil {
+		t.Fatalf("StopAgent failed: %v", err)
+	}
+
+	// Give the SIGTERM a moment to fan out across the group.
+	deadline = time.Now().Add(7 * time.Second)
+	for time.Now().Before(deadline) {
+		shellDead := syscall.Kill(innerShellPid, 0) != nil
+		sleepDead := syscall.Kill(sleepPid, 0) != nil
+		if shellDead && sleepDead {
+			return // pass
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if syscall.Kill(innerShellPid, 0) == nil {
+		t.Errorf("inner shell pid %d STILL alive after StopAgent — process-group kill is broken", innerShellPid)
+	}
+	if syscall.Kill(sleepPid, 0) == nil {
+		t.Errorf("sleep grandchild pid %d STILL alive after StopAgent — process-group kill is broken (this is the zombie-bridge bug)", sleepPid)
 	}
 }
 
