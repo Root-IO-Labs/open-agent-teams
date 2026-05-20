@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`browser.md` ref-bounded screenshot guidance teaches "container, not
+  heading" + acknowledges the off-screen scroll fix (Part 4.F.9 follow-up).**
+  Observed 2026-05-20 on Wikipedia "New York City": when the user asked
+  "screenshot the References section", the agent picked the `<h2>References</h2>`
+  heading ref (a thin one-line strip) instead of the section container,
+  then `browser_screenshot {ref}` hung for 60 seconds because the
+  heading sat ~30,000 px below the fold and CDP allocated viewport-
+  spanning scaffolding bitmaps for the off-screen capture. The
+  bridge-side fix lives in `oat-browser-agent` (scroll the element into
+  view before measuring); the prompt-side fix is to tell the agent to
+  pick the section *container* — the parent `<div>` / `<section>` /
+  region — not just the heading element. The prompt now spells this
+  out for the Wikipedia case (use `browser_find` and look for refs
+  with role `generic` or `heading` that sit ABOVE the heading's ref
+  in the snapshot order; verify with a small `browser_get_text {ref}`
+  if unsure). Lives in
+  [`internal/templates/agent-templates/browser.md`](internal/templates/agent-templates/browser.md);
+  no Go code changes.
+
 ### Added
 
 - **Daemon socket verb `restart_browser_agent`.** A purpose-built
