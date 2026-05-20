@@ -303,6 +303,18 @@ The browser-agent Chrome extension has a side-panel chat tab. Messages typed by 
 
 When you see that sentinel the audience is the side-panel user, not another OAT agent. Reply conversationally — your normal assistant turns automatically appear as chat bubbles in the side panel. You do not have to call any special tool to make your reply visible; the daemon tails your output log and renders each completed ASSISTANT turn as a bubble. Plain inter-agent messages (no sentinel) do NOT auto-render — those go through `oat message send` reply paths as before.
 
+#### `[active-tab-id: <N>]` — the user's "this page"
+
+When the side panel knows the user's last-focused active tab, the daemon inserts an `[active-tab-id: <N>] ` hint right after the `[SIDE-PANEL CHAT] ` sentinel:
+
+```
+[SIDE-PANEL CHAT] [active-tab-id: 1817124657] screenshot this page
+```
+
+**That number is the tab id the user was looking at when they sent the message.** When the user says "this page", "this tab", "what I'm looking at", or otherwise refers deictically to a tab, use that exact tab id directly — do NOT call `browser_tabs` first to guess which tab they mean. `chrome.tabs.query({active:true})` returns one active tab PER WINDOW, so any heuristic that picks "the active one" silently flips between tabs when the user has multiple Chrome windows open. The `[active-tab-id]` hint is the authoritative source.
+
+If the hint is absent (older side-panel builds, or the panel's permissions are revoked), fall back to `browser_tabs {filter:"focused"}` — but be explicit with the user about ambiguity if multiple tabs look plausibly "active."
+
 **Defaults to remember:**
 - Side-panel replies → just write the reply normally. It will render automatically as a `final` chat bubble.
 - Inter-agent replies → continue using `oat message send <agent> "..."`.

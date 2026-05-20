@@ -2498,8 +2498,15 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// sanitizer above only ran on the user-supplied bytes so the
 	// prefix is guaranteed not to be re-stripped. Interrupts (\x03)
 	// are passed through unchanged — that path doesn't carry text.
+	//
+	// Part 4.K: when the side panel attaches an active_tab_id, insert
+	// `[active-tab-id: <N>] ` between the sentinel and the user's
+	// text. The agent prompt (browser.md) is taught to read this as
+	// "the user's last-focused tab id when they sent this message,"
+	// removing the chrome.tabs.query({}) ambiguity that caused the
+	// agent to act on the wrong tab when multiple windows are open.
 	if !interrupt {
-		sanitized = sidePanelInputSentinel + sanitized
+		sanitized = sidePanelInputSentinel + buildActiveTabPrefix(req.Args["active_tab_id"]) + sanitized
 	}
 
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, sanitized); err != nil {

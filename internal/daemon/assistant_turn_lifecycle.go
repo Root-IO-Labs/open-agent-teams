@@ -1,9 +1,49 @@
 package daemon
 
+import (
+	"fmt"
+	"strconv"
+)
+
 // This file owns the daemon-side lifecycle helpers for the per-agent
 // assistantTurnTailer + turnBroadcaster pair. Kept separate from
 // daemon.go so the bulk of daemon.go stays readable and Part 2g's
 // concerns are easy to find in a code review.
+
+// buildActiveTabPrefix returns the optional `[active-tab-id: <N>] `
+// fragment the daemon inserts between sidePanelInputSentinel and the
+// user's text on side-panel chat input (Part 4.K). Accepts the raw
+// `active_tab_id` argument value as it arrives from the socket layer
+// (interface{}: float64 from JSON, int / int64 from in-process tests,
+// string from the dispatch table's stringy fallback). Anything else,
+// or a non-positive id, returns "" — silent fall-through so an older
+// side-panel build without the field continues to work.
+//
+// Kept in this file (not daemon.go) so all the side-panel-chat
+// lifecycle helpers are colocated; the parser/tailer files import
+// nothing from daemon.go.
+func buildActiveTabPrefix(raw interface{}) string {
+	if raw == nil {
+		return ""
+	}
+	var tabID int64
+	switch v := raw.(type) {
+	case float64:
+		tabID = int64(v)
+	case int:
+		tabID = int64(v)
+	case int64:
+		tabID = v
+	case string:
+		if parsed, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			tabID = parsed
+		}
+	}
+	if tabID <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("[active-tab-id: %d] ", tabID)
+}
 
 // sidePanelInputSentinel is the prefix the daemon prepends to text
 // injected via handleAgentInput before it reaches the agent's PTY.

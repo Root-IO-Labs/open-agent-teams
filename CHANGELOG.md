@@ -87,6 +87,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[active-tab-id: <N>]` injection on side-panel chat input
+  (Part 4.K).** Counterpart to the
+  [oat-browser-agent](../oat-browser-agent/CHANGELOG.md) change
+  that attaches `activeTabId` to `user_message` WS frames. The
+  daemon's `handleAgentInput` now reads an optional
+  `active_tab_id` arg and injects `[active-tab-id: <N>] ` between
+  the existing `[SIDE-PANEL CHAT] ` sentinel and the user's text,
+  giving the agent a deterministic "this page" target instead of
+  having to call `browser_tabs` and silently pick one of N tabs
+  that all report `active: true` (Chrome reports one active tab
+  per window).
+  - `internal/daemon/assistant_turn_lifecycle.go`: new pure
+    `buildActiveTabPrefix(raw interface{}) string` helper. Accepts
+    float64 / int / int64 / string-int, returns "" for nil, zero,
+    negative, garbage strings, or non-numeric types. Pure function
+    — no I/O, no daemon state — so it tests directly without a
+    fake backend.
+  - `internal/daemon/daemon.go::handleAgentInput`: invokes the
+    helper inside the existing non-interrupt branch, producing
+    `[SIDE-PANEL CHAT] [active-tab-id: 1817124657] screenshot`
+    when the bridge supplies the id and `[SIDE-PANEL CHAT]
+    screenshot` (unchanged behavior) when it does not.
+    Interrupts (`\x03`) skip the prefix entirely; they have no
+    payload to annotate.
+  - `internal/templates/agent-templates/browser.md`: new
+    "`[active-tab-id: <N>]` — the user's 'this page'" subsection
+    under "Real-Time User Chat" with a worked example and an
+    explicit instruction NOT to call `browser_tabs` first to
+    guess. Falls back to `browser_tabs {filter:"focused"}` when
+    the hint is absent (older side-panel builds).
+
+  Tests:
+  [`internal/daemon/agent_input_test.go::TestBuildActiveTabPrefix`](internal/daemon/agent_input_test.go)
+  with 9 subcases covering each input shape + every silent-drop
+  rule. Existing handler tests still pass.
+
 - **`oat agent refresh-prompts [--repo <name>]` + auto-sync of
   per-repo agent templates on every prompt write (Part 4.H).**
   Closes a long-standing footgun: `~/.oat/repos/<repo>/agents/*.md`

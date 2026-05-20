@@ -229,6 +229,38 @@ func TestHandleAgentInput_InterruptFlagPlumbing(t *testing.T) {
 	}
 }
 
+// Part 4.K: buildActiveTabPrefix is the pure function that converts
+// the socket arg `active_tab_id` into the optional
+// `[active-tab-id: <N>] ` fragment that goes between the
+// sidePanelInputSentinel and the user's text. Five cases cover every
+// way the socket layer can hand us the value plus the silent-drop
+// rules for "not a positive int."
+func TestBuildActiveTabPrefix(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  interface{}
+		want string
+	}{
+		{"nil_drops", nil, ""},
+		{"float64_positive_normalizes", float64(1817124657), "[active-tab-id: 1817124657] "},
+		{"int_positive", 42, "[active-tab-id: 42] "},
+		{"int64_positive", int64(99999), "[active-tab-id: 99999] "},
+		{"string_int_parses", "12345", "[active-tab-id: 12345] "},
+		{"string_garbage_drops", "not-an-int", ""},
+		{"zero_drops", 0, ""},
+		{"negative_drops", -1, ""},
+		{"bool_drops", true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildActiveTabPrefix(tc.raw)
+			if got != tc.want {
+				t.Errorf("buildActiveTabPrefix(%v) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 // findRepoBySession is the lookup the handler uses to map the
 // bridge's OAT_BROWSER_AGENT_SESSION env back to a state.Repository.
 // Worth a direct test so a future refactor (e.g. swapping the linear
