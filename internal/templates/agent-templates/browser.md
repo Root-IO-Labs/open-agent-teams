@@ -54,7 +54,7 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 - `browser_dismiss_overlay` — auto-dismiss cookie banners and popups
 
 **Advanced:**
-- `browser_evaluate` — execute JavaScript (use sparingly)
+- `browser_evaluate` — **OPTIONAL** tool. Execute JavaScript. May not be in your tool list — JS eval is a powerful escape hatch and operators have to opt in. If you call it and get back `browser_evaluate is not a valid tool, try one of [...]`, the operator hasn't enabled it — DO NOT retry. Use the snapshot/find/text tools instead (`browser_find`, `browser_snapshot`, `browser_get_text`, `browser_extract`, `browser_observe`); they cover the overwhelming majority of "I need to inspect the DOM" use cases without needing eval. Only fall back to `browser_evaluate` when those genuinely can't answer the question AND the tool is enabled.
 - `browser_extract` — structured data extraction
 - `browser_wait_for` — wait for element or text to appear
 - `browser_tabs`, `browser_close_tab` — tab management
@@ -166,6 +166,13 @@ What NOT to do:
 - Do NOT call `browser_show_window` or resize the window as a "fix" for `truncated` — the cap is independent of window size.
 - Do NOT use `offsetY` for prose reads when `browser_get_text` would work — slicing wastes tokens on image downscaling that the API does anyway.
 - Do NOT pass BOTH `ref` AND (`offsetY` or `fullPage: false`) — they're mutually exclusive framing intents; the call will fail with INVALID_PARAMS. Pick one.
+
+**User-owned tabs (`userOwnedTab: true`).** A `browser_screenshot { fullPage: true }` or `{ offsetY: N }` call against a tab the user owns (any tab outside the dedicated agent window — i.e. anything you didn't create with `browser_new_tab`) returns a single viewport's worth of content captured from the page's CURRENT scroll position. The result carries `userOwnedTab: true` to make this explicit. Two consequences you have to plan for:
+
+- **Your requested `offsetY` is ignored on user tabs.** The bridge can't scroll the user's tab without visibly perturbing them (same policy as `INPUT_ON_USER_TAB_REFUSED` on `browser_scroll_to`). `captureOffsetY` in the result reflects where the user actually is, not where you asked to start. If `captureOffsetY` doesn't match `offsetY`, you're seeing what the user sees — not what you wanted to see.
+- **Iterating via `offsetY` does not work on user tabs.** Calling `browser_screenshot` again with `offsetY: <nextOffsetY>` will produce the SAME image (still capturing from the user's current scroll). For substantive reads on a user tab, switch strategy: (a) `browser_get_text { mode: 'main' }` for prose / article body; (b) `browser_snapshot { interactiveOnly: false }` + `browser_screenshot { ref }` to capture a specific section (ref-bounded captures don't physically scroll); (c) ask the user to scroll, or open the same URL in a new tab via `browser_new_tab` (that's an agent-owned tab — full stitching works there).
+
+Agent-owned tabs (any tab you created via `browser_new_tab`, or any tab inside the agent window) are NOT subject to this restriction — they take the full scroll-and-stitch path and you get the same `truncated`/`nextOffsetY` iteration semantics described above.
 - Do NOT use `ref` for a section you've never seen — take a `browser_snapshot` first so the ref points at a real, current element. Stale refs return `TARGET_NOT_FOUND`.
 
 ### One decision at a time

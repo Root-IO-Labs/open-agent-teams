@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`browser.md` marks `browser_evaluate` as OPTIONAL + teaches snapshot/
+  find fallback (Part 4 follow-up).** Observed 2026-05-21 in
+  `~/.oat/output/oat-browser-test/browser-agent.log` at 23:03:56: the
+  agent attempted `browser_evaluate` to traverse the DOM for a
+  References section container, the runtime tool list refused it with
+  `browser_evaluate is not a valid tool, try one of [...]`, and the
+  agent retried 4 more times anyway before giving up. Root cause:
+  `browser_evaluate` is defined in the bridge but lives in the
+  `OPTIONAL_TOOLS` allowlist (gated off by default — JS eval is a
+  meaningful escape hatch and warrants explicit opt-in by the
+  operator). The prompt previously described it as if it were always
+  available. Fix: the "Advanced" section now flags it as OPTIONAL,
+  explicitly tells the agent NOT to retry on `is not a valid tool`,
+  and steers it to `browser_find` / `browser_snapshot` /
+  `browser_get_text` / `browser_extract` / `browser_observe` (which
+  ARE in the default list) for the overwhelming majority of DOM-
+  inspection use cases. We do not auto-enable `browser_evaluate`
+  in OAT by default — operators who need it can opt in via the
+  bridge config.
+
+- **`browser.md` documents the `userOwnedTab: true` screenshot contract
+  + teaches strategy switching on user tabs (Part 4.F.11 follow-up).**
+  Companion to the bridge-side fix in `oat-browser-agent` that gates
+  the scroll-and-stitch path on tab ownership. Adds a new section
+  under "`browser_screenshot` — defaults to full-page" explaining:
+  (a) what `userOwnedTab: true` means in a result; (b) why the
+  agent's requested `offsetY` is ignored on user tabs (the bridge
+  can't scroll the user's tab without visibly perturbing them);
+  (c) why iterating via `offsetY` on a user tab returns the same
+  image every call; (d) the right strategy switches —
+  `browser_get_text { mode: 'main' }` for prose, `browser_snapshot`
+  + `browser_screenshot { ref }` for specific sections (ref-bounded
+  captures don't physically scroll), or `browser_new_tab` to get an
+  agent-owned tab where full stitching works.
+
 - **`browser.md` ref-bounded screenshot guidance teaches "container, not
   heading" + acknowledges the off-screen scroll fix (Part 4.F.9 follow-up).**
   Observed 2026-05-20 on Wikipedia "New York City": when the user asked
