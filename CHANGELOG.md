@@ -123,6 +123,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Part 4.K diagnostic at `handleAgentInput`: log the inbound
+  `active_tab_id` value at INFO.** Companion to the
+  [oat-browser-agent](../oat-browser-agent/CHANGELOG.md) diagnostics
+  promoted at the sidepanel, background, and bridge chokepoints.
+  Reported by the user 2026-05-21: every `[SIDE-PANEL CHAT]` line
+  reaching the agent prompt in today's retest was missing the
+  expected `[active-tab-id: N]` prefix, despite the upstream wire
+  chain looking correct. None of the existing logs in the chain
+  show what `activeTabId` value was on the wire at each hop, so we
+  can't tell from logs alone whether the daemon is dropping the
+  field, never receiving it, or receiving it and silently passing
+  it through. The new line in `internal/daemon/daemon.go::handleAgentInput`
+  shows the raw socket arg value, its Go type, and the resolved
+  `[active-tab-id: N] ` prefix string for every non-interrupt
+  agent_input. Tagged Part 4.K in the message so it's easy to
+  demote back to `d.logger.Debug` once the active-tab-id flow is
+  confirmed end-to-end. Existing `agent_input_test.go` cases for
+  `buildActiveTabPrefix` continue to pin the function behaviour.
+
+### Changed
+
+- **`internal/templates/agent-templates/browser.md`: TAB_NOT_ATTACHED,
+  CDP_TIMEOUT, and INPUT_ON_USER_TAB_REFUSED error handling guidance.**
+  Reported by the user 2026-05-21: the agent kept retrying
+  `browser_screenshot` with the same args after both
+  `CDP_TIMEOUT` and `TAB_NOT_ATTACHED`, AND confabulated a "your
+  messages were interrupting me" narrative when the real cause was
+  the Chrome 148 captureScreenshot regression hitting the
+  `offsetY` full-page path. Prompt updates:
+  - `TAB_NOT_ATTACHED` error row flipped from `retryable: no` to
+    `retryable: yes` with the explicit recovery sequence
+    (`debugger_attach { tabId }` for the SAME id, THEN retry the
+    original call). The previous "no" reading led the agent to
+    abandon recoverable sessions; the actual problem is that the
+    bridge dropped the debugger attach and the recovery is one
+    `debugger_attach` away.
+  - `CDP_TIMEOUT` row: same `retryable: yes` but clarified that
+    repeated timeouts on the same tool with the same args mean
+    "switch strategy," not "this was user interruption."
+  - New `INPUT_ON_USER_TAB_REFUSED` row documenting the bridge
+    policy that blocks input tools (`browser_scroll`,
+    `browser_scroll_to`, `browser_click`, `browser_type`, etc.) on
+    the user's currently-focused tab. Lists the three viable
+    workarounds: (a) ref-bounded screenshots auto-scroll inside
+    the screenshot path without perturbing the user; (b)
+    `browser_new_tab` to do the work in a tab the agent owns; (c)
+    report the limitation and ask the user to switch tabs.
+  - New "Don't confabulate user-interruption when tool calls hang"
+    subsection explicitly tells the agent that per-tool timeouts
+    fire on the bridge's internal budget, independent of user
+    input, and lists the three real causes (rendering issue, lost
+    attach, page hang) plus the strategy-switch recommendations
+    (prefer ref-bounded screenshots, fall back to
+    `browser_get_text {mode:'main'}` for long content,
+    `browser_snapshot` for state verification).
+
+  Note: `docs/DIRECTORY_STRUCTURE.md` regenerator has a
+  pre-existing drift that wants to delete the
+  `output/browser-agent-actions.jsonl` and
+  `downloads/<repo>/` entries; intentionally NOT included in this
+  commit because dropping those entries is destroying valid
+  documentation. Tracked as a separate follow-up.
+
 - **`[active-tab-id: <N>]` injection on side-panel chat input
   (Part 4.K).** Counterpart to the
   [oat-browser-agent](../oat-browser-agent/CHANGELOG.md) change

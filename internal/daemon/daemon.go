@@ -2506,7 +2506,25 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// removing the chrome.tabs.query({}) ambiguity that caused the
 	// agent to act on the wrong tab when multiple windows are open.
 	if !interrupt {
-		sanitized = sidePanelInputSentinel + buildActiveTabPrefix(req.Args["active_tab_id"]) + sanitized
+		// Part 4.K diagnostic (added 2026-05-21): log the inbound
+		// active_tab_id value at INFO so we can correlate "side
+		// panel said X" with "daemon saw X" without tailing
+		// per-process console.* in the extension/bridge. User
+		// reported every [SIDE-PANEL CHAT] line reaching the
+		// agent prompt without an [active-tab-id: N] prefix
+		// despite the upstream wire chain looking correct — the
+		// next retest's daemon.log line tells us whether the
+		// daemon is dropping the field, never receiving it, or
+		// receiving and silently passing it through. Demote to
+		// d.logger.Debug once the active-tab-id flow is
+		// confirmed end-to-end.
+		rawTabID := req.Args["active_tab_id"]
+		prefix := buildActiveTabPrefix(rawTabID)
+		d.logger.Info(
+			"agent_input active_tab_id for %s/%s: raw=%v type=%T → prefix=%q",
+			repoName, agentName, rawTabID, rawTabID, prefix,
+		)
+		sanitized = sidePanelInputSentinel + prefix + sanitized
 	}
 
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, sanitized); err != nil {

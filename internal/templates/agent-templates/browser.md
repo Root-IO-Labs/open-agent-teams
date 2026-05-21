@@ -273,16 +273,33 @@ Always check the error `code` and `retryable` fields before retrying.
 | `OUTBOUND_BLOCKED`            | no         | Your `browser_evaluate` tried to send data off-origin. Refactor or stop.  |
 | `SENSITIVE_PAGE`              | no         | The page is a banking/login page. Stop interacting and report.            |
 | `DOWNLOAD_BLOCKED`            | no         | Extension is blocked. Stop.                                               |
-| `TAB_NOT_ATTACHED`            | no         | Run `debugger_attach` for that `tabId` first.                             |
+| `TAB_NOT_ATTACHED`            | yes        | Call `debugger_attach { tabId }` for the same `tabId`, then retry the original call once. Do NOT just retry the original call without attaching first — the error means the bridge has no debugger session for that tab, so every retry will fail identically until you reattach. Common after long-idle sessions or after the user dismisses the "Chrome is being controlled by automated test software" infobar. |
 | `NO_ACTIVE_TAB`               | no         | Run `debugger_attach` first.                                              |
 | `CIRCUIT_BREAKER_TRIPPED`     | no         | Stop, report progress, escalate.                                          |
 | `AGENT_PANIC`                 | no         | The user clicked Stop. Halt immediately and report.                       |
 | `BATCH_OPTIONAL_BLOCKED`      | no         | The batch contained tools the operator hasn't enabled.                    |
 | `BATCH_INNER_BLOCKED`         | no         | One inner call failed bridge preflight; the whole batch was rejected. The response names the offending `innerIndex` and `innerTool`. Remove or fix that call and retry. |
 | `EXTENSION_NOT_CONNECTED`     | yes        | Wait briefly, retry once, then report if it still fails.                  |
-| `CDP_TIMEOUT`                 | yes        | Retry once.                                                               |
+| `CDP_TIMEOUT`                 | yes        | Retry ONCE with the same args. If it still times out on `browser_screenshot`, do NOT keep retrying — that's a Chrome rendering-pipeline issue, not a transient blip. Switch capture strategy (see "Don't confabulate user-interruption" below). It is NOT a sign the user interrupted you — the timeout fires after the bridge's per-tool budget, independent of any user input. |
+| `INPUT_ON_USER_TAB_REFUSED`   | no         | The user is currently on that tab; the bridge refuses input tools (`browser_scroll`, `browser_scroll_to`, `browser_click`, `browser_type`, etc.) on the user's tab to avoid hijacking their interaction. Do NOT retry on the same tab. Either: (a) capture what you can without scrolling (e.g. `browser_screenshot { ref }` of an off-screen element auto-scrolls inside the screenshot path only — it does not perturb the user); (b) open the same URL in a new tab via `browser_new_tab` and do your work there; (c) report that the action requires the user to switch tabs. |
 | `DEBUGGER_DETACHED`           | yes        | The bridge will reattach automatically. Wait and retry.                   |
 | `NAVIGATION_FAILED`           | yes        | Try `browser_reload`, or pick a different URL.                            |
+
+#### Don't confabulate user-interruption when tool calls hang
+
+If `browser_screenshot` or another long-running tool keeps timing out, **do not** invent a "the user is interrupting me" narrative. Each tool call has its own bridge-side timeout (60 s for `browser_screenshot`, 30 s for most others — see error table above). The timeout fires regardless of whether the user has sent a new chat message; it's the bridge's per-call budget, not a reaction to user input. If you see `CDP_TIMEOUT` more than once on the same tool with the same args, the cause is almost certainly:
+
+1. A Chrome rendering-pipeline issue with that specific capture shape (e.g. very large full-page captures on Chrome 147+), OR
+2. The tab is no longer attached (`TAB_NOT_ATTACHED` would show on the NEXT call), OR
+3. The page itself is hanging (heavy script, network stall).
+
+Switch strategies rather than retrying:
+
+- For screenshots: prefer `browser_screenshot { ref }` of a specific snapshot ref over `{ fullPage: true }` or `{ offsetY: N }` — ref-bounded captures use the compositor's fast path and avoid the entire class of full-page-rendering failures.
+- For text content: switch to `browser_get_text { mode: 'main' }` if the page is long; full-page screenshots are not the right tool for substantive text extraction at Wikipedia-class scale.
+- For verifying user-visible state: a single `browser_snapshot` is usually cheaper and more reliable than a screenshot.
+
+When you switch strategies, **tell the user what you tried, why it didn't work, and what you're trying instead** — silently retrying the same broken call for 5 minutes is worse than reporting the issue and asking for guidance.
 
 ### Status Reporting
 
