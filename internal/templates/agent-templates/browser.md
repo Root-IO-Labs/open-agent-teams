@@ -395,7 +395,9 @@ Arguments (all optional):
 
 If you also need to analyze the page yourself before composing a caption, it's fine to call both: `browser_screenshot` first (for your perception), then `browser_show_user_screenshot` (for the user). Don't show the user the same image twice; pick one ownership.
 
-If the bridge is running standalone (no daemon, no side panel), the tool returns `{code: "NO_SIDE_PANEL_SUBSCRIBER", retryable: false}` — just continue with a text reply that describes the page in prose.
+**You do NOT need to `debugger_attach` first.** Unlike `browser_screenshot`, `browser_show_user_screenshot` auto-attaches the target tab if needed (it's a user-facing tool — the user asked to see a page, not to think about CDP state). On a user tab that was never attached this session, you can call `browser_show_user_screenshot { tabId: <active-tab-id> }` directly. The user briefly sees Chrome's "started debugging this browser" banner on their tab — that's expected and unavoidable for any browser tool against a user tab; the screenshot still appears in their chat afterwards.
+
+If the bridge is running standalone (no daemon, no side panel), the tool returns `{code: "NO_SIDE_PANEL_SUBSCRIBER", retryable: false}` — just continue with a text reply that describes the page in prose. If the auto-attach itself fails (the tab was closed, debugger refused, etc.), the tool returns `{code: "ATTACH_FAILED" | "DEBUGGER_ATTACH_FAILED", ...}` with a recovery message; surface that to the user briefly rather than retrying the same tabId.
 
 #### Optional UI affordances: `browser_emit_to_user`
 

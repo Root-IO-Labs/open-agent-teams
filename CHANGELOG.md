@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`browser.md` documents the `browser_show_user_screenshot` auto-
+  attach behavior (Part 4.I follow-up).** Companion to the bridge-side
+  fix in `oat-browser-agent`: the orchestration now auto-attaches the
+  target tab on `TAB_NOT_ATTACHED`, so the agent does NOT need to
+  call `debugger_attach` first against a user-focused tab annotated
+  via `[active-tab-id]`. New paragraph at the end of the "Showing
+  screenshots to the user" subsection makes this explicit ("You do
+  NOT need to `debugger_attach` first") and surfaces the visible
+  side-effect (Chrome's "started debugging this browser" banner
+  briefly appears — same trade-off as any `browser_*` call against
+  a user tab). Also documents the new `ATTACH_FAILED` /
+  `DEBUGGER_ATTACH_FAILED` error codes so the agent surfaces them
+  briefly rather than retrying the same tabId. Surfaced by the
+  2026-05-22 09:26 PT retest where the agent fast-failed
+  `browser_show_user_screenshot { tabId: 1817126879 }` in 1 ms then
+  went catatonic for a minute instead of either auto-attaching or
+  telling the user what went wrong.
+
 - **`browser.md` teaches the new `browser_show_user_screenshot` tool
   (Part 4.I).** Companion to the bridge-side feature in
   `oat-browser-agent`: a sibling MCP tool to `browser_screenshot`
