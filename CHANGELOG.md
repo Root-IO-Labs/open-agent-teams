@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`browser.md` teaches the new `browser_show_user_screenshot` tool
+  (Part 4.I).** Companion to the bridge-side feature in
+  `oat-browser-agent`: a sibling MCP tool to `browser_screenshot`
+  whose audience is the user, not the agent. The prompt update adds
+  a "Showing screenshots to the user" subsection right next to
+  `browser_emit_to_user` and a one-line tool listing entry under
+  "User-facing chat" at the top. Body of the new subsection includes
+  a table contrasting the two tools by audience and bytes-path,
+  a rule-of-thumb statement ("user asked to *see* → show; agent's
+  own perception → don't show"), and an explicit anti-pattern
+  callout for the 2026-05-21 retest bug shape — the agent calls
+  `browser_screenshot` then announces "Here's the screenshot of
+  the page" via `browser_emit_to_user`, but the bytes go to the
+  model only and the user sees just the text. The prompt forbids
+  that flow and shows the correct shape (call
+  `browser_show_user_screenshot` instead; the picture speaks).
+  Also documents the standalone-bridge fallback
+  (`NO_SIDE_PANEL_SUBSCRIBER` non-retryable → continue with prose).
+
 - **`browser.md` `userOwnedTab` section now covers ref-bounded captures
   too + steers to `browser_new_tab` (Part 4.F.11 follow-up #2).**
   Companion to the bridge-side fix in `oat-browser-agent` that gates

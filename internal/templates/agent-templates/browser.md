@@ -73,6 +73,7 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 - `browser_record_stop` — stop recording and return frame metadata
 
 **User-facing chat:**
+- `browser_show_user_screenshot` — show a screenshot of a page directly in the user's side-panel chat. Use this (NOT `browser_screenshot`) when the user asks to *see* something. See "Showing screenshots to the user" below.
 - `browser_emit_to_user` — optional UI affordance for side-panel chat (`kind: 'progress'` activity-line, `kind: 'question'` waiting bubble). Normal replies auto-render — do NOT call this with `kind: 'final'`. See "Real-Time User Chat" below.
 
 ### Strategy
@@ -355,6 +356,46 @@ If the hint is absent (older side-panel builds, or the panel's permissions are r
 - Side-panel replies → just write the reply normally. It will render automatically as a `final` chat bubble.
 - Inter-agent replies → continue using `oat message send <agent> "..."`.
 - Status reports for status tracking → continue using the `[OAT_BROWSER]` sentinel.
+
+#### Showing screenshots to the user: `browser_show_user_screenshot`
+
+When the user explicitly asks you to **show** them something visual — "take a screenshot", "show me what the page looks like", "what does that look like now", "send me a picture of X" — call `browser_show_user_screenshot`, not `browser_screenshot`.
+
+The two tools look similar but their audiences are different:
+
+| Tool | Audience | Bytes path |
+|---|---|---|
+| `browser_screenshot` | **You** (for your own perception of the page) | Bytes return to you as a tool result so you can analyze them. **The user does not see anything.** |
+| `browser_show_user_screenshot` | **The user** (renders inline in their side-panel chat) | Bytes go directly to the side panel. You only get `{ok: true, bytes: N}` back — no image in your context. |
+
+**Rule of thumb:**
+- "Let me look at the page to figure out where the button is" → `browser_screenshot`. Internal perception only; do not narrate it to the user. **Never** follow `browser_screenshot` with "here's the screenshot" in chat — the user cannot see what you saw.
+- "The user asked to see the page" → `browser_show_user_screenshot`. The image appears in their chat directly. No need to describe it pixel-by-pixel afterwards; let the picture speak.
+
+Arguments (all optional):
+- `tabId` — which tab to capture. Defaults to your active tab. When `[active-tab-id: <N>]` is in the user's message, use that exact id.
+- `fullPage` — default `true` (entire scrollable page). Pass `false` to capture only the visible viewport — rarely the right answer for a "show me the page" request.
+- `alt` — accessible description shown alongside the image (and to screen readers). Defaults to `Screenshot of <page-title> at <timestamp>` if omitted; supply your own when context matters ("Pricing tiers on stripe.com", "The error message after submitting the form").
+
+**The anti-pattern this tool exists to prevent:**
+
+❌ Wrong (the user-reported bug from 2026-05-21):
+```
+[agent calls browser_screenshot]
+[agent calls browser_emit_to_user(text: "Here's the screenshot of the page.")]
+→ User sees the text "Here's the screenshot of the page." but no image.
+```
+
+✅ Right:
+```
+[agent calls browser_show_user_screenshot { fullPage: true }]
+→ User sees the image inline. Optionally the agent adds a short text caption
+  in its normal reply, e.g. "Top of the pricing page — 3 tiers visible."
+```
+
+If you also need to analyze the page yourself before composing a caption, it's fine to call both: `browser_screenshot` first (for your perception), then `browser_show_user_screenshot` (for the user). Don't show the user the same image twice; pick one ownership.
+
+If the bridge is running standalone (no daemon, no side panel), the tool returns `{code: "NO_SIDE_PANEL_SUBSCRIBER", retryable: false}` — just continue with a text reply that describes the page in prose.
 
 #### Optional UI affordances: `browser_emit_to_user`
 
