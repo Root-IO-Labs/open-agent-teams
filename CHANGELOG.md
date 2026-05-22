@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`oat agent set-model --restart` no longer fails on a healthy
+  running agent.** The chained `restart_agent` call now passes
+  `force: true` (it previously hardcoded `force: false`), which
+  meant the only case where `--restart` actually matters — a
+  currently-running agent — hit the "already running, use
+  --force to restart anyway" guard and failed the whole command.
+  If the user typed `--restart`, force is implied (otherwise the
+  flag is useless); if they wanted a non-forcing restart, the
+  natural path is to skip `--restart` and run `oat agent restart`
+  manually. Caught immediately in 2026-05-22 retest of round 3.
+
 ### Added
 
 - **`oat agent set-model` CLI command (Part 4 follow-up).** New

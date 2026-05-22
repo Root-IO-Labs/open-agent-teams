@@ -845,7 +845,10 @@ func (c *CLI) registerCommands() {
 			"                  but the running agent process keeps using the old model\n" +
 			"                  until the next natural restart. Restarting a worker\n" +
 			"                  mid-task drops in-flight context — the flag is opt-in\n" +
-			"                  so you acknowledge that trade-off explicitly.\n\n" +
+			"                  so you acknowledge that trade-off explicitly. The\n" +
+			"                  chained restart implies --force on `oat agent restart`,\n" +
+			"                  so a healthy running agent IS bounced (that's the\n" +
+			"                  whole point of the flag).\n\n" +
 			"The model must already be onboarded (`oat model onboard <id>`). The\n" +
 			"command is a no-op when the agent is already on the requested model;\n" +
 			"--restart still fires in that case if requested.\n\n" +
@@ -7067,12 +7070,21 @@ func (c *CLI) setAgentModelCmd(args []string) error {
 
 	if restart {
 		fmt.Printf("Restarting agent '%s' to apply new model...\n", agentName)
+		// Force=true on the chained restart. Rationale: --restart on
+		// set-model is opt-in (you typed it explicitly), and the only
+		// case where a restart actually matters is when the agent is
+		// currently RUNNING -- otherwise its next spawn will pick up
+		// the new model naturally. Without force, the chained restart
+		// hits the "already running" guard in handleRestartAgent and
+		// fails the whole command, defeating the point of the flag.
+		// If you wanted a non-forcing restart, you'd skip --restart
+		// and run `oat agent restart` manually.
 		restartResp, restartErr := client.Send(socket.Request{
 			Command: "restart_agent",
 			Args: map[string]interface{}{
 				"repo":  repoName,
 				"agent": agentName,
-				"force": false,
+				"force": true,
 			},
 		})
 		if restartErr != nil {
