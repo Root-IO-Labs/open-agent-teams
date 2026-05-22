@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`browser.md` teaches the framing rule for tall pages on
+  `browser_show_user_screenshot` (Part 4.I follow-up #2 prompt
+  side).** Companion to the schema-parity fix in
+  `oat-browser-agent`. The tool now accepts `ref` + `offsetY`
+  (mirrors `browser_screenshot`), and the prompt's "Showing
+  screenshots to the user" section gains a "Framing rule for
+  tall pages" callout: section asks (References, charts, cards)
+  use `ref`; slice asks use `offsetY`; `fullPage:true` is for
+  short pages only — a full-page stitch on a Wikipedia-class
+  page hits the ~25 MP per-capture budget and the bottom is
+  blank-padded (which is what happened in the 2026-05-22 retest
+  before the parity fix landed).
+
 ### Fixed
 
 - **`oat agent set-model --restart` no longer fails on a healthy

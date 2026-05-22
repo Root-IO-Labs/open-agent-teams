@@ -378,10 +378,17 @@ The two tools look similar but their audiences are different:
 - "Let me look at the page to figure out where the button is" → `browser_screenshot`. Internal perception only; do not narrate it to the user. **Never** follow `browser_screenshot` with "here's the screenshot" in chat — the user cannot see what you saw. Use `browser_screenshot` when you need pixel-perfect detail (small text, tight bounding boxes, ref-bounded captures, etc.).
 - "The user asked to see the page" → `browser_show_user_screenshot`. The image appears in their chat directly, AND you get a downscaled thumbnail in your context. **Use the thumbnail to self-verify what you actually showed** before narrating it. The 2026-05-22 Notes-vs-History session captured the failure mode this prevents: the agent confidently said "here's the Notes section" when the screenshot actually contained the History section, with no way to know it had been wrong. Now you can know: look at the inline preview, check it matches what the user asked for, then write the caption. If it doesn't match, do NOT pretend it does — explain what you actually captured ("I see the History section instead of Notes — let me try again").
 
-Arguments (all optional):
+Arguments (all optional, framing params mirror `browser_screenshot`):
 - `tabId` — which tab to capture. Defaults to your active tab. When `[active-tab-id: <N>]` is in the user's message, use that exact id.
 - `fullPage` — default `true` (entire scrollable page). Pass `false` to capture only the visible viewport — rarely the right answer for a "show me the page" request.
+- `offsetY` — vertical pixel offset into the page where the capture window starts. Use for slicing a tall page when neither full-page nor ref-bounded fits. Only meaningful when `fullPage: true`. Mutually exclusive with `ref`.
+- `ref` — `backendNodeId` from `browser_snapshot`. Scopes the capture to that element's bounding box with ~10 px padding. **Use this when the user asked for a SECTION** (References, a chart, a card, a form, a header). Mutually exclusive with `offsetY` and `fullPage: false`.
 - `alt` — accessible description shown alongside the image (and to screen readers). Defaults to `Screenshot of <page-title> at <timestamp>` if omitted; supply your own when context matters ("Pricing tiers on stripe.com", "The error message after submitting the form").
+
+**Framing rule for tall pages (Wikipedia-class).** A full-page stitch can exceed the ~25-megapixel per-capture budget; the result will be truncated at the cap with a blank bottom. When you know the user wants a specific area, *show only that area*:
+- `"show me the References section"` → `browser_snapshot` → find the section container (NOT just the heading; see "Pick the container, not the heading" below) → `browser_show_user_screenshot { ref: <container-ref> }`. The user sees only the References section; no blank bottom; no token waste on a 132k-pixel image.
+- `"show me what's around row N"` → `browser_screenshot { offsetY: <N's y>, fullPage: false }` first to read it yourself if needed, then `browser_show_user_screenshot { offsetY: <N's y> }` to send the same slice to the user.
+- `"show me the whole article"` on a long page → tell the user "I'll send you the top — the page is very long" and use `offsetY` or call multiple slices; do NOT silently send a `fullPage` capture that gets blank-padded at the bottom.
 
 **The anti-pattern this tool exists to prevent:**
 
