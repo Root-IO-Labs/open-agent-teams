@@ -2372,6 +2372,14 @@ func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
 	// response surfaces both signals so the CLI can render the
 	// right wording.
 	priorModel := agent.Model
+	// Whether the agent is currently running. The CLI uses this to
+	// make the "you need to restart" nudge explicit ("agent is still
+	// running on the old model" vs the generic "restart for this to
+	// take effect"). PID > 0 in state.json is the same liveness
+	// signal the rest of the daemon's lifecycle code reads -- it
+	// can lag a recently-died process briefly, but the worst case
+	// here is a stale "still running" hint, which is cheap.
+	wasRunning := agent.PID > 0
 	var (
 		changedModel   bool
 		clearedMarkers bool
@@ -2407,6 +2415,13 @@ func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
 		// reflects the running agent's model).
 		"requires_restart":     changedModel,
 		"cleared_swap_markers": clearedMarkers,
+		// Agent liveness at the moment the change was persisted.
+		// CLI uses this to make the post-set-model nudge explicit
+		// ("agent is still running on the old model" instead of
+		// the generic "restart for this to take effect"). Read
+		// from state.Agent.PID -- same signal the rest of the
+		// daemon's lifecycle code uses.
+		"was_running": wasRunning,
 	})
 }
 

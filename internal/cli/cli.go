@@ -7038,10 +7038,11 @@ func (c *CLI) setAgentModelCmd(args []string) error {
 	// the user what was actually persisted (which may differ from
 	// what they typed, e.g. `claude-opus-4-7` vs `anthropic:claude-opus-4-7`).
 	var (
-		priorModel    string
-		newModel      = model
-		changed       = true
-		needsRestart  = true
+		priorModel   string
+		newModel     = model
+		changed      = true
+		needsRestart = true
+		wasRunning   = false
 	)
 	if data, ok := resp.Data.(map[string]interface{}); ok {
 		if pm, ok := data["prior_model"].(string); ok {
@@ -7055,6 +7056,9 @@ func (c *CLI) setAgentModelCmd(args []string) error {
 		}
 		if r, ok := data["requires_restart"].(bool); ok {
 			needsRestart = r
+		}
+		if w, ok := data["was_running"].(bool); ok {
+			wasRunning = w
 		}
 	}
 
@@ -7103,7 +7107,19 @@ func (c *CLI) setAgentModelCmd(args []string) error {
 			fmt.Printf("✓ Agent '%s' restarted on new model\n", agentName)
 		}
 	} else if changed && needsRestart {
-		format.Dimmed("  Restart the agent for this to take effect: `oat agent restart %s`", agentName)
+		// Explicit copy when the agent is still running. The bare
+		// "restart for this to take effect" was easy to read as
+		// "your change is queued and harmless" when in fact the
+		// running process is still on the OLD model and will keep
+		// using it until the next spawn. Spell that out so the
+		// operator knows whether they need to act now or later.
+		if wasRunning && priorModel != "" {
+			format.Dimmed("  Agent '%s' is still running on the OLD model ('%s'). Restart it for '%s' to take effect: `oat agent restart %s`", agentName, priorModel, newModel, agentName)
+		} else if wasRunning {
+			format.Dimmed("  Agent '%s' is still running on the previous model. Restart it for '%s' to take effect: `oat agent restart %s`", agentName, newModel, agentName)
+		} else {
+			format.Dimmed("  Agent '%s' is not running; it will pick up '%s' on next start: `oat agent start %s`", agentName, newModel, agentName)
+		}
 	}
 
 	return nil

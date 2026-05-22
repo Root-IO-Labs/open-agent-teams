@@ -206,6 +206,80 @@ func TestHandleSetAgentModel_HappyPath(t *testing.T) {
 	if data["cleared_swap_markers"] != false {
 		t.Errorf("cleared_swap_markers = %v, want false (no markers were set)", data["cleared_swap_markers"])
 	}
+	// Seed agent has PID=0 (not running). was_running must be false
+	// so the CLI nudge picks the "will pick up on next start" copy
+	// instead of "still running on the OLD model". The running-agent
+	// branch is pinned by TestHandleSetAgentModel_WasRunning below.
+	if data["was_running"] != false {
+		t.Errorf("was_running = %v, want false (PID=0 in seed)", data["was_running"])
+	}
+}
+
+// TestHandleSetAgentModel_WasRunning pins the response field the
+// CLI consumes to make the post-set-model nudge explicit ("agent
+// is still running on the OLD model" vs "will pick up on next
+// start"). The signal is PID > 0 in state.json -- same liveness
+// read the rest of the daemon's lifecycle code uses.
+func TestHandleSetAgentModel_WasRunning(t *testing.T) {
+	t.Run("was_running=true when agent PID > 0", func(t *testing.T) {
+		d := setupSetModelTestState(t)
+		// Promote the seed agent to "running" by writing a non-zero
+		// PID. Doesn't matter that it's not a real process for this
+		// test -- the handler only reads the PID value.
+		if err := d.state.ModifyAgent("test-repo", "browser-agent", func(a *state.Agent) {
+			a.PID = 12345
+		}); err != nil {
+			t.Fatal(err)
+		}
+		resp := d.handleSetAgentModel(socket.Request{
+			Command: "set_agent_model",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "browser-agent",
+				"model": "anthropic:claude-opus-4-7",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success, got error: %s", resp.Error)
+		}
+		data := resp.Data.(map[string]interface{})
+		if data["was_running"] != true {
+			t.Errorf("was_running = %v, want true (PID=12345)", data["was_running"])
+		}
+	})
+
+	t.Run("was_running=false on no-op too (so nudge copy doesn't lie about a non-change)", func(t *testing.T) {
+		d := setupSetModelTestState(t)
+		// Even with PID > 0, the no-op path should report was_running=true
+		// so the CLI knows the running process is on the same model the
+		// user just re-picked. The CLI suppresses the nudge for no-op
+		// (changed=false), so this signal is mostly informational here,
+		// but having it correct keeps downstream UIs (TUI panel etc.)
+		// consistent.
+		if err := d.state.ModifyAgent("test-repo", "browser-agent", func(a *state.Agent) {
+			a.PID = 12345
+		}); err != nil {
+			t.Fatal(err)
+		}
+		resp := d.handleSetAgentModel(socket.Request{
+			Command: "set_agent_model",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "browser-agent",
+				"model": "anthropic:claude-sonnet-4-6", // same as seed
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success, got error: %s", resp.Error)
+		}
+		data := resp.Data.(map[string]interface{})
+		if data["changed"] != false {
+			t.Errorf("changed = %v, want false (no-op)", data["changed"])
+		}
+		if data["was_running"] != true {
+			t.Errorf("was_running = %v, want true even on no-op (PID=12345)", data["was_running"])
+		}
+	})
 }
 
 func TestHandleSetAgentModel_Canonicalization(t *testing.T) {
