@@ -24,6 +24,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`oat agent set-model` now atomically clears the auto-swap
+  markers when an operator picks a model.** Closes the first of
+  three plan-body gaps on `cli-agent-set-model` (per the 2026-
+  05-22 audit). When a previous daemon restart auto-swapped an
+  agent's model because the requested model was not onboarded,
+  `state.Agent.ModelSwappedOnRestart` / `ModelSwapReason` /
+  `ModelSwapPrevious` are set so `oat agent ls` shows the
+  `!model-swapped` marker. The plan body explicitly required
+  that an explicit `set-model` invocation supersede that
+  marker — the operator's active choice IS the recovery action,
+  and leaving the marker in place would be misleading.
+  Previously the handler only wrote `Agent.Model`, leaving the
+  markers untouched until a subsequent successful restart
+  cleared them via the auto-clear path in `daemon.go` (an event
+  the operator can't trigger without a stop+start cycle).
+
+  Fix: `handleSetAgentModel` in `internal/daemon/daemon.go` now
+  always runs through `ModifyAgent` (no more no-op early
+  return) and atomically writes the new canonical model AND
+  clears all three swap-marker fields when any are set. The
+  socket response gains a `cleared_swap_markers: bool` field
+  so the CLI can render the right wording. Two sub-cases work
+  correctly: model-also-changes (the common path) and operator-
+  re-picks-the-auto-swap-fallback-model (marker-only update
+  with no model change; `requires_restart: false` since the
+  agent process is already on the picked model).
+
+  Plan-body design decision recorded: the original AC also
+  suggested *refuse* when the agent is running (v1 hard-fail
+  policy). The shipped code keeps *allow + nudge* (`changed:
+  true, requires_restart: true` in the response, plus the
+  `--restart` flag that chains `stop → set → start`
+  atomically). Allow+nudge is strictly more flexible — an
+  operator can pre-stage a model change and restart on their
+  own schedule — without losing safety, since the agent
+  process keeps using the old model until its next spawn.
+  Documented in the plan body alongside this commit so it
+  doesn't read as a missed AC.
+
+  Verification:
+    - New `TestHandleSetAgentModel_ClearsSwapMarkers` in
+      `internal/daemon/handlers_set_model_test.go` pins both
+      sub-cases.
+    - Existing happy-path and no-op tests updated to assert
+      `cleared_swap_markers: false` on the default (no-marker)
+      state.
+    - Full Go suite green (`go test ./...` passes for all 25
+      packages incl. daemon, state, backend, test/).
+
+  Still deferred: a full E2E in `test/` that asserts the
+  daemon spawn argv contains the new `-M <id>`. The current
+  test harness has no backend-spawn-argv intercept; that work
+  would land alongside a future `pkg/backend/` test refactor.
+  The handler seam + state.json persistence are fully covered;
+  the missing E2E only adds value for catching regressions in
+  argv construction (a thin, well-tested path in
+  `pkg/backend/direct_backend.go`).
+
 - **`oat agent set-model --restart` no longer fails on a healthy
   running agent.** The chained `restart_agent` call now passes
   `force: true` (it previously hardcoded `force: false`), which

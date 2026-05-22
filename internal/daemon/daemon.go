@@ -2358,36 +2358,55 @@ func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
 		}
 		canonical = c
 	}
-	// No-op when the model is already set to the same canonical
-	// value. Surfaces as success so a chained --restart still
-	// fires (which is what the operator asked for); the response
-	// data flags it so the CLI can show a "no change needed"
-	// note instead of "updated".
+	// Always run through ModifyAgent so two things happen
+	// atomically when both are needed: (a) the model swap, and
+	// (b) the clearing of any auto-swap markers from a previous
+	// restart-on-missing-model recovery. The plan body (cli-
+	// agent-set-model) is explicit that "the operator's explicit
+	// choice supersedes any prior auto-swap" — once the operator
+	// has actively picked a model, the marker is misleading even
+	// when the picked model equals the auto-swap fallback (in
+	// which case the operator has implicitly endorsed the
+	// fallback as their choice). The no-op "model didn't change"
+	// case still flips the markers off if they were set; the
+	// response surfaces both signals so the CLI can render the
+	// right wording.
 	priorModel := agent.Model
-	if priorModel == canonical {
-		return socket.SuccessResponse(map[string]interface{}{
-			"prior_model":   priorModel,
-			"new_model":     canonical,
-			"changed":       false,
-			"requires_restart": false,
-		})
-	}
-
+	var (
+		changedModel   bool
+		clearedMarkers bool
+	)
 	if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
-		a.Model = canonical
+		if a.Model != canonical {
+			a.Model = canonical
+			changedModel = true
+		}
+		if a.ModelSwappedOnRestart || a.ModelSwapReason != "" || a.ModelSwapPrevious != "" {
+			a.ModelSwappedOnRestart = false
+			a.ModelSwapReason = ""
+			a.ModelSwapPrevious = ""
+			clearedMarkers = true
+		}
 	}); err != nil {
 		return socket.ErrorResponse("failed to update agent model: %s", err.Error())
 	}
 
-	d.logger.Info("Set agent %s/%s model: %q -> %q", repoName, agentName, priorModel, canonical)
+	if changedModel {
+		d.logger.Info("Set agent %s/%s model: %q -> %q (cleared_swap_markers=%t)", repoName, agentName, priorModel, canonical, clearedMarkers)
+	} else if clearedMarkers {
+		d.logger.Info("Set agent %s/%s model: no model change (already %q); cleared auto-swap markers", repoName, agentName, canonical)
+	}
 	return socket.SuccessResponse(map[string]interface{}{
-		"prior_model":   priorModel,
-		"new_model":     canonical,
-		"changed":       true,
+		"prior_model": priorModel,
+		"new_model":   canonical,
+		"changed":     changedModel,
 		// Agent only picks up model changes on (re)spawn. CLI
 		// uses this to decide whether to nudge the user about
-		// the --restart flag.
-		"requires_restart": true,
+		// the --restart flag. No-op-model-but-marker-cleared
+		// case does NOT require a restart (state already
+		// reflects the running agent's model).
+		"requires_restart":     changedModel,
+		"cleared_swap_markers": clearedMarkers,
 	})
 }
 

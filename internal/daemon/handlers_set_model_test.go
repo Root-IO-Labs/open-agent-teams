@@ -200,6 +200,12 @@ func TestHandleSetAgentModel_HappyPath(t *testing.T) {
 	if data["requires_restart"] != true {
 		t.Errorf("requires_restart = %v, want true", data["requires_restart"])
 	}
+	// Default-seeded agent has no swap markers, so cleared_swap_markers
+	// must be false on the happy path. The marker-clearing branch is
+	// pinned by TestHandleSetAgentModel_ClearsSwapMarkers below.
+	if data["cleared_swap_markers"] != false {
+		t.Errorf("cleared_swap_markers = %v, want false (no markers were set)", data["cleared_swap_markers"])
+	}
 }
 
 func TestHandleSetAgentModel_Canonicalization(t *testing.T) {
@@ -253,6 +259,124 @@ func TestHandleSetAgentModel_NoOpWhenAlreadySet(t *testing.T) {
 	if data["requires_restart"] != false {
 		t.Errorf("requires_restart = %v, want false on no-op", data["requires_restart"])
 	}
+	// No markers were set on the seed agent, so this no-op also
+	// has nothing to clear.
+	if data["cleared_swap_markers"] != false {
+		t.Errorf("cleared_swap_markers = %v, want false (no markers + same model = pure no-op)", data["cleared_swap_markers"])
+	}
+}
+
+// TestHandleSetAgentModel_ClearsSwapMarkers pins the plan-body AC
+// (cli-agent-set-model line 74): when an explicit `oat agent set-
+// model` runs against an agent that has auto-swap markers set from
+// a prior restart, those markers MUST be cleared. The operator's
+// explicit choice supersedes any prior auto-swap. Two sub-cases:
+// the model also changes (the common path), and the operator
+// re-picks the same model that auto-swap fell back to (the marker
+// clears, no model swap happens).
+func TestHandleSetAgentModel_ClearsSwapMarkers(t *testing.T) {
+	t.Run("clears markers when model also changes", func(t *testing.T) {
+		d := setupSetModelTestState(t)
+
+		// Simulate the daemon having auto-swapped to sonnet-4-6
+		// because the originally-requested opus-4-7 was missing
+		// from the registry at restart time.
+		if err := d.state.ModifyAgent("test-repo", "browser-agent", func(a *state.Agent) {
+			a.ModelSwappedOnRestart = true
+			a.ModelSwapReason = "model \"anthropic:claude-opus-4-7\" was not onboarded"
+			a.ModelSwapPrevious = "anthropic:claude-opus-4-7"
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Operator runs set-model to land on opus-4-7 (which is
+		// now onboarded — this is the recovery action).
+		resp := d.handleSetAgentModel(socket.Request{
+			Command: "set_agent_model",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "browser-agent",
+				"model": "anthropic:claude-opus-4-7",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success, got error: %s", resp.Error)
+		}
+
+		// Markers must be gone — they describe a recovery state
+		// the operator has just explicitly overridden.
+		agent, _ := d.state.GetAgent("test-repo", "browser-agent")
+		if agent.ModelSwappedOnRestart {
+			t.Error("ModelSwappedOnRestart not cleared after explicit set-model")
+		}
+		if agent.ModelSwapReason != "" {
+			t.Errorf("ModelSwapReason = %q, want empty after explicit set-model", agent.ModelSwapReason)
+		}
+		if agent.ModelSwapPrevious != "" {
+			t.Errorf("ModelSwapPrevious = %q, want empty after explicit set-model", agent.ModelSwapPrevious)
+		}
+
+		data := resp.Data.(map[string]interface{})
+		if data["changed"] != true {
+			t.Errorf("changed = %v, want true", data["changed"])
+		}
+		if data["cleared_swap_markers"] != true {
+			t.Errorf("cleared_swap_markers = %v, want true (markers were set, now cleared)", data["cleared_swap_markers"])
+		}
+	})
+
+	t.Run("clears markers even when operator re-picks the auto-swap fallback model", func(t *testing.T) {
+		// Edge case: the operator inspects `oat agent ls`, sees
+		// the !model-swapped marker against sonnet-4-6, and
+		// decides "actually sonnet is fine, I just want to
+		// acknowledge it". They run set-model to the SAME
+		// model. The model swap is a no-op, but the marker
+		// should still clear — operator has explicitly endorsed
+		// the fallback as their choice. Without this branch the
+		// marker would only ever clear via auto-clear on
+		// successful restart (daemon.go:6406), which is a
+		// different code path the operator can't trigger
+		// without a stop+start cycle.
+		d := setupSetModelTestState(t)
+		if err := d.state.ModifyAgent("test-repo", "browser-agent", func(a *state.Agent) {
+			a.ModelSwappedOnRestart = true
+			a.ModelSwapReason = "model \"anthropic:claude-opus-4-7\" was not onboarded"
+			a.ModelSwapPrevious = "anthropic:claude-opus-4-7"
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Re-pick the model the agent is ALREADY on.
+		resp := d.handleSetAgentModel(socket.Request{
+			Command: "set_agent_model",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "browser-agent",
+				"model": "anthropic:claude-sonnet-4-6",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success, got error: %s", resp.Error)
+		}
+
+		agent, _ := d.state.GetAgent("test-repo", "browser-agent")
+		if agent.ModelSwappedOnRestart || agent.ModelSwapReason != "" || agent.ModelSwapPrevious != "" {
+			t.Error("markers not cleared on no-model-change set-model")
+		}
+		data := resp.Data.(map[string]interface{})
+		if data["changed"] != false {
+			t.Errorf("changed = %v, want false (model didn't change)", data["changed"])
+		}
+		// The restart nudge SHOULD NOT fire — agent's runtime
+		// model didn't change. Marker-only changes don't
+		// require a restart.
+		if data["requires_restart"] != false {
+			t.Errorf("requires_restart = %v, want false (marker-only change doesn't need restart)", data["requires_restart"])
+		}
+		if data["cleared_swap_markers"] != true {
+			t.Errorf("cleared_swap_markers = %v, want true", data["cleared_swap_markers"])
+		}
+	})
 }
 
 func TestHandleSetAgentModel_RejectsUnknownModel(t *testing.T) {
