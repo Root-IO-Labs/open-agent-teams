@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`browser.md` `userOwnedTab` section now covers ref-bounded captures
+  too + steers to `browser_new_tab` (Part 4.F.11 follow-up #2).**
+  Companion to the bridge-side fix in `oat-browser-agent` that gates
+  `DOM.scrollIntoViewIfNeeded` on tab ownership for the ref-bounded
+  path. Adds three points to the user-tab screenshot section:
+  (a) `browser_screenshot { ref }` no longer auto-scrolls on user
+  tabs — if the element is off-screen, the result still comes back
+  successful with `userOwnedTab: true` but `capturedBox` may be empty;
+  (b) the document-coord `boundingBox` field lets the agent tell
+  whether the requested element is above, in, or below the user's
+  current viewport; (c) strongly recommends `browser_new_tab` as the
+  preferred strategy when visual capture of off-screen content is
+  needed — this matches what the agent already discovered organically
+  on the 2026-05-21 retest #3 (detect `userOwnedTab: true`, open
+  same URL in a fresh agent-owned tab, snapshot + screenshot there).
+
 - **`browser.md` marks `browser_evaluate` as OPTIONAL + teaches snapshot/
   find fallback (Part 4 follow-up).** Observed 2026-05-21 in
   `~/.oat/output/oat-browser-test/browser-agent.log` at 23:03:56: the
