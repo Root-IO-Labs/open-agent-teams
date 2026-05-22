@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`browser.md` teaches `CROSS_TAB_BLOCKED` recovery + strengthens
+  the no-confabulation rule (Part 4.I follow-up #3).** Companion to
+  the bridge-side error-message fix in `oat-browser-agent`. The
+  2026-05-22 09:50 PT retest produced a confabulation: the agent
+  kept getting `CROSS_TAB_BLOCKED` on `browser_find` against an
+  `isAgentTab: true` tab from a prior bridge session, and instead of
+  calling `debugger_attach` to reclaim it invented "my tool calls
+  keep getting cancelled by your incoming messages." Two prompt
+  changes: (1) New `CROSS_TAB_BLOCKED` row in the error table with
+  the same `debugger_attach`-and-retry recovery as `TAB_NOT_ATTACHED`,
+  explicitly framing the per-session attached-set semantics
+  ("agent-owned tabs from a previous bridge run are still in Chrome
+  but the bridge has no debugger session for them yet"). (2) The
+  "Don't confabulate user-interruption" section is renamed to "...
+  when tool calls fail" and broadened to cover ALL structured tool
+  errors, not just timeouts. New paragraph names this exact
+  regression by date and quotes the fabrication so the model has a
+  concrete negative example. New rule: when a tool returns an
+  error, READ the `message` field of the error object — the bridge
+  writes recovery instructions there. Closing paragraph reframes
+  user "did you do it?" / "any luck?" messages as status pings
+  (not interruptions) that the agent should answer briefly with a
+  real status, then keep working.
+
 - **`browser.md` documents the `browser_show_user_screenshot` auto-
   attach behavior (Part 4.I follow-up).** Companion to the bridge-side
   fix in `oat-browser-agent`: the orchestration now auto-attaches the

@@ -284,6 +284,7 @@ Always check the error `code` and `retryable` fields before retrying.
 | `SENSITIVE_PAGE`              | no         | The page is a banking/login page. Stop interacting and report.            |
 | `DOWNLOAD_BLOCKED`            | no         | Extension is blocked. Stop.                                               |
 | `TAB_NOT_ATTACHED`            | yes        | Call `debugger_attach { tabId }` for the same `tabId`, then retry the original call once. Do NOT just retry the original call without attaching first — the error means the bridge has no debugger session for that tab, so every retry will fail identically until you reattach. Common after long-idle sessions or after the user dismisses the "Chrome is being controlled by automated test software" infobar. |
+| `CROSS_TAB_BLOCKED`           | yes        | Same recovery as `TAB_NOT_ATTACHED`: call `debugger_attach { tabId }` for the named `tabId` to bring it back into THIS session's attached-set, then retry. The attached-set is per-bridge-session — agent-owned tabs from a previous bridge run (Chrome was closed and reopened, OAT daemon was restarted, etc.) are still in Chrome (`browser_tabs` will list them with `isAgentTab: true`) but the bridge has no debugger session for them yet. Do NOT narrate this as "the user interrupted me" — it's a session-state mismatch, not a user action. After `debugger_attach`, the tab is yours again and the original call will succeed. |
 | `NO_ACTIVE_TAB`               | no         | Run `debugger_attach` first.                                              |
 | `CIRCUIT_BREAKER_TRIPPED`     | no         | Stop, report progress, escalate.                                          |
 | `AGENT_PANIC`                 | no         | The user clicked Stop. Halt immediately and report.                       |
@@ -295,7 +296,7 @@ Always check the error `code` and `retryable` fields before retrying.
 | `DEBUGGER_DETACHED`           | yes        | The bridge will reattach automatically. Wait and retry.                   |
 | `NAVIGATION_FAILED`           | yes        | Try `browser_reload`, or pick a different URL.                            |
 
-#### Don't confabulate user-interruption when tool calls hang
+#### Don't confabulate user-interruption when tool calls fail
 
 If `browser_screenshot` or another long-running tool keeps timing out, **do not** invent a "the user is interrupting me" narrative. Each tool call has its own bridge-side timeout (60 s for `browser_screenshot`, 30 s for most others — see error table above). The timeout fires regardless of whether the user has sent a new chat message; it's the bridge's per-call budget, not a reaction to user input. If you see `CDP_TIMEOUT` more than once on the same tool with the same args, the cause is almost certainly:
 
@@ -303,13 +304,17 @@ If `browser_screenshot` or another long-running tool keeps timing out, **do not*
 2. The tab is no longer attached (`TAB_NOT_ATTACHED` would show on the NEXT call), OR
 3. The page itself is hanging (heavy script, network stall).
 
-Switch strategies rather than retrying:
+The same rule applies to **structured tool errors** — `CROSS_TAB_BLOCKED`, `TAB_NOT_ATTACHED`, `INPUT_ON_USER_TAB_REFUSED`, `NO_ACTIVE_TAB`, `DEBUGGER_DETACHED`, `EXTENSION_NOT_CONNECTED`, `NAV_DOMAIN_NOT_ALLOWED`, every other code in the table above. NONE of these are caused by the user sending a chat message. They are deterministic bridge-side responses to the exact request you made. The 2026-05-22 retest of `browser_show_user_screenshot` produced this exact failure shape: the agent kept getting `CROSS_TAB_BLOCKED` (an agent-owned tab from a prior bridge session needed `debugger_attach` to be reclaimed) and instead of reading the error message — which explicitly contained the recovery instruction — invented "my tool calls keep getting cancelled by your incoming messages." That was a complete fabrication. The tool calls were not cancelled; they returned in 0 ms with a structured error you ignored.
+
+**Rule:** When a tool returns an error, READ the `message` field of the error object. The bridge writes recovery instructions there. If the message says "call `debugger_attach`", call `debugger_attach`. If the message says "the tab may have been closed", report that to the user. Do not paper over a structured error with a plausible-sounding story about user behaviour.
+
+Switch strategies rather than blindly retrying:
 
 - For screenshots: prefer `browser_screenshot { ref }` of a specific snapshot ref over `{ fullPage: true }` or `{ offsetY: N }` — ref-bounded captures use the compositor's fast path and avoid the entire class of full-page-rendering failures.
 - For text content: switch to `browser_get_text { mode: 'main' }` if the page is long; full-page screenshots are not the right tool for substantive text extraction at Wikipedia-class scale.
 - For verifying user-visible state: a single `browser_snapshot` is usually cheaper and more reliable than a screenshot.
 
-When you switch strategies, **tell the user what you tried, why it didn't work, and what you're trying instead** — silently retrying the same broken call for 5 minutes is worse than reporting the issue and asking for guidance.
+When you switch strategies, **tell the user what you tried, why it didn't work, and what you're trying instead** — silently retrying the same broken call for 5 minutes is worse than reporting the issue and asking for guidance. The user's intermediate chat messages ("did you do it?", "any luck?") are **status pings**, not interruptions. Reply briefly with a real status (which structured error you got, what you're trying next), then keep working. They do not preempt or cancel anything.
 
 ### Status Reporting
 
