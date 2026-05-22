@@ -287,9 +287,33 @@ oat agent complete                          # Worker says "I'm done, clean me up
 oat agent complete --worker <worker-name>   # Supervisor completes a worker on its behalf
 oat agent waiting                           # Worker enters dormant state (PR or verification)
 oat agent restart <name>                    # Restart a stuck agent
+oat agent set-model <name> --model <id>     # Change the LLM model the agent uses
 oat agent tell <name> "message"             # Send a message to an agent
 oat agent interrupt <name>                  # Send Ctrl-C to an agent
 ```
+
+### `oat agent set-model`
+
+Change which LLM model an agent uses without hand-editing `~/.oat/state.json`. The model must already be onboarded (`oat model onboard <id>`); typos are rejected up front rather than at the agent's next restart.
+
+```bash
+oat agent set-model <name> --model <model-id> [--repo <repo>] [--restart]
+```
+
+Examples:
+
+```bash
+# Persist the change; the running agent keeps the old model until its
+# next natural restart. Useful when you don't want to disturb in-flight work.
+oat agent set-model browser-agent --model anthropic:claude-opus-4-7
+
+# Persist and restart immediately so the new model is active right away.
+# Restarting a worker mid-task drops in-flight context, so --restart is
+# opt-in -- you acknowledge the trade-off explicitly.
+oat agent set-model browser-agent --model anthropic:claude-opus-4-7 --restart
+```
+
+The command accepts both prefixed (`anthropic:claude-opus-4-7`) and unprefixed (`claude-opus-4-7`) forms and persists the canonical prefixed form, matching the `oat model onboard` shape. When the agent is already on the requested model, it's a no-op success (`--restart` still fires in that case if requested).
 
 `oat agent waiting` marks the worker as dormant (zero token burn). When a PR exists, the daemon monitors it for CI failures, merge conflicts, new comments, merges, and closures, then wakes the worker with a targeted message when action is needed. When verification is pending (no PR yet), the daemon sets `WaitingForVerification` and returns a `dormant_verification` status. If the worker is already dormant for verification, the response includes explicit "STOP" instructions to prevent polling.
 

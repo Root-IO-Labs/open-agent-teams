@@ -1930,6 +1930,8 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 		return d.handleRestartAgent(req)
 	case "restart_browser_agent":
 		return d.handleRestartBrowserAgent(req)
+	case "set_agent_model":
+		return d.handleSetAgentModel(req)
 
 	case "trigger_cleanup":
 		return d.handleTriggerCleanup(req)
@@ -2274,6 +2276,119 @@ func (d *Daemon) handleAddAgent(req socket.Request) socket.Response {
 
 	d.logger.Info("Added agent %s to repo %s", agentName, repoName)
 	return socket.SuccessResponse(nil)
+}
+
+// handleSetAgentModel updates the model an agent uses. Validates the
+// new model against loaded profiles (so a typo fails here rather than
+// silently triggering a swap on the next restart), then writes the
+// canonical form to state.json via ModifyAgent so the change is
+// atomic and survives concurrent updates. The agent process is NOT
+// restarted by this handler — the agent only re-reads its model
+// configuration on (re)spawn. The CLI's --restart flag chains a
+// follow-up restart_agent call after this returns.
+//
+// Why a dedicated handler vs. extending add_agent: add_agent is a
+// create-only handler that fails on duplicates. The set-model flow
+// needs the opposite semantics — the agent must already exist, and
+// the rest of its config (worktree, session, PID, etc.) must be left
+// alone. ModifyAgent gives the atomic-update primitive without
+// risking a stale-copy clobber of unrelated fields.
+func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
+	repoName, errResp, ok := getRequiredStringArg(req.Args, "repo", "repository name is required")
+	if !ok {
+		return errResp
+	}
+
+	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
+	if !ok {
+		return errResp
+	}
+
+	rawModel, errResp, ok := getRequiredStringArg(req.Args, "model", "model id is required (e.g. anthropic:claude-opus-4-7)")
+	if !ok {
+		return errResp
+	}
+
+	// Look up the agent first — fail fast with a clear error if the
+	// repo or agent doesn't exist (the CLI's preflight should have
+	// caught this, but the handler must be safe to call directly).
+	repo, exists := d.state.GetRepo(repoName)
+	if !exists {
+		return socket.ErrorResponse("repository %q not found", repoName)
+	}
+	agent, agentExists := repo.Agents[agentName]
+	if !agentExists {
+		return socket.ErrorResponse("agent %q not found in repository %q", agentName, repoName)
+	}
+
+	// Validate the new model against loaded profiles. Reject typos
+	// here rather than silently letting a misconfigured agent
+	// auto-swap on the next restart (same logic as handleAddAgent's
+	// model-override branch). The canonical (always-prefixed) form
+	// is what gets persisted so state converges on the same shape
+	// as `oat model onboard` registrations.
+	role := routing.RoleWorker
+	switch agent.Type {
+	case state.AgentTypeSupervisor, state.AgentTypeWorkspace, state.AgentTypeMergeQueue, state.AgentTypePRShepherd:
+		role = routing.RoleOrchestrator
+	}
+	canonical := rawModel
+	if d.modelProfiles != nil && d.modelProfiles.Count() > 0 {
+		c, vErr := d.modelProfiles.ValidateAndCanonicalize(rawModel, role)
+		if vErr != nil {
+			return socket.ErrorResponse(
+				"model %q rejected: %s — run `oat model onboard %s` first if this is a new model",
+				rawModel, vErr.Error(), rawModel,
+			)
+		}
+		if role == routing.RoleWorker && len(repo.AllowedWorkerModels) > 0 {
+			found := false
+			for _, m := range repo.AllowedWorkerModels {
+				if m == rawModel || m == c {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return socket.ErrorResponse(
+					"model %q is not in the allowed worker models for repo %q — update with: oat config %s worker-models add %s",
+					c, repoName, repoName, c,
+				)
+			}
+		}
+		canonical = c
+	}
+	// No-op when the model is already set to the same canonical
+	// value. Surfaces as success so a chained --restart still
+	// fires (which is what the operator asked for); the response
+	// data flags it so the CLI can show a "no change needed"
+	// note instead of "updated".
+	priorModel := agent.Model
+	if priorModel == canonical {
+		return socket.SuccessResponse(map[string]interface{}{
+			"prior_model":   priorModel,
+			"new_model":     canonical,
+			"changed":       false,
+			"requires_restart": false,
+		})
+	}
+
+	if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+		a.Model = canonical
+	}); err != nil {
+		return socket.ErrorResponse("failed to update agent model: %s", err.Error())
+	}
+
+	d.logger.Info("Set agent %s/%s model: %q -> %q", repoName, agentName, priorModel, canonical)
+	return socket.SuccessResponse(map[string]interface{}{
+		"prior_model":   priorModel,
+		"new_model":     canonical,
+		"changed":       true,
+		// Agent only picks up model changes on (re)spawn. CLI
+		// uses this to decide whether to nudge the user about
+		// the --restart flag.
+		"requires_restart": true,
+	})
 }
 
 // handleStartWorker starts a worker process via the daemon backend and registers

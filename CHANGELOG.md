@@ -7,7 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`oat agent set-model` CLI command (Part 4 follow-up).** New
+  `oat agent set-model <name> --model <id> [--repo <repo>]
+  [--restart]` verb replaces the hand-edit-`state.json` workflow
+  that the 2026-05-22 Opus 4.7 onboarding session had to walk an
+  agent through. The model must already be onboarded (validated
+  against loaded profiles with `ValidateAndCanonicalize`, same
+  surface as `oat agent add --model`); typos fail here rather than
+  at the agent's next restart with a confusing "model not found"
+  deep in the spawn path. Accepts both prefixed
+  (`anthropic:claude-opus-4-7`) and unprefixed (`claude-opus-4-7`)
+  forms and persists the canonical prefixed form, matching the
+  `oat model onboard` shape so state.json stays consistent.
+  Daemon-side `handleSetAgentModel` uses `state.ModifyAgent` for
+  atomic update so the rest of the agent's fields (PID, session,
+  worktree, etc.) are left alone. When the agent is already on
+  the requested model the command is a no-op success — a chained
+  `--restart` still fires in that case if requested. `--restart`
+  is opt-in (not the default) because restarting a worker mid-task
+  drops in-flight context; without the flag the CLI prints an
+  explicit "restart to apply" nudge so the manual path stays
+  obvious. Documented in `docs/COMMANDS.md` and the
+  Common Operations section of `AGENTS.md`. Daemon socket
+  command: `set_agent_model`. Tests cover arg validation,
+  happy path, canonicalization, no-op, unknown-model rejection,
+  and the worker-allow-list constraint.
+
 ### Changed
+
+- **`browser.md` teaches the downscaled-preview workflow for
+  `browser_show_user_screenshot` (Part 4.I follow-up).** Companion
+  to the bridge-side change in `oat-browser-agent` that returns an
+  inline JPEG thumbnail (~768 px / quality 60, ~5–10 KB) alongside
+  the side-panel push. Updates the "Showing screenshots to the
+  user" section so the agent KNOWS it now gets a preview AND
+  knows to USE it: "look at the inline preview, check it matches
+  what the user asked for, then write the caption. If it doesn't
+  match, do NOT pretend it does — explain what you actually
+  captured." Closes the confabulation gap caught 2026-05-22 (the
+  Notes-vs-History session, where the agent confidently described
+  a screenshot of the wrong section because it had no way to see
+  what it had shown). Also distinguishes when to use
+  `browser_screenshot` (pixel-perfect detail for the agent's own
+  analysis) vs `browser_show_user_screenshot` (user-facing +
+  inline thumbnail for self-verification).
+- **`browser.md` teaches `TAB_CLOSED` recovery (Part 4 follow-up
+  `p4-fast-fail-closed-tab`).** Companion to the bridge-side
+  closed-tab error normalization in `oat-browser-agent`. New
+  `TAB_CLOSED` row in the error table with explicit "do NOT retry
+  with the same tabId" / "open a new tab via `browser_new_tab`" /
+  "surface to the user if the user closed their own tab" guidance,
+  and adds `TAB_CLOSED` to the structured-tool-errors list in the
+  no-confabulation section. Pairs with the bridge fix that drops
+  resolution time on a closed-tab error from a 30 s `CDP_TIMEOUT`
+  hang (which the agent has historically confabulated as "the
+  user interrupted me") to sub-100 ms.
 
 - **`browser.md` teaches `CROSS_TAB_BLOCKED` recovery + strengthens
   the no-confabulation rule (Part 4.I follow-up #3).** Companion to

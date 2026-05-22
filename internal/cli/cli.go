@@ -828,6 +828,33 @@ func (c *CLI) registerCommands() {
 		Run:         c.restartAgentCmd,
 	}
 
+	agentCmd.Subcommands["set-model"] = &Command{
+		Name:        "set-model",
+		Description: "Change the LLM model an agent uses (e.g. anthropic:claude-opus-4-7)",
+		Usage: "oat agent set-model <name> --model <id> [--repo <repo>] [--restart]\n\n" +
+			"Flags:\n" +
+			"  --model <id>    Required. The model id to set, e.g. anthropic:claude-opus-4-7.\n" +
+			"                  Accepts both prefixed and unprefixed forms; canonical (always-\n" +
+			"                  prefixed) form is persisted. Validated against loaded profiles\n" +
+			"                  up front so typos fail here rather than at the agent's next\n" +
+			"                  restart.\n" +
+			"  --repo <repo>   Repository the agent belongs to. Inferred from cwd when run\n" +
+			"                  inside a oat worktree.\n" +
+			"  --restart       Also restart the agent so the new model is picked up\n" +
+			"                  immediately. Without this flag the change is persisted\n" +
+			"                  but the running agent process keeps using the old model\n" +
+			"                  until the next natural restart. Restarting a worker\n" +
+			"                  mid-task drops in-flight context — the flag is opt-in\n" +
+			"                  so you acknowledge that trade-off explicitly.\n\n" +
+			"The model must already be onboarded (`oat model onboard <id>`). The\n" +
+			"command is a no-op when the agent is already on the requested model;\n" +
+			"--restart still fires in that case if requested.\n\n" +
+			"Examples:\n" +
+			"  oat agent set-model browser-agent --model anthropic:claude-opus-4-7 --restart\n" +
+			"  oat agent set-model worker-swift-eagle --model openai:gpt-5-5 --repo myrepo",
+		Run: c.setAgentModelCmd,
+	}
+
 	agentCmd.Subcommands["refresh-prompts"] = &Command{
 		Name:        "refresh-prompts",
 		Description: "Re-sync ~/.oat/repos/<repo>/agents/*.md from the embedded templates",
@@ -6943,6 +6970,128 @@ func (c *CLI) restartAgentCmd(args []string) error {
 		}
 	} else {
 		fmt.Printf("✓ Agent '%s' restarted successfully\n", agentName)
+	}
+
+	return nil
+}
+
+// setAgentModelCmd changes which LLM model an agent uses. Thin
+// wrapper around the daemon's `set_agent_model` socket call (where
+// validation + atomic state update live) plus an optional chained
+// `restart_agent` when --restart is set.
+//
+// Design notes (Part 4 follow-up — see plan body):
+//   - Hand-editing state.json is the alternative this replaces; an
+//     undocumented brittle path that the 2026-05-22 Opus 4.7
+//     onboarding session had to walk an agent through.
+//   - --restart is opt-in (not the default) because restarting a
+//     worker mid-task drops in-flight context. The CLI prints an
+//     explicit "restart to apply" nudge when --restart is omitted
+//     so the manual path stays obvious.
+//   - Daemon owns model validation (ValidateAndCanonicalize against
+//     loaded profiles) so a typo fails here rather than at next
+//     agent restart with a confusing "model not found" deep in
+//     the spawn path.
+func (c *CLI) setAgentModelCmd(args []string) error {
+	flags, remaining := ParseFlags(args)
+	if len(remaining) < 1 {
+		return errors.InvalidUsage("usage: oat agent set-model <name> --model <id> [--repo <repo>] [--restart]")
+	}
+	agentName := remaining[0]
+
+	model := strings.TrimSpace(flags["model"])
+	if model == "" {
+		return errors.InvalidUsage("--model is required (e.g. --model anthropic:claude-opus-4-7)")
+	}
+
+	repoName := flags["repo"]
+	if repoName == "" {
+		inferred, err := c.inferRepoFromCwd()
+		if err != nil {
+			return errors.InvalidUsage("could not determine repository - use --repo flag or run from within a oat worktree")
+		}
+		repoName = inferred
+	}
+
+	restart := flags["restart"] == "true"
+
+	client := socket.NewClient(c.paths.DaemonSock)
+	resp, err := client.Send(socket.Request{
+		Command: "set_agent_model",
+		Args: map[string]interface{}{
+			"repo":  repoName,
+			"agent": agentName,
+			"model": model,
+		},
+	})
+	if err != nil {
+		return errors.DaemonCommunicationFailed("setting agent model", err)
+	}
+	if !resp.Success {
+		return errors.Wrap(errors.CategoryRuntime, "failed to set agent model", fmt.Errorf("%s", resp.Error))
+	}
+
+	// Pull the canonical-form metadata back out so the CLI can show
+	// the user what was actually persisted (which may differ from
+	// what they typed, e.g. `claude-opus-4-7` vs `anthropic:claude-opus-4-7`).
+	var (
+		priorModel    string
+		newModel      = model
+		changed       = true
+		needsRestart  = true
+	)
+	if data, ok := resp.Data.(map[string]interface{}); ok {
+		if pm, ok := data["prior_model"].(string); ok {
+			priorModel = pm
+		}
+		if nm, ok := data["new_model"].(string); ok {
+			newModel = nm
+		}
+		if c, ok := data["changed"].(bool); ok {
+			changed = c
+		}
+		if r, ok := data["requires_restart"].(bool); ok {
+			needsRestart = r
+		}
+	}
+
+	if changed {
+		if priorModel == "" {
+			fmt.Printf("✓ Agent '%s' model set to '%s'\n", agentName, newModel)
+		} else {
+			fmt.Printf("✓ Agent '%s' model changed: '%s' -> '%s'\n", agentName, priorModel, newModel)
+		}
+	} else {
+		fmt.Printf("Agent '%s' already on model '%s' (no change)\n", agentName, newModel)
+	}
+
+	if restart {
+		fmt.Printf("Restarting agent '%s' to apply new model...\n", agentName)
+		restartResp, restartErr := client.Send(socket.Request{
+			Command: "restart_agent",
+			Args: map[string]interface{}{
+				"repo":  repoName,
+				"agent": agentName,
+				"force": false,
+			},
+		})
+		if restartErr != nil {
+			return errors.DaemonCommunicationFailed("restarting agent after set-model", restartErr)
+		}
+		if !restartResp.Success {
+			return errors.Wrap(errors.CategoryRuntime, "failed to restart agent after set-model", fmt.Errorf("%s", restartResp.Error))
+		}
+		if data, ok := restartResp.Data.(map[string]interface{}); ok {
+			if pid, ok := data["pid"].(float64); ok {
+				fmt.Printf("✓ Agent '%s' restarted on new model (PID: %d)\n", agentName, int(pid))
+			} else {
+				fmt.Printf("✓ Agent '%s' restarted on new model\n", agentName)
+			}
+		} else {
+			fmt.Printf("✓ Agent '%s' restarted on new model\n", agentName)
+		}
+	} else if changed && needsRestart {
+		format.Dimmed("  Restart the agent for this to take effect: `oat agent restart %s`", agentName)
 	}
 
 	return nil

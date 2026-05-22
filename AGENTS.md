@@ -292,6 +292,18 @@ oat cleanup --dry-run  # See what would be cleaned
 oat cleanup            # Actually clean up
 ```
 
+### Change which model an agent uses
+
+```bash
+# Persist the change; agent picks it up at its next natural restart.
+oat agent set-model <agent-name> --model <model-id>
+
+# Persist and restart immediately (drops in-flight context).
+oat agent set-model <agent-name> --model <model-id> --restart
+```
+
+Model must already be onboarded (`oat model onboard <id>`); typos are rejected here rather than at the agent's next restart. Replaces the old hand-edit-`state.json` workflow.
+
 ### Test prompt changes
 
 ```bash

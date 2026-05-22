@@ -1506,6 +1506,7 @@ func TestNilArgsMap(t *testing.T) {
 		{"handleCompleteAgent", "complete_agent", d.handleCompleteAgent},
 		{"handleAddRepo", "add_repo", d.handleAddRepo},
 		{"handleRemoveRepo", "remove_repo", d.handleRemoveRepo},
+		{"handleSetAgentModel", "set_agent_model", d.handleSetAgentModel},
 	}
 
 	for _, tt := range tests {
