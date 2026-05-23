@@ -5656,6 +5656,27 @@ func (d *Daemon) buildBrowserAgentMCPConfig(repoName, sessionName, agentName str
 			// "chat path disabled".
 			"OAT_BROWSER_AGENT_SESSION": sessionName,
 			"OAT_BROWSER_AGENT_NAME":    agentName,
+			// Stable bridge identity (Part 5g.1). The bridge writes
+			// this into bridge-runtime.json so the NM broker (Part
+			// 5g.2) can rank concurrent bridges without a WS round-
+			// trip per candidate.
+			//
+			// Format `<repo>:<agent>` for browser-agents; the
+			// `_assistant-<name>` shape lands when the assistant
+			// agent type ships (Part 5). The bridge falls back to
+			// the audit-log-dir's parent basename when this var is
+			// missing -- backwards-compat for older daemons spawning
+			// new bridges, or new daemons spawning older bridges
+			// (the new bridge tolerates absence; the old bridge
+			// ignores the env var entirely; either way the
+			// downstream broker code does the right thing).
+			//
+			// NOTE: chat_capable is deliberately NOT passed via env.
+			// The bridge derives it from
+			// OAT_BROWSER_AGENT_SESSION/_NAME (the canonical Part
+			// 4.A check) so the persisted value can never disagree
+			// with the WS bridge_capabilities frame. Closes 5g.6 T1.
+			"OAT_BROWSER_AGENT_ID": repoName + ":" + agentName,
 		},
 	}
 	cfg := map[string]any{

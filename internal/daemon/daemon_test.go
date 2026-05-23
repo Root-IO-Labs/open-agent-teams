@@ -2721,6 +2721,17 @@ func TestBuildBrowserAgentMCPConfig_StructureAndContents(t *testing.T) {
 	if got := s.Env["OAT_BROWSER_AGENT_NAME"]; got != "browser-agent" {
 		t.Errorf("OAT_BROWSER_AGENT_NAME = %q, want %q", got, "browser-agent")
 	}
+	// Part 5g.1: stable bridge identity. The bridge persists this
+	// into bridge-runtime.json so the NM broker (Part 5g.2) can rank
+	// concurrent bridges without a per-candidate WS round-trip.
+	// Format `<repo>:<agent>` -- repo first to keep it scannable in
+	// logs alongside the existing `<session>/<agent>` worktree-key
+	// format used elsewhere in the daemon. If this changes, the
+	// bridge's resolveAgentId + the broker's selection policy must
+	// move in lock-step.
+	if got := s.Env["OAT_BROWSER_AGENT_ID"]; got != "my-repo:browser-agent" {
+		t.Errorf("OAT_BROWSER_AGENT_ID = %q, want %q", got, "my-repo:browser-agent")
+	}
 	// Post-Part-9b: the back-compat pins are GONE. Each OAT-spawned
 	// bridge gets an OS-assigned port (no port-19222 collision when
 	// another bridge is already running) and the NM broker delivers
@@ -2821,6 +2832,14 @@ func TestBuildBrowserAgentMCPConfig_IdentityVarsAreFaithfullyPlumbed(t *testing.
 			}
 			if got := env["OAT_BROWSER_AGENT_NAME"]; got != tc.agent {
 				t.Errorf("OAT_BROWSER_AGENT_NAME = %q, want %q", got, tc.agent)
+			}
+			// Part 5g.1: same fidelity contract for the stable
+			// bridge identity. A renamed agent must surface the new
+			// id so the NM broker (5g.2) and the chrome.storage
+			// per-id keys (5g.3) don't collide with the old one.
+			wantID := tc.repo + ":" + tc.agent
+			if got := env["OAT_BROWSER_AGENT_ID"]; got != wantID {
+				t.Errorf("OAT_BROWSER_AGENT_ID = %q, want %q", got, wantID)
 			}
 		})
 	}
