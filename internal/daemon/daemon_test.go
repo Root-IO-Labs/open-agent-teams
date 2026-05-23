@@ -4570,3 +4570,155 @@ func TestRecordTaskHistoryWithSummary(t *testing.T) {
 		t.Errorf("History entry summary = %q, want 'Implemented the feature successfully'", history[0].Summary)
 	}
 }
+
+// TestCountLiveBrowserAgentsExcept pins the Part 5g.5 Slice A
+// coexistence-log helper. The function powers the
+// "browser-agent coexistence" INFO line emitted from
+// startRegisteredAgent, so the truth-table here is the
+// load-bearing assertion that a future state-shape refactor
+// can't silently regress (e.g. a PID-cleanup pass that nulls
+// dead PIDs to -1 instead of 0, or a renaming of
+// AgentTypeBrowser to something the count helper doesn't
+// know about).
+func TestCountLiveBrowserAgentsExcept(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	mkRepo := func(name string) {
+		t.Helper()
+		repo := &state.Repository{
+			GithubURL:   "https://github.com/test/" + name,
+			SessionName: name,
+			Agents:      make(map[string]state.Agent),
+		}
+		if err := d.state.AddRepo(name, repo); err != nil {
+			t.Fatalf("AddRepo(%q): %v", name, err)
+		}
+	}
+	addAgent := func(repoName, agentName string, t_ state.AgentType, pid int) {
+		t.Helper()
+		ag := state.Agent{
+			Type:         t_,
+			WorktreePath: "/tmp/" + repoName + "/" + agentName,
+			WindowName:   agentName,
+			SessionID:    repoName + "-" + agentName,
+			CreatedAt:    time.Now(),
+			PID:          pid,
+		}
+		if err := d.state.AddAgent(repoName, agentName, ag); err != nil {
+			t.Fatalf("AddAgent(%q,%q): %v", repoName, agentName, err)
+		}
+	}
+
+	// Empty world: zero live browser-agents.
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 0 {
+		t.Errorf("empty world: count = %d, want 0", got)
+	}
+
+	mkRepo("repoA")
+	mkRepo("repoB")
+	mkRepo("repoC")
+
+	// Self-exclusion: the spawning agent is not counted as
+	// "another". Otherwise the very first browser-agent spawn
+	// would falsely log coexistence against itself.
+	addAgent("repoA", "browser-agent", state.AgentTypeBrowser, 1111)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 0 {
+		t.Errorf("self-exclusion: count = %d, want 0 (the spawning agent must not count itself)", got)
+	}
+
+	// Coexistence: a second live browser-agent in a different
+	// repo IS counted. This is the operator-visible signal we
+	// want to surface.
+	addAgent("repoB", "browser-agent", state.AgentTypeBrowser, 2222)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 1 {
+		t.Errorf("coexistence: count = %d, want 1 (repoB/browser-agent is alive and != caller)", got)
+	}
+
+	// Dead PID (PID == 0): NOT counted. This is the contract that
+	// keeps a stale state.json (agent removed but PID not yet
+	// cleaned) from spamming the coexistence log on every fresh
+	// spawn.
+	addAgent("repoC", "browser-agent", state.AgentTypeBrowser, 0)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 1 {
+		t.Errorf("dead-PID exclusion: count = %d, want 1 (repoC has PID=0 so it must not count)", got)
+	}
+
+	// Non-browser types: NOT counted. The coexistence log is
+	// browser-agent specific; a worker / supervisor / etc.
+	// running alongside is normal and shouldn't trigger it.
+	addAgent("repoA", "worker-1", state.AgentTypeWorker, 3333)
+	addAgent("repoA", "supervisor", state.AgentTypeSupervisor, 4444)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 1 {
+		t.Errorf("non-browser exclusion: count = %d, want 1 (worker + supervisor must not count)", got)
+	}
+
+	// Same repo, different name: two browser-agents in the same
+	// repo is rare but valid (user added a second one for a
+	// distinct task). Coexistence still applies; both should be
+	// surfaced.
+	addAgent("repoA", "browser-agent-2", state.AgentTypeBrowser, 5555)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 2 {
+		t.Errorf("same-repo second browser-agent: count = %d, want 2 (repoB + repoA/browser-agent-2)", got)
+	}
+
+	// Calling from the perspective of the newly-spawned
+	// browser-agent-2 must also self-exclude (so the very FIRST
+	// thing browser-agent-2's own coexistence-log check sees is
+	// "one other browser-agent", not 2).
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent-2"); got != 2 {
+		t.Errorf("self-exclusion from second agent: count = %d, want 2 (repoB + repoA/browser-agent)", got)
+	}
+}
+
+// TestCountLiveBrowserAgentsExceptDoesNotBlockOnConcurrentReaders
+// pins the Part 5g.5 Slice A non-blocking invariant the way it
+// actually matters in practice: the count helper goes through
+// state.GetAllRepos() which takes an RLock and returns a deep-
+// copy snapshot. Concurrent spawn paths (each holding their own
+// state write briefly, then calling the count helper afterward)
+// must NOT serialize on each other through the count read --
+// that would defeat the whole point of "two browser-agents can
+// come up in parallel". This test asserts the count helper runs
+// to completion against a state that's also being read by other
+// goroutines; if a future refactor swaps RLock for a write lock
+// or otherwise introduces serialization, the test still passes
+// (it doesn't assert wall-clock parallelism) but the comment
+// here is the human-readable invariant a code reviewer can hold
+// against the diff.
+func TestCountLiveBrowserAgentsExceptDoesNotBlockOnConcurrentReaders(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("test-repo", "browser-1", state.Agent{
+		Type: state.AgentTypeBrowser, PID: 1234, CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	// 10 concurrent readers, each calling the count helper
+	// against the live state. Completing without a deadlock or
+	// race is the assertion.
+	done := make(chan struct{}, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			_ = countLiveBrowserAgentsExcept(d.state, "test-repo", "browser-1")
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("count helper hung under concurrent read load (iteration %d) — non-blocking invariant regressed", i)
+		}
+	}
+}

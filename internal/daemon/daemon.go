@@ -3808,7 +3808,74 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 	}
 
 	d.logger.Info("Started registered agent %s/%s (PID=%d)", repoName, agentName, pid)
+
+	// Part 5g.5 Slice A (2026-05-22): operator-visible coexistence
+	// log for browser-agents. When a second (or third, ...)
+	// browser-agent across any repo comes up while another is
+	// already alive, emit a one-line INFO event so the operator
+	// can correlate "I started a workflow-helper in repo B and
+	// my agent in repo A kept working" with the design intent.
+	//
+	// The non-blocking invariant itself is implicit in the
+	// surrounding code: there's no `if otherBrowserAgentAlive {
+	// block / wait }` gate before the spawn -- each browser-agent
+	// goes through the same per-repo path independently. Each
+	// gets its own `OAT_BROWSER_AGENT_ID` (Part 5g.1) and the
+	// extension's 5g.2 broker selection picks among them. The
+	// load-bearing assertion that the spawn env is consistent
+	// (so chat_capable: true is deterministic) lives in
+	// daemon_test.go:TestBuildBrowserAgentMCPConfig_IdentityVarsAreFaithfullyPlumbed.
+	//
+	// No-op for non-browser agents (log gates on AgentTypeBrowser).
+	// No throttle: coexistence transitions are rare in practice and
+	// the log line is cheap; deferring to a future debouncer would
+	// risk silently dropping the very signal operators need to see.
+	if agent.Type == state.AgentTypeBrowser {
+		others := countLiveBrowserAgentsExcept(d.state, repoName, agentName)
+		if others > 0 {
+			d.logger.Info(
+				"browser-agent coexistence: %s/%s (id=%s:%s, PID=%d) started; %d other live browser-agent(s) across all repos",
+				repoName, agentName, repoName, agentName, pid, others,
+			)
+		}
+	}
+
 	return pid, nil
+}
+
+// countLiveBrowserAgentsExcept counts AgentTypeBrowser agents across
+// every repo that have a non-zero PID, EXCLUDING the (repoName,
+// agentName) just spawned (the caller has already written its PID
+// to state when this is called).
+//
+// "Live" here is the state-file truth (PID != 0). Health-check
+// reconciliation that clears stale PIDs runs every ~2 minutes; in
+// the rare window where a dead bridge's PID hasn't been cleared
+// yet, the count is an over-estimate, which is the right error
+// direction for an operator-visible log (worst case: a spurious
+// coexistence line when one of the "other" agents is already
+// gone -- preferable to silently undercounting an actually-live
+// coexistence event).
+//
+// Cheap: a state snapshot iteration is O(repos * agents) and only
+// runs on browser-agent spawn. Not in any hot path.
+func countLiveBrowserAgentsExcept(s *state.State, excludeRepo, excludeAgent string) int {
+	count := 0
+	for repoName, repo := range s.GetAllRepos() {
+		for agentName, agent := range repo.Agents {
+			if repoName == excludeRepo && agentName == excludeAgent {
+				continue
+			}
+			if agent.Type != state.AgentTypeBrowser {
+				continue
+			}
+			if agent.PID == 0 {
+				continue
+			}
+			count++
+		}
+	}
+	return count
 }
 
 // handleAgentWaiting marks a worker as dormant (waiting for PR resolution).
