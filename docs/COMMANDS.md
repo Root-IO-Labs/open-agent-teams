@@ -77,6 +77,26 @@ oat workspace <name>               # Connect (shorthand)
 
 Workspaces use `workspace/<name>` branches. A "default" workspace spawns automatically when you init a repo.
 
+## Personal Assistants
+
+Persistent conversational agents that live in the side panel. Different from the workflow-helper browser-agent (one-shot); the assistant sticks around between tasks.
+
+```bash
+oat assistant start [name]                            # Spawn (default name: personal)
+oat assistant start work --model anthropic:claude-opus-4-7  # Multiple in parallel
+oat assistant stop [name]                             # Gracefully stop
+oat assistant restart [name] [--fresh]                # --fresh wipes session JSONL
+oat assistant status [name]                           # Model / PID / state
+oat assistant attach [name]                           # Alias for `oat ui --repo`
+oat assistant set-model <id> [name]                   # Update model (next restart)
+oat assistant reset [name] [--full]                   # Wipe session JSONL
+oat assistant compact [name]                          # Synthetic compaction
+oat assistant logs [name] [--follow]                  # Tail output log
+oat assistant list                                    # All assistants + state
+```
+
+Daemon auto-starts if missing. Assistants live in virtual repos (`_assistant-<name>`); hidden from `oat repo list` unless `--all`. Full walkthrough: [docs/ASSISTANT.md](ASSISTANT.md).
+
 ## Workers
 
 Workers do the grunt work. Give them a task, they make a PR.

@@ -35,7 +35,8 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
   "pr_shepherd_config": { /* PRShepherdConfig object */ },
   "fork_config": { /* ForkConfig object */ },
   "target_branch": "main",
-  "allowed_worker_models": ["anthropic:claude-sonnet-4-6", "openrouter:deepseek/deepseek-v3.2:nitro"]
+  "allowed_worker_models": ["anthropic:claude-sonnet-4-6", "openrouter:deepseek/deepseek-v3.2:nitro"],
+  "is_virtual": false                  // Optional (default false). True for `_assistant-<name>` virtual repos that have no .git and host only an AgentTypeAssistant; hidden from `oat repo list` by default (`--all` to show).
 }
 ```
 
@@ -43,7 +44,7 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
 
 ```json
 {
-  "type": "worker",                    // "supervisor" | "worker" | "merge-queue" | "workspace" | "review" | "verification" | "pr-shepherd" | "generic-persistent"
+  "type": "worker",                    // "supervisor" | "worker" | "merge-queue" | "workspace" | "review" | "verification" | "pr-shepherd" | "generic-persistent" | "browser" | "assistant"
   "worktree_path": "/path/to/worktree",
   "window_name": "0",                  // Agent name within backend session
   "session_id": "agent-session-id",
@@ -93,7 +94,10 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
   "prompt_user_tokens": 0,            // Estimated token count of user task message at spawn
   "rejection_count": 0,               // Number of times verification rejected this worker; used for rejection cap escalation (workers only)
   "last_nudge_hash": "",              // Hash of last nudge body for deduplication
-  "nudge_skip_count": 0               // Consecutive nudges suppressed by hash dedup
+  "nudge_skip_count": 0,              // Consecutive nudges suppressed by hash dedup
+  "model_swapped_on_restart": false,  // Set when daemon auto-swapped agent.Model on the most recent restart (e.g. model was un-onboarded). Cleared by `oat agent set-model` and by a successful explicit restart with a valid model.
+  "model_swap_reason": "",            // Human-readable reason for the last auto-swap (e.g. "model not in repo allow-list"). Pairs with model_swapped_on_restart.
+  "previous_model": ""                // Model the agent was running before the last auto-swap. Used by `oat status` to surface "was running on X, now on Y".
 }
 ```
 
@@ -106,6 +110,8 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
 - `verification`: Independent pre-PR reviewer (ephemeral, spawned by `oat worker request-review`)
 - `pr-shepherd`: Monitors PRs in fork mode
 - `generic-persistent`: Custom persistent agents
+- `browser`: Opt-in workflow-helper that controls Chrome via the `oat-browser-agent` MCP bridge. One-shot (calls `oat agent complete` when done). Spawned by `oat agent add browser-agent`.
+- `assistant`: Personal AI assistant. Persistent, conversational, lives in a virtual repo (`_assistant-<name>` with `is_virtual=true`). Spawned by `oat assistant start [name]` (default name `personal`). Shares the bridge/MCP wiring with `browser` but keeps `compact_conversation` because the daemon-side 75 %/95 % context-capacity safety net relies on it.
 
 ### TaskHistoryEntry Object
 

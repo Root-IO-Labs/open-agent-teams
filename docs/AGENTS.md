@@ -217,6 +217,27 @@ The Browser Agent requires the `oat-browser-agent` Chrome extension and bridge t
 
 **Status reporting**: The browser agent emits `[OAT_BROWSER] status: <message>` sentinel lines for OAT's OutputWatcher.
 
+### 10. Personal Assistant (`internal/templates/agent-templates/assistant.md`)
+
+**Role**: Long-lived conversational helper for the user (chat companion, lightweight research)
+**Worktree**: Virtual repo (no `.git`, no worktree); lives under `~/.oat/repos/_assistant-<name>/`
+**Lifecycle**: Opt-in, persistent
+
+The Personal Assistant is a separate agent type from the workflow-helper Browser Agent. Where the Browser Agent is one-shot (a worker spawns it, it QAs the worker's UI change, it exits via `oat agent complete`), the Personal Assistant is a long-lived collaborator the user starts once and chats with whenever:
+
+- Spawned via `oat assistant start [name]` (default name `personal`). Multiple assistants can run in parallel for different scopes (`work`, `personal`, etc.).
+- Lives in a **virtual repo** (`state.Repository.IsVirtual=true`) — no git, no supervisor/merge-queue/workspace co-tenants, hidden from `oat repo list` unless `--all`.
+- Uses the same bridge + MCP wiring as the Browser Agent (`usesBrowserBridge()`), so the same `_shared-browser-safety.md` fragment governs safety, prompt-injection defense, cross-tab discipline, and dedicated-agent-window topology.
+- **Differs from Browser Agent in tool catalog**: assistant keeps `compact_conversation` (denied for browser). The 95% context-capacity safety net relies on it.
+- **Defense-in-depth**: if the assistant ever calls `oat agent complete`, the daemon returns success/no-op + WARN instead of actually completing it. The assistant prompt teaches it not to call complete; the daemon enforces.
+
+**Context capacity safety net** (Part 5e in plan): the daemon polls `[OAT_TOKENS]` events vs effective context limit (`min(profile.MaxInputTokens, 128 K)`) and:
+
+- At ≥ 75 %: silent PTY hint instructing the assistant to call `compact_conversation`. Suppressed 5 min after fire.
+- At ≥ 95 %: synthetic compact-conversation directive injected as a separate PTY message before forwarding any pending user message. Gated by `OAT_CONTEXT_SAFETY_NET` (default ON).
+
+See [ASSISTANT.md](ASSISTANT.md) for the user-facing walkthrough and [MCP.md](MCP.md) for the bridge env-var contract (which now includes `OAT_AGENT_TYPE`, `OAT_REPO`, `OAT_MEMORY_ENABLED` for the future memory subsystem).
+
 ## Daemon (Background Process)
 
 The daemon is **not an AI agent**. It is a deterministic Go process (`internal/daemon/`) that runs in the background, managing agent lifecycles and coordinating work through timers and programmatic checks. It has no LLM, no reasoning ability, and no capacity for nuanced judgment. It can check binary conditions (is a PR merged? has a timer expired?) but it cannot investigate *why* something is stuck or decide whether an agent is making meaningful progress on a complex task.

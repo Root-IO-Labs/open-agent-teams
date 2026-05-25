@@ -135,6 +135,10 @@ servers define their own:
 | `OAT_BRIDGE_TRUST_LOCALHOST` | no | Accept anonymous localhost WS opens. Default is token-required (since plan Part 9a). Only set this if you are running the bridge in an isolated VM where localhost is trusted by construction; production end-user installs should leave it unset and let the Native-Messaging broker deliver the per-launch session token. |
 | `OAT_BRIDGE_ALLOW_MULTI` | no | Opt back in to the pre-1.0 multi-client WS fan-out. Default is single-client (one extension per bridge). |
 | `OAT_BRIDGE_STRICT_MODE` | no | Schema-runtime drift telemetry mode: `warn` (default) / `reject` / `off`. See `oat-browser-agent` CHANGELOG. |
+| `OAT_AGENT_TYPE` | yes (assistant spawn only) | Set to `assistant` for `AgentTypeAssistant`. Signals "I am a persistent personal assistant, not a one-shot browser-agent" to any future memory middleware. No consumer in v1; emission is forward-compatible scaffolding. |
+| `OAT_REPO` | yes (assistant spawn only) | Set to the virtual repo name (`_assistant-<name>`) so a future memory middleware can scope per-assistant storage without re-deriving anything. |
+| `OAT_MEMORY_ENABLED` | yes (assistant spawn only) | Always `1` at assistant spawn. Generic "memory subsystems may activate" hint; harmless when no consumer is present. The separate OAT memory/RAG design effort owns the consumer side. |
+| `OAT_CONTEXT_SAFETY_NET` | no | Daemon-side toggle for the Part 5e context-capacity safety net (75 % silent hint + 95 % synthetic compact-conversation inject). Default `1` (on); set `0` / `false` / `off` to disable. Garbage values fail-safe to on. |
 
 ## Result-type semantics
 

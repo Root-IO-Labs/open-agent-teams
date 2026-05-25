@@ -275,6 +275,8 @@ See [Monitoring token usage and cache efficiency](docs/ADVANCED_USAGE.md#monitor
 
 **Extensible in markdown** — Customize any agent by creating `.oat/agents/worker.md` in your repo (team-shared) or `~/.oat/repos/<repo>/agents/worker.md` (local). Add project context for all workers via `oat-worker-prompt-extensions/` at your repo root. Spawn entirely custom agents with `oat agents spawn`.
 
+**Personal AI assistant** — `oat assistant start` spins up a persistent conversational agent that lives in your browser's side panel and sticks around between tasks. Different from the workflow-helper browser-agent (one-shot, spawned by a worker); the assistant is a long-lived collaborator with its own chat history. Run multiple in parallel (`personal`, `work`, etc.). See [docs/ASSISTANT.md](docs/ASSISTANT.md).
+
 ## Commands
 
 **Start working**
