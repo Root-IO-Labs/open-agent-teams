@@ -3874,6 +3874,10 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 			envVars = append(envVars, fmt.Sprintf("OAT_BACKEND=%s", beName))
 		}
 		envVars = append(envVars, fmt.Sprintf("OAT_TOOL_LOG=%s", logFile))
+		// Part 5f: emit assistant-only env vars (OAT_AGENT_TYPE /
+		// OAT_REPO / OAT_MEMORY_ENABLED) for any future memory
+		// middleware to consume. No-op for non-assistant types.
+		envVars = append(envVars, assistantSpawnEnvVars(agent.Type, repoName)...)
 		// Inject CLI-forwarded env vars (tokens, API keys) so agents inherit
 		// the caller's environment even when the daemon lacks those vars.
 		envVars = append(envVars, extraEnv...)
@@ -6106,6 +6110,8 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 			envVars = append(envVars, fmt.Sprintf("OAT_BACKEND=%s", backend))
 		}
 		envVars = append(envVars, fmt.Sprintf("OAT_TOOL_LOG=%s", logFile))
+		// Part 5f: assistant memory env-var prep (see assistant_env.go).
+		envVars = append(envVars, assistantSpawnEnvVars(cfg.agentType, repoName)...)
 		// Sidecar socket path (empty when OAT_USE_SIDECAR != 1). Must be
 		// wired at every StartAgent call site or the feature flag is
 		// partial — agents created through this path would silently skip
@@ -6736,6 +6742,8 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		envVars = append(envVars, fmt.Sprintf("OAT_BACKEND=%s", backend))
 	}
 	envVars = append(envVars, fmt.Sprintf("OAT_TOOL_LOG=%s", logFile))
+	// Part 5f: assistant memory env-var prep (see assistant_env.go).
+	envVars = append(envVars, assistantSpawnEnvVars(agent.Type, repoName)...)
 	// Sidecar path also wired on restart so an agent that was started
 	// with sidecar on keeps sidecar on across a manual restart.
 	sidecarPath := sidecarSocketPath(repoName, agentName)
