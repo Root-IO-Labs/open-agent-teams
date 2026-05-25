@@ -3970,11 +3970,12 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 	// the log line is cheap; deferring to a future debouncer would
 	// risk silently dropping the very signal operators need to see.
 	if usesBrowserBridge(agent.Type) {
-		others := countLiveBrowserAgentsExcept(d.state, repoName, agentName)
+		browsers, assistants := countLiveBridgeAgentsByTypeExcept(d.state, repoName, agentName)
+		others := browsers + assistants
 		if others > 0 {
 			d.logger.Info(
-				"browser-agent coexistence: %s/%s (id=%s:%s, PID=%d) started; %d other live browser-agent(s) across all repos",
-				repoName, agentName, repoName, agentName, pid, others,
+				"browser-agent coexistence: %s/%s (id=%s:%s, type=%s, PID=%d) started; %d other live (assistants: %d, browser-agents: %d)",
+				repoName, agentName, repoName, agentName, agent.Type, pid, others, assistants, browsers,
 			)
 		}
 	}
@@ -4009,7 +4010,29 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 // Cheap: a state snapshot iteration is O(repos * agents) and only
 // runs on bridge-agent spawn. Not in any hot path.
 func countLiveBrowserAgentsExcept(s *state.State, excludeRepo, excludeAgent string) int {
-	count := 0
+	browsers, assistants := countLiveBridgeAgentsByTypeExcept(s, excludeRepo, excludeAgent)
+	return browsers + assistants
+}
+
+// countLiveBridgeAgentsByTypeExcept is the Part 5g.5 Slice B split form
+// of countLiveBrowserAgentsExcept. It returns (browsers, assistants) so
+// the coexistence INFO line can distinguish "your assistant is alive
+// alongside a workflow-helper that just spawned" from "two workflow-
+// helpers are coexisting" -- a meaningful operator distinction (the
+// former is the intended assistant-coexistence design, the latter is
+// usually a multi-task scenario or a stuck cleanup).
+//
+// Same correctness contract as countLiveBrowserAgentsExcept (which is
+// now a thin wrapper over this helper):
+//   - Excludes the (excludeRepo, excludeAgent) entry so a spawning
+//     agent never counts itself.
+//   - Only counts entries with PID != 0 (state-file truth).
+//   - Only counts agents for which usesBrowserBridge returns true.
+//
+// Counts every other agent type as zero (workers, supervisors, merge
+// queues, reviewers, etc. are not bridge users and never participate
+// in the coexistence event).
+func countLiveBridgeAgentsByTypeExcept(s *state.State, excludeRepo, excludeAgent string) (browsers, assistants int) {
 	for repoName, repo := range s.GetAllRepos() {
 		for agentName, agent := range repo.Agents {
 			if repoName == excludeRepo && agentName == excludeAgent {
@@ -4021,10 +4044,15 @@ func countLiveBrowserAgentsExcept(s *state.State, excludeRepo, excludeAgent stri
 			if agent.PID == 0 {
 				continue
 			}
-			count++
+			switch agent.Type {
+			case state.AgentTypeBrowser:
+				browsers++
+			case state.AgentTypeAssistant:
+				assistants++
+			}
 		}
 	}
-	return count
+	return browsers, assistants
 }
 
 // handleAgentWaiting marks a worker as dormant (waiting for PR resolution).

@@ -3013,6 +3013,199 @@ func TestBuildBrowserAgentMCPConfig_IdentityVarsAreFaithfullyPlumbed(t *testing.
 	}
 }
 
+// TestAssistantChatCapableStableAcrossRestart_Part5g5SliceB pins the
+// Part 5g.5 Slice B "`oat assistant restart` chat_capable stability"
+// assertion. The contract: when an AgentTypeAssistant restarts, the
+// bridge that comes back up MUST still advertise chat_capable=true.
+//
+// chat_capable is derived (on the bridge side) by isChatCapableFromEnv
+// from OAT_BROWSER_AGENT_SESSION + OAT_BROWSER_AGENT_NAME. So on the
+// daemon side, the load-bearing requirement is: buildBrowserAgentMCPConfig
+// for the SAME (repo, session, agent) tuple is deterministic AND the
+// vars it emits are non-empty (which is what isChatCapableFromEnv
+// treats as the "OAT-spawned, chat path enabled" signal).
+//
+// The "restart" in this test is byte-for-byte deterministic: a real
+// restart calls buildBrowserAgentMCPConfig with the SAME tuple. If
+// the daemon ever introduced time-based jitter or PID-derived
+// randomness here, this test would catch it.
+//
+// Cross-validates the bridge-side invariant from oat-browser-agent's
+// 5g.6 T1 tests (isChatCapableFromEnv returns true iff both env vars
+// are present + non-empty). The two repos share the same contract via
+// the OAT_BROWSER_AGENT_SESSION/_NAME env-var protocol, but neither
+// test can see the other repo at build time -- so each side pins its
+// half independently.
+func TestAssistantChatCapableStableAcrossRestart_Part5g5SliceB(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	scriptPath := filepath.Join(t.TempDir(), "bridge.js")
+	if err := os.WriteFile(scriptPath, []byte("// stub"), 0644); err != nil {
+		t.Fatalf("write stub bridge: %v", err)
+	}
+	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
+
+	// Assistant tuple shape: virtual repo "_assistant-personal",
+	// session matches the repo (the assistant CLI canonicalises this),
+	// agent name "personal" (the default name from oat assistant start).
+	repo := "_assistant-personal"
+	session := "_assistant-personal"
+	agent := "personal"
+
+	// Build #1: pre-restart.
+	cfg1, err := d.buildBrowserAgentMCPConfig(repo, session, agent)
+	if err != nil {
+		t.Fatalf("buildBrowserAgentMCPConfig pre-restart: %v", err)
+	}
+
+	// Build #2 and #3: simulating two distinct restart cycles. The
+	// real restart path tears down the old bridge process, then the
+	// daemon spawns a new one with the same MCP config. The test
+	// approximation is "call the builder again" -- this is honest
+	// about what's verifiable here: the daemon-side env contract.
+	// The bridge-process-handshake stability is verified in the
+	// oat-browser-agent runtime-file + nm-broker test suites.
+	cfg2, err := d.buildBrowserAgentMCPConfig(repo, session, agent)
+	if err != nil {
+		t.Fatalf("buildBrowserAgentMCPConfig restart-1: %v", err)
+	}
+	cfg3, err := d.buildBrowserAgentMCPConfig(repo, session, agent)
+	if err != nil {
+		t.Fatalf("buildBrowserAgentMCPConfig restart-2: %v", err)
+	}
+
+	if cfg1 != cfg2 || cfg2 != cfg3 {
+		t.Errorf("buildBrowserAgentMCPConfig is not deterministic across calls -- chat_capable could flap across `oat assistant restart`.\n#1=%s\n#2=%s\n#3=%s", cfg1, cfg2, cfg3)
+	}
+
+	// Now assert the bridge-side chat_capable contract on the
+	// emitted env vars. The bridge's isChatCapableFromEnv treats
+	// SESSION + NAME both-present-and-non-empty as the truth
+	// signal; the daemon's job is to make sure those vars are
+	// always non-empty for an assistant.
+	var parsed struct {
+		Servers []struct {
+			Env map[string]string `json:"env"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal([]byte(cfg1), &parsed); err != nil {
+		t.Fatalf("unmarshal cfg1: %v\ncfg=%s", err, cfg1)
+	}
+	env := parsed.Servers[0].Env
+	if env["OAT_BROWSER_AGENT_SESSION"] == "" {
+		t.Error("OAT_BROWSER_AGENT_SESSION is empty -- bridge would derive chat_capable=false, breaking the assistant side-panel chat path")
+	}
+	if env["OAT_BROWSER_AGENT_NAME"] == "" {
+		t.Error("OAT_BROWSER_AGENT_NAME is empty -- bridge would derive chat_capable=false, breaking the assistant side-panel chat path")
+	}
+	wantID := repo + ":" + agent
+	if got := env["OAT_BROWSER_AGENT_ID"]; got != wantID {
+		t.Errorf("OAT_BROWSER_AGENT_ID = %q, want %q -- 5g.1 stable-identity contract for assistants", got, wantID)
+	}
+}
+
+// TestAssistantRestartDoesNotFlipWorkflowHelperChatCapable_Part5g5SliceB
+// pins the Slice B "anti-flap during cold start" assertion: when an
+// assistant is mid-restart (PID temporarily 0 in state) and a workflow-
+// helper browser-agent spawns at the same time, the workflow-helper's
+// chat_capable env vars MUST NOT be affected by the assistant's lifecycle
+// state. Each bridge's spawn-env is computed from its OWN (repo, agent)
+// tuple via buildBrowserAgentMCPConfig and never reads cross-agent state.
+//
+// This is the daemon-side half of the broader anti-flap contract. The
+// extension-side half (NM broker not promoting a workflow-helper into
+// the chat slot during the assistant's brief unavailability window)
+// lives in oat-browser-agent's nm-port-anti-flap.test.ts.
+//
+// Why this matters: the original concern was that an aggressive cleanup
+// pass or a shared-state mutation in startRegisteredAgent could
+// accidentally couple the two bridges' chat_capable values. Pinning the
+// per-agent-tuple independence here means any future refactor that
+// introduces a cross-agent dependency in the spawn-env path will fail
+// loudly.
+func TestAssistantRestartDoesNotFlipWorkflowHelperChatCapable_Part5g5SliceB(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	scriptPath := filepath.Join(t.TempDir(), "bridge.js")
+	if err := os.WriteFile(scriptPath, []byte("// stub"), 0644); err != nil {
+		t.Fatalf("write stub bridge: %v", err)
+	}
+	t.Setenv("OAT_BROWSER_AGENT_BRIDGE_PATH", scriptPath)
+
+	// Set up an assistant in mid-restart (PID=0 simulates the brief
+	// window between graceful stop and the next spawn) and a workflow-
+	// helper browser-agent that is about to spawn in another repo.
+	_ = d.state.AddRepo("_assistant-personal", &state.Repository{
+		SessionName: "_assistant-personal",
+		IsVirtual:   true,
+		Agents:      map[string]state.Agent{},
+	})
+	_ = d.state.AddAgent("_assistant-personal", "personal", state.Agent{
+		Type: state.AgentTypeAssistant,
+		PID:  0,
+	})
+	_ = d.state.AddRepo("weather-app", &state.Repository{
+		SessionName: "weather-app",
+		Agents:      map[string]state.Agent{},
+	})
+
+	// Build the workflow-helper's MCP config WHILE the assistant is
+	// mid-restart. The workflow-helper's env vars are derived from
+	// its own (repo, session, agent) tuple, not from any shared
+	// state -- so the assistant's PID=0 condition must not perturb
+	// what comes out here.
+	helperCfg, err := d.buildBrowserAgentMCPConfig("weather-app", "weather-app", "browser-agent")
+	if err != nil {
+		t.Fatalf("buildBrowserAgentMCPConfig for workflow-helper during assistant restart: %v", err)
+	}
+
+	// Then build the assistant's MCP config (simulating its restart
+	// completing). It must STILL emit the chat_capable env vars; the
+	// workflow-helper's earlier build must not have leaked into the
+	// assistant's config.
+	assistantCfg, err := d.buildBrowserAgentMCPConfig("_assistant-personal", "_assistant-personal", "personal")
+	if err != nil {
+		t.Fatalf("buildBrowserAgentMCPConfig for assistant post-restart: %v", err)
+	}
+
+	var parsed struct {
+		Servers []struct {
+			Env map[string]string `json:"env"`
+		} `json:"servers"`
+	}
+
+	// Workflow-helper assertions: vars are independent of the
+	// assistant's lifecycle state.
+	if err := json.Unmarshal([]byte(helperCfg), &parsed); err != nil {
+		t.Fatalf("unmarshal helperCfg: %v\ncfg=%s", err, helperCfg)
+	}
+	helperEnv := parsed.Servers[0].Env
+	if got, want := helperEnv["OAT_BROWSER_AGENT_SESSION"], "weather-app"; got != want {
+		t.Errorf("workflow-helper OAT_BROWSER_AGENT_SESSION = %q, want %q (must be derived from its own tuple, not affected by assistant state)", got, want)
+	}
+	if got, want := helperEnv["OAT_BROWSER_AGENT_NAME"], "browser-agent"; got != want {
+		t.Errorf("workflow-helper OAT_BROWSER_AGENT_NAME = %q, want %q (must be derived from its own tuple, not affected by assistant state)", got, want)
+	}
+	if got, want := helperEnv["OAT_BROWSER_AGENT_ID"], "weather-app:browser-agent"; got != want {
+		t.Errorf("workflow-helper OAT_BROWSER_AGENT_ID = %q, want %q", got, want)
+	}
+
+	// Assistant assertions: post-restart config still has chat_capable
+	// env vars. NOT affected by the workflow-helper's prior build.
+	if err := json.Unmarshal([]byte(assistantCfg), &parsed); err != nil {
+		t.Fatalf("unmarshal assistantCfg: %v\ncfg=%s", err, assistantCfg)
+	}
+	asstEnv := parsed.Servers[0].Env
+	if asstEnv["OAT_BROWSER_AGENT_SESSION"] == "" || asstEnv["OAT_BROWSER_AGENT_NAME"] == "" {
+		t.Errorf("assistant chat_capable env vars empty after coexistent workflow-helper spawn: SESSION=%q NAME=%q -- workflow-helper spawn must not flip assistant chat_capable", asstEnv["OAT_BROWSER_AGENT_SESSION"], asstEnv["OAT_BROWSER_AGENT_NAME"])
+	}
+	if got, want := asstEnv["OAT_BROWSER_AGENT_ID"], "_assistant-personal:personal"; got != want {
+		t.Errorf("assistant OAT_BROWSER_AGENT_ID = %q, want %q -- assistant identity must not be perturbed by workflow-helper spawn", got, want)
+	}
+}
+
 // TestBuildBrowserAgentMCPConfig_PerRepoAuditDir documents that two
 // repos get distinct audit-log dirs even though they share the same
 // bridge command -- the audit-log isolation is repo-scoped.
@@ -4862,6 +5055,126 @@ func TestCountLiveBrowserAgentsExcept(t *testing.T) {
 	addAgent("repoE-dead-assistant", "old", state.AgentTypeAssistant, 0)
 	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 3 {
 		t.Errorf("dead assistant exclusion: count = %d, want 3 (PID=0 assistant must not count)", got)
+	}
+}
+
+// TestCountLiveBridgeAgentsByTypeExcept_Part5g5SliceB pins the
+// split-by-type form of the coexistence counter. Slice A's
+// countLiveBrowserAgentsExcept returns a single int (browsers +
+// assistants); Slice B introduces the split form so the INFO log
+// can distinguish "your assistant is alive alongside a workflow-
+// helper that just spawned" from "two workflow-helpers are
+// coexisting" -- meaningful for operators triaging coexistence
+// issues. This test pins the per-type tally truth-table; the
+// existing Slice A test above continues to pin the summed total.
+//
+// Same correctness invariants (self-exclusion, PID != 0, only
+// usesBrowserBridge types count) apply. The single-int wrapper
+// must always equal browsers + assistants -- pinned at the end
+// of each case so a future skew between the two helpers fails
+// loudly here rather than drifting silently.
+func TestCountLiveBridgeAgentsByTypeExcept_Part5g5SliceB(t *testing.T) {
+	tmpDir, _ := os.MkdirTemp("", "oat-test-bridge-bytype-*")
+	defer os.RemoveAll(tmpDir)
+
+	paths := config.NewTestPaths(tmpDir)
+	d, err := New(paths)
+	if err != nil {
+		t.Fatalf("Failed to create daemon: %v", err)
+	}
+
+	mkRepo := func(name string) {
+		_ = d.state.AddRepo(name, &state.Repository{
+			SessionName: name,
+			Agents:      map[string]state.Agent{},
+		})
+	}
+	addAgent := func(repo, agent string, typ state.AgentType, pid int) {
+		_ = d.state.AddAgent(repo, agent, state.Agent{
+			Type: typ,
+			PID:  pid,
+		})
+	}
+	assertSum := func(label string, b, a int) {
+		t.Helper()
+		got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent")
+		if got != b+a {
+			t.Errorf("%s: wrapper countLiveBrowserAgentsExcept = %d, want %d (browsers=%d + assistants=%d). The single-int helper MUST stay equal to the split-form sum.", label, got, b+a, b, a)
+		}
+	}
+
+	mkRepo("repoA")
+	mkRepo("repoB")
+	mkRepo("repoC")
+	mkRepo("repoD")
+
+	// Empty world: zero of each.
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 0 || a != 0 {
+		t.Errorf("empty world: got browsers=%d, assistants=%d, want 0/0", b, a)
+	}
+	assertSum("empty world", 0, 0)
+
+	// Self-exclusion: a single browser-agent counting itself sees zero
+	// of each type. This is load-bearing -- the very first spawn must
+	// not log coexistence against itself.
+	addAgent("repoA", "browser-agent", state.AgentTypeBrowser, 1111)
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 0 || a != 0 {
+		t.Errorf("self-exclusion: got browsers=%d, assistants=%d, want 0/0", b, a)
+	}
+	assertSum("self-exclusion", 0, 0)
+
+	// Single browser-agent elsewhere: browsers=1, assistants=0.
+	addAgent("repoB", "browser-agent", state.AgentTypeBrowser, 2222)
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 1 || a != 0 {
+		t.Errorf("one other browser: got browsers=%d, assistants=%d, want 1/0", b, a)
+	}
+	assertSum("one other browser", 1, 0)
+
+	// Add an assistant in repoC: browsers=1, assistants=1. This is
+	// THE intended operator-visible distinction Slice B adds: the
+	// summed total (2) hides the fact that the user's assistant is
+	// alive alongside a workflow-helper -- the split form surfaces it.
+	addAgent("repoC", "personal", state.AgentTypeAssistant, 3333)
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 1 || a != 1 {
+		t.Errorf("browser+assistant coexistence: got browsers=%d, assistants=%d, want 1/1", b, a)
+	}
+	assertSum("browser+assistant coexistence", 1, 1)
+
+	// Add a second assistant in repoD: browsers=1, assistants=2.
+	// Multi-assistant is officially declared unsupported in 5g.8 but
+	// the counter must still report accurately so the INFO log
+	// surfaces it (and operators see the warning sign).
+	addAgent("repoD", "work", state.AgentTypeAssistant, 4444)
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 1 || a != 2 {
+		t.Errorf("multi-assistant: got browsers=%d, assistants=%d, want 1/2", b, a)
+	}
+	assertSum("multi-assistant", 1, 2)
+
+	// Assistant self-exclusion: from the assistant's spawn perspective
+	// (excludeRepo=repoC, excludeAgent=personal), the OTHER assistant
+	// (repoD/work) counts toward assistants, and both browsers (repoA
+	// and repoB) count toward browsers. The repoC/personal entry
+	// itself does NOT.
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoC", "personal"); b != 2 || a != 1 {
+		t.Errorf("assistant self-exclusion: got browsers=%d, assistants=%d, want 2/1", b, a)
+	}
+
+	// Dead PID exclusion applies per-type. A PID=0 browser does not
+	// inflate browsers; a PID=0 assistant does not inflate assistants.
+	addAgent("repoA", "dead-browser", state.AgentTypeBrowser, 0)
+	addAgent("repoA", "dead-assistant", state.AgentTypeAssistant, 0)
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 1 || a != 2 {
+		t.Errorf("dead-PID exclusion per type: got browsers=%d, assistants=%d, want 1/2 (the two dead entries must not count)", b, a)
+	}
+	assertSum("dead-PID exclusion per type", 1, 2)
+
+	// Non-bridge types count toward neither browsers nor assistants.
+	// A repo with a worker + supervisor running alongside is normal
+	// and must not poison the coexistence tally.
+	addAgent("repoA", "worker-1", state.AgentTypeWorker, 5555)
+	addAgent("repoA", "supervisor", state.AgentTypeSupervisor, 6666)
+	if b, a := countLiveBridgeAgentsByTypeExcept(d.state, "repoA", "browser-agent"); b != 1 || a != 2 {
+		t.Errorf("non-bridge exclusion: got browsers=%d, assistants=%d, want 1/2 (worker + supervisor must not count)", b, a)
 	}
 }
 
