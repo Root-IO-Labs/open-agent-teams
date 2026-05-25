@@ -35,6 +35,7 @@ package cli
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -93,7 +94,7 @@ func (c *CLI) registerAssistantCommands() {
 	assistantCmd.Subcommands["status"] = &Command{
 		Name:        "status",
 		Description: "Show assistant state: model, PID, last activity",
-		Usage:       "oat assistant status [name]",
+		Usage:       "oat assistant status [name] [--json]",
 		Run:         c.assistantStatus,
 	}
 	assistantCmd.Subcommands["attach"] = &Command{
@@ -129,7 +130,7 @@ func (c *CLI) registerAssistantCommands() {
 	assistantCmd.Subcommands["list"] = &Command{
 		Name:        "list",
 		Description: "List all assistants and their current state",
-		Usage:       "oat assistant list",
+		Usage:       "oat assistant list [--json]",
 		Run:         c.assistantList,
 	}
 
@@ -355,13 +356,59 @@ func (c *CLI) assistantRestart(args []string) error {
 	return nil
 }
 
+// AssistantStatusJSON is the wire shape `oat assistant status
+// --json` emits to stdout. Owned here on the Go side because Part 6a
+// (NM broker RPC handlers in oat-browser-agent) just JSON-parses +
+// forwards; the schema decision lives in one place. Field renames or
+// type changes need a coordinated edit at both the
+// `oat_assistant_status` NM handler and any side-panel renderer that
+// consumes the parsed shape. Pinned by TestAssistantStatusJSON in
+// `internal/cli/assistant_test.go`.
+//
+// State enum semantics (use exactly these strings; the side panel
+// reads them):
+//
+//	"no_repo"                  — virtual repo doesn't exist at all
+//	                             (assistant has never been started or
+//	                             the repo was manually removed).
+//	"stopped"                  — virtual repo exists, no Agent record
+//	                             (operator ran `oat assistant stop`,
+//	                             or the agent was never started).
+//	"running"                  — Agent record exists, pid>0, pid is
+//	                             alive on this host.
+//	"registered_not_running"   — Agent record exists but no live PID
+//	                             (auto-restart may be pending, or
+//	                             agent was killed externally).
+type AssistantStatusJSON struct {
+	Name      string `json:"name"`
+	RepoKey   string `json:"repo_key"`
+	AgentName string `json:"agent_name"`
+	State     string `json:"state"`
+	// PID == 0 when no agent record OR when daemon hasn't observed a
+	// PID yet. Side panel renders as "—" / hides the row in that case.
+	PID int `json:"pid"`
+	// Model is the LITERAL agent.Model value (empty string when unset).
+	// We don't substitute "(default)" the way the human printer does
+	// because callers shelling out + parsing want to round-trip a
+	// missing model back into `oat assistant set-model`. Side panel
+	// can render the empty string as "(default)" client-side.
+	Model                 string `json:"model"`
+	ModelSwappedOnRestart bool   `json:"model_swapped_on_restart"`
+	ModelSwapReason       string `json:"model_swap_reason,omitempty"`
+}
+
 // assistantStatus prints a compact snapshot of the assistant's
 // state. Reads from list_agents on the virtual repo (cheap; no
 // extra socket verbs needed). If no agent record exists, reports
 // "stopped" — that's the user's mental model when an assistant
 // hasn't been started yet OR has been explicitly stopped.
+//
+// --json (Part 6 Slice 6.1, 2026-05-25): emit AssistantStatusJSON
+// instead of the multi-line human format. The Part 6a NM RPC
+// `oat_assistant_status` shells out to this and JSON-parses the
+// result, so the wire shape lives here and not in the bridge.
 func (c *CLI) assistantStatus(args []string) error {
-	_, remaining := ParseFlags(args)
+	flags, remaining := ParseFlags(args)
 	name := resolveAssistantName(remaining)
 	if err := validateVirtualRepoName(name); err != nil {
 		return err
@@ -371,6 +418,14 @@ func (c *CLI) assistantStatus(args []string) error {
 	}
 	repoKey := virtualRepoNameFor(name)
 	agent := agentSlug(name)
+	outputJSON := flags["json"] == "true"
+
+	status := AssistantStatusJSON{
+		Name:      name,
+		RepoKey:   repoKey,
+		AgentName: agent,
+		State:     "stopped",
+	}
 
 	resp, err := c.sendDaemonRequest("list_agents", map[string]interface{}{
 		"repo": repoKey,
@@ -378,13 +433,26 @@ func (c *CLI) assistantStatus(args []string) error {
 	})
 	if err != nil {
 		// list_agents on an unregistered repo yields an error;
-		// treat that as "stopped" rather than spamming the user
-		// with a low-level daemon message.
+		// treat that as "stopped (no_repo)" rather than spamming the
+		// user with a low-level daemon message. JSON callers
+		// distinguish via state="no_repo" so they can render
+		// "Assistant has never been started" vs "Assistant was
+		// stopped" appropriately.
+		status.State = "no_repo"
+		if outputJSON {
+			return emitAssistantJSON(status)
+		}
 		fmt.Printf("Assistant '%s': stopped (no virtual repo registered)\n", name)
 		return nil
 	}
 	rec, ok := findAssistantAgentMap(resp.Data, agent)
 	if !ok {
+		// Virtual repo exists, no Agent record. Keep state="stopped"
+		// (vs "no_repo") so the side panel can show "Stopped — Start
+		// to begin chatting".
+		if outputJSON {
+			return emitAssistantJSON(status)
+		}
 		fmt.Printf("Assistant '%s': stopped\n", name)
 		fmt.Printf("  Virtual repo: %s (registered; no agent record)\n", repoKey)
 		fmt.Printf("  Start with: oat assistant start %s\n", name)
@@ -394,27 +462,52 @@ func (c *CLI) assistantStatus(args []string) error {
 	if v, ok := rec["pid"].(float64); ok {
 		pid = int(v)
 	}
-	model, _ := rec["model"].(string)
+	status.PID = pid
+	if m, _ := rec["model"].(string); m != "" {
+		status.Model = m
+	}
+	status.ModelSwappedOnRestart, _ = rec["model_swapped_on_restart"].(bool)
+	status.ModelSwapReason, _ = rec["model_swap_reason"].(string)
+	if pid > 0 && isProcessAlive(pid) {
+		status.State = "running"
+	} else {
+		status.State = "registered_not_running"
+	}
+
+	if outputJSON {
+		return emitAssistantJSON(status)
+	}
+
+	model := status.Model
 	if model == "" {
 		model = "(default)"
 	}
-	swapped, _ := rec["model_swapped_on_restart"].(bool)
-	swapReason, _ := rec["model_swap_reason"].(string)
-
 	fmt.Printf("Assistant '%s':\n", name)
 	fmt.Printf("  Virtual repo: %s\n", repoKey)
 	fmt.Printf("  Agent name:   %s\n", agent)
 	fmt.Printf("  PID:          %d\n", pid)
 	fmt.Printf("  Model:        %s\n", model)
-	if swapped {
-		fmt.Printf("  WARNING:      Model auto-swapped on last restart (%s)\n", swapReason)
+	if status.ModelSwappedOnRestart {
+		fmt.Printf("  WARNING:      Model auto-swapped on last restart (%s)\n", status.ModelSwapReason)
 	}
-	if pid > 0 && isProcessAlive(pid) {
+	if status.State == "running" {
 		fmt.Printf("  State:        running\n")
 	} else {
 		fmt.Printf("  State:        registered but not running (auto-restart may be pending)\n")
 	}
 	return nil
+}
+
+// emitAssistantJSON writes any value as 2-space-indented JSON to
+// stdout with a trailing newline. Matches the convention the
+// existing `oat version --json` path uses (cli.go line 309).
+// Centralised so the status + list paths produce byte-identical
+// formatting and the test suite can assert on it without per-call
+// duplication.
+func emitAssistantJSON(v interface{}) error {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
 }
 
 // findAssistantAgentMap pulls the raw map for a named agent out of
@@ -633,12 +726,40 @@ func printLogTail(path string, tailBytes int64) error {
 	return scanner.Err()
 }
 
+// AssistantListEntryJSON is one row of the `oat assistant list
+// --json` output. Pinned by TestAssistantListJSON. State enum is a
+// SUPERSET of AssistantStatusJSON.State because list also surfaces
+// "dead" (pid>0 but process not alive on this host — a CRASHED
+// agent that the daemon's health-check hasn't observed yet) and
+// "registered" (Agent record exists, pid==0; never started since
+// daemon boot OR daemon hasn't spawned it yet).
+//
+// Field naming intentionally matches AssistantStatusJSON where it
+// overlaps so the side panel can reuse a single renderer. The list
+// shape stays a flat array (NOT { entries: [...] }) so the NM RPC
+// handler can `JSON.parse(stdout)` and treat the result as the
+// final value with no unwrapping.
+type AssistantListEntryJSON struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+	Model string `json:"model"`
+	PID   int    `json:"pid"`
+}
+
 // assistantList enumerates every virtual repo + its assistant
 // state. This is the "filter view" implementation chosen during
 // the Part 5 design questions — same data as `oat agent list`,
 // rendered with assistant-friendly columns and filtered to
 // AgentTypeAssistant.
+//
+// --json (Part 6 Slice 6.1, 2026-05-25): emit a JSON array of
+// AssistantListEntryJSON. Empty result is the literal `[]\n` (NOT
+// the human-text "No assistants registered." message) so callers
+// can `length === 0` check the parsed result without string parsing.
 func (c *CLI) assistantList(args []string) error {
+	flags, _ := ParseFlags(args)
+	outputJSON := flags["json"] == "true"
+
 	if err := c.ensureDaemonRunning(); err != nil {
 		return err
 	}
@@ -646,26 +767,14 @@ func (c *CLI) assistantList(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(virt) == 0 {
-		fmt.Println("No assistants registered.")
-		fmt.Println("Start one with: oat assistant start")
-		return nil
-	}
 
-	// For each virtual repo, fetch its agents (cheap: in-memory)
-	// and find the AgentTypeAssistant record (there's at most one
-	// per virtual repo by convention).
-	fmt.Printf("Assistants (%d):\n\n", len(virt))
-	fmt.Printf("  %-20s  %-10s  %-30s  %-6s\n", "NAME", "STATE", "MODEL", "PID")
-	fmt.Printf("  %s\n", strings.Repeat("-", 70))
+	entries := make([]AssistantListEntryJSON, 0, len(virt))
 	for repoKey := range virt {
 		name := strings.TrimPrefix(repoKey, "_assistant-")
-		// Local var name avoids shadowing the imported `state`
-		// package; the table column is "STATE".
-		runState := "stopped"
-		model := "(default)"
-		pidStr := "-"
-
+		entry := AssistantListEntryJSON{
+			Name:  name,
+			State: "stopped",
+		}
 		resp, err := c.sendDaemonRequest("list_agents", map[string]interface{}{
 			"repo": repoKey,
 			"rich": true,
@@ -677,21 +786,46 @@ func (c *CLI) assistantList(args []string) error {
 					pid = int(v)
 				}
 				if m, _ := rec["model"].(string); m != "" {
-					model = m
+					entry.Model = m
 				}
+				entry.PID = pid
 				if pid > 0 {
-					pidStr = fmt.Sprintf("%d", pid)
 					if isProcessAlive(pid) {
-						runState = "running"
+						entry.State = "running"
 					} else {
-						runState = "dead"
+						entry.State = "dead"
 					}
 				} else {
-					runState = "registered"
+					entry.State = "registered"
 				}
 			}
 		}
-		fmt.Printf("  %-20s  %-10s  %-30s  %-6s\n", name, runState, model, pidStr)
+		entries = append(entries, entry)
+	}
+
+	if outputJSON {
+		return emitAssistantJSON(entries)
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No assistants registered.")
+		fmt.Println("Start one with: oat assistant start")
+		return nil
+	}
+
+	fmt.Printf("Assistants (%d):\n\n", len(entries))
+	fmt.Printf("  %-20s  %-10s  %-30s  %-6s\n", "NAME", "STATE", "MODEL", "PID")
+	fmt.Printf("  %s\n", strings.Repeat("-", 70))
+	for _, e := range entries {
+		model := e.Model
+		if model == "" {
+			model = "(default)"
+		}
+		pidStr := "-"
+		if e.PID > 0 {
+			pidStr = fmt.Sprintf("%d", e.PID)
+		}
+		fmt.Printf("  %-20s  %-10s  %-30s  %-6s\n", e.Name, e.State, model, pidStr)
 	}
 	return nil
 }

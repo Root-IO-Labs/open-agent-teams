@@ -24,6 +24,10 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -202,5 +206,220 @@ func TestRegisterAssistantCommands_Part5d(t *testing.T) {
 		if !found {
 			t.Errorf("undocumented `oat assistant %s` subcommand present", verb)
 		}
+	}
+}
+
+// captureStdout runs fn while redirecting os.Stdout to a pipe, then
+// returns everything fn wrote. Used by the JSON-output tests so they
+// can assert on the actual byte stream produced by emitAssistantJSON.
+// The Part 6a NM RPC handlers will parse the same byte stream, so an
+// assertion on the test side is the same contract as the production
+// caller.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+
+	done := make(chan struct{})
+	var buf bytes.Buffer
+	go func() {
+		_, _ = io.Copy(&buf, r)
+		close(done)
+	}()
+
+	fn()
+	_ = w.Close()
+	<-done
+	return buf.String()
+}
+
+// TestAssistantStatusJSON_Schema_Part6Slice1 pins the wire shape
+// emitted by `oat assistant status --json`. Part 6a's NM RPC handler
+// (`oat_assistant_status` in oat-browser-agent's nm-broker.ts) JSON-
+// parses this exact byte stream — a silent rename of any field, or a
+// shift in the State enum vocabulary, breaks the side-panel control
+// area without surfacing as a Go-side test failure. So pin both:
+//
+//  1. JSON keys (snake_case, exact spellings).
+//  2. State enum strings (matches the docstring on AssistantStatusJSON).
+func TestAssistantStatusJSON_Schema_Part6Slice1(t *testing.T) {
+	t.Run("full populated row round-trips byte-stable", func(t *testing.T) {
+		in := AssistantStatusJSON{
+			Name:                  "work",
+			RepoKey:               "_assistant-work",
+			AgentName:             "work",
+			State:                 "running",
+			PID:                   12345,
+			Model:                 "anthropic:claude-sonnet-4-6",
+			ModelSwappedOnRestart: true,
+			ModelSwapReason:       "model unavailable on this host",
+		}
+		got := captureStdout(t, func() {
+			if err := emitAssistantJSON(in); err != nil {
+				t.Fatalf("emitAssistantJSON: %v", err)
+			}
+		})
+		var back AssistantStatusJSON
+		if err := json.Unmarshal([]byte(got), &back); err != nil {
+			t.Fatalf("emitted JSON did not round-trip: %v\n%s", err, got)
+		}
+		if back != in {
+			t.Errorf("round-trip mismatch:\n  in:  %#v\n  out: %#v", in, back)
+		}
+		// Snake_case key spot-check on the literal bytes — Go's
+		// default Marshal would have emitted "Name", "RepoKey", etc.
+		// without struct tags. The NM RPC handler greps for these
+		// keys so a typo here would silently nullify a field.
+		for _, key := range []string{
+			`"name"`, `"repo_key"`, `"agent_name"`, `"state"`,
+			`"pid"`, `"model"`, `"model_swapped_on_restart"`,
+			`"model_swap_reason"`,
+		} {
+			if !strings.Contains(got, key) {
+				t.Errorf("expected key %s in JSON, missing from:\n%s", key, got)
+			}
+		}
+	})
+
+	t.Run("swap_reason is omitempty when not set", func(t *testing.T) {
+		in := AssistantStatusJSON{
+			Name:      "personal",
+			RepoKey:   "_assistant-personal",
+			AgentName: "personal",
+			State:     "stopped",
+		}
+		got := captureStdout(t, func() {
+			if err := emitAssistantJSON(in); err != nil {
+				t.Fatalf("emitAssistantJSON: %v", err)
+			}
+		})
+		if strings.Contains(got, "model_swap_reason") {
+			t.Errorf("model_swap_reason should be omitted when empty, got:\n%s", got)
+		}
+		// model (no omitempty) MUST still appear with empty string —
+		// the side panel uses field presence to know whether to ask
+		// the daemon for a default. If the key disappears, the side
+		// panel can't distinguish "not set" from "key missing in
+		// older daemon" — making "" explicit closes that gap.
+		if !strings.Contains(got, `"model": ""`) {
+			t.Errorf("expected explicit empty model, got:\n%s", got)
+		}
+	})
+
+	t.Run("state enum vocabulary is exactly the documented set", func(t *testing.T) {
+		// Documented in the AssistantStatusJSON docstring. If you add
+		// a new state, also add it here AND update the side-panel
+		// renderer in oat-browser-agent/extension/src/sidepanel.ts.
+		want := map[string]bool{
+			"no_repo":                true,
+			"stopped":                true,
+			"running":                true,
+			"registered_not_running": true,
+		}
+		for state := range want {
+			in := AssistantStatusJSON{State: state}
+			data, _ := json.Marshal(in)
+			if !strings.Contains(string(data), `"state":"`+state+`"`) {
+				t.Errorf("state %q did not round-trip in marshal: %s", state, data)
+			}
+		}
+	})
+}
+
+// TestAssistantListEntryJSON_Schema_Part6Slice1 pins the list-row
+// shape. List has a wider state enum than status (adds "dead" and
+// "registered") because list shows EVERY registered virtual repo
+// including ones whose agent records are stale; status is always
+// addressed at one specific assistant and degrades the same row to
+// "registered_not_running" or "stopped" instead. Document this
+// asymmetry here so a future refactor doesn't unify them naively.
+func TestAssistantListEntryJSON_Schema_Part6Slice1(t *testing.T) {
+	t.Run("populated row round-trips byte-stable", func(t *testing.T) {
+		in := []AssistantListEntryJSON{
+			{Name: "personal", State: "running", Model: "anthropic:claude-sonnet-4-6", PID: 99},
+			{Name: "work", State: "stopped", Model: "", PID: 0},
+			{Name: "crashed", State: "dead", Model: "anthropic:claude-opus-4-7", PID: 4242},
+			{Name: "registered-only", State: "registered", Model: "", PID: 0},
+		}
+		got := captureStdout(t, func() {
+			if err := emitAssistantJSON(in); err != nil {
+				t.Fatalf("emitAssistantJSON: %v", err)
+			}
+		})
+		var back []AssistantListEntryJSON
+		if err := json.Unmarshal([]byte(got), &back); err != nil {
+			t.Fatalf("emitted JSON did not round-trip: %v\n%s", err, got)
+		}
+		if len(back) != len(in) {
+			t.Fatalf("length mismatch: got %d, want %d", len(back), len(in))
+		}
+		for i := range in {
+			if back[i] != in[i] {
+				t.Errorf("row %d mismatch:\n  in:  %#v\n  out: %#v", i, in[i], back[i])
+			}
+		}
+		for _, key := range []string{`"name"`, `"state"`, `"model"`, `"pid"`} {
+			if !strings.Contains(got, key) {
+				t.Errorf("expected key %s in JSON, missing from:\n%s", key, got)
+			}
+		}
+	})
+
+	t.Run("empty list emits literal []", func(t *testing.T) {
+		// Part 6a NM RPC handler does `length === 0` on the parsed
+		// result; if we emitted `null` (the Go-default for nil slice
+		// without preallocation) the handler would crash. Pin the
+		// empty-slice path so the assistantList preallocation
+		// `make([]AssistantListEntryJSON, 0, len(virt))` stays
+		// preallocated.
+		var empty []AssistantListEntryJSON = make([]AssistantListEntryJSON, 0)
+		got := captureStdout(t, func() {
+			if err := emitAssistantJSON(empty); err != nil {
+				t.Fatalf("emitAssistantJSON: %v", err)
+			}
+		})
+		trimmed := strings.TrimSpace(got)
+		if trimmed != "[]" {
+			t.Errorf("expected literal '[]' for empty list, got %q", trimmed)
+		}
+	})
+
+	t.Run("list state enum vocabulary is exactly the documented set", func(t *testing.T) {
+		// Wider than status — see docstring on AssistantListEntryJSON.
+		want := []string{"running", "stopped", "dead", "registered"}
+		for _, state := range want {
+			in := AssistantListEntryJSON{Name: "x", State: state}
+			data, _ := json.Marshal(in)
+			if !strings.Contains(string(data), `"state":"`+state+`"`) {
+				t.Errorf("state %q did not round-trip in marshal: %s", state, data)
+			}
+		}
+	})
+}
+
+// TestEmitAssistantJSON_Indentation_Part6Slice1 pins the indentation
+// convention (2 spaces, trailing newline) so the Part 6a tests in
+// oat-browser-agent that snapshot CLI stdout don't drift if a future
+// refactor swaps to `json.Marshal` (no indent) or to 4 spaces.
+func TestEmitAssistantJSON_Indentation_Part6Slice1(t *testing.T) {
+	in := AssistantStatusJSON{Name: "x", State: "stopped"}
+	got := captureStdout(t, func() {
+		if err := emitAssistantJSON(in); err != nil {
+			t.Fatalf("emitAssistantJSON: %v", err)
+		}
+	})
+	if !strings.HasSuffix(got, "\n") {
+		t.Errorf("expected trailing newline, got %q", got)
+	}
+	// 2-space indentation marker — any nested key should be preceded
+	// by exactly 2 spaces (not 4, not tab). The literal "  \"" check
+	// catches accidental tab/4-space drift.
+	if !strings.Contains(got, "  \"name\"") {
+		t.Errorf("expected 2-space indent before \"name\", got:\n%s", got)
 	}
 }

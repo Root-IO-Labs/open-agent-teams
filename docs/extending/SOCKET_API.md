@@ -14,6 +14,9 @@ list_agents
 complete_agent
 agent_waiting
 restart_agent
+restart_browser_agent
+reset_assistant_session
+set_agent_model
 trigger_cleanup
 repair_state
 get_repo_config
@@ -31,7 +34,11 @@ start_repo_agents
 start_worker
 send_agent_input
 agent_input
+stream_output
+stream_events
 stream_agent_output
+stream_assistant_turns
+stream_context_capacity
 interrupt_agent
 escape_agent
 start_verification
@@ -63,6 +70,9 @@ Each command below matches a `case` in `handleRequest`.
 | `list_agents` | List agents for a repo | `repo` |
 | `complete_agent` | Mark agent ready for cleanup | `repo`, `name`, `summary`, `failure_reason` |
 | `restart_agent` | Restart a persistent agent | `repo`, `name` |
+| `restart_browser_agent` | Restart the bridge-attached browser-agent identified by `session` (`OAT_BROWSER_AGENT_SESSION`). Same identity model as `agent_input`; restricted to `AgentTypeBrowser`. | `session` (string), `agent` (string, optional — defaults to single agent in the session) |
+| `reset_assistant_session` | Wipe an assistant's session JSONL (used by the side panel's "Reset session" button). With `full: true`, also clears the agent's scratchpad directory. Restricted to `AgentTypeAssistant`; idempotent on missing files. Identified by `(session, agent)` for parity with `agent_input`. | `session` (string), `agent` (string), `full` (bool, optional) |
+| `set_agent_model` | Persist a new `model` preference on an agent record. Takes effect on the next restart; clears any auto-swap markers (`model_swapped_on_restart` / `model_swap_reason` / `model_swap_previous`) so the operator's explicit choice supersedes a prior daemon-side auto-swap. Response includes `was_running` so the CLI/UI can show the right "restart for this to take effect" copy. | `repo` (string), `agent` (string), `model` (string, canonical id like `anthropic:claude-sonnet-4-6`) |
 | `trigger_cleanup` | Force cleanup cycle | none |
 | `repair_state` | Run state repair routine | none |
 | `get_repo_config` | Get merge-queue / pr-shepherd config | `repo` |
@@ -76,7 +86,11 @@ Each command below matches a `case` in `handleRequest`.
 | `start_verification` | Mark a worker as awaiting verification, pin `worker.BaseSHA` (from CLI-provided `base_sha` or daemon-side snapshot), and pin the verifier agent name. Called by `oat worker request-review` before `start_verification_agent`. | `repo`, `worker`, `verifier`, `commit_sha`, `base_sha` (optional) |
 | `start_verification_agent` | Start a verification agent process via daemon backend (auto-retires completed verifiers on re-request) | `repo`, `agent`, `worktree_path` |
 | `agent_input` | Side-panel chat PTY-injection. Identifies the agent by `session` (matched against `repo.SessionName`) rather than by `repo` so the oat-browser-agent bridge can use the `OAT_BROWSER_AGENT_SESSION` env var directly. Input is sanitized via `internal/socket.SanitizePTYInput` to mitigate control-character prompt injection (Dropbox 2024); rejected with a structured error if it strips more than 5% injection-class C0 bytes, exceeds 32 KiB, contains invalid UTF-8, or — in interrupt mode — is anything other than the single byte `0x03`. **Restricted to `AgentTypeBrowser` agents only**; other types return an error so a misconfigured or malicious bridge cannot reach the supervisor/worker PTY through this verb. | `session` (string, matched against `repo.SessionName`), `agent` (string, agent name within the session), `text` (string, raw text — sanitized at the daemon edge), `interrupt` (bool, optional; when `true` the text must be exactly `\x03` and the input bypasses the C0 strip rules) |
+| `stream_output` | **(streaming verb.)** Line-buffered tail of an agent's PTY log. Used by `oat ui` and other operator-facing tools. Distinct from `stream_agent_output` (which is raw bytes for the side-panel debug view) — this verb only emits complete lines and strips ANSI escapes. | `repo` (string), `agent` (string) |
+| `stream_events` | **(streaming verb.)** Long-lived stream of daemon-level events (agent lifecycle, message routing, cleanup cycles). Used by monitoring/extension integrations to react to state changes without polling `status`. | none |
 | `stream_agent_output` | **(streaming verb — handshake then long-lived JSON-line stream.)** Side-panel chat PTY-output stream. Fans out raw, unmodified PTY byte chunks (including ANSI escapes — unlike the existing line-based `stream_output`) to the oat-browser-agent bridge so the side panel can render both a pretty activity indicator (bytes-flowed heartbeat) and an authentic debug terminal. Throttled at the daemon socket boundary to 16 ms minimum batch interval. Backpressure: if the subscriber's frame channel fills (~256 KiB worth of in-flight chunks at typical chunk sizes), additional bytes are dropped and surface as a `{"gap": N, "ts": "..."}` frame on the next successful flush. Identifies the agent by `(session, agent)` to match the bridge's `OAT_BROWSER_AGENT_*` env vars. **Restricted to `AgentTypeBrowser` agents only**, same boundary as `agent_input`. Frame schema: `{"chunk": "<base64>", "ts": "<rfc3339nano>"}` for raw bytes, `{"gap": N, "ts": "..."}` for drops, `{"done": true}` on agent exit, `{"error": "..."}` on unrecoverable failure. | `session` (string, matched against `repo.SessionName`), `agent` (string, agent name within the session) |
+| `stream_assistant_turns` | **(streaming verb.)** Per-turn structured event stream for AgentTypeAssistant: turn-start, tool-call, tool-result, assistant-message, turn-end. The oat-browser-agent bridge subscribes once per assistant and fans the events out as side-panel chat bubbles. Distinct from `stream_agent_output` because the bridge needs the structured turn semantics (e.g. to render tool-call panels) — the raw PTY bytes don't carry that information cleanly. Restricted to `AgentTypeAssistant`. | `session` (string), `agent` (string) |
+| `stream_context_capacity` | **(streaming verb — Part 5e Slice B.)** Pushes per-turn context-capacity frames (`{pct, tier, used_tokens, limit_tokens, ts}`) so the side panel can render the amber pill (85%) and red banner (90%) without polling. Dedupe: the daemon only emits when the agent crosses a tier boundary (including drops back to `ok` after a successful compaction), so quiet conversations produce one frame per turn. Restricted to `AgentTypeAssistant`. | `session` (string), `agent` (string) |
 
 ## Minimal client examples
 

@@ -305,19 +305,51 @@ func parseStateStructsFromDocs() (map[string][]string, error) {
 	return structs, nil
 }
 
-// parseSocketCommandsFromCode extracts socket commands from handleRequest.
+// parseSocketCommandsFromCode extracts socket commands from the daemon's
+// command dispatchers. Two source files contribute: `handleRequest` in
+// `daemon.go` for the regular request/response verbs, and `HandleStream`
+// in `stream_handler.go` for the long-lived streaming verbs. The two
+// dispatchers are separate because streams require holding the
+// connection open beyond a single request, but they share the same
+// docs marker — operators don't care which file a verb lives in.
 func parseSocketCommandsFromCode() ([]string, error) {
+	var commands []string
+
+	type dispatcher struct {
+		file string
+		fn   string
+	}
+	dispatchers := []dispatcher{
+		{"internal/daemon/daemon.go", "handleRequest"},
+		{"internal/daemon/stream_handler.go", "HandleStream"},
+	}
+	for _, d := range dispatchers {
+		got, err := extractSwitchCaseStrings(d.file, d.fn)
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, got...)
+	}
+	return uniqueSorted(commands), nil
+}
+
+// extractSwitchCaseStrings parses the named Go file and returns the
+// quoted string literals from every `case "..."` clause inside the
+// named function's top-level `switch req.Command { ... }` statement.
+// Shared by parseSocketCommandsFromCode so streaming verbs and
+// request/response verbs get tracked the same way.
+func extractSwitchCaseStrings(filePath, funcName string) ([]string, error) {
 	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, "internal/daemon/daemon.go", nil, 0)
+	node, err := parser.ParseFile(fset, filePath, nil, 0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse daemon.go: %w", err)
+		return nil, fmt.Errorf("failed to parse %s: %w", filePath, err)
 	}
 
 	var commands []string
 
 	ast.Inspect(node, func(n ast.Node) bool {
 		fn, ok := n.(*ast.FuncDecl)
-		if !ok || fn.Name == nil || fn.Name.Name != "handleRequest" {
+		if !ok || fn.Name == nil || fn.Name.Name != funcName {
 			return true
 		}
 
@@ -348,7 +380,7 @@ func parseSocketCommandsFromCode() ([]string, error) {
 		return false
 	})
 
-	return uniqueSorted(commands), nil
+	return commands, nil
 }
 
 // parseSocketCommandsFromDocs reads socket command list from marker comments.

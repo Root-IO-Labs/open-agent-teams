@@ -86,13 +86,13 @@ oat assistant start [name]                            # Spawn (default name: per
 oat assistant start work --model anthropic:claude-opus-4-7  # Multiple in parallel
 oat assistant stop [name]                             # Gracefully stop
 oat assistant restart [name] [--fresh]                # --fresh wipes session JSONL
-oat assistant status [name]                           # Model / PID / state
+oat assistant status [name] [--json]                  # Model / PID / state (--json for machine output)
 oat assistant attach [name]                           # Alias for `oat ui --repo`
 oat assistant set-model <id> [name]                   # Update model (next restart)
 oat assistant reset [name] [--full]                   # Wipe session JSONL
 oat assistant compact [name]                          # Synthetic compaction
 oat assistant logs [name] [--follow]                  # Tail output log
-oat assistant list                                    # All assistants + state
+oat assistant list [--json]                           # All assistants + state (--json for machine output)
 ```
 
 Daemon auto-starts if missing. Assistants live in virtual repos (`_assistant-<name>`); hidden from `oat repo list` unless `--all`. Full walkthrough: [docs/ASSISTANT.md](ASSISTANT.md).

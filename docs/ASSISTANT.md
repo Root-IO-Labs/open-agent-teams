@@ -33,13 +33,13 @@ The assistant lives in a **virtual repo** (`_assistant-<name>` under `~/.oat/rep
 oat assistant start [name] [--model <id>] [--open-panel]   # idempotent
 oat assistant stop [name]                                   # gracefully stop
 oat assistant restart [name] [--fresh]                      # --fresh wipes JSONL
-oat assistant status [name]                                 # model / PID / state
+oat assistant status [name] [--json]                        # model / PID / state (--json for machine output)
 oat assistant attach [name]                                 # alias for `oat ui --repo`
 oat assistant set-model <id> [name]                         # update model (next restart)
 oat assistant reset [name] [--full]                         # wipe session JSONL
 oat assistant compact [name]                                # synthetic compaction
 oat assistant logs [name] [--follow]                        # tail output log
-oat assistant list                                          # all assistants
+oat assistant list [--json]                                 # all assistants (--json for machine output)
 ```
 
 Default name is `personal` if you omit `[name]`.
