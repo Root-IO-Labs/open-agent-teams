@@ -1180,6 +1180,11 @@ Aliases for --allowed-worker-models: --available-worker-models, --allowed-models
 
 	c.rootCmd.Subcommands["agents"] = agentsCmd
 
+	// Part 5d: `oat assistant <verb>` tree for persistent personal
+	// assistants. Lives in internal/cli/assistant.go so the
+	// 10-verb dispatch doesn't bloat this already-5500-line file.
+	c.registerAssistantCommands()
+
 	// TUI command
 	c.rootCmd.Subcommands["ui"] = &Command{
 		Name:        "ui",
