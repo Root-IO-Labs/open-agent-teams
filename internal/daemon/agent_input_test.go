@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -382,6 +384,267 @@ func TestHandleRestartBrowserAgent_Validation(t *testing.T) {
 		})
 		if resp.Success {
 			t.Fatal("expected rejection for missing session arg, got success")
+		}
+	})
+}
+
+// TestHandleResetAssistantSession_Part5eSliceB4 pins the contract for
+// the Reset session button's daemon-side verb. What we verify:
+//
+//  1. Restricted to AgentTypeAssistant: workflow-helper browser-agents
+//     get a clean "restricted to assistant agent type" error so the
+//     bridge can surface it cleanly.
+//  2. Unknown session / unknown agent / missing args all error cleanly
+//     (mirrors restart_browser_agent's validation surface).
+//  3. Successful wipe: returns { wiped: true, agent, repo,
+//     scratchpad_cleared: bool }. With full=false, scratchpad is
+//     untouched. With full=true, scratchpad gets removed AND the
+//     field reports true.
+//  4. Idempotent on missing session JSONL: a Reset issued against an
+//     assistant whose session JSONL doesn't exist yet (fresh agent
+//     that hasn't accumulated context) is still a success -- not an
+//     error -- so the side panel doesn't surface a spurious failure
+//     when the user clicks Reset on a freshly-started assistant.
+func TestHandleResetAssistantSession_Part5eSliceB4(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	if err := d.state.AddRepo("_assistant-personal", &state.Repository{
+		SessionName: "_assistant-personal",
+		IsVirtual:   true,
+	}); err != nil {
+		t.Fatalf("AddRepo assistant: %v", err)
+	}
+	if err := d.state.AddRepo("my-repo", &state.Repository{
+		SessionName: "my-session",
+	}); err != nil {
+		t.Fatalf("AddRepo browser: %v", err)
+	}
+	if err := d.state.AddAgent("_assistant-personal", "personal", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "personal",
+	}); err != nil {
+		t.Fatalf("AddAgent assistant: %v", err)
+	}
+	if err := d.state.AddAgent("my-repo", "browser-agent", state.Agent{
+		Type:       state.AgentTypeBrowser,
+		WindowName: "browser-agent",
+	}); err != nil {
+		t.Fatalf("AddAgent browser: %v", err)
+	}
+	if err := d.state.AddAgent("my-repo", "supervisor", state.Agent{
+		Type:       state.AgentTypeSupervisor,
+		WindowName: "supervisor",
+	}); err != nil {
+		t.Fatalf("AddAgent supervisor: %v", err)
+	}
+
+	t.Run("rejects browser-agent type", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "my-session",
+				"agent":   "browser-agent",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for browser-agent type (only assistant is allowed)")
+		}
+		if !strings.Contains(resp.Error, "restricted to assistant agent type") {
+			t.Errorf("error %q should surface the assistant-only type-guard message", resp.Error)
+		}
+	})
+
+	t.Run("rejects supervisor (or any non-assistant)", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "my-session",
+				"agent":   "supervisor",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for supervisor agent")
+		}
+		if !strings.Contains(resp.Error, "restricted to assistant agent type") {
+			t.Errorf("error %q should surface the assistant-only type-guard message", resp.Error)
+		}
+	})
+
+	t.Run("rejects unknown session", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "no-such-session",
+				"agent":   "personal",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for unknown session")
+		}
+		if !strings.Contains(resp.Error, "no repository is bound") {
+			t.Errorf("error %q should explain session lookup failure", resp.Error)
+		}
+	})
+
+	t.Run("rejects unknown agent within resolved repo", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "_assistant-personal",
+				"agent":   "no-such-agent",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for unknown agent")
+		}
+		if !strings.Contains(resp.Error, "not found in session") {
+			t.Errorf("error %q should explain agent lookup failure", resp.Error)
+		}
+	})
+
+	t.Run("rejects missing session arg", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"agent": "personal",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for missing session arg")
+		}
+	})
+
+	t.Run("rejects missing agent arg", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "_assistant-personal",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for missing agent arg")
+		}
+	})
+
+	t.Run("succeeds with no session JSONL on disk (fresh assistant)", func(t *testing.T) {
+		// Idempotent contract: the side panel must not surface a
+		// spurious error when the user clicks Reset on a freshly-
+		// started assistant whose session JSONL hasn't been written
+		// yet. The wipe is best-effort -- missing file is success.
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "_assistant-personal",
+				"agent":   "personal",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success on missing JSONL (idempotent), got error: %v", resp.Error)
+		}
+		data, ok := resp.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("Data is not map[string]interface{}: %T", resp.Data)
+		}
+		if data["wiped"] != true {
+			t.Errorf("wiped = %v, want true", data["wiped"])
+		}
+		if data["agent"] != "personal" {
+			t.Errorf("agent = %v, want \"personal\"", data["agent"])
+		}
+		if data["repo"] != "_assistant-personal" {
+			t.Errorf("repo = %v, want \"_assistant-personal\"", data["repo"])
+		}
+		if data["scratchpad_cleared"] != false {
+			t.Errorf("scratchpad_cleared = %v, want false (full was not set)", data["scratchpad_cleared"])
+		}
+	})
+
+	t.Run("wipes an existing session JSONL on disk", func(t *testing.T) {
+		// Pre-create the session JSONL the runtime would have left
+		// behind. The verb must remove it AND report wiped: true.
+		jsonlPath := d.paths.AgentLogFile("_assistant-personal", "personal", false)
+		jsonlPath = strings.TrimSuffix(jsonlPath, ".log") + ".session.jsonl"
+		if err := os.MkdirAll(filepath.Dir(jsonlPath), 0o755); err != nil {
+			t.Fatalf("mkdir parent: %v", err)
+		}
+		if err := os.WriteFile(jsonlPath, []byte("simulated session content\n"), 0o644); err != nil {
+			t.Fatalf("write fake JSONL: %v", err)
+		}
+
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "_assistant-personal",
+				"agent":   "personal",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success, got error: %v", resp.Error)
+		}
+		if _, err := os.Stat(jsonlPath); !os.IsNotExist(err) {
+			t.Errorf("session JSONL still exists at %s (err=%v) -- wipe did not delete it", jsonlPath, err)
+		}
+	})
+
+	t.Run("full=true also clears the scratchpad directory", func(t *testing.T) {
+		// Pre-create a fake scratchpad dir so we can verify the wipe.
+		scratch := d.paths.ScratchpadDir("_assistant-personal")
+		if err := os.MkdirAll(filepath.Join(scratch, "subdir"), 0o755); err != nil {
+			t.Fatalf("mkdir scratchpad: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(scratch, "subdir", "note.txt"), []byte("simulated scratchpad content\n"), 0o644); err != nil {
+			t.Fatalf("write fake scratchpad file: %v", err)
+		}
+
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "_assistant-personal",
+				"agent":   "personal",
+				"full":    true,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success with full=true, got error: %v", resp.Error)
+		}
+		data, ok := resp.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("Data is not map[string]interface{}: %T", resp.Data)
+		}
+		if data["scratchpad_cleared"] != true {
+			t.Errorf("scratchpad_cleared = %v, want true (full was set + scratchpad existed)", data["scratchpad_cleared"])
+		}
+		if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+			t.Errorf("scratchpad dir still exists at %s (err=%v) -- full wipe did not remove it", scratch, err)
+		}
+	})
+
+	t.Run("full=true with no scratchpad is idempotent success", func(t *testing.T) {
+		// Same as above, but the scratchpad dir doesn't exist. The
+		// wipe attempt must succeed silently and report
+		// scratchpad_cleared: true (the dir is gone; the postcondition
+		// holds whether we removed it or it was never there).
+		scratch := d.paths.ScratchpadDir("_assistant-personal")
+		_ = os.RemoveAll(scratch) // ensure absent
+
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"session": "_assistant-personal",
+				"agent":   "personal",
+				"full":    true,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success with full=true and no scratchpad, got error: %v", resp.Error)
+		}
+		data, ok := resp.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("Data is not map[string]interface{}: %T", resp.Data)
+		}
+		if data["scratchpad_cleared"] != true {
+			t.Errorf("scratchpad_cleared = %v, want true (postcondition: dir is absent)", data["scratchpad_cleared"])
 		}
 	})
 }

@@ -1983,6 +1983,8 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 		return d.handleRestartAgent(req)
 	case "restart_browser_agent":
 		return d.handleRestartBrowserAgent(req)
+	case "reset_assistant_session":
+		return d.handleResetAssistantSession(req)
 	case "set_agent_model":
 		return d.handleSetAgentModel(req)
 
@@ -4396,6 +4398,91 @@ func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
 		"restarted": true,
 		"agent":     agentName,
 		"repo":      repoName,
+	})
+}
+
+// handleResetAssistantSession is Part 5e Slice B.4's daemon-side
+// implementation of the side-panel "Reset session" button (90% /
+// safety_net tier banner). Wipes the assistant's session-JSONL file
+// so the NEXT spawn starts fresh, with no LLM context carried over.
+// Optional `full` arg also clears the scratchpad directory (matching
+// `oat assistant reset --full`).
+//
+// The CLI's wipeAssistantSession in internal/cli/assistant.go does
+// the exact same wipe but from a CLI-side `os.Remove` -- the
+// extension cannot reach the filesystem, so this socket verb is
+// required to give the Reset button a daemon-mediated path. The two
+// implementations stay deliberately small and parallel; a future
+// refactor that wraps both in a shared helper is welcome but not in
+// scope for this commit.
+//
+// Identity model + restriction mirrors handleRestartBrowserAgent:
+//   - Addressed by (session, agent) so the bridge does not need to
+//     reverse-resolve the repo name.
+//   - Restricted to AgentTypeAssistant. Workflow-helper browser-
+//     agents have no concept of "session reset" -- they're short-
+//     lived task-bound and the operator restarts them via the
+//     existing restart_browser_agent path. Returning an error here
+//     is the right behaviour; the bridge's UI never wires a Reset
+//     button for non-assistant tiers anyway (the context_capacity
+//     stream is restricted to assistants, so the banner doesn't
+//     render for them).
+//
+// Returns { wiped: true, agent, repo, scratchpad_cleared: bool }.
+func (d *Daemon) handleResetAssistantSession(req socket.Request) socket.Response {
+	sessionName, errResp, ok := getRequiredStringArg(req.Args, "session", "session name is required")
+	if !ok {
+		return errResp
+	}
+	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
+	if !ok {
+		return errResp
+	}
+	full := getOptionalBoolArg(req.Args, "full", false)
+
+	repoName, _, found := d.findRepoBySession(sessionName)
+	if !found {
+		return socket.ErrorResponse("no repository is bound to session %q", sessionName)
+	}
+	agent, exists := d.state.GetAgent(repoName, agentName)
+	if !exists {
+		return socket.ErrorResponse("agent '%s' not found in session %q", agentName, sessionName)
+	}
+	if agent.Type != state.AgentTypeAssistant {
+		return socket.ErrorResponse("reset_assistant_session is restricted to assistant agent type; %s/%s is %s", repoName, agentName, agent.Type)
+	}
+
+	// Path derivation mirrors internal/cli/assistant.go:wipeAssistantSession.
+	// If the runtime ever renames the session-JSONL on-disk shape,
+	// both call-sites need to update in lockstep -- documented at the
+	// CLI side and pinned by a test there.
+	jsonlPath := d.paths.AgentLogFile(repoName, agentName, false)
+	jsonlPath = strings.TrimSuffix(jsonlPath, ".log") + ".session.jsonl"
+	if err := os.Remove(jsonlPath); err != nil && !os.IsNotExist(err) {
+		return socket.ErrorResponse("failed to wipe session JSONL %s: %v", jsonlPath, err)
+	}
+
+	scratchpadCleared := false
+	if full {
+		scratch := d.paths.ScratchpadDir(repoName)
+		if err := os.RemoveAll(scratch); err != nil && !os.IsNotExist(err) {
+			// Non-fatal: the JSONL wipe already succeeded so the
+			// primary reset-the-context goal is achieved. Surface
+			// the scratchpad failure in the response so the bridge
+			// can surface it to the user, but do NOT escalate to a
+			// full error response.
+			d.logger.Warn("reset_assistant_session: failed to clear scratchpad at %s for %s/%s: %v", scratch, repoName, agentName, err)
+		} else {
+			scratchpadCleared = true
+		}
+	}
+
+	d.logger.Info("reset_assistant_session: wiped %s for %s/%s (full=%v scratchpad_cleared=%v)", jsonlPath, repoName, agentName, full, scratchpadCleared)
+	return socket.SuccessResponse(map[string]interface{}{
+		"wiped":              true,
+		"agent":              agentName,
+		"repo":               repoName,
+		"scratchpad_cleared": scratchpadCleared,
 	})
 }
 
