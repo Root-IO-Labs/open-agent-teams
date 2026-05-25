@@ -109,15 +109,45 @@ func (d *Daemon) modelParamsJSON(modelID string) string {
 // Other agent types (worker, supervisor, merge-queue, review, verification,
 // pr-shepherd) keep the full tool catalog. Returns nil for those so callers
 // can `append(args, denyToolArgs(t)...)` unconditionally.
+// usesBrowserBridge returns true for agent types that spawn (or coexist
+// with) an oat-browser-agent bridge process. Today both AgentTypeBrowser
+// (workflow helpers) and AgentTypeAssistant (Part 5a personal assistants)
+// share the bridge — same MCP wiring via buildBrowserAgentMCPConfig, same
+// bridge-unreachable back-off semantics, same assistant-turn tailer for
+// side-panel chat. Callers should branch on this helper, NOT a raw
+// `agent.Type == state.AgentTypeBrowser` comparison, when their concern
+// is "is there a bridge involved?" rather than "is this specifically the
+// goal-driven workflow helper?". See Part 5a of the
+// side-panel-chat-and-status plan for the call-site audit.
+func usesBrowserBridge(t state.AgentType) bool {
+	return t == state.AgentTypeBrowser || t == state.AgentTypeAssistant
+}
+
 func denyToolArgs(agentType state.AgentType) []string {
-	if agentType != state.AgentTypeBrowser {
+	switch agentType {
+	case state.AgentTypeBrowser:
+		return []string{
+			"--deny-tool", "task",
+			"--deny-tool", "http_request",
+			"--deny-tool", "fetch_url",
+			"--deny-tool", "compact_conversation",
+		}
+	case state.AgentTypeAssistant:
+		// Part 5a + 5e: the assistant shares browser's "no task /
+		// no raw http" posture (its tool surface is bridge-mediated
+		// browsing, not orchestration or raw fetch), BUT it MUST
+		// retain `compact_conversation` because the entire 75/85/90/95
+		// capacity-tier mechanism in 5e relies on the agent (or the
+		// daemon, at 95% under OAT_CONTEXT_SAFETY_NET) being able to
+		// invoke it. Stripping it would silently disarm the
+		// safety net.
+		return []string{
+			"--deny-tool", "task",
+			"--deny-tool", "http_request",
+			"--deny-tool", "fetch_url",
+		}
+	default:
 		return nil
-	}
-	return []string{
-		"--deny-tool", "task",
-		"--deny-tool", "http_request",
-		"--deny-tool", "fetch_url",
-		"--deny-tool", "compact_conversation",
 	}
 }
 
@@ -1016,7 +1046,7 @@ func (d *Daemon) checkAgentHealth() {
 					// Without this guard, the 2-min health-check
 					// loop spawns a doomed bridge subprocess every
 					// cycle and burns tokens on its startup banner.
-					if agent.Type == state.AgentTypeBrowser {
+					if usesBrowserBridge(agent.Type) {
 						failures := d.recordBridgeUnreachable(cooldownKey, time.Now())
 						if failures >= bridgeUnreachableThreshold {
 							d.logger.Warn(
@@ -1049,7 +1079,7 @@ func (d *Daemon) checkAgentHealth() {
 						// Browser-agent: a successful restart clears
 						// the failure window. The next dead-check
 						// starts the counter over.
-						if agent.Type == state.AgentTypeBrowser {
+						if usesBrowserBridge(agent.Type) {
 							d.clearBridgeUnreachable(cooldownKey)
 						}
 					}
@@ -1570,12 +1600,17 @@ func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now 
 			message = "[daemon] Status check: Update on your review progress?"
 		case state.AgentTypeVerification:
 			message = "[daemon] Status check: Update on your verification progress? Deliver your verdict soon."
-		// AgentTypeBrowser is intentionally NOT nudged. Per Part 2 of
-		// the mcp-and-opt-in-browser-agent plan: browser-agent is a
-		// tool, not a worker. It receives tasks via inter-agent
-		// messaging (supervisor / worker → browser-agent) and sits
-		// silent between tasks. A "status check" nudge would waste an
-		// LLM turn to answer "nothing happening" between tool calls.
+		// AgentTypeBrowser and AgentTypeAssistant are intentionally
+		// NOT nudged. Per Part 2 of mcp-and-opt-in-browser-agent:
+		// browser-agent is a tool, not a worker; it receives tasks via
+		// inter-agent messaging and sits silent between tasks. Per
+		// Part 5a of side-panel-chat-and-status: AgentTypeAssistant
+		// receives its tasks from side-panel chat (user input) and
+		// sits silent between user messages. In both cases a "status
+		// check" nudge would waste an LLM turn to answer "nothing
+		// happening" -- the wrong UX for the assistant especially,
+		// which would otherwise interrupt the user with unsolicited
+		// status messages in the side panel.
 		case state.AgentTypeGenericPersistent:
 			message = "[daemon] Status check: Update on your progress?"
 		default:
@@ -2023,12 +2058,26 @@ func (d *Daemon) handleStatus(req socket.Request) socket.Response {
 func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 	repos := d.state.GetAllRepos()
 
+	// Part 5c: virtual repos (IsVirtual == true; today only
+	// `_assistant-<name>` repos) are hidden from the default
+	// `oat repo list` output. The user shouldn't have to scroll
+	// past their personal assistant's bookkeeping when listing
+	// real source-code repos. `include_virtual` (default false) is
+	// the opt-in toggle the CLI flips when the user passes
+	// `oat repo list --all`. The simple (non-rich) backward-compat
+	// branch honors the same filter so CLI verbs that just want
+	// the name set don't accidentally enumerate assistants.
+	includeVirtual := getOptionalBoolArg(req.Args, "include_virtual", false)
+
 	// Check if rich format is requested
 	rich := getOptionalBoolArg(req.Args, "rich", false)
 	if !rich {
 		// Return simple list for backward compatibility
 		repoNames := make([]string, 0, len(repos))
-		for name := range repos {
+		for name, repo := range repos {
+			if !includeVirtual && repo.IsVirtual {
+				continue
+			}
 			repoNames = append(repoNames, name)
 		}
 		return socket.SuccessResponse(repoNames)
@@ -2037,6 +2086,9 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 	// Return detailed repo info
 	repoDetails := make([]map[string]interface{}, 0, len(repos))
 	for repoName, repo := range repos {
+		if !includeVirtual && repo.IsVirtual {
+			continue
+		}
 		// Count agents by type
 		workerCount := 0
 		swappedModelCount := 0
@@ -2075,6 +2127,7 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 			"pr_management_mode":  prManagementMode,
 			"idle_mode":           repo.IdleMode,
 			"swapped_model_count": swappedModelCount,
+			"is_virtual":          repo.IsVirtual,
 		})
 	}
 
@@ -2088,9 +2141,25 @@ func (d *Daemon) handleAddRepo(req socket.Request) socket.Response {
 		return errResp
 	}
 
-	githubURL, errResp, ok := getRequiredStringArg(req.Args, "github_url", "GitHub repository URL is required (e.g., 'https://github.com/owner/repo')")
-	if !ok {
-		return errResp
+	// Part 5c: virtual repos have no GitHub remote. The CLI's
+	// virtual-repo helper passes `is_virtual=true` along with an
+	// empty `github_url`, so we must read `is_virtual` BEFORE the
+	// github_url requirement check and bypass it for virtual repos.
+	// Validated separately below; the empty string is the only
+	// permitted github_url value when is_virtual=true.
+	isVirtualArg := getOptionalBoolArg(req.Args, "is_virtual", false)
+	var githubURL string
+	if isVirtualArg {
+		githubURL = getOptionalStringArg(req.Args, "github_url", "")
+		if githubURL != "" {
+			return socket.ErrorResponse("virtual repositories must not have a github_url (got %q); they exist purely as containers for assistant-style agents", githubURL)
+		}
+	} else {
+		var resp socket.Response
+		githubURL, resp, ok = getRequiredStringArg(req.Args, "github_url", "GitHub repository URL is required (e.g., 'https://github.com/owner/repo')")
+		if !ok {
+			return resp
+		}
 	}
 
 	sessionName, errResp, ok := getRequiredStringArg(req.Args, "session_name", "session name is required")
@@ -2138,6 +2207,19 @@ func (d *Daemon) handleAddRepo(req socket.Request) socket.Response {
 		psConfig.Enabled = true
 	}
 
+	// Part 5c: `is_virtual` was already parsed at the top of the
+	// handler (so it can gate the `github_url` requirement check);
+	// reuse the value here. When true the daemon stores the repo
+	// as-is but the CLI's preflight has skipped `git clone`,
+	// `gh label create`, fork detection, merge-queue / pr-shepherd
+	// registration, etc. -- everything that assumes a real git
+	// remote. mqConfig / psConfig fields are still persisted
+	// (Enabled defaults to true) so that if a virtual repo is ever
+	// flipped to non-virtual the merge-queue / pr-shepherd configs
+	// are sensible; but the daemon's spawn paths gate on IsVirtual
+	// before reading them.
+	isVirtual := isVirtualArg
+
 	repo := &state.Repository{
 		GithubURL:        githubURL,
 		SessionName:      sessionName,
@@ -2146,13 +2228,16 @@ func (d *Daemon) handleAddRepo(req socket.Request) socket.Response {
 		PRShepherdConfig: psConfig,
 		ForkConfig:       forkConfig,
 		Model:            getOptionalStringArg(req.Args, "model", ""),
+		IsVirtual:        isVirtual,
 	}
 
 	if err := d.state.AddRepo(name, repo); err != nil {
 		return socket.ErrorResponse("%s", err.Error())
 	}
 
-	if forkConfig.IsFork {
+	if isVirtual {
+		d.logger.Info("Added virtual repository: %s (no git remote; for assistant-style agents)", name)
+	} else if forkConfig.IsFork {
 		d.logger.Info("Added repository: %s (fork of %s/%s, pr-shepherd: enabled=%v)", name, forkConfig.UpstreamOwner, forkConfig.UpstreamRepo, psConfig.Enabled)
 	} else {
 		d.logger.Info("Added repository: %s (merge queue: enabled=%v, track=%s)", name, mqConfig.Enabled, mqConfig.TrackMode)
@@ -2620,8 +2705,8 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// is allowed to address browser agents ONLY. Restricting at the
 	// daemon edge means a misconfigured bridge or a malicious WS
 	// peer can't escalate to "inject prompt text into the supervisor."
-	if agent.Type != state.AgentTypeBrowser {
-		return socket.ErrorResponse("agent_input is restricted to browser-agent type; %s/%s is %s", repoName, agentName, agent.Type)
+	if !usesBrowserBridge(agent.Type) {
+		return socket.ErrorResponse("agent_input is restricted to browser-bridge agent types (browser, assistant); %s/%s is %s", repoName, agentName, agent.Type)
 	}
 
 	sanitized, sErr := socket.SanitizePTYInput(text, socket.SanitizeOpts{AllowInterrupt: interrupt})
@@ -2787,7 +2872,7 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 			// Part 2g: stop the assistant-turn tailer for browser-agents
 			// so the next add+start spins up a fresh tailer rather than
 			// leaking a goroutine and a stale broadcaster.
-			if agent.Type == state.AgentTypeBrowser {
+			if usesBrowserBridge(agent.Type) {
 				d.stopAssistantTurnTailer(repo.SessionName, agentName)
 			}
 		}
@@ -2977,6 +3062,24 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 	agent, exists := d.state.GetAgent(repoName, agentName)
 	if !exists {
 		return socket.ErrorResponse("agent '%s' not found in repository '%s' - check available agents with: oat worker list --repo %s", agentName, repoName, repoName)
+	}
+
+	// Part 5a: AgentTypeAssistant defense-in-depth. The assistant
+	// prompt tells the model not to call `oat agent complete`, but if
+	// it improvises and calls anyway we don't want an error response
+	// that confuses the model into looping or escalating. Instead we
+	// log a WARN (so operators can see drift from the prompt) and
+	// return a no-op success so the agent moves on. Returning an
+	// error here would also propagate to the CLI and surface as a
+	// hard failure in the side panel, which the user can't easily
+	// recover from. Handled before the permanentTypes map so the
+	// no-op path takes precedence over the rejected-with-error path.
+	if agent.Type == state.AgentTypeAssistant {
+		d.logger.Warn("Assistant %s/%s called `oat agent complete` -- ignoring (assistants are persistent; no-op ACK)", repoName, agentName)
+		return socket.SuccessResponse(map[string]any{
+			"status":  "no_op",
+			"message": "Assistants are persistent and do not complete. The daemon ignored this call. Continue the conversation; the user is still here.",
+		})
 	}
 
 	// Guard: permanent agents (supervisor, workspace, merge-queue) cannot be completed.
@@ -3758,10 +3861,10 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// CLI `oat agent add browser-agent` runs the same probe at
 		// add-time so users get the actionable error earlier.
 		var mcpConfig string
-		if agent.Type == state.AgentTypeBrowser {
+		if usesBrowserBridge(agent.Type) {
 			cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName, repo.SessionName, agentName)
 			if mcpErr != nil {
-				d.logger.Warn("Browser agent %s/%s starting without MCP tools: %v", repoName, agentName, mcpErr)
+				d.logger.Warn("Bridge-using agent %s/%s (%s) starting without MCP tools: %v", repoName, agentName, agent.Type, mcpErr)
 			} else {
 				mcpConfig = cfg
 			}
@@ -3773,7 +3876,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// comment in restartAgent for the race-window post-mortem.
 		// Polling inside tailer.run() handles the "log file does not
 		// exist yet" case until the agent's first write.
-		if agent.Type == state.AgentTypeBrowser {
+		if usesBrowserBridge(agent.Type) {
 			d.startAssistantTurnTailer(repo.SessionName, agentName, logFile)
 		}
 
@@ -3830,7 +3933,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 	// No throttle: coexistence transitions are rare in practice and
 	// the log line is cheap; deferring to a future debouncer would
 	// risk silently dropping the very signal operators need to see.
-	if agent.Type == state.AgentTypeBrowser {
+	if usesBrowserBridge(agent.Type) {
 		others := countLiveBrowserAgentsExcept(d.state, repoName, agentName)
 		if others > 0 {
 			d.logger.Info(
@@ -3843,10 +3946,20 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 	return pid, nil
 }
 
-// countLiveBrowserAgentsExcept counts AgentTypeBrowser agents across
-// every repo that have a non-zero PID, EXCLUDING the (repoName,
-// agentName) just spawned (the caller has already written its PID
-// to state when this is called).
+// countLiveBrowserAgentsExcept counts bridge-using agents
+// (AgentTypeBrowser + AgentTypeAssistant — anything for which
+// usesBrowserBridge returns true) across every repo that have a
+// non-zero PID, EXCLUDING the (repoName, agentName) just spawned
+// (the caller has already written its PID to state when this is
+// called).
+//
+// Part 5a extended this counter from "browser only" to "any
+// bridge-using type" so the 5g.5 coexistence log fires for the new
+// browser↔assistant and assistant↔assistant scenarios too, not just
+// the original browser↔browser one. The name is retained (rather
+// than renamed to e.g. countLiveBridgeAgentsExcept) to avoid churning
+// the test surface that already pins the behavior; the docstring is
+// the source of truth for what it actually counts.
 //
 // "Live" here is the state-file truth (PID != 0). Health-check
 // reconciliation that clears stale PIDs runs every ~2 minutes; in
@@ -3858,7 +3971,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 // coexistence event).
 //
 // Cheap: a state snapshot iteration is O(repos * agents) and only
-// runs on browser-agent spawn. Not in any hot path.
+// runs on bridge-agent spawn. Not in any hot path.
 func countLiveBrowserAgentsExcept(s *state.State, excludeRepo, excludeAgent string) int {
 	count := 0
 	for repoName, repo := range s.GetAllRepos() {
@@ -3866,7 +3979,7 @@ func countLiveBrowserAgentsExcept(s *state.State, excludeRepo, excludeAgent stri
 			if repoName == excludeRepo && agentName == excludeAgent {
 				continue
 			}
-			if agent.Type != state.AgentTypeBrowser {
+			if !usesBrowserBridge(agent.Type) {
 				continue
 			}
 			if agent.PID == 0 {
@@ -4175,8 +4288,8 @@ func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
 	if !exists {
 		return socket.ErrorResponse("agent '%s' not found in session %q", agentName, sessionName)
 	}
-	if agent.Type != state.AgentTypeBrowser {
-		return socket.ErrorResponse("restart_browser_agent is restricted to browser-agent type; %s/%s is %s", repoName, agentName, agent.Type)
+	if !usesBrowserBridge(agent.Type) {
+		return socket.ErrorResponse("restart_browser_agent is restricted to browser-bridge agent types (browser, assistant); %s/%s is %s", repoName, agentName, agent.Type)
 	}
 	if agent.ReadyForCleanup {
 		return socket.ErrorResponse("agent '%s' is marked as complete and pending cleanup", agentName)
@@ -4201,7 +4314,7 @@ func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
 	if err := d.restartAgent(repoName, agentName, agent, repo); err != nil {
 		return socket.ErrorResponse("failed to restart agent: %v", err)
 	}
-	if agent.Type == state.AgentTypeBrowser {
+	if usesBrowserBridge(agent.Type) {
 		d.clearBridgeUnreachable(fmt.Sprintf("%s/%s", repoName, agentName))
 	}
 	d.logger.Info("Successfully restarted %s/%s from side-panel request", repoName, agentName)
@@ -4273,11 +4386,13 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 		return socket.ErrorResponse("failed to restart agent: %v", err)
 	}
 
-	// Browser-agent: a user-initiated restart clears the
-	// bridge-unreachable back-off window so the next failure starts
-	// the counter over rather than instantly tripping the threshold.
-	// Per Part 2 of mcp-and-opt-in-browser-agent_a10544be.plan.md.
-	if agent.Type == state.AgentTypeBrowser {
+	// Browser-bridge agents (browser, assistant): a user-initiated
+	// restart clears the bridge-unreachable back-off window so the
+	// next failure starts the counter over rather than instantly
+	// tripping the threshold. Per Part 2 of
+	// mcp-and-opt-in-browser-agent_a10544be.plan.md (extended to
+	// AgentTypeAssistant in Part 5a of side-panel-chat-and-status).
+	if usesBrowserBridge(agent.Type) {
 		d.clearBridgeUnreachable(fmt.Sprintf("%s/%s", repoName, agentName))
 	}
 
@@ -5973,10 +6088,10 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		// browser tools. Resolution failure logs a WARN; the agent
 		// still spawns so the operator can attach and diagnose.
 		var mcpConfig string
-		if cfg.agentType == state.AgentTypeBrowser {
+		if usesBrowserBridge(cfg.agentType) {
 			mc, mcpErr := d.buildBrowserAgentMCPConfig(repoName, repo.SessionName, cfg.agentName)
 			if mcpErr != nil {
-				d.logger.Warn("Browser agent %s/%s starting without MCP tools: %v", repoName, cfg.agentName, mcpErr)
+				d.logger.Warn("Bridge-using agent %s/%s (%s) starting without MCP tools: %v", repoName, cfg.agentName, cfg.agentType, mcpErr)
 			} else {
 				mcpConfig = mc
 			}
@@ -6285,7 +6400,7 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 	var promptText string
 
 	switch agentType {
-	case state.AgentTypeMergeQueue, state.AgentTypeWorker, state.AgentTypeReview, state.AgentTypeVerification, state.AgentTypeBrowser:
+	case state.AgentTypeMergeQueue, state.AgentTypeWorker, state.AgentTypeReview, state.AgentTypeVerification, state.AgentTypeBrowser, state.AgentTypeAssistant:
 		localAgentsDir := d.paths.RepoAgentsDir(repoName)
 		// Part 4.H: keep the per-repo agents/ dir in sync with the
 		// embedded templates on EVERY prompt-write call, not just on
@@ -6314,6 +6429,33 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 			if def.Name == defName {
 				promptText = def.Content
 				break
+			}
+		}
+
+		// Part 5b: for bridge-using agent types (browser + assistant),
+		// concatenate the shared `_shared-browser-safety.md` fragment
+		// after the per-type prompt. The fragment carries the
+		// safety-critical bits (Safety Rules / Prompt Injection
+		// Defense / Cross-Tab Discipline / Dedicated Agent Window)
+		// that both agents must obey -- sharing prevents drift
+		// between the two prompts' safety sections (the most
+		// security-sensitive part of the prompt; a fix in one would
+		// silently miss the other). Loaded via the same
+		// agents.NewReader path that already read the per-type
+		// definition, so the lookup is O(N) over a tiny N and adds
+		// no IO. The fragment's filename starts with "_" so it
+		// never matches an AgentType string and can't be picked up
+		// as a primary prompt by accident.
+		if usesBrowserBridge(agentType) {
+			const sharedFragmentName = "_shared-browser-safety"
+			for _, def := range definitions {
+				if def.Name == sharedFragmentName {
+					if promptText != "" {
+						promptText += "\n\n---\n\n"
+					}
+					promptText += def.Content
+					break
+				}
 			}
 		}
 
@@ -6564,10 +6706,10 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// been upgraded between the first spawn and the restart, and we
 	// always want to write the freshest .oat/mcp.json.
 	var mcpConfig string
-	if agent.Type == state.AgentTypeBrowser {
+	if usesBrowserBridge(agent.Type) {
 		cfg, mcpErr := d.buildBrowserAgentMCPConfig(repoName, repo.SessionName, agentName)
 		if mcpErr != nil {
-			d.logger.Warn("Browser agent %s/%s restarting without MCP tools: %v", repoName, agentName, mcpErr)
+			d.logger.Warn("Bridge-using agent %s/%s (%s) restarting without MCP tools: %v", repoName, agentName, agent.Type, mcpErr)
 		} else {
 			mcpConfig = cfg
 		}
@@ -6587,7 +6729,7 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// correctly). The tailer.run() goroutine itself polls until the
 	// log file exists, so registering early when the file may not
 	// yet be created is safe.
-	if os.Getenv("OAT_TEST_MODE") != "1" && agent.Type == state.AgentTypeBrowser {
+	if os.Getenv("OAT_TEST_MODE") != "1" && usesBrowserBridge(agent.Type) {
 		d.startAssistantTurnTailer(repo.SessionName, agentName, logFile)
 	}
 

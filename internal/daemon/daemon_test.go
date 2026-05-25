@@ -485,6 +485,174 @@ func TestHandleListRepos(t *testing.T) {
 	}
 }
 
+// Part 5c: handleListRepos must hide virtual repos by default and
+// include them only when include_virtual=true is passed. Tested
+// across both the simple (non-rich) and rich response shapes
+// because both code paths are wired separately. Also pins that the
+// rich payload carries `is_virtual` so the CLI can render virtual
+// repos with a distinguishing mode column.
+func TestHandleListRepos_VirtualFilter_Part5c(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	addRepo := func(name string, isVirtual bool) {
+		t.Helper()
+		repo := &state.Repository{
+			GithubURL:   "https://github.com/test/" + name,
+			SessionName: "oat-" + name,
+			Agents:      make(map[string]state.Agent),
+			IsVirtual:   isVirtual,
+		}
+		if err := d.state.AddRepo(name, repo); err != nil {
+			t.Fatalf("AddRepo(%q): %v", name, err)
+		}
+	}
+	addRepo("real-repo-1", false)
+	addRepo("real-repo-2", false)
+	addRepo("_assistant-personal", true)
+	addRepo("_assistant-work", true)
+
+	// Default (no include_virtual): only real repos visible in
+	// the simple shape.
+	respDefault := d.handleListRepos(socket.Request{Command: "list_repos"})
+	if !respDefault.Success {
+		t.Fatalf("default list_repos failed: %s", respDefault.Error)
+	}
+	names, ok := respDefault.Data.([]string)
+	if !ok {
+		t.Fatalf("default list_repos data shape: %T", respDefault.Data)
+	}
+	if len(names) != 2 {
+		t.Errorf("default list_repos: got %d names %v, want 2 (virtual repos must be hidden)", len(names), names)
+	}
+	for _, n := range names {
+		if strings.HasPrefix(n, "_assistant-") {
+			t.Errorf("default list_repos leaked virtual repo: %q", n)
+		}
+	}
+
+	// include_virtual=true: all four visible.
+	respAll := d.handleListRepos(socket.Request{
+		Command: "list_repos",
+		Args:    map[string]interface{}{"include_virtual": true},
+	})
+	if !respAll.Success {
+		t.Fatalf("include_virtual list_repos failed: %s", respAll.Error)
+	}
+	allNames, ok := respAll.Data.([]string)
+	if !ok {
+		t.Fatalf("include_virtual list_repos data shape: %T", respAll.Data)
+	}
+	if len(allNames) != 4 {
+		t.Errorf("include_virtual list_repos: got %d names %v, want 4 (all repos including virtual)", len(allNames), allNames)
+	}
+
+	// Rich shape default: only real repos, but each row carries
+	// the new `is_virtual` field so a CLI that opts in can branch
+	// without re-querying.
+	respRich := d.handleListRepos(socket.Request{
+		Command: "list_repos",
+		Args:    map[string]interface{}{"rich": true},
+	})
+	if !respRich.Success {
+		t.Fatalf("rich list_repos failed: %s", respRich.Error)
+	}
+	rows, ok := respRich.Data.([]map[string]interface{})
+	if !ok {
+		t.Fatalf("rich list_repos shape: %T", respRich.Data)
+	}
+	if len(rows) != 2 {
+		t.Errorf("rich list_repos default: got %d rows, want 2 (virtual hidden)", len(rows))
+	}
+	for _, row := range rows {
+		isV, present := row["is_virtual"].(bool)
+		if !present {
+			t.Errorf("rich list_repos row missing `is_virtual` field: %+v", row)
+		}
+		if isV {
+			t.Errorf("rich list_repos leaked virtual repo even with default filter: %+v", row)
+		}
+	}
+
+	// Rich shape with include_virtual=true: all four, and the
+	// virtual ones carry is_virtual=true while the real ones
+	// carry is_virtual=false.
+	respRichAll := d.handleListRepos(socket.Request{
+		Command: "list_repos",
+		Args:    map[string]interface{}{"rich": true, "include_virtual": true},
+	})
+	if !respRichAll.Success {
+		t.Fatalf("rich include_virtual failed: %s", respRichAll.Error)
+	}
+	allRows, _ := respRichAll.Data.([]map[string]interface{})
+	if len(allRows) != 4 {
+		t.Fatalf("rich include_virtual: got %d rows, want 4", len(allRows))
+	}
+	virtCount := 0
+	for _, row := range allRows {
+		if isV, _ := row["is_virtual"].(bool); isV {
+			virtCount++
+			name, _ := row["name"].(string)
+			if !strings.HasPrefix(name, "_assistant-") {
+				t.Errorf("row marked is_virtual but name lacks `_assistant-` prefix: %q", name)
+			}
+		}
+	}
+	if virtCount != 2 {
+		t.Errorf("rich include_virtual: got %d virtual rows, want 2", virtCount)
+	}
+}
+
+// Part 5c: handleAddRepo must honor `is_virtual=true` in the request
+// args. The persisted Repository.IsVirtual field is what every
+// downstream code path (list_repos filter, daemon spawn-skip
+// branches, future `oat assistant` verbs) gates on. Tested both
+// for the explicit-true case and the default-false case (no field
+// passed -> repo is treated as a real repo).
+func TestHandleAddRepo_IsVirtualFlag_Part5c(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	respVirtual := d.handleAddRepo(socket.Request{
+		Command: "add_repo",
+		Args: map[string]interface{}{
+			"name":         "_assistant-personal",
+			"github_url":   "",
+			"session_name": "oat-assistant-personal",
+			"is_virtual":   true,
+		},
+	})
+	if !respVirtual.Success {
+		t.Fatalf("add_repo is_virtual=true failed: %s", respVirtual.Error)
+	}
+	got, ok := d.state.GetRepo("_assistant-personal")
+	if !ok {
+		t.Fatalf("virtual repo not persisted")
+	}
+	if !got.IsVirtual {
+		t.Errorf("virtual repo persisted with IsVirtual=false (should be true)")
+	}
+
+	respReal := d.handleAddRepo(socket.Request{
+		Command: "add_repo",
+		Args: map[string]interface{}{
+			"name":         "real-repo",
+			"github_url":   "https://github.com/x/real",
+			"session_name": "oat-real-repo",
+		},
+	})
+	if !respReal.Success {
+		t.Fatalf("add_repo default failed: %s", respReal.Error)
+	}
+	gotReal, ok := d.state.GetRepo("real-repo")
+	if !ok {
+		t.Fatalf("real repo not persisted")
+	}
+	if gotReal.IsVirtual {
+		t.Errorf("default add_repo persisted with IsVirtual=true (should default to false)")
+	}
+}
+
 func TestHandleAddRepo(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
@@ -4644,13 +4812,15 @@ func TestCountLiveBrowserAgentsExcept(t *testing.T) {
 		t.Errorf("dead-PID exclusion: count = %d, want 1 (repoC has PID=0 so it must not count)", got)
 	}
 
-	// Non-browser types: NOT counted. The coexistence log is
-	// browser-agent specific; a worker / supervisor / etc.
+	// Non-bridge types: NOT counted. The coexistence log is
+	// bridge-agent specific (per Part 5a, this means
+	// AgentTypeBrowser OR AgentTypeAssistant; see the
+	// usesBrowserBridge helper). A worker / supervisor / etc.
 	// running alongside is normal and shouldn't trigger it.
 	addAgent("repoA", "worker-1", state.AgentTypeWorker, 3333)
 	addAgent("repoA", "supervisor", state.AgentTypeSupervisor, 4444)
 	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 1 {
-		t.Errorf("non-browser exclusion: count = %d, want 1 (worker + supervisor must not count)", got)
+		t.Errorf("non-bridge exclusion: count = %d, want 1 (worker + supervisor must not count)", got)
 	}
 
 	// Same repo, different name: two browser-agents in the same
@@ -4668,6 +4838,183 @@ func TestCountLiveBrowserAgentsExcept(t *testing.T) {
 	// "one other browser-agent", not 2).
 	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent-2"); got != 2 {
 		t.Errorf("self-exclusion from second agent: count = %d, want 2 (repoB + repoA/browser-agent)", got)
+	}
+
+	// Part 5a: AgentTypeAssistant is a bridge-using type and MUST
+	// be counted by this helper. Adding a live assistant in a
+	// fourth repo should bump the count for any spawn-perspective
+	// query that excludes only itself. This is the test that pins
+	// the 5g.5 Slice B behavior promised in the plan body
+	// ("coexistence log fires for browser↔assistant too").
+	mkRepo("repoD-assistant")
+	addAgent("repoD-assistant", "personal", state.AgentTypeAssistant, 7777)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 3 {
+		t.Errorf("assistant counted: count = %d, want 3 (repoB + repoA/browser-agent-2 + repoD-assistant/personal)", got)
+	}
+	// Self-exclusion symmetry: from the assistant's own spawn
+	// perspective the assistant must not count itself.
+	if got := countLiveBrowserAgentsExcept(d.state, "repoD-assistant", "personal"); got != 3 {
+		t.Errorf("assistant self-exclusion: count = %d, want 3 (the three browser-agents elsewhere)", got)
+	}
+	// And a dead assistant (PID=0) must not count, same contract
+	// as a dead browser.
+	mkRepo("repoE-dead-assistant")
+	addAgent("repoE-dead-assistant", "old", state.AgentTypeAssistant, 0)
+	if got := countLiveBrowserAgentsExcept(d.state, "repoA", "browser-agent"); got != 3 {
+		t.Errorf("dead assistant exclusion: count = %d, want 3 (PID=0 assistant must not count)", got)
+	}
+}
+
+// Part 5b: writePromptFileWithPrefix must concatenate
+// `_shared-browser-safety.md` AFTER the per-type prompt for both
+// AgentTypeBrowser and AgentTypeAssistant -- one source of truth
+// for the safety-critical bridge contract. Other agent types
+// (worker, supervisor, etc.) must NOT pick up the fragment; they
+// don't speak to the bridge and including it would (a) waste
+// tokens and (b) confuse the agent with a tool catalog it doesn't
+// have. We test all three branches here.
+//
+// We use SyncAgentTemplates to populate the per-repo agents dir
+// (the production code path), then call writePromptFileWithPrefix
+// and read the resulting prompt file from
+// `<paths.Root>/prompts/<agentName>.md` to verify the concat.
+func TestWritePromptFileWithPrefix_SharedSafetyFragment_Part5b(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// Make a repo dir so the agents/ subdir resolves under it.
+	const repoName = "test-repo"
+	if err := os.MkdirAll(d.paths.RepoDir(repoName), 0o755); err != nil {
+		t.Fatalf("MkdirAll repoDir: %v", err)
+	}
+
+	// Marker substring uniquely contained in the shared fragment.
+	// Picked from the SAFETY RULES section, which is the most
+	// security-sensitive bit and the one we MOST want to know is
+	// reaching the agent.
+	const sharedMarker = "Reach the same goals via the rules below"
+
+	cases := []struct {
+		agentType state.AgentType
+		want      bool // want shared fragment present
+	}{
+		{state.AgentTypeBrowser, true},
+		{state.AgentTypeAssistant, true},
+		{state.AgentTypeWorker, false},
+		{state.AgentTypeReview, false},
+		{state.AgentTypeMergeQueue, false},
+		{state.AgentTypeVerification, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.agentType), func(t *testing.T) {
+			agentName := "probe-" + string(tc.agentType)
+			promptPath, err := d.writePromptFileWithPrefix(repoName, tc.agentType, agentName, "")
+			if err != nil {
+				t.Fatalf("writePromptFileWithPrefix: %v", err)
+			}
+			content, err := os.ReadFile(promptPath)
+			if err != nil {
+				t.Fatalf("read written prompt: %v", err)
+			}
+			s := string(content)
+			has := strings.Contains(s, sharedMarker)
+			if has != tc.want {
+				t.Errorf("shared fragment presence for %s: got %v, want %v (len=%d)", tc.agentType, has, tc.want, len(s))
+			}
+			// For bridge types, also verify the per-type prompt's
+			// role line precedes the shared fragment -- the order
+			// matters because the agent reads its role first, then
+			// the shared safety rules. If the shared fragment came
+			// first the prompt would start with "## Safety Rules"
+			// (no role context above it).
+			if tc.want {
+				roleLineIdx := -1
+				switch tc.agentType {
+				case state.AgentTypeBrowser:
+					roleLineIdx = strings.Index(s, "You are a browser agent")
+				case state.AgentTypeAssistant:
+					roleLineIdx = strings.Index(s, "You are a personal AI assistant")
+				}
+				sharedIdx := strings.Index(s, sharedMarker)
+				if roleLineIdx < 0 {
+					t.Errorf("expected per-type role line in prompt for %s; got prompt: %.200s", tc.agentType, s)
+				}
+				if roleLineIdx >= 0 && sharedIdx >= 0 && roleLineIdx > sharedIdx {
+					t.Errorf("for %s, per-type role line came AFTER shared fragment (roleIdx=%d, sharedIdx=%d) -- expected role line first", tc.agentType, roleLineIdx, sharedIdx)
+				}
+			}
+		})
+	}
+}
+
+// Part 5a: usesBrowserBridge is the single source of truth for "this
+// agent type spawns / coexists with an oat-browser-agent bridge".
+// All daemon-side switch sites that used to gate on
+// AgentTypeBrowser now route through this helper so AgentTypeAssistant
+// gets identical wiring (MCP config, assistant-turn tailer, bridge
+// back-off, agent_input access). Pin the contract here so a future
+// refactor that, say, adds a third bridge-using type can grep for
+// usesBrowserBridge and find every site at once.
+func TestUsesBrowserBridge_Part5a(t *testing.T) {
+	cases := []struct {
+		agentType state.AgentType
+		want      bool
+	}{
+		{state.AgentTypeBrowser, true},
+		{state.AgentTypeAssistant, true},
+		{state.AgentTypeWorker, false},
+		{state.AgentTypeSupervisor, false},
+		{state.AgentTypeMergeQueue, false},
+		{state.AgentTypePRShepherd, false},
+		{state.AgentTypeReview, false},
+		{state.AgentTypeVerification, false},
+		{state.AgentTypeWorkspace, false},
+		{state.AgentTypeGenericPersistent, false},
+		{state.AgentTypeAgentBuilder, false},
+		{state.AgentType(""), false},
+		{state.AgentType("unknown-future-type"), false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.agentType), func(t *testing.T) {
+			if got := usesBrowserBridge(tc.agentType); got != tc.want {
+				t.Errorf("usesBrowserBridge(%q) = %v, want %v", tc.agentType, got, tc.want)
+			}
+		})
+	}
+}
+
+// Part 5a: denyToolArgs must strip task/http_request/fetch_url for
+// AgentTypeAssistant -- same as browser -- BUT must NOT strip
+// compact_conversation. The 5e capacity-tier system (75/85/90/95)
+// relies on the agent (and the daemon at 95% safety-net) being able
+// to invoke compact_conversation; stripping it would silently
+// disarm the safety net and let the assistant slide into the 100%-
+// context crash loop documented in plan section 5e ("What happens at
+// 100% if every safeguard fails"). This test pins the divergence
+// from browser's deny list so that contract can't quietly regress.
+func TestDenyToolArgs_AssistantKeepsCompactConversation_Part5a(t *testing.T) {
+	args := denyToolArgs(state.AgentTypeAssistant)
+	if len(args) == 0 {
+		t.Fatal("assistant should have a deny list; got empty (compact_conversation MUST be retained but task/http_request/fetch_url must be denied)")
+	}
+	joined := strings.Join(args, " ")
+	for _, mustDeny := range []string{"task", "http_request", "fetch_url"} {
+		if !strings.Contains(joined, mustDeny) {
+			t.Errorf("assistant deny list missing %q; joined=%q", mustDeny, joined)
+		}
+	}
+	if strings.Contains(joined, "compact_conversation") {
+		t.Errorf("assistant deny list MUST NOT include compact_conversation (5e capacity safety net depends on it); joined=%q", joined)
+	}
+
+	// Sanity: browser's deny list still contains compact_conversation
+	// (browser uses its own short-session lifecycle and doesn't want
+	// users discovering a "wipe everything" command in side-panel
+	// chat -- the pre-5a contract).
+	browserArgs := denyToolArgs(state.AgentTypeBrowser)
+	browserJoined := strings.Join(browserArgs, " ")
+	if !strings.Contains(browserJoined, "compact_conversation") {
+		t.Errorf("browser deny list lost compact_conversation; the 5a refactor must NOT change browser's deny list. joined=%q", browserJoined)
 	}
 }
 

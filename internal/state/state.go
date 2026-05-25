@@ -24,6 +24,13 @@ const (
 	AgentTypeGenericPersistent AgentType = "generic-persistent"
 	AgentTypeAgentBuilder      AgentType = "agent-builder"
 	AgentTypeBrowser           AgentType = "browser"
+	// AgentTypeAssistant is a persistent personal-assistant agent that lives
+	// in a virtual repo (see Repository.IsVirtual). Unlike AgentTypeBrowser
+	// (which is a goal-driven workflow helper that exits via
+	// `oat agent complete`), an assistant is long-lived: it sits attached to
+	// the side panel, waits for user instructions, and never self-completes.
+	// See Part 5a of the side-panel-chat-and-status plan.
+	AgentTypeAssistant AgentType = "assistant"
 )
 
 // IsPersistent returns true if this agent type represents a persistent agent
@@ -32,7 +39,7 @@ const (
 // (worker, review, verification) are not auto-restarted.
 func (t AgentType) IsPersistent() bool {
 	switch t {
-	case AgentTypeSupervisor, AgentTypeMergeQueue, AgentTypePRShepherd, AgentTypeWorkspace, AgentTypeGenericPersistent, AgentTypeAgentBuilder, AgentTypeBrowser:
+	case AgentTypeSupervisor, AgentTypeMergeQueue, AgentTypePRShepherd, AgentTypeWorkspace, AgentTypeGenericPersistent, AgentTypeAgentBuilder, AgentTypeBrowser, AgentTypeAssistant:
 		return true
 	default:
 		return false
@@ -260,6 +267,13 @@ type Repository struct {
 	Model                   string             `json:"model,omitempty"`                     // Default LLM model for agents in this repo (e.g., "claude-sonnet-4-6")
 	AllowedWorkerModels     []string           `json:"allowed_worker_models,omitempty"`     // Restrict which models can be used for workers (empty = no restriction)
 	WorkspaceStuckDetection bool               `json:"workspace_stuck_detection,omitempty"` // Enable workspace stuck-thinking detection (off by default)
+	// IsVirtual marks repos that do not back onto a real git working tree
+	// (e.g. the `_assistant-<name>` repos that host AgentTypeAssistant
+	// agents). The daemon skips `git clone`, worktree creation, and the
+	// default supervisor/merge-queue/workspace agent spawn for virtual
+	// repos. Zero-value (false) preserves all existing behavior for state
+	// files written before Part 5a of the side-panel-chat-and-status plan.
+	IsVirtual bool `json:"is_virtual,omitempty"`
 }
 
 // State represents the entire daemon state
@@ -466,6 +480,7 @@ func (s *State) GetAllRepos() map[string]*Repository {
 			Model:                   repo.Model,
 			IdleMode:                repo.IdleMode,
 			WorkspaceStuckDetection: repo.WorkspaceStuckDetection,
+			IsVirtual:               repo.IsVirtual, // Part 5c
 		}
 		// Copy agents
 		for agentName, agent := range repo.Agents {

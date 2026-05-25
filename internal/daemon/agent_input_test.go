@@ -142,7 +142,7 @@ func TestHandleAgentInput_RestrictedToBrowserType(t *testing.T) {
 			if resp.Success {
 				t.Fatalf("agent_input must NOT accept non-browser agent type %s", agentType)
 			}
-			if !strings.Contains(resp.Error, "restricted to browser-agent type") {
+			if !strings.Contains(resp.Error, "restricted to browser-bridge agent types") {
 				t.Errorf("error %q should explain the agent-type restriction", resp.Error)
 			}
 		})
@@ -336,7 +336,7 @@ func TestHandleRestartBrowserAgent_Validation(t *testing.T) {
 		if resp.Success {
 			t.Fatal("expected rejection for supervisor agent, got success")
 		}
-		if !strings.Contains(resp.Error, "restricted to browser-agent type") {
+		if !strings.Contains(resp.Error, "restricted to browser-bridge agent types") {
 			t.Errorf("error %q should surface the type-guard message", resp.Error)
 		}
 	})
@@ -384,4 +384,97 @@ func TestHandleRestartBrowserAgent_Validation(t *testing.T) {
 			t.Fatal("expected rejection for missing session arg, got success")
 		}
 	})
+}
+
+// Part 5a: AgentTypeAssistant is a peer of AgentTypeBrowser for the
+// usesBrowserBridge() gate -- agent_input must accept it (side-panel
+// chat is exactly how assistants receive user input) and reject every
+// other type with the same defense-in-depth message. We test this
+// post-gate, before the backend send, by relying on the fact that
+// no real backend is wired in setupTestDaemon: an accepted assistant
+// will fall through to the next step (sanitizer pass + backend send
+// failure), which manifests as either Success=true (if the fake
+// backend is permissive) or a NON-type-guard error string. Either
+// outcome distinguishes "accepted past the type guard" from
+// "rejected at the type guard". This is the same probe pattern the
+// matching browser test would use; we just point it at the assistant.
+func TestHandleAgentInput_AssistantBypassesTypeGuard_Part5a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	if err := d.state.AddRepo("my-repo", &state.Repository{
+		SessionName: "my-session",
+		IsVirtual:   true,
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("my-repo", "personal", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "personal",
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	resp := d.handleAgentInput(socket.Request{
+		Command: "agent_input",
+		Args: map[string]interface{}{
+			"session": "my-session",
+			"agent":   "personal",
+			"text":    "hello from the side panel",
+		},
+	})
+	// The type guard MUST NOT fire for an assistant. The response
+	// may still fail downstream (no real PTY in test), but the
+	// failure must be backend-shaped, never "restricted to ...".
+	if strings.Contains(resp.Error, "restricted to browser-bridge agent types") {
+		t.Fatalf("agent_input rejected AgentTypeAssistant at the type guard; expected pass-through. resp=%+v", resp)
+	}
+}
+
+// Part 5a: handleCompleteAgent must intercept AgentTypeAssistant
+// BEFORE the permanentTypes "cannot be completed" rejection and
+// return a SUCCESS no-op with status=="no_op" + the don't-loop
+// guidance message. The pre-5a behavior (the permanentTypes guard)
+// would have returned an ErrorResponse, which the LLM would have
+// re-tried or escalated -- precisely the loop this defense-in-depth
+// branch prevents. Pinning the success-shape here so a future
+// refactor doesn't accidentally drop the assistant back into the
+// rejected path.
+func TestHandleCompleteAgent_AssistantNoOp_Part5a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	if err := d.state.AddRepo("_assistant-personal", &state.Repository{
+		SessionName: "assistant-personal",
+		IsVirtual:   true,
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("_assistant-personal", "personal", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "personal",
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	resp := d.handleCompleteAgent(socket.Request{
+		Command: "complete_agent",
+		Args: map[string]interface{}{
+			"repo":  "_assistant-personal",
+			"agent": "personal",
+		},
+	})
+	if !resp.Success {
+		t.Fatalf("expected SUCCESS no-op for assistant complete; got error: %s", resp.Error)
+	}
+	body, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map response data, got %T (%+v)", resp.Data, resp.Data)
+	}
+	if status, _ := body["status"].(string); status != "no_op" {
+		t.Errorf("expected status=='no_op' for assistant complete no-op, got %q", status)
+	}
+	if msg, _ := body["message"].(string); !strings.Contains(strings.ToLower(msg), "persistent") {
+		t.Errorf("expected 'persistent' in no-op message guiding the model not to loop; got %q", msg)
+	}
 }

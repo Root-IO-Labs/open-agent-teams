@@ -13,15 +13,25 @@ func TestListAgentTemplates(t *testing.T) {
 		t.Fatalf("ListAgentTemplates failed: %v", err)
 	}
 
-	// Check that we have the expected templates
+	// Check that we have the expected templates. Part 5b added
+	// `assistant.md` (the AgentTypeAssistant prompt) and
+	// `_shared-browser-safety.md` (the safety fragment both
+	// browser.md and assistant.md load via writePromptFileWithPrefix
+	// in internal/daemon/daemon.go). The leading-underscore filename
+	// is intentional: it cannot collide with any state.AgentType
+	// string, and any future code that filters out underscore-
+	// prefixed entries (e.g. an "agent type picker" UI) can rely on
+	// the convention.
 	expected := map[string]bool{
-		"agent-builder.md": true,
-		"browser.md":       true,
-		"merge-queue.md":   true,
-		"pr-shepherd.md":   true,
-		"worker.md":        true,
-		"reviewer.md":      true,
-		"verification.md":  true,
+		"_shared-browser-safety.md": true,
+		"agent-builder.md":          true,
+		"assistant.md":              true,
+		"browser.md":                true,
+		"merge-queue.md":            true,
+		"pr-shepherd.md":            true,
+		"worker.md":                 true,
+		"reviewer.md":               true,
+		"verification.md":           true,
 	}
 
 	if len(templates) != len(expected) {

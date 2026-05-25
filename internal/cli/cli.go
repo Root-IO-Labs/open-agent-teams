@@ -519,7 +519,7 @@ func (c *CLI) registerCommands() {
 	repoCmd.Subcommands["list"] = &Command{
 		Name:        "list",
 		Description: "List tracked repositories",
-		Usage:       "oat repo list",
+		Usage:       "oat repo list [--all]\n\n--all also includes virtual repos (assistant containers, see `oat assistant`).",
 		Run:         c.listRepos,
 	}
 
@@ -2449,8 +2449,22 @@ func (c *CLI) initRepo(args []string) error {
 }
 
 func (c *CLI) listRepos(args []string) error {
+	// Part 5c: --all opts into showing virtual repos (today: the
+	// `_assistant-<name>` containers for AgentTypeAssistant). The
+	// daemon's list_repos hides them by default so the user's
+	// real source-code repos aren't crowded out by assistant
+	// bookkeeping; `oat assistant list` is the canonical view of
+	// virtual repos when the user wants to see them
+	// assistant-specifically.
+	includeVirtual := false
+	for _, a := range args {
+		if a == "--all" || a == "-a" {
+			includeVirtual = true
+		}
+	}
 	resp, err := c.sendDaemonRequest("list_repos", map[string]interface{}{
-		"rich": true,
+		"rich":            true,
+		"include_virtual": includeVirtual,
 	})
 	if err != nil {
 		return err
@@ -2462,18 +2476,30 @@ func (c *CLI) listRepos(args []string) error {
 	}
 
 	if len(repos) == 0 {
-		fmt.Println("No repositories tracked")
+		if includeVirtual {
+			fmt.Println("No repositories tracked (including virtual)")
+		} else {
+			fmt.Println("No repositories tracked")
+		}
 		format.Dimmed("\nInitialize a repository with: oat init <github-url>")
+		if !includeVirtual {
+			format.Dimmed("Or start a personal assistant: oat assistant start")
+		}
 		return nil
 	}
 
-	format.Header("Tracked repositories (%d):", len(repos))
+	if includeVirtual {
+		format.Header("Tracked repositories (%d, including virtual):", len(repos))
+	} else {
+		format.Header("Tracked repositories (%d):", len(repos))
+	}
 	fmt.Println()
 
 	table := format.NewColoredTable("REPO", "MODE", "AGENTS", "STATUS", "SESSION")
 	for _, repo := range repos {
 		if repoMap, ok := repo.(map[string]interface{}); ok {
 			name, _ := repoMap["name"].(string)
+			isVirtualRepo, _ := repoMap["is_virtual"].(bool)
 			totalAgents := 0
 			if v, ok := repoMap["total_agents"].(float64); ok {
 				totalAgents = int(v)
@@ -2490,11 +2516,17 @@ func (c *CLI) listRepos(args []string) error {
 			upstreamOwner, _ := repoMap["upstream_owner"].(string)
 			upstreamRepo, _ := repoMap["upstream_repo"].(string)
 
-			// Format mode string
+			// Format mode string. Virtual takes precedence in the
+			// output because it changes how the user should reason
+			// about every other column (no merge queue, no PRs, no
+			// fork upstream — see Part 5c).
 			var modeStr string
-			if isFork {
+			switch {
+			case isVirtualRepo:
+				modeStr = "virtual (assistant)"
+			case isFork:
 				modeStr = fmt.Sprintf("fork of %s/%s", upstreamOwner, upstreamRepo)
-			} else {
+			default:
 				modeStr = "upstream"
 			}
 

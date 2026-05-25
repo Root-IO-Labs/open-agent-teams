@@ -1881,6 +1881,12 @@ func TestAgentTypeIsPersistent(t *testing.T) {
 		{AgentTypeWorkspace, true},
 		{AgentTypeGenericPersistent, true},
 		{AgentTypeBrowser, true},
+		// Part 5a: AgentTypeAssistant is persistent. It sits in the
+		// side panel waiting for user input; it must auto-restart
+		// on crash (matching every other persistent type) so the
+		// user doesn't have to manually `oat assistant restart`
+		// after every backend hiccup.
+		{AgentTypeAssistant, true},
 		// Transient agents should return false
 		{AgentTypeWorker, false},
 		{AgentTypeReview, false},
@@ -1896,6 +1902,80 @@ func TestAgentTypeIsPersistent(t *testing.T) {
 				t.Errorf("AgentType(%q).IsPersistent() = %v, want %v", tt.agentType, got, tt.persistent)
 			}
 		})
+	}
+}
+
+// Part 5a: Repository.IsVirtual must round-trip cleanly. Critically,
+// state.json files written before Part 5a (where the field didn't
+// exist) must deserialize with IsVirtual == false rather than
+// returning a JSON error. Go's encoding/json behavior gives us this
+// for free (zero-value for missing fields), but we pin it here so a
+// future refactor (e.g. switching struct tags from omitempty to a
+// custom marshaler) doesn't silently regress migration safety.
+func TestRepositoryIsVirtual_BackwardCompatRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	statePath := filepath.Join(tmpDir, "state.json")
+
+	// Step 1: write an "old-style" state file with NO is_virtual field.
+	// This is the on-disk shape produced by every daemon built before
+	// Part 5a landed. We hand-write the JSON so the test does not
+	// depend on the current MarshalJSON behavior of Repository.
+	oldStyle := []byte(`{
+		"repos": {
+			"legacy-repo": {
+				"github_url": "https://github.com/x/legacy",
+				"session_name": "oat-legacy-repo",
+				"agents": {}
+			}
+		}
+	}`)
+	if err := os.WriteFile(statePath, oldStyle, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Step 2: load through the production Load path. Must not error
+	// and must default IsVirtual=false.
+	loaded, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("Load() of pre-Part-5a state must succeed; got %v", err)
+	}
+	repo, ok := loaded.GetRepo("legacy-repo")
+	if !ok {
+		t.Fatalf("legacy-repo missing after load")
+	}
+	if repo.IsVirtual {
+		t.Errorf("IsVirtual on legacy-pre-5a state should default to false; got true")
+	}
+
+	// Step 3: flip IsVirtual=true on a fresh repo + save + reload --
+	// the round-trip must preserve the value.
+	virtRepo := &Repository{
+		SessionName: "oat-assistant-personal",
+		Agents:      make(map[string]Agent),
+		IsVirtual:   true,
+	}
+	if err := loaded.AddRepo("_assistant-personal", virtRepo); err != nil {
+		t.Fatalf("AddRepo virtual: %v", err)
+	}
+	reloaded, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("Load() after virtual save: %v", err)
+	}
+	gotVirt, ok := reloaded.GetRepo("_assistant-personal")
+	if !ok {
+		t.Fatalf("_assistant-personal missing after reload")
+	}
+	if !gotVirt.IsVirtual {
+		t.Errorf("IsVirtual=true did not survive save/reload round-trip")
+	}
+	// And the legacy repo's IsVirtual must still be false (we never
+	// touched it; the new field on the new repo shouldn't bleed).
+	gotLegacy, ok := reloaded.GetRepo("legacy-repo")
+	if !ok {
+		t.Fatalf("legacy-repo missing after second reload")
+	}
+	if gotLegacy.IsVirtual {
+		t.Errorf("legacy-repo IsVirtual flipped to true unexpectedly")
 	}
 }
 
