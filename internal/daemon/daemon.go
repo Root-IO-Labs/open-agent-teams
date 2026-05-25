@@ -244,6 +244,13 @@ type Daemon struct {
 	// the periodic refresher.
 	corpusIndex   *routing.CorpusIndex
 	corpusIndexMu sync.RWMutex
+
+	// Part 5e: in-memory dedupe state for the 75 % capacity hint +
+	// the once-per-agent "no profile, falling back" WARN. See
+	// context_capacity.go. Allocated unconditionally in New(); the
+	// extra map costs ~80 bytes idle and lets every other daemon
+	// path call into contextCap without nil-checking.
+	contextCap *contextCapacityState
 }
 
 // corpusIndexRefreshInterval — how often the daemon rebuilds the V2
@@ -313,6 +320,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		restartCooldown:             make(map[string]time.Time),
 		bridgeUnreachable:           make(map[string][]time.Time),
 		assistantTurnTailers:        make(map[string]*assistantTurnTailer),
+		contextCap:                  newContextCapacityState(),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -2759,6 +2767,30 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 			repoName, agentName, rawTabID, rawTabID, prefix,
 		)
 		sanitized = sidePanelInputSentinel + prefix + sanitized
+	}
+
+	// Part 5e safety net: if the assistant is at >= 95 % effective
+	// context capacity AND OAT_CONTEXT_SAFETY_NET is enabled
+	// (default ON), prepend a synthetic compact-conversation
+	// directive as a separate PTY message BEFORE the user's. Done
+	// here (not inline with sanitized) so the directive doesn't
+	// inherit the sentinel/active-tab-id prefix the user message
+	// gets -- the agent's prompt teaches it to read [OAT-system]
+	// lines as out-of-band, not as side-panel user input.
+	// Non-interrupt path only; interrupts go directly to the
+	// runtime without buffering, where prepending an instruction
+	// would be wrong semantically.
+	if !interrupt {
+		if directive, inject := d.shouldInjectContextSafetyNet(agent, repoName, agentName); inject {
+			if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, directive); err != nil {
+				// Best-effort: log + continue. We still send the
+				// user's message because dropping it would be more
+				// surprising than skipping the safety net.
+				d.logger.Warn("context safety-net inject failed for %s/%s: %v", repoName, agentName, err)
+			} else {
+				d.logger.Warn("context safety-net injected for %s/%s before user message (capacity threshold crossed)", repoName, agentName)
+			}
+		}
 	}
 
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, sanitized); err != nil {
@@ -6355,6 +6387,12 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 			repoName, agentName, agent.TotalTokens, agent.MaxTokens)
 		go d.stopAgentOverBudget(repoName, agentName, agent)
 	}
+
+	// Part 5e: piggyback the assistant context-capacity hint on the
+	// same token-usage event so we don't add a separate poll loop.
+	// No-ops for non-assistant types; in-memory dedupe gates repeat
+	// hints. See context_capacity.go.
+	d.maybeNudgeContextCapacity(repoName, agentName, agent)
 }
 
 // stopAgentOverBudget kills a worker that exceeded its token budget and notifies
