@@ -97,12 +97,20 @@ type contextCapacityState struct {
 	mu          sync.Mutex
 	lastHintAt  map[string]time.Time
 	fallbackLog map[string]bool // dedupe the "no profile, falling back" WARN per-agent
+	// lastTier (Part 5e Slice B) is the most-recent tier the daemon
+	// observed for this agent. publishCapacityFrameIfTierChanged
+	// reads + writes it under the same mutex above so the
+	// `stream_context_capacity` wire only emits frames on actual
+	// transitions. Values: "ok" | "hint" | "amber" | "banner" |
+	// "safety_net" (the same enum as contextCapacityFrame.Tier).
+	lastTier map[string]string
 }
 
 func newContextCapacityState() *contextCapacityState {
 	return &contextCapacityState{
 		lastHintAt:  make(map[string]time.Time),
 		fallbackLog: make(map[string]bool),
+		lastTier:    make(map[string]string),
 	}
 }
 
@@ -219,6 +227,20 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	}
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
 	pct := computeCapacityPct(agent.TotalTokens, limit)
+
+	// Part 5e Slice B: emit a tier-crossing frame on the
+	// stream_context_capacity wire BEFORE the early-return below.
+	// Crossings BELOW 75% (e.g. "hint" → "ok" after a successful
+	// compact_conversation) are an important signal too -- they tell
+	// the side panel to hide the amber pill / banner -- so we must
+	// not gate this on pct >= contextTierHint the way the PTY hint
+	// path does. The broadcaster's per-agent dedupe (lastTier)
+	// ensures the wire only fires when the tier actually changes,
+	// regardless of how often this function is called.
+	if repo, ok := d.state.GetRepo(repoName); ok {
+		d.publishCapacityFrameIfTierChanged(repoName, agentName, repo.SessionName, pct, agent.TotalTokens, limit)
+	}
+
 	if pct < contextTierHint {
 		return
 	}

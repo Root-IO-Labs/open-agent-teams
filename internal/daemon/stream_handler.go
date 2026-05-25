@@ -78,6 +78,8 @@ func (sh *streamHandler) HandleStream(req socket.Request, conn net.Conn) {
 		sh.handleStreamAgentOutput(req, conn)
 	case "stream_assistant_turns":
 		sh.handleStreamAssistantTurns(req, conn)
+	case "stream_context_capacity":
+		sh.handleStreamContextCapacity(req, conn)
 	default:
 		// Unknown streaming command — send error and close
 		resp := socket.Response{Success: false, Error: "unknown stream command: " + req.Command}
@@ -609,6 +611,115 @@ func (sh *streamHandler) handleStreamAssistantTurns(req socket.Request, conn net
 			}
 		case <-connDead:
 			sh.d.logger.Debug("stream_assistant_turns client disconnected for %s/%s", sessionName, agentName)
+			return
+		}
+	}
+}
+
+// handleStreamContextCapacity is Part 5e Slice B's daemon→bridge
+// push channel for context-capacity tier crossings. Subscribes the
+// caller to the per-agent capacityBroadcaster: every tier crossing
+// the daemon observes (driven by token-usage events in
+// handleTokenUsageEvent → maybeNudgeContextCapacity →
+// publishCapacityFrameIfTierChanged) becomes a JSON frame on this
+// stream.
+//
+// Restricted to AgentTypeAssistant — the workflow-helper
+// AgentTypeBrowser doesn't surface side-panel chat UI, so capacity
+// indicators would be meaningless there. Same identity model as
+// stream_assistant_turns: addressed by (session, agent_name) so the
+// bridge doesn't have to reverse-resolve the repo name.
+//
+// Protocol mirrors stream_assistant_turns:
+//  1. Server sends handshake: {"success":true,"stream":true}
+//  2. Server sends a snapshot frame (current tier + pct + used + limit)
+//     so a freshly-connected side panel learns its starting state
+//     without waiting for the next tier crossing.
+//  3. Server streams JSON contextCapacityFrame lines on every
+//     subsequent tier crossing.
+//  4. On broadcaster close / daemon shutdown: {"done":true}.
+//  5. On error: {"error":"msg"} then close.
+//
+// The snapshot frame uses computed-now pct, NOT the broadcaster's
+// dedupe state -- so a side panel that connects mid-session at,
+// say, 87% sees an "amber" frame even though that tier crossing
+// happened before the connection.
+func (sh *streamHandler) handleStreamContextCapacity(req socket.Request, conn net.Conn) {
+	defer conn.Close()
+	enc := json.NewEncoder(conn)
+
+	sessionName, _ := req.Args["session"].(string)
+	agentName, _ := req.Args["agent"].(string)
+	if sessionName == "" || agentName == "" {
+		enc.Encode(socket.Response{Success: false, Error: "session and agent are required"}) //nolint:errcheck
+		return
+	}
+
+	repoName, _, found := sh.d.findRepoBySession(sessionName)
+	if !found {
+		enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
+		return
+	}
+	agent, exists := sh.d.state.GetAgent(repoName, agentName)
+	if !exists {
+		enc.Encode(socket.Response{Success: false, Error: "agent '" + agentName + "' not found in session " + sessionName}) //nolint:errcheck
+		return
+	}
+	if agent.Type != state.AgentTypeAssistant {
+		enc.Encode(socket.Response{Success: false, Error: "stream_context_capacity is restricted to assistant agent type; " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
+		return
+	}
+
+	broadcaster := sh.d.lookupOrCreateCapacityBroadcaster(sessionName, agentName)
+	ch, cancel := broadcaster.Subscribe()
+	defer cancel()
+	sh.d.logger.Info("stream_context_capacity: bridge subscribed for %s/%s", sessionName, agentName)
+
+	// Handshake.
+	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+	if err := enc.Encode(socket.Response{Success: true, Stream: true}); err != nil {
+		return
+	}
+
+	// Snapshot frame: tell the freshly-connected side panel what the
+	// current tier is so it can render the right indicator without
+	// waiting for the next tier crossing. Computed from CURRENT
+	// agent state (the broadcaster's lastTier dedupe is irrelevant
+	// here -- this is an unconditional reply to the new subscriber).
+	limit, _ := sh.d.effectiveContextLimit(agent.Model, repoName, agentName)
+	pct := computeCapacityPct(agent.TotalTokens, limit)
+	snapshot := capacitySnapshotFrame(pct, agent.TotalTokens, limit)
+	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+	if err := enc.Encode(snapshot); err != nil {
+		return
+	}
+
+	// Detect client disconnect on idle.
+	connDead := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		conn.Read(buf) //nolint:errcheck
+		close(connDead)
+	}()
+
+	for {
+		select {
+		case frame, ok := <-ch:
+			if !ok {
+				conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+				enc.Encode(contextCapacityFrame{Done: true})              //nolint:errcheck
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+			if err := enc.Encode(frame); err != nil {
+				sh.d.logger.Debug("stream_context_capacity write failed for %s/%s: %v", sessionName, agentName, err)
+				return
+			}
+			if frame.Done {
+				return
+			}
+		case <-connDead:
+			sh.d.logger.Debug("stream_context_capacity client disconnected for %s/%s", sessionName, agentName)
 			return
 		}
 	}

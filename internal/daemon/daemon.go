@@ -251,6 +251,15 @@ type Daemon struct {
 	// extra map costs ~80 bytes idle and lets every other daemon
 	// path call into contextCap without nil-checking.
 	contextCap *contextCapacityState
+
+	// capacityBroadcasters (Part 5e Slice B) holds one
+	// capacityBroadcaster per (session, agent) tuple for the
+	// stream_context_capacity socket verb. Lazily populated by
+	// lookupOrCreateCapacityBroadcaster on first publish or first
+	// subscribe; never torn down (entries are tiny and GC'd at
+	// daemon exit). Guarded by capacityBroadcastersMu.
+	capacityBroadcastersMu sync.Mutex
+	capacityBroadcasters   map[string]*capacityBroadcaster
 }
 
 // corpusIndexRefreshInterval — how often the daemon rebuilds the V2
@@ -321,6 +330,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		bridgeUnreachable:           make(map[string][]time.Time),
 		assistantTurnTailers:        make(map[string]*assistantTurnTailer),
 		contextCap:                  newContextCapacityState(),
+		capacityBroadcasters:        make(map[string]*capacityBroadcaster),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
