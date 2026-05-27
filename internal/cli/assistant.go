@@ -283,9 +283,21 @@ func (c *CLI) assistantStart(args []string) error {
 	return nil
 }
 
-// assistantStop removes the agent record (which kills the process
-// via remove_agent's backend.StopAgent call). The virtual repo +
-// session JSONL remain intact for next `oat assistant start`.
+// assistantStop pauses the assistant: kills the process but
+// PRESERVES the state.Agent record + virtual repo + session
+// JSONL + rotation archives so a later `oat assistant restart`
+// resumes at the same conversation. Wired to the Part 7 Commit
+// 7.1 `stop_agent` daemon verb, not the legacy `remove_agent`.
+// The latter would wipe the record (turning Stop into Delete);
+// the side-panel UX expects Stop=pause, Delete=nuke, mirroring
+// `oat repo hibernate` semantics for repo-scoped agents.
+//
+// "Not found" stays a soft success because the user's mental
+// model of Stop is "make sure it's not running" — if the
+// daemon doesn't even have a record, the agent is already not
+// running. (Post-7.1 the daemon ALSO retains the record after
+// Stop, so this branch only fires on a never-started or
+// already-deleted agent.)
 func (c *CLI) assistantStop(args []string) error {
 	_, remaining := ParseFlags(args)
 	name := resolveAssistantName(remaining)
@@ -298,22 +310,18 @@ func (c *CLI) assistantStop(args []string) error {
 	repoKey := virtualRepoNameFor(name)
 	agent := agentSlug(name)
 
-	_, err := c.sendDaemonRequest("remove_agent", map[string]interface{}{
+	_, err := c.sendDaemonRequest("stop_agent", map[string]interface{}{
 		"repo":  repoKey,
 		"agent": agent,
 	})
 	if err != nil {
-		// "Not found" / "no such agent" is acceptable -- the user's
-		// mental model of `stop` is "make sure it's not running".
-		// If it wasn't running, we did our job.
-		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "not found") || strings.Contains(msg, "no such agent") {
+		if isAgentNotFoundError(err) {
 			fmt.Printf("Assistant '%s' is not running.\n", name)
 			return nil
 		}
 		return err
 	}
-	fmt.Printf("✓ Assistant '%s' stopped.\n", name)
+	fmt.Printf("✓ Assistant '%s' stopped (record preserved; use `oat assistant restart` to resume).\n", name)
 	return nil
 }
 

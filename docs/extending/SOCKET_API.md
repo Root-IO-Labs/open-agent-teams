@@ -10,6 +10,7 @@ remove_repo
 reload_model_profiles
 add_agent
 remove_agent
+stop_agent
 list_agents
 complete_agent
 agent_waiting
@@ -67,6 +68,7 @@ Each command below matches a `case` in `handleRequest`.
 | `remove_repo` | Stop tracking a repo | `name` (string) |
 | `add_agent` | Register an agent in state | `repo`, `name`, `type`, `worktree_path`, `window_name`, `session_id`, `pid` |
 | `remove_agent` | Remove agent from state | `repo`, `name` |
+| `stop_agent` | Pause an agent: kill the process and zero the PID, but PRESERVE the `state.Agent` record so a later `restart_agent` resumes at the same session JSONL and worktree. Sets `agent.LastError` to `"stopped by user"` so the side panel + Part-7.2 recovery audit can see why PID is zero. **Restricted to `AgentType in {Assistant, Browser}`** via `state.AgentType.IsPausable()`; other types return `RPC_AGENT_TYPE_NOT_PAUSABLE` with a pointer at `oat repo hibernate` (repo-scoped pause) or `oat agent remove` (task-scoped cancel). Per-agent stop/restart mutex serialises concurrent Stop+Restart from rage-clicks so state stays coherent. Backend escalates SIGTERM→SIGKILL after 5s so a hung agent can't deadlock the verb. | `repo` (string), `agent` (string) |
 | `list_agents` | List agents for a repo | `repo` |
 | `complete_agent` | Mark agent ready for cleanup | `repo`, `name`, `summary`, `failure_reason` |
 | `restart_agent` | Restart a persistent agent | `repo`, `name` |

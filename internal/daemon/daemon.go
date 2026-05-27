@@ -260,6 +260,32 @@ type Daemon struct {
 	// daemon exit). Guarded by capacityBroadcastersMu.
 	capacityBroadcastersMu sync.Mutex
 	capacityBroadcasters   map[string]*capacityBroadcaster
+
+	// Per-agent stop/restart mutex (Part 7 Commit 7.1). Keyed by
+	// "<repo>/<agent>". Used by handleStopAgent and
+	// handleRestartAgent to serialise rapid-fire Stop+Restart
+	// click sequences from the side panel: without this the two
+	// verbs can race each other and the agent's PID field, the
+	// process tree, and the workspace-replacement notifier
+	// (handleRemoveAgent line ~2951) can end up out of step.
+	//
+	// Why a map of *sync.Mutex and not sync.Map: we need to
+	// LOOK UP an existing mutex and create one on first sight,
+	// atomically. sync.Map's LoadOrStore returns the stored
+	// value but doesn't help with the typical "lock the mutex
+	// for the duration of this verb" idiom because the type-
+	// erased interface{} requires a cast. The bare map + outer
+	// mutex is plainer and the contention is irrelevant (this
+	// only fires when a user is mashing buttons).
+	//
+	// Lock ordering: agentLifecycleMu (this) acquired first to
+	// look up the per-agent mutex; agentLifecycleMu released
+	// before the per-agent mutex is locked. No other daemon
+	// mutex is held while a per-agent mutex is locked. Per-
+	// agent mutexes are NEVER held in a goroutine; only synch-
+	// ronously inside a single handler.
+	agentLifecycleMu     sync.Mutex
+	agentLifecycleMutexes map[string]*sync.Mutex
 }
 
 // corpusIndexRefreshInterval — how often the daemon rebuilds the V2
@@ -331,6 +357,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		assistantTurnTailers:        make(map[string]*assistantTurnTailer),
 		contextCap:                  newContextCapacityState(),
 		capacityBroadcasters:        make(map[string]*capacityBroadcaster),
+		agentLifecycleMutexes:       make(map[string]*sync.Mutex),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -1970,6 +1997,9 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 	case "remove_agent":
 		return d.handleRemoveAgent(req)
 
+	case "stop_agent":
+		return d.handleStopAgent(req)
+
 	case "list_agents":
 		return d.handleListAgents(req)
 
@@ -2884,6 +2914,141 @@ func (d *Daemon) handleEscapeAgent(req socket.Request) socket.Response {
 
 	d.logger.Debug("Sent escape to %s/%s", repoName, agentName)
 	return socket.SuccessResponse(nil)
+}
+
+// agentLifecycleMutex returns the *sync.Mutex shared by stop_agent
+// and restart_agent for the given "<repo>/<agent>" identity. The
+// mutex is created on first sight and never garbage-collected; the
+// daemon process lifetime is the same as state's so retaining a
+// few dozen sync.Mutex values (which are tiny) for the life of the
+// daemon is the simpler choice than reference-counting. See the
+// Daemon.agentLifecycleMutexes doc comment for the lock ordering
+// invariants.
+func (d *Daemon) agentLifecycleMutex(repoName, agentName string) *sync.Mutex {
+	key := repoName + "/" + agentName
+	d.agentLifecycleMu.Lock()
+	defer d.agentLifecycleMu.Unlock()
+	mu, ok := d.agentLifecycleMutexes[key]
+	if !ok {
+		mu = &sync.Mutex{}
+		d.agentLifecycleMutexes[key] = mu
+	}
+	return mu
+}
+
+// handleStopAgent kills an agent process but PRESERVES the
+// state.Agent record (Part 7 Commit 7.1). The user-facing
+// semantic on the side panel is "pause" — Stop kills the
+// process, Restart later brings it back at the same agent name
+// with the same session JSONL. This is distinct from
+// handleRemoveAgent, which wipes the record so the next start
+// is a fresh agent.
+//
+// Restricted via state.AgentType.IsPausable() to {Assistant,
+// Browser}. Other agent types return an error pointing them at
+// `oat repo hibernate`, which is the right pause semantic for
+// repo-scoped persistents because it also archives the worktree
+// as a patch.
+//
+// Backend.StopAgent already implements SIGTERM → 5s wait →
+// SIGKILL escalation (see pkg/backend/direct_backend.go); the
+// hung-agent case can't deadlock this verb.
+//
+// Per-agent stop/restart mutex: serialises against a concurrent
+// handleRestartAgent for the same agent. Without the mutex a
+// rapid Stop+Restart from the side panel can corrupt
+// state.Agent.PID (one verb writes PID=0 just as the other
+// writes the new PID) and the workspace-replacement notifier
+// in handleRemoveAgent can fire against an agent that's already
+// restarting. Acquired here and released after BOTH backend
+// stop and state mutation complete.
+func (d *Daemon) handleStopAgent(req socket.Request) socket.Response {
+	repoName, errResp, ok := getRequiredStringArg(req.Args, "repo", "repository name is required")
+	if !ok {
+		return errResp
+	}
+
+	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
+	if !ok {
+		return errResp
+	}
+
+	// Serialise against restart_agent for this same identity.
+	// Acquired before the existence check so a concurrent
+	// restart-then-stop sequence can't observe an
+	// "in-between" state where the agent record momentarily
+	// vanishes.
+	mu := d.agentLifecycleMutex(repoName, agentName)
+	mu.Lock()
+	defer mu.Unlock()
+
+	agent, exists := d.state.GetAgent(repoName, agentName)
+	if !exists {
+		return socket.ErrorResponse("agent %s not found in repo %s", agentName, repoName)
+	}
+
+	// HARD WHITELIST: only Assistant + Browser are pausable.
+	// Workers/review/verification are task-scoped and use the
+	// `oat agent remove` path on cancellation; supervisors and
+	// the other persistents use `oat repo hibernate`. The
+	// caller-facing error string is operator-actionable.
+	if !agent.Type.IsPausable() {
+		return socket.ErrorResponse(
+			"agent type %q is not pausable (RPC_AGENT_TYPE_NOT_PAUSABLE); use `oat repo hibernate` to pause repo-scoped agents, or `oat agent remove` for task-scoped ones",
+			agent.Type,
+		)
+	}
+
+	repo, repoExists := d.state.GetRepo(repoName)
+	if repoExists {
+		windowName := agent.WindowName
+		if windowName == "" {
+			windowName = agentName
+		}
+		if err := d.backend.StopAgent(d.ctx, repo.SessionName, windowName); err != nil {
+			// Backend stop failure is logged but NOT promoted to
+			// an RPC error: the state mutation below still runs
+			// so a "stopped" record reflects user intent even if
+			// the backend lost track of the PID (most common
+			// reason: the process already crashed). The pre-7.1
+			// `remove_agent` code path had the same forgiving
+			// behaviour; preserving it here keeps stop_agent and
+			// remove_agent symmetric from the user's POV.
+			d.logger.Warn("stop_agent: backend.StopAgent failed for %s/%s: %v", repoName, agentName, err)
+		} else {
+			d.logger.Info("stop_agent: stopped agent process %s/%s", repoName, agentName)
+		}
+		// Part 2g symmetry with handleRemoveAgent: stop the
+		// assistant-turn tailer for browser-agents so the next
+		// add+start doesn't leak the goroutine. Assistants don't
+		// use this tailer (assistantTurnTailers is keyed by
+		// browser-bridge agents), so the call is a no-op there
+		// — usesBrowserBridge gates it.
+		if usesBrowserBridge(agent.Type) {
+			d.stopAssistantTurnTailer(repo.SessionName, agentName)
+		}
+	}
+
+	// State mutation: zero out the PID + record the user-paused
+	// reason, but PRESERVE the rest of the record (worktree
+	// path, session id, model, etc.) so a subsequent
+	// restart_agent has everything it needs. LastError is the
+	// existing field used by `oat status` to surface the most
+	// recent lifecycle event; "stopped by user" is operator-
+	// actionable enough without inventing a new state-machine
+	// enum.
+	if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+		a.PID = 0
+		a.LastError = "stopped by user"
+	}); err != nil {
+		return socket.ErrorResponse("stop_agent: failed to update state for %s/%s: %v", repoName, agentName, err)
+	}
+
+	d.logger.Info("stop_agent: marked %s/%s as stopped (record preserved)", repoName, agentName)
+	return socket.SuccessResponse(map[string]interface{}{
+		"repo":  repoName,
+		"agent": agentName,
+	})
 }
 
 // handleRemoveAgent kills an agent process and removes it from state.
@@ -4517,6 +4682,27 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 	}
 
 	force := getOptionalBoolArg(req.Args, "force", false)
+
+	// Per-agent stop/restart serialisation (Part 7 Commit 7.1).
+	// Rapid Stop+Restart from the side panel must not race —
+	// without this, the stop_agent verb could set PID=0 right
+	// AFTER restart_agent recorded the new PID, leaving the new
+	// process alive but state thinking it's stopped. Acquired
+	// for the FULL duration of the restart (existence checks,
+	// backend stop of prior, restartAgent call) so a concurrent
+	// stop_agent waits until the restart commits before doing
+	// its own work. See Daemon.agentLifecycleMutexes doc for
+	// the lock-ordering invariant.
+	//
+	// Lower-level `restartAgent` is also called from the health-
+	// check loop without this mutex; that's intentional. The
+	// health check is server-driven and runs at most once per
+	// 2-min cycle so it doesn't race the user's rapid clicks,
+	// and Part 7 Commit 7.2 will audit the health-check path to
+	// add a "user stopped this" gate keyed off LastError.
+	mu := d.agentLifecycleMutex(repoName, agentName)
+	mu.Lock()
+	defer mu.Unlock()
 
 	agent, exists := d.state.GetAgent(repoName, agentName)
 	if !exists {

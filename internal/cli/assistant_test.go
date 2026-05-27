@@ -27,11 +27,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
 )
 
@@ -498,6 +503,151 @@ func TestPickModelEcho_Part7Commit0(t *testing.T) {
 				t.Errorf("pickModelEcho(%v) = %q, want %q", tc.rec, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAssistantStop_SendsStopAgentVerb_Part7Commit1 pins the Part 7
+// Commit 7.1 contract: `oat assistant stop` must send the
+// `stop_agent` daemon verb (pause-with-record-preserved), NOT
+// `remove_agent` (delete). A regression here turns Stop back into
+// Delete and silently wipes the user's session JSONL + virtual
+// repo — exactly the smoke-test bug Commit 7.1 fixes — so the
+// pin is worth the small harness it requires.
+//
+// Harness setup:
+//   - Spin up a real socket.Server on a temp Unix socket so the
+//     CLI's sendDaemonRequest exercises its actual codepath
+//     (encoding, framing, deadline) instead of a mocked-out
+//     short-circuit.
+//   - Plant a PID file containing THIS test process's PID so
+//     ensureDaemonRunning short-circuits ("running"=true) and
+//     doesn't try to RunDetached an oat binary that isn't on
+//     $PATH in the test runner.
+//   - Recording handler captures every Request it sees; the
+//     test asserts on the recorded command + args.
+func TestAssistantStop_SendsStopAgentVerb_Part7Commit1(t *testing.T) {
+	// macOS Unix sockets cap at 104 bytes; t.TempDir() under
+	// /var/folders/... pushes us close to the limit. Use os.MkdirTemp
+	// rooted at the shorter /tmp so the socket path fits.
+	tmpDir, err := os.MkdirTemp("/tmp", "oat-stop-")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	sockPath := filepath.Join(tmpDir, "d.sock")
+	pidPath := filepath.Join(tmpDir, "d.pid")
+
+	// Plant a fake PID file with our own PID so ensureDaemonRunning's
+	// IsRunning() check returns true (process exists; signal 0 OK).
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		t.Fatalf("plant pid file: %v", err)
+	}
+
+	var recordedMu sync.Mutex
+	recorded := make([]socket.Request, 0, 1)
+	handler := socket.HandlerFunc(func(req socket.Request) socket.Response {
+		recordedMu.Lock()
+		recorded = append(recorded, req)
+		recordedMu.Unlock()
+		return socket.Response{Success: true, Data: nil}
+	})
+
+	server := socket.NewServer(sockPath, handler)
+	if err := server.Start(); err != nil {
+		t.Fatalf("server.Start: %v", err)
+	}
+	defer server.Stop()
+	go server.Serve()
+	// Brief wait for the listener to be ready — mirrors the
+	// pattern in internal/socket/socket_test.go.
+	time.Sleep(100 * time.Millisecond)
+
+	paths := &config.Paths{
+		Root:       tmpDir,
+		DaemonSock: sockPath,
+		DaemonPID:  pidPath,
+	}
+	c := NewWithPaths(paths)
+	// Silence stdout — assistantStop prints a success line on the
+	// happy path that we don't need to validate here. The fmt.Printf
+	// goes to the test process's stdout otherwise, which is just
+	// noise in `go test -v`.
+	stdout := os.Stdout
+	devNull, _ := os.Open(os.DevNull)
+	os.Stdout = devNull
+	t.Cleanup(func() {
+		os.Stdout = stdout
+		devNull.Close()
+	})
+
+	if err := c.assistantStop([]string{"personal"}); err != nil {
+		t.Fatalf("assistantStop returned error: %v", err)
+	}
+
+	recordedMu.Lock()
+	defer recordedMu.Unlock()
+	if len(recorded) != 1 {
+		t.Fatalf("expected exactly 1 daemon request, got %d: %+v", len(recorded), recorded)
+	}
+	got := recorded[0]
+	if got.Command != "stop_agent" {
+		t.Errorf("verb must be stop_agent (Part 7 Commit 7.1 contract), got %q", got.Command)
+	}
+	if got.Command == "remove_agent" {
+		t.Errorf("REGRESSION: assistantStop is sending remove_agent again; Stop would delete the record + session JSONL")
+	}
+	if repo, _ := got.Args["repo"].(string); repo != "_assistant-personal" {
+		t.Errorf("repo arg = %q, want %q", repo, "_assistant-personal")
+	}
+	if agent, _ := got.Args["agent"].(string); agent != "personal" {
+		t.Errorf("agent arg = %q, want %q", agent, "personal")
+	}
+}
+
+// TestAssistantStop_NotRunningIsSoftSuccess_Part7Commit1 pins the
+// "agent already gone" branch: stop_agent returning an error whose
+// message contains "not found" must be turned into nil + a friendly
+// message, mirroring the user's mental model of Stop ("make sure
+// it's not running"). The branch is shared with the Restart fall-
+// through path (Commit 7.0) via the isAgentNotFoundError helper,
+// so a regression here would also break Restart-from-deleted —
+// pinning it explicitly keeps both paths honest.
+func TestAssistantStop_NotRunningIsSoftSuccess_Part7Commit1(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("/tmp", "oat-stop-nr-")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	sockPath := filepath.Join(tmpDir, "d.sock")
+	pidPath := filepath.Join(tmpDir, "d.pid")
+
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		t.Fatalf("plant pid file: %v", err)
+	}
+
+	handler := socket.HandlerFunc(func(req socket.Request) socket.Response {
+		return socket.Response{
+			Success: false,
+			Error:   "agent personal not found in repo _assistant-personal",
+		}
+	})
+	server := socket.NewServer(sockPath, handler)
+	if err := server.Start(); err != nil {
+		t.Fatalf("server.Start: %v", err)
+	}
+	defer server.Stop()
+	go server.Serve()
+	time.Sleep(100 * time.Millisecond)
+
+	paths := &config.Paths{Root: tmpDir, DaemonSock: sockPath, DaemonPID: pidPath}
+	c := NewWithPaths(paths)
+	stdout := os.Stdout
+	devNull, _ := os.Open(os.DevNull)
+	os.Stdout = devNull
+	t.Cleanup(func() { os.Stdout = stdout; devNull.Close() })
+
+	if err := c.assistantStop([]string{"personal"}); err != nil {
+		t.Errorf("Stop against a non-running agent must be soft-success; got error: %v", err)
 	}
 }
 

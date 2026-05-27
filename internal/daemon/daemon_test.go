@@ -3,10 +3,12 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -900,6 +902,243 @@ func TestHandleRemoveAgent(t *testing.T) {
 	_, exists := d.state.GetAgent("test-repo", "test-agent")
 	if exists {
 		t.Error("handleRemoveAgent() did not remove agent from state")
+	}
+}
+
+// TestHandleStopAgent (Part 7 Commit 7.1) covers:
+//   - Missing-arg validation (repo, agent).
+//   - Agent-not-found returns an error WITHOUT crashing.
+//   - All 11 AgentType values: Assistant + Browser succeed
+//     (record preserved, PID zeroed, LastError set), the other
+//     9 return RPC_AGENT_TYPE_NOT_PAUSABLE.
+//   - State-preservation contract: after a successful Stop the
+//     state.Agent record is still queryable (NOT deleted), and
+//     its non-PID fields (WindowName, SessionID, CreatedAt,
+//     WorktreePath, Type) are unchanged.
+//
+// Backend.StopAgent will return "session not found" against
+// the test daemon's empty DirectBackend, which the handler
+// logs and ignores. That mirrors the pre-7.1 remove_agent
+// behaviour and is the right shape: the user's intent ("be
+// stopped") survives an already-dead process.
+func TestHandleStopAgent(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+
+	t.Run("missing repo arg", func(t *testing.T) {
+		resp := d.handleStopAgent(socket.Request{
+			Command: "stop_agent",
+			Args:    map[string]interface{}{"agent": "x"},
+		})
+		if resp.Success {
+			t.Error("expected failure with missing repo")
+		}
+	})
+
+	t.Run("missing agent arg", func(t *testing.T) {
+		resp := d.handleStopAgent(socket.Request{
+			Command: "stop_agent",
+			Args:    map[string]interface{}{"repo": "test-repo"},
+		})
+		if resp.Success {
+			t.Error("expected failure with missing agent")
+		}
+	})
+
+	t.Run("agent not in state", func(t *testing.T) {
+		resp := d.handleStopAgent(socket.Request{
+			Command: "stop_agent",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "no-such-agent",
+			},
+		})
+		if resp.Success {
+			t.Error("expected failure for nonexistent agent")
+		}
+		if !strings.Contains(strings.ToLower(resp.Error), "not found") {
+			t.Errorf("error must contain 'not found' for isAgentNotFoundError compatibility, got: %s", resp.Error)
+		}
+	})
+
+	allowed := map[state.AgentType]bool{
+		state.AgentTypeAssistant: true,
+		state.AgentTypeBrowser:   true,
+	}
+	cases := []state.AgentType{
+		state.AgentTypeAssistant,
+		state.AgentTypeBrowser,
+		state.AgentTypeWorker,
+		state.AgentTypeSupervisor,
+		state.AgentTypeMergeQueue,
+		state.AgentTypePRShepherd,
+		state.AgentTypeWorkspace,
+		state.AgentTypeReview,
+		state.AgentTypeVerification,
+		state.AgentTypeGenericPersistent,
+		state.AgentTypeAgentBuilder,
+	}
+	for _, at := range cases {
+		at := at
+		t.Run("type/"+string(at), func(t *testing.T) {
+			agentName := "agent-" + string(at)
+			created := time.Now().Add(-1 * time.Hour)
+			ag := state.Agent{
+				Type:         at,
+				WindowName:   "win-" + agentName,
+				SessionID:    "sid-" + agentName,
+				WorktreePath: "/tmp/wt-" + agentName,
+				CreatedAt:    created,
+				PID:          12345,
+			}
+			if err := d.state.AddAgent("test-repo", agentName, ag); err != nil {
+				t.Fatalf("AddAgent: %v", err)
+			}
+			t.Cleanup(func() {
+				_ = d.state.RemoveAgent("test-repo", agentName)
+			})
+
+			resp := d.handleStopAgent(socket.Request{
+				Command: "stop_agent",
+				Args: map[string]interface{}{
+					"repo":  "test-repo",
+					"agent": agentName,
+				},
+			})
+
+			if allowed[at] {
+				if !resp.Success {
+					t.Fatalf("stop_agent should succeed for %s; got error: %s", at, resp.Error)
+				}
+				after, ok := d.state.GetAgent("test-repo", agentName)
+				if !ok {
+					t.Fatalf("agent record was deleted; stop_agent must preserve it for %s", at)
+				}
+				if after.PID != 0 {
+					t.Errorf("PID should be zeroed after Stop, got %d", after.PID)
+				}
+				if after.LastError != "stopped by user" {
+					t.Errorf("LastError = %q, want %q", after.LastError, "stopped by user")
+				}
+				if after.Type != at {
+					t.Errorf("Type mutated: got %s want %s", after.Type, at)
+				}
+				if after.WindowName != ag.WindowName ||
+					after.SessionID != ag.SessionID ||
+					after.WorktreePath != ag.WorktreePath {
+					t.Error("non-PID fields mutated after stop_agent; record-preservation contract broken")
+				}
+				if !after.CreatedAt.Equal(created) {
+					t.Errorf("CreatedAt was mutated: got %v want %v", after.CreatedAt, created)
+				}
+				return
+			}
+
+			if resp.Success {
+				t.Fatalf("stop_agent should REJECT non-pausable type %s", at)
+			}
+			if !strings.Contains(resp.Error, "RPC_AGENT_TYPE_NOT_PAUSABLE") {
+				t.Errorf("rejection error must mention RPC_AGENT_TYPE_NOT_PAUSABLE for %s, got: %s", at, resp.Error)
+			}
+			after, ok := d.state.GetAgent("test-repo", agentName)
+			if !ok {
+				t.Fatalf("agent record vanished for rejected type %s; rejection must not mutate state", at)
+			}
+			if after.PID != 12345 {
+				t.Errorf("rejected stop_agent mutated PID (got %d, want 12345) for type %s", after.PID, at)
+			}
+			if after.LastError != "" {
+				t.Errorf("rejected stop_agent set LastError (%q) for type %s", after.LastError, at)
+			}
+		})
+	}
+}
+
+// TestHandleStopAgent_ConcurrentSerializesViaMutex exercises
+// the per-agent stop/restart mutex (Part 7 Commit 7.1). Two
+// goroutines fire handleStopAgent for the SAME agent
+// concurrently; the mutex must serialise them so the first
+// observes Success and the second observes either Success
+// (idempotent re-stop) or a clean state where PID is still 0
+// and LastError still "stopped by user". Critically: the
+// goroutines must NOT race past each other to leave the state
+// half-mutated (PID nonzero AND LastError set, or PID zero
+// AND LastError empty).
+func TestHandleStopAgent_ConcurrentSerializesViaMutex(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+
+	const N = 8
+	for i := 0; i < N; i++ {
+		agentName := fmt.Sprintf("personal-%d", i)
+		ag := state.Agent{
+			Type:       state.AgentTypeAssistant,
+			WindowName: agentName,
+			SessionID:  "sid-" + agentName,
+			CreatedAt:  time.Now(),
+			PID:        9999,
+		}
+		if err := d.state.AddAgent("test-repo", agentName, ag); err != nil {
+			t.Fatalf("AddAgent: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		const concurrent = 4
+		results := make([]bool, concurrent)
+		for k := 0; k < concurrent; k++ {
+			k := k
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				resp := d.handleStopAgent(socket.Request{
+					Command: "stop_agent",
+					Args: map[string]interface{}{
+						"repo":  "test-repo",
+						"agent": agentName,
+					},
+				})
+				results[k] = resp.Success
+			}()
+		}
+		wg.Wait()
+
+		successes := 0
+		for _, ok := range results {
+			if ok {
+				successes++
+			}
+		}
+		if successes == 0 {
+			t.Fatalf("agent %s: at least one concurrent stop_agent must succeed", agentName)
+		}
+		after, ok := d.state.GetAgent("test-repo", agentName)
+		if !ok {
+			t.Fatalf("agent %s: record vanished after concurrent stop_agent", agentName)
+		}
+		if after.PID != 0 {
+			t.Errorf("agent %s: PID = %d, want 0 (final state must be coherent)", agentName, after.PID)
+		}
+		if after.LastError != "stopped by user" {
+			t.Errorf("agent %s: LastError = %q, want %q", agentName, after.LastError, "stopped by user")
+		}
 	}
 }
 

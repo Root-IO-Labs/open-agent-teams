@@ -46,6 +46,33 @@ func (t AgentType) IsPersistent() bool {
 	}
 }
 
+// IsPausable returns true if this agent type supports the `stop_agent`
+// daemon verb (Part 7 Commit 7.1). Pause semantics — process killed,
+// state record preserved so a later Restart resumes — only make sense
+// for user-facing web agents (assistants on the side panel, browser
+// workflow-helpers controlled from the same panel). Other agent types
+// have different lifecycle invariants:
+//
+//   - Workers / review / verification are task-scoped; the right
+//     "stop" verb is `oat agent complete` (graceful) or
+//     `oat agent remove` (force) and they go away entirely on stop.
+//   - Supervisors / merge-queue / PR-shepherd / workspace are repo-
+//     scoped persistents; the right way to pause them is
+//     `oat repo hibernate`, which also archives the worktree.
+//
+// Whitelist (not blacklist) so adding a new AgentType is denied by
+// default until the new type's lifecycle is reviewed and explicitly
+// added here. The corresponding daemon handler returns
+// RPC_AGENT_TYPE_NOT_PAUSABLE when this method returns false.
+func (t AgentType) IsPausable() bool {
+	switch t {
+	case AgentTypeAssistant, AgentTypeBrowser:
+		return true
+	default:
+		return false
+	}
+}
+
 // TrackMode defines which PRs the merge queue should track
 type TrackMode string
 
@@ -238,6 +265,24 @@ type Agent struct {
 	// operator can decide whether to re-onboard it or pick a permanent
 	// replacement via `oat agent set-model`.
 	ModelSwapPrevious string `json:"model_swap_previous,omitempty"`
+
+	// LastError is a free-form short string capturing the most recent
+	// lifecycle event that produced an error/halt — surfaced in
+	// `oat status` and the side panel so an operator (or the
+	// post-Part-7.2 recovery audit) can see WHY the PID is zero
+	// without having to grep daemon.log.
+	//
+	// Initial use (Part 7 Commit 7.1): handleStopAgent sets this to
+	// "stopped by user" when the user clicks Stop in the side panel
+	// or runs `oat assistant stop`. Part 7 Commit 7.2 will key the
+	// recovery-suppression check off this string ("did the user
+	// explicitly stop this agent? don't auto-restore it") so the
+	// daemon's health-check loop doesn't fight the user's intent.
+	//
+	// Other lifecycle paths (model-swap, rejection-cap, etc.) have
+	// their own dedicated fields; this one is reserved for the
+	// "process is gone and here's the user-visible reason" surface.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // IsDormant returns true if the agent is in any dormancy state (waiting for
