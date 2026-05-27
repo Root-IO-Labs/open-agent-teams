@@ -286,7 +286,38 @@ type Daemon struct {
 	// ronously inside a single handler.
 	agentLifecycleMu     sync.Mutex
 	agentLifecycleMutexes map[string]*sync.Mutex
+
+	// Part 7 Commit 7.3: per-target write throttle for the
+	// route_user_message verb. Key: "<repo>/<agent>" (same
+	// canonical form as agentLifecycleMutexes). Value: timestamp
+	// of the most recent SUCCESSFUL route. We reject the next
+	// route within routeRateLimitWindow (100 ms) of the stored
+	// timestamp with RPC_RATE_LIMITED. The cap is intentionally
+	// low — it exists to prevent a misbehaving extension or a
+	// CLI loop from saturating the PTY with thousands of writes
+	// per second (which would interleave bytes in the agent's
+	// stdin and produce garbage prompts), NOT to gate normal
+	// human typing.
+	//
+	// Failed routes (validation, type-not-routable, sanitization
+	// failures) do NOT update the timestamp — they consumed no
+	// PTY bandwidth, so they shouldn't poison subsequent legit
+	// writes. Only the successful PTY send refreshes the entry.
+	//
+	// Guarded by routeRateLimitMu. Held only for the
+	// instant-check / instant-update; never while doing I/O.
+	routeRateLimitMu sync.Mutex
+	routeRateLimit   map[string]time.Time
 }
+
+// routeRateLimitWindow is the minimum interval between
+// consecutive successful route_user_message calls to the same
+// target. See Daemon.routeRateLimit for the rationale.
+//
+// Kept as a package-level var (NOT a const) so daemon tests
+// can shrink it to 0 to assert the policy without 100 ms
+// of sleep per iteration.
+var routeRateLimitWindow = 100 * time.Millisecond
 
 // corpusIndexRefreshInterval — how often the daemon rebuilds the V2
 // router's corpus snapshot. Routing decisions read the cached snapshot,
@@ -358,6 +389,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		contextCap:                  newContextCapacityState(),
 		capacityBroadcasters:        make(map[string]*capacityBroadcaster),
 		agentLifecycleMutexes:       make(map[string]*sync.Mutex),
+		routeRateLimit:              make(map[string]time.Time),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -2028,6 +2060,9 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 	case "stop_agent":
 		return d.handleStopAgent(req)
 
+	case "route_user_message":
+		return d.handleRouteUserMessage(req)
+
 	case "list_agents":
 		return d.handleListAgents(req)
 
@@ -3077,6 +3112,262 @@ func (d *Daemon) handleStopAgent(req socket.Request) socket.Response {
 		"repo":  repoName,
 		"agent": agentName,
 	})
+}
+
+// routeUserMessageMaxBytes is the hard cap on the `text` arg of
+// route_user_message. 64 KiB matches the existing user_message
+// wire cap; anything bigger gets RPC_PAYLOAD_TOO_LARGE up front
+// (no PTY write attempted). Note that SanitizePTYInput's
+// internal cap is 32 KiB — a 32-64 KiB payload passes this gate
+// but fails sanitisation with the same RPC_PAYLOAD_TOO_LARGE
+// response (see handleRouteUserMessage); the user-visible
+// outcome is identical, no information leak from the dual gate.
+const routeUserMessageMaxBytes = 64 * 1024
+
+// handleRouteUserMessage (Part 7 Commit 7.3) is the daemon-side
+// of the side panel's per-target chat routing. The side panel
+// picker selects a {repo, agent} pair; the bridge forwards the
+// user's text to this verb instead of the bonded `agent_input`
+// path so a single bridge can chat with any of N alive agents
+// simultaneously.
+//
+// Security mitigations baked in (each tested separately so a
+// regression in one doesn't silently widen the surface):
+//
+//  1. Target-type whitelist (Assistant + Browser only). Hard
+//     whitelist, NOT blacklist: a future AgentType added without
+//     touching IsRoutableTarget() is denied by default rather
+//     than silently routable. This is the single most important
+//     gate — without it the side panel could ship messages to a
+//     supervisor or worker's PTY and confuse the multi-agent
+//     coordination loop.
+//
+//  2. Per-target rate limit (100 ms; see routeRateLimitWindow).
+//     Caps PTY-write throughput so a runaway loop can't
+//     interleave bytes in the agent's stdin. Failed routes do
+//     NOT update the throttle so legit traffic isn't blocked by
+//     attackers spamming malformed routes.
+//
+//  3. PTY-input sanitisation via SanitizePTYInput
+//     (AllowInterrupt=false). Strips C0/C1 controls, ANSI/OSC
+//     escape sequences, and rejects oversized / mostly-control
+//     payloads. Same defence the user_message bonded path uses
+//     so a routed message is no more dangerous than a direct one.
+//
+//  4. Audit log per route: a single JSONL line per route to
+//     `~/.oat/output/<target_repo>/<target_agent>.routes.jsonl`
+//     with `{ts, target_repo, target_agent, byte_count,
+//     sha256(text)}`. NEVER logs the full text — the transcript
+//     already lives in the assistant's session JSONL and
+//     duplicating it here would leak chat content into a file
+//     with weaker access controls (multi-tenant developer
+//     machines, log shipping, etc.). sha256 + byte_count is
+//     enough for forensic "did this exact text arrive?" queries
+//     while keeping the audit log information-theoretically
+//     small.
+//
+//  5. Size cap: 64 KiB at the verb entry (routeUserMessageMaxBytes).
+//     SanitizePTYInput has its own 32 KiB cap that catches
+//     anything between 32-64 KiB; both return
+//     RPC_PAYLOAD_TOO_LARGE so the caller sees a single error
+//     contract.
+//
+// Error codes (substring match on the response.Error string, in
+// line with RPC_AGENT_TYPE_NOT_PAUSABLE from Commit 7.1):
+//
+//   - RPC_AGENT_NOT_FOUND       — target doesn't exist in state.
+//   - RPC_AGENT_NOT_RUNNING     — exists but PID == 0.
+//   - RPC_TARGET_NOT_ROUTABLE   — AgentType not in {Assistant, Browser}.
+//   - RPC_RATE_LIMITED          — < 100 ms since last successful route.
+//   - RPC_PAYLOAD_TOO_LARGE     — text > 64 KiB or sanitiser rejection.
+//
+// Failure to write the audit log is NOT promoted to an RPC
+// error: the PTY write already happened and rolling it back
+// is impossible. The failure is logged at WARN so an operator
+// can grep daemon.log if the audit trail goes silent. This is
+// the same forgiving treatment the other audit-log call sites
+// (token outcome log, browser-agent action log) use.
+func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
+	repoName, errResp, ok := getRequiredStringArg(req.Args, "repo", "repository name is required")
+	if !ok {
+		return errResp
+	}
+	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
+	if !ok {
+		return errResp
+	}
+	text, errResp, ok := getRequiredStringArg(req.Args, "text", "text is required")
+	if !ok {
+		return errResp
+	}
+
+	// Size cap (gate #5) FIRST — cheapest check, doesn't touch
+	// state, so a 50 MB junk payload doesn't even cost a map
+	// lookup. The byte length is in UTF-8 octets (Go strings are
+	// already byte-counted by len()), matching the wire cap.
+	if len(text) > routeUserMessageMaxBytes {
+		return socket.ErrorResponse(
+			"text is %d bytes; route_user_message cap is %d bytes (RPC_PAYLOAD_TOO_LARGE)",
+			len(text), routeUserMessageMaxBytes,
+		)
+	}
+
+	agent, exists := d.state.GetAgent(repoName, agentName)
+	if !exists {
+		return socket.ErrorResponse("agent %s not found in repo %s (RPC_AGENT_NOT_FOUND)", agentName, repoName)
+	}
+
+	// Target-type whitelist (gate #1). The IsPausable() method
+	// from Commit 7.1 is the SAME whitelist semantically (an
+	// agent type that can pause is one with a meaningful
+	// side-panel chat surface), but rather than couple two
+	// independent decisions to one method we expose a separate
+	// IsRoutableTarget() so a future change ("Browser can chat
+	// but should NOT pause") doesn't accidentally break either
+	// gate. Today both methods return the same set.
+	if !agent.Type.IsRoutableTarget() {
+		return socket.ErrorResponse(
+			"agent type %q is not routable from the side panel (RPC_TARGET_NOT_ROUTABLE); only assistant + browser agents accept routed user_message",
+			agent.Type,
+		)
+	}
+
+	if agent.PID == 0 {
+		return socket.ErrorResponse(
+			"agent %s/%s has no live process (RPC_AGENT_NOT_RUNNING); use `oat agent restart` first",
+			repoName, agentName,
+		)
+	}
+
+	repo, repoExists := d.state.GetRepo(repoName)
+	if !repoExists {
+		// State inconsistency: the agent record exists but its
+		// repo doesn't. Surface as not-found rather than a
+		// 500-class internal error — from the caller's POV the
+		// target is unreachable, which is the same as not-found.
+		return socket.ErrorResponse("repo %s missing for agent %s (RPC_AGENT_NOT_FOUND)", repoName, agentName)
+	}
+
+	// Per-target rate limit (gate #2). Held briefly only for
+	// the lookup-and-decide; the actual PTY write happens
+	// AFTER releasing the lock so a slow backend doesn't block
+	// every other target's throttle check.
+	key := repoName + "/" + agentName
+	now := time.Now()
+	d.routeRateLimitMu.Lock()
+	if last, found := d.routeRateLimit[key]; found {
+		if now.Sub(last) < routeRateLimitWindow {
+			d.routeRateLimitMu.Unlock()
+			return socket.ErrorResponse(
+				"route to %s/%s rate-limited (RPC_RATE_LIMITED); minimum interval is %s",
+				repoName, agentName, routeRateLimitWindow,
+			)
+		}
+	}
+	d.routeRateLimitMu.Unlock()
+
+	// Sanitisation (gate #3). The same function gates the bonded
+	// user_message path (Part 2b), so a routed message is no
+	// more dangerous than a direct one. AllowInterrupt=false
+	// because the side-panel Interrupt button takes a separate
+	// code path; routed messages are always plain text.
+	sanitized, err := socket.SanitizePTYInput(text, socket.SanitizeOpts{})
+	if err != nil {
+		// Sanitiser oversize collapses into the same
+		// RPC_PAYLOAD_TOO_LARGE bucket as the 64 KiB pre-check
+		// so callers see one error contract. Other sanitiser
+		// failures (control-byte injection, invalid UTF-8) get
+		// their own explanatory string — they're a security
+		// signal, not a size issue.
+		if err == socket.ErrSanitizeOversized {
+			return socket.ErrorResponse(
+				"text is too large after sanitisation (RPC_PAYLOAD_TOO_LARGE): %v",
+				err,
+			)
+		}
+		return socket.ErrorResponse("text failed sanitisation: %v", err)
+	}
+
+	// Backend write. We do NOT hold any daemon mutex during the
+	// PTY write — backend.SendMessage uses its own per-window
+	// serialisation inside DirectBackend, so concurrent routes
+	// to the SAME target serialise at that layer without us
+	// holding daemon-level locks. Concurrent routes to
+	// DIFFERENT targets proceed in parallel.
+	windowName := agent.WindowName
+	if windowName == "" {
+		windowName = agentName
+	}
+	if err := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); err != nil {
+		return socket.ErrorResponse("backend.SendMessage failed for %s/%s: %v", repoName, agentName, err)
+	}
+
+	// Update rate-limit timestamp ONLY on success. See the
+	// routeRateLimit field doc for why failed routes don't
+	// poison the throttle.
+	d.routeRateLimitMu.Lock()
+	d.routeRateLimit[key] = time.Now()
+	d.routeRateLimitMu.Unlock()
+
+	// Audit log (gate #4). Best-effort; failure is logged but
+	// doesn't fail the verb. We log the SANITISED byte count
+	// (post-strip) AND the sha256 of the SANITISED text because
+	// that's what the agent actually received. A future forensic
+	// analysis asking "did agent X see exactly this text?" needs
+	// the sanitised form, not the wire form.
+	if err := d.appendRouteAuditLog(repoName, agentName, sanitized); err != nil {
+		d.logger.Warn("route_user_message: audit-log append failed for %s/%s: %v", repoName, agentName, err)
+	}
+
+	return socket.SuccessResponse(map[string]interface{}{
+		"repo":       repoName,
+		"agent":      agentName,
+		"byte_count": len(sanitized),
+	})
+}
+
+// appendRouteAuditLog writes one JSONL record per successful
+// route_user_message call to
+// `~/.oat/output/<repo>/<agent>.routes.jsonl`. NEVER includes
+// the raw text — only a sha256 + byte count. See the
+// handleRouteUserMessage doc (gate #4) for the privacy
+// rationale.
+//
+// File handling: open with O_APPEND|O_CREATE|O_WRONLY so
+// concurrent writers from independent goroutines don't
+// truncate each other's lines; the kernel guarantees
+// single-write atomicity up to PIPE_BUF (typically 4 KiB),
+// and our line is ~120 bytes, well under that.
+func (d *Daemon) appendRouteAuditLog(repoName, agentName, sanitizedText string) error {
+	dir := d.paths.RepoOutputDir(repoName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	path := filepath.Join(dir, agentName+".routes.jsonl")
+
+	sum := sha256.Sum256([]byte(sanitizedText))
+	record := map[string]interface{}{
+		"ts":           time.Now().UTC().Format(time.RFC3339Nano),
+		"target_repo":  repoName,
+		"target_agent": agentName,
+		"byte_count":   len(sanitizedText),
+		"sha256":       hex.EncodeToString(sum[:]),
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal audit record: %w", err)
+	}
+	data = append(data, '\n')
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("write audit line: %w", err)
+	}
+	return nil
 }
 
 // handleRemoveAgent kills an agent process and removes it from state.

@@ -73,6 +73,35 @@ func (t AgentType) IsPausable() bool {
 	}
 }
 
+// IsRoutableTarget reports whether this AgentType can receive a
+// routed `user_message` from the side-panel chat picker
+// (Part 7 Commit 7.3 `route_user_message` daemon verb).
+//
+// Today this method returns the same set as IsPausable() —
+// Assistant + Browser — because the two questions ("can the
+// user pause this from the side panel?" and "can the user
+// chat with this from the side panel?") happen to coincide:
+// every side-panel-controllable agent is both pausable and
+// chat-routable. They're exposed as separate methods anyway
+// because a future split (e.g. an agent type that accepts chat
+// but cannot be paused via stop_agent, or vice-versa) must NOT
+// accidentally widen one gate when narrowing the other. Two
+// methods = two intentional decisions.
+//
+// Whitelist (not blacklist), same reasoning as IsPausable():
+// a new AgentType is denied routing by default until the
+// reviewer explicitly adds it here. The handler returns
+// RPC_TARGET_NOT_ROUTABLE when this method returns false; see
+// docs/extending/SOCKET_API.md `route_user_message` section.
+func (t AgentType) IsRoutableTarget() bool {
+	switch t {
+	case AgentTypeAssistant, AgentTypeBrowser:
+		return true
+	default:
+		return false
+	}
+}
+
 // TrackMode defines which PRs the merge queue should track
 type TrackMode string
 

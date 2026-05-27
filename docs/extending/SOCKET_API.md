@@ -11,6 +11,7 @@ reload_model_profiles
 add_agent
 remove_agent
 stop_agent
+route_user_message
 list_agents
 complete_agent
 agent_waiting
@@ -69,6 +70,7 @@ Each command below matches a `case` in `handleRequest`.
 | `add_agent` | Register an agent in state | `repo`, `name`, `type`, `worktree_path`, `window_name`, `session_id`, `pid` |
 | `remove_agent` | Remove agent from state | `repo`, `name` |
 | `stop_agent` | Pause an agent: kill the process and zero the PID, but PRESERVE the `state.Agent` record so a later `restart_agent` resumes at the same session JSONL and worktree. Sets `agent.LastError` to `"stopped by user"` so the side panel + Part-7.2 recovery audit can see why PID is zero. **Restricted to `AgentType in {Assistant, Browser}`** via `state.AgentType.IsPausable()`; other types return `RPC_AGENT_TYPE_NOT_PAUSABLE` with a pointer at `oat repo hibernate` (repo-scoped pause) or `oat agent remove` (task-scoped cancel). Per-agent stop/restart mutex serialises concurrent Stop+Restart from rage-clicks so state stays coherent. Backend escalates SIGTERM→SIGKILL after 5s so a hung agent can't deadlock the verb. | `repo` (string), `agent` (string) |
+| `route_user_message` | Route a side-panel chat message to a specific `{repo, agent}` target instead of the bonded `agent_input` path. Lets one bridge chat with N targets simultaneously (the chat-tab picker UX). **Five gates**: (1) **target-type whitelist** — `AgentType.IsRoutableTarget()` restricts to `{Assistant, Browser}` (hard whitelist; new types denied by default), (2) **per-target rate limit** at 100 ms (caps PTY-write throughput, prevents stdin byte interleaving), (3) **PTY-input sanitisation** via `internal/socket.SanitizePTYInput` (strips C0/C1 controls + ANSI/OSC sequences), (4) **audit log** at `~/.oat/output/<target_repo>/<target_agent>.routes.jsonl` with `{ts, target_repo, target_agent, byte_count, sha256(sanitised_text)}` — NEVER the full text (privacy contract; transcripts live in session JSONL), (5) **64 KiB size cap**. Error codes (substring on `response.error`): `RPC_AGENT_NOT_FOUND`, `RPC_AGENT_NOT_RUNNING`, `RPC_TARGET_NOT_ROUTABLE`, `RPC_RATE_LIMITED`, `RPC_PAYLOAD_TOO_LARGE`. Response success payload includes `byte_count` (sanitised length). | `repo` (string), `agent` (string), `text` (string, ≤64 KiB) |
 | `list_agents` | List agents for a repo | `repo` |
 | `complete_agent` | Mark agent ready for cleanup | `repo`, `name`, `summary`, `failure_reason` |
 | `restart_agent` | Restart a persistent agent | `repo`, `name` |

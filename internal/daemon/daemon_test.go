@@ -1280,6 +1280,455 @@ func TestAgentLastErrorSaysUserStopped_Part7Commit2(t *testing.T) {
 	}
 }
 
+// routeTestBackend (Part 7 Commit 7.3) is a minimal stub that
+// satisfies backend_pkg.ProcessBackend for the route_user_message
+// test matrix. It records every SendMessage call so tests can
+// assert on the EXACT sanitised bytes that hit the (would-be)
+// PTY without standing up a real DirectBackend session.
+//
+// Pattern: embed a nil ProcessBackend interface so we get
+// "method missing" panics on any call we DIDN'T explicitly
+// override — that's a louder failure than a no-op stub
+// silently swallowing an unexpected call. Today we only need
+// SendMessage. If a future test exercises StopAgent or
+// SendEscape against this stub, the panic message tells the
+// next reader exactly which method to add.
+type routeTestBackend struct {
+	backend_pkg.ProcessBackend // nil: forces a panic on any un-overridden method
+	mu                         sync.Mutex
+	sent                       []routeSendCall
+	// sendErr lets the test plant a backend.SendMessage error
+	// (covers the "backend write failed" branch of the handler).
+	sendErr error
+}
+
+type routeSendCall struct {
+	Session string
+	Agent   string
+	Message string
+}
+
+func (b *routeTestBackend) SendMessage(_ context.Context, session, agent, message string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sendErr != nil {
+		return b.sendErr
+	}
+	b.sent = append(b.sent, routeSendCall{Session: session, Agent: agent, Message: message})
+	return nil
+}
+
+func (b *routeTestBackend) calls() []routeSendCall {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]routeSendCall, len(b.sent))
+	copy(out, b.sent)
+	return out
+}
+
+// TestHandleRouteUserMessage_Part7Commit3 covers the documented
+// matrix from the plan body:
+//
+//   - missing-arg validation (repo, agent, text)
+//   - size cap (RPC_PAYLOAD_TOO_LARGE)
+//   - target-not-found (RPC_AGENT_NOT_FOUND)
+//   - target-not-running (PID=0 → RPC_AGENT_NOT_RUNNING)
+//   - type whitelist (11 types: Assistant + Browser allowed,
+//     every other type rejected with RPC_TARGET_NOT_ROUTABLE)
+//   - sanitisation (control bytes stripped before PTY write)
+//   - audit log entry written
+//   - success returns sanitised byte_count
+//
+// Rate-limit + concurrency live in their own tests below so
+// each can use isolated state without resetting throttle
+// timestamps mid-table.
+func TestHandleRouteUserMessage_Part7Commit3(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	fake := &routeTestBackend{}
+	d.backend = fake
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+
+	addAgent := func(t *testing.T, name string, at state.AgentType, pid int) {
+		t.Helper()
+		ag := state.Agent{
+			Type:       at,
+			WindowName: "win-" + name,
+			SessionID:  "sid-" + name,
+			CreatedAt:  time.Now(),
+			PID:        pid,
+		}
+		if err := d.state.AddAgent("test-repo", name, ag); err != nil {
+			t.Fatalf("AddAgent %s: %v", name, err)
+		}
+	}
+
+	t.Run("missing repo arg", func(t *testing.T) {
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args:    map[string]interface{}{"agent": "x", "text": "hi"},
+		})
+		if resp.Success {
+			t.Error("missing repo should fail")
+		}
+	})
+	t.Run("missing agent arg", func(t *testing.T) {
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args:    map[string]interface{}{"repo": "test-repo", "text": "hi"},
+		})
+		if resp.Success {
+			t.Error("missing agent should fail")
+		}
+	})
+	t.Run("missing text arg", func(t *testing.T) {
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args:    map[string]interface{}{"repo": "test-repo", "agent": "x"},
+		})
+		if resp.Success {
+			t.Error("missing text should fail")
+		}
+	})
+
+	t.Run("payload over size cap", func(t *testing.T) {
+		addAgent(t, "size-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "size-target") })
+		big := strings.Repeat("a", routeUserMessageMaxBytes+1)
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "size-target",
+				"text":  big,
+			},
+		})
+		if resp.Success {
+			t.Fatal("oversized text must be rejected")
+		}
+		if !strings.Contains(resp.Error, "RPC_PAYLOAD_TOO_LARGE") {
+			t.Errorf("expected RPC_PAYLOAD_TOO_LARGE, got: %s", resp.Error)
+		}
+	})
+
+	t.Run("agent not found", func(t *testing.T) {
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "nonexistent",
+				"text":  "hi",
+			},
+		})
+		if resp.Success {
+			t.Fatal("nonexistent agent must be rejected")
+		}
+		if !strings.Contains(resp.Error, "RPC_AGENT_NOT_FOUND") {
+			t.Errorf("expected RPC_AGENT_NOT_FOUND, got: %s", resp.Error)
+		}
+	})
+
+	t.Run("agent not running (PID=0)", func(t *testing.T) {
+		addAgent(t, "stopped", state.AgentTypeAssistant, 0)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "stopped") })
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "stopped",
+				"text":  "hi",
+			},
+		})
+		if resp.Success {
+			t.Fatal("PID=0 must be rejected")
+		}
+		if !strings.Contains(resp.Error, "RPC_AGENT_NOT_RUNNING") {
+			t.Errorf("expected RPC_AGENT_NOT_RUNNING, got: %s", resp.Error)
+		}
+	})
+
+	allowed := map[state.AgentType]bool{
+		state.AgentTypeAssistant: true,
+		state.AgentTypeBrowser:   true,
+	}
+	cases := []state.AgentType{
+		state.AgentTypeAssistant,
+		state.AgentTypeBrowser,
+		state.AgentTypeWorker,
+		state.AgentTypeSupervisor,
+		state.AgentTypeMergeQueue,
+		state.AgentTypePRShepherd,
+		state.AgentTypeWorkspace,
+		state.AgentTypeReview,
+		state.AgentTypeVerification,
+		state.AgentTypeGenericPersistent,
+		state.AgentTypeAgentBuilder,
+	}
+	for _, at := range cases {
+		at := at
+		t.Run("type/"+string(at), func(t *testing.T) {
+			// Each type sub-test gets its own agent name so the
+			// rate-limit + audit-log assertions don't bleed across
+			// the matrix.
+			agentName := "type-" + string(at)
+			addAgent(t, agentName, at, 12345)
+			t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", agentName) })
+
+			resp := d.handleRouteUserMessage(socket.Request{
+				Command: "route_user_message",
+				Args: map[string]interface{}{
+					"repo":  "test-repo",
+					"agent": agentName,
+					"text":  "hello",
+				},
+			})
+
+			if allowed[at] {
+				if !resp.Success {
+					t.Fatalf("route should succeed for routable type %s, got: %s", at, resp.Error)
+				}
+				return
+			}
+			if resp.Success {
+				t.Fatalf("route should REJECT non-routable type %s", at)
+			}
+			if !strings.Contains(resp.Error, "RPC_TARGET_NOT_ROUTABLE") {
+				t.Errorf("expected RPC_TARGET_NOT_ROUTABLE for %s, got: %s", at, resp.Error)
+			}
+		})
+	}
+
+	t.Run("sanitisation strips control bytes before PTY write", func(t *testing.T) {
+		// Use a fresh agent so the post-call audit-log assertion
+		// targets exactly the file produced by this sub-test.
+		addAgent(t, "sanitise-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "sanitise-target") })
+
+		// Wait long enough that prior sub-tests' throttle entries
+		// won't reject our route. The whitelist matrix above
+		// touched many agents but each had its own key, so the
+		// "sanitise-target" key starts fresh. Belt-and-braces.
+		fakeBefore := len(fake.calls())
+
+		_ = "Hello\x07\x1b[31mthere\x1b[0m world" // ANSI + BEL
+		raw := "Hello\x07\x1b[31mthere\x1b[0m world"
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "sanitise-target",
+				"text":  raw,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("sanitise route should succeed; got: %s", resp.Error)
+		}
+
+		calls := fake.calls()
+		if len(calls) != fakeBefore+1 {
+			t.Fatalf("expected 1 new SendMessage call, got %d (total now %d)",
+				len(calls)-fakeBefore, len(calls))
+		}
+		last := calls[len(calls)-1]
+		// BEL (0x07) and ANSI escape sequences must be stripped.
+		if strings.ContainsAny(last.Message, "\x07\x1b") {
+			t.Errorf("sanitised message still contains control bytes: %q", last.Message)
+		}
+		if !strings.Contains(last.Message, "Hello") || !strings.Contains(last.Message, "there") || !strings.Contains(last.Message, "world") {
+			t.Errorf("sanitised message dropped legitimate content: %q", last.Message)
+		}
+	})
+
+	t.Run("audit log entry written on success", func(t *testing.T) {
+		addAgent(t, "audit-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "audit-target") })
+
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "audit-target",
+				"text":  "audit me please",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("audit route should succeed; got: %s", resp.Error)
+		}
+
+		auditPath := filepath.Join(d.paths.RepoOutputDir("test-repo"), "audit-target.routes.jsonl")
+		data, err := os.ReadFile(auditPath)
+		if err != nil {
+			t.Fatalf("audit file %s not written: %v", auditPath, err)
+		}
+		line := strings.TrimSpace(string(data))
+		if line == "" {
+			t.Fatal("audit file is empty")
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("audit line is not JSON: %v (line=%q)", err, line)
+		}
+		for _, field := range []string{"ts", "target_repo", "target_agent", "byte_count", "sha256"} {
+			if _, ok := rec[field]; !ok {
+				t.Errorf("audit record missing field %q: %v", field, rec)
+			}
+		}
+		// CRITICAL: the raw text must NOT appear in the audit log
+		// — privacy contract. The test prompt is unique enough
+		// that a substring search is meaningful.
+		if strings.Contains(line, "audit me please") {
+			t.Errorf("audit log MUST NOT contain raw text; line=%q", line)
+		}
+		if got, _ := rec["target_repo"].(string); got != "test-repo" {
+			t.Errorf("target_repo = %q, want test-repo", got)
+		}
+		if got, _ := rec["target_agent"].(string); got != "audit-target" {
+			t.Errorf("target_agent = %q, want audit-target", got)
+		}
+	})
+}
+
+// TestHandleRouteUserMessage_RateLimit_Part7Commit3 pins the
+// per-target throttle: two routes to the same agent within
+// the window must reject the second one with RPC_RATE_LIMITED,
+// and the THIRD call (after the window elapses) must succeed.
+// The throttle window is shrunk to a few milliseconds for test
+// speed via the package-level routeRateLimitWindow var.
+func TestHandleRouteUserMessage_RateLimit_Part7Commit3(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	d.backend = &routeTestBackend{}
+
+	if err := d.state.AddRepo("test-repo", &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("test-repo", "throttle-target", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "throttle-target",
+		PID:        9999,
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	// Shrink the throttle window for the test. Save + restore so
+	// other parallel tests aren't affected.
+	prev := routeRateLimitWindow
+	routeRateLimitWindow = 25 * time.Millisecond
+	defer func() { routeRateLimitWindow = prev }()
+
+	send := func() socket.Response {
+		return d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "throttle-target",
+				"text":  "hi",
+			},
+		})
+	}
+
+	if r := send(); !r.Success {
+		t.Fatalf("first route should succeed; got: %s", r.Error)
+	}
+	if r := send(); r.Success {
+		t.Fatal("second route within window must be rate-limited")
+	} else if !strings.Contains(r.Error, "RPC_RATE_LIMITED") {
+		t.Errorf("expected RPC_RATE_LIMITED, got: %s", r.Error)
+	}
+	time.Sleep(2 * routeRateLimitWindow)
+	if r := send(); !r.Success {
+		t.Fatalf("third route after window should succeed; got: %s", r.Error)
+	}
+}
+
+// TestRouteUserMessageConcurrent_Part7Commit3 asserts that
+// concurrent routes to the SAME target produce no byte-
+// interleaving in the backend SendMessage calls — each
+// recorded message must be one of the inputs verbatim, never
+// a spliced mix. This is the contract the plan body calls out
+// for cross-PTY safety.
+//
+// The DirectBackend serialises writes per agent internally,
+// so the stub backend's recorder just needs to capture
+// whatever sequence of calls actually arrives. We then assert
+// no recorded Message string is a non-input mixture.
+func TestRouteUserMessageConcurrent_Part7Commit3(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	fake := &routeTestBackend{}
+	d.backend = fake
+
+	if err := d.state.AddRepo("test-repo", &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("test-repo", "concurrent-target", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "concurrent-target",
+		PID:        9999,
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	// Disable the throttle for this test so ALL N goroutines'
+	// routes can land — we're testing byte-coherence, not the
+	// throttle (which has its own test).
+	prev := routeRateLimitWindow
+	routeRateLimitWindow = 0
+	defer func() { routeRateLimitWindow = prev }()
+
+	const N = 12
+	inputs := make(map[string]bool, N)
+	for i := 0; i < N; i++ {
+		inputs[fmt.Sprintf("payload-%d", i)] = true
+	}
+
+	var wg sync.WaitGroup
+	for input := range inputs {
+		input := input
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = d.handleRouteUserMessage(socket.Request{
+				Command: "route_user_message",
+				Args: map[string]interface{}{
+					"repo":  "test-repo",
+					"agent": "concurrent-target",
+					"text":  input,
+				},
+			})
+		}()
+	}
+	wg.Wait()
+
+	// Every recorded message MUST be exactly one of the inputs;
+	// any spliced/interleaved string would fail the membership
+	// check.
+	for _, call := range fake.calls() {
+		if !inputs[call.Message] {
+			t.Errorf("recorded message %q is not a verbatim input — interleaving detected", call.Message)
+		}
+	}
+}
+
 func TestHandleStartVerificationAgentValidation(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
