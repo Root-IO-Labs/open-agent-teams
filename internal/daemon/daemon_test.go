@@ -6208,3 +6208,231 @@ func TestCountLiveBrowserAgentsExceptDoesNotBlockOnConcurrentReaders(t *testing.
 		}
 	}
 }
+
+// TestHandlePauseWebAgents_ScopeWhitelist_Part7Commit6 is the
+// load-bearing test for the "Pause OAT" button. It pins the
+// security invariant that the verb only enumerates
+// AgentType.IsPausable() agents — Workers / Supervisors /
+// Reviewers / Merge-Queues are NEVER drained even though they
+// share the same state structure. The whitelist is what
+// distinguishes "pause my web agents" from a global state
+// catastrophe.
+//
+// Setup: three repos, each containing one Assistant + one
+// Worker + one Supervisor. Expected: 3 stop_agent equivalents
+// (one per assistant), workers and supervisors untouched.
+func TestHandlePauseWebAgents_ScopeWhitelist_Part7Commit6(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repoNames := []string{"repo-a", "repo-b", "repo-c"}
+	for _, name := range repoNames {
+		repo := &state.Repository{
+			GithubURL:   "https://github.com/test/" + name,
+			SessionName: "sess-" + name,
+			Agents:      make(map[string]state.Agent),
+		}
+		if err := d.state.AddRepo(name, repo); err != nil {
+			t.Fatalf("AddRepo %s: %v", name, err)
+		}
+		// Plant one Assistant (pausable), one Worker (NOT
+		// pausable), one Supervisor (NOT pausable). All three
+		// share a non-zero PID so the test catches a bug where
+		// the loop drains a non-whitelisted agent.
+		for _, ag := range []struct {
+			name string
+			typ  state.AgentType
+		}{
+			{name: "assistant-1", typ: state.AgentTypeAssistant},
+			{name: "worker-1", typ: state.AgentTypeWorker},
+			{name: "supervisor", typ: state.AgentTypeSupervisor},
+		} {
+			a := state.Agent{
+				Type:       ag.typ,
+				WindowName: ag.name,
+				SessionID:  ag.name + "-sid",
+				CreatedAt:  time.Now(),
+				PID:        9999,
+			}
+			if err := d.state.AddAgent(name, ag.name, a); err != nil {
+				t.Fatalf("AddAgent %s/%s: %v", name, ag.name, err)
+			}
+		}
+	}
+
+	resp := d.handlePauseWebAgents(socket.Request{Command: "pause_web_agents"})
+	if !resp.Success {
+		t.Fatalf("pause_web_agents failed: %v", resp.Error)
+	}
+
+	// Validate the result shape — counts AND per-agent
+	// entries. Per-agent entries are what the side-panel toast
+	// surfaces; the counts let the caller short-circuit on
+	// "everything succeeded" without walking the results.
+	data, ok := resp.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("pause_web_agents Data should be map, got %T", resp.Data)
+	}
+	stopped, _ := data["stopped_count"].(int)
+	if stopped != 3 {
+		t.Errorf("stopped_count = %d, want 3 (one per repo's assistant)", stopped)
+	}
+	failed, _ := data["failed_count"].(int)
+	if failed != 0 {
+		t.Errorf("failed_count = %d, want 0", failed)
+	}
+
+	// Whitelist enforcement: every Worker / Supervisor must
+	// still have PID = 9999 because the verb skipped them.
+	// Every Assistant must have PID = 0 + LastError set.
+	for _, name := range repoNames {
+		for _, agentName := range []string{"assistant-1", "worker-1", "supervisor"} {
+			ag, exists := d.state.GetAgent(name, agentName)
+			if !exists {
+				t.Fatalf("agent %s/%s vanished after pause", name, agentName)
+			}
+			if ag.Type.IsPausable() {
+				if ag.PID != 0 {
+					t.Errorf("%s/%s: pausable agent should have PID=0, got %d", name, agentName, ag.PID)
+				}
+				if ag.LastError == "" {
+					t.Errorf("%s/%s: pausable agent should have non-empty LastError", name, agentName)
+				}
+			} else {
+				if ag.PID != 9999 {
+					t.Errorf("%s/%s: NON-pausable agent type %s should be untouched (PID=9999), got PID=%d (whitelist regression)",
+						name, agentName, ag.Type, ag.PID)
+				}
+				if ag.LastError != "" {
+					t.Errorf("%s/%s: NON-pausable agent type %s should have empty LastError, got %q (whitelist regression)",
+						name, agentName, ag.Type, ag.LastError)
+				}
+			}
+		}
+	}
+}
+
+// TestHandlePauseWebAgents_AlreadyStoppedFastPath pins the
+// per-agent status-code contract: an agent with PID == 0 on
+// entry is reported as `already_stopped` and contributes to
+// skipped_count, not stopped_count. The side-panel toast
+// uses this distinction to decide whether to show "N
+// agents already paused" vs "paused N agents".
+func TestHandlePauseWebAgents_AlreadyStoppedFastPath_Part7Commit6(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "sess-1",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+
+	// One already-stopped (PID=0) + one running (PID=9999),
+	// both Assistant.
+	for name, pid := range map[string]int{
+		"already-stopped": 0,
+		"running":         9999,
+	} {
+		a := state.Agent{
+			Type:       state.AgentTypeAssistant,
+			WindowName: name,
+			SessionID:  name + "-sid",
+			CreatedAt:  time.Now(),
+			PID:        pid,
+		}
+		if err := d.state.AddAgent("test-repo", name, a); err != nil {
+			t.Fatalf("AddAgent %s: %v", name, err)
+		}
+	}
+
+	resp := d.handlePauseWebAgents(socket.Request{Command: "pause_web_agents"})
+	if !resp.Success {
+		t.Fatalf("pause_web_agents failed: %v", resp.Error)
+	}
+	data := resp.Data.(map[string]interface{})
+	stopped, _ := data["stopped_count"].(int)
+	skipped, _ := data["skipped_count"].(int)
+	if stopped != 1 {
+		t.Errorf("stopped_count = %d, want 1 (only the PID=9999 agent)", stopped)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped_count = %d, want 1 (the PID=0 agent)", skipped)
+	}
+
+	// Per-agent status codes are what the toast surfaces.
+	results, _ := data["results"].([]struct {
+		Repo   string `json:"repo"`
+		Agent  string `json:"agent"`
+		Type   string `json:"agent_type"`
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	})
+	// The struct-slice cast fails (Go reflection sees the
+	// concrete type the handler returned, which is not
+	// exported). Fall through to a JSON round-trip — same
+	// shape the bridge will consume on the wire.
+	if results == nil {
+		raw, _ := json.Marshal(data["results"])
+		var parsed []map[string]interface{}
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("results unmarshal: %v", err)
+		}
+		statusByAgent := map[string]string{}
+		for _, r := range parsed {
+			statusByAgent[r["agent"].(string)] = r["status"].(string)
+		}
+		if statusByAgent["already-stopped"] != "already_stopped" {
+			t.Errorf("already-stopped agent status = %q, want already_stopped", statusByAgent["already-stopped"])
+		}
+		if statusByAgent["running"] != "stopped" {
+			t.Errorf("running agent status = %q, want stopped", statusByAgent["running"])
+		}
+	}
+}
+
+// TestHandlePauseWebAgents_MultiRepoEnumeration pins the
+// cross-repo enumeration contract: three repos, two
+// Assistants each, all running → 6 stop_agent equivalents.
+// The plan body explicitly calls out this scenario as the
+// minimum integration shape.
+func TestHandlePauseWebAgents_MultiRepoEnumeration_Part7Commit6(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	for _, repoName := range []string{"r1", "r2", "r3"} {
+		repo := &state.Repository{
+			GithubURL:   "https://github.com/test/" + repoName,
+			SessionName: "sess-" + repoName,
+			Agents:      make(map[string]state.Agent),
+		}
+		if err := d.state.AddRepo(repoName, repo); err != nil {
+			t.Fatalf("AddRepo %s: %v", repoName, err)
+		}
+		for _, agentName := range []string{"personal", "work"} {
+			a := state.Agent{
+				Type:       state.AgentTypeAssistant,
+				WindowName: agentName,
+				SessionID:  agentName + "-sid",
+				CreatedAt:  time.Now(),
+				PID:        9999,
+			}
+			if err := d.state.AddAgent(repoName, agentName, a); err != nil {
+				t.Fatalf("AddAgent %s/%s: %v", repoName, agentName, err)
+			}
+		}
+	}
+
+	resp := d.handlePauseWebAgents(socket.Request{Command: "pause_web_agents"})
+	if !resp.Success {
+		t.Fatalf("pause_web_agents failed: %v", resp.Error)
+	}
+	data := resp.Data.(map[string]interface{})
+	stopped, _ := data["stopped_count"].(int)
+	if stopped != 6 {
+		t.Errorf("stopped_count = %d, want 6 (3 repos x 2 assistants)", stopped)
+	}
+}

@@ -2090,6 +2090,9 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 	case "route_user_message":
 		return d.handleRouteUserMessage(req)
 
+	case "pause_web_agents":
+		return d.handlePauseWebAgents(req)
+
 	case "list_agents":
 		return d.handleListAgents(req)
 
@@ -3164,6 +3167,203 @@ func (d *Daemon) handleStopAgent(req socket.Request) socket.Response {
 	return socket.SuccessResponse(map[string]interface{}{
 		"repo":  repoName,
 		"agent": agentName,
+	})
+}
+
+// handlePauseWebAgents (Part 7 Commit 7.6) is the daemon-side
+// of the side panel's "Pause OAT" button. It pauses everything
+// the side panel cares about — assistants + browser-agents —
+// across every repo, leaving workers / supervisors / merge-
+// queues / daemon untouched. A truly-global "pause everything"
+// stays a CLI / future-desktop-interface operation (see
+// `oat repo hibernate` for the supervisor/worker counterpart).
+//
+// Enumeration whitelist: state.AgentType.IsPausable(), the
+// same whitelist stop_agent uses. This is the security
+// boundary — a future AgentType added without touching
+// IsPausable() is excluded by default rather than silently
+// drained by a "pause everything" click. Tested in
+// TestHandlePauseWebAgents_ScopeWhitelist.
+//
+// Per-agent semantics: each agent goes through the same
+// in-process logic as handleStopAgent (backend.StopAgent +
+// state.ModifyAgent with PID=0 + LastError, then publish the
+// agent_stopped lifecycle frame). We DO acquire the same
+// per-agent lifecycle mutex so a concurrent restart_agent for
+// the same identity serialises correctly. We do NOT invoke
+// handleStopAgent directly because that path requires a
+// socket.Request shape; calling its core logic inline keeps
+// the call cheap and avoids round-tripping through the RPC
+// dispatch.
+//
+// Result shape: per-agent status entries with the codes
+// `stopped` (newly halted), `already_stopped` (PID was 0 on
+// entry; no backend call made), `failed` (backend or state
+// mutation error). The post-pause toast in the side panel
+// can show partial-failure detail without a second
+// list_agents round-trip.
+//
+// Best-effort by design: a single agent's failure does not
+// short-circuit the rest of the enumeration. This matches
+// the user's mental model of "pause everything you can" —
+// the alternative (abort on first failure) leaves the panel
+// in a half-paused state that's strictly worse for the user
+// than "all but one paused, here's the failure detail".
+func (d *Daemon) handlePauseWebAgents(req socket.Request) socket.Response {
+	type pauseResult struct {
+		Repo   string `json:"repo"`
+		Agent  string `json:"agent"`
+		Type   string `json:"agent_type"`
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}
+	// _ = req: kept on the signature for routing-handler
+	// uniformity. The verb takes no arguments today — a future
+	// repo-scoped variant could pull a `repo` filter from here.
+	_ = req
+
+	results := make([]pauseResult, 0)
+	stoppedCount := 0
+	skippedCount := 0
+	failedCount := 0
+
+	// Snapshot the repo set up front so a concurrent
+	// add_repo / remove_repo doesn't interleave with the
+	// enumeration. GetAllRepos returns a fresh map under the
+	// state's RWMutex, so the iteration below is safe.
+	repos := d.state.GetAllRepos()
+	for repoName, repo := range repos {
+		agentNames, err := d.state.ListAgents(repoName)
+		if err != nil {
+			// Repo gone between snapshot and ListAgents - rare
+			// but possible. Skip with a single placeholder so
+			// the caller sees the partial-skip detail.
+			d.logger.Debug("pause_web_agents: ListAgents(%s) failed: %v", repoName, err)
+			continue
+		}
+		for _, agentName := range agentNames {
+			agent, exists := d.state.GetAgent(repoName, agentName)
+			if !exists {
+				continue
+			}
+			// HARD WHITELIST: same gate stop_agent uses. Workers /
+			// supervisors / reviewers / merge-queues are excluded
+			// by IsPausable() returning false. The whitelist is
+			// the security boundary; we never see them in this
+			// loop's body for state mutation.
+			if !agent.Type.IsPausable() {
+				continue
+			}
+
+			// Already-stopped fast path: PID == 0 means the
+			// process is not running (either previously stopped
+			// or never started). Record the no-op and move on
+			// without acquiring the lifecycle mutex.
+			if agent.PID == 0 {
+				results = append(results, pauseResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "already_stopped",
+				})
+				skippedCount++
+				continue
+			}
+
+			// Serialise against restart_agent for this identity,
+			// matching handleStopAgent's contract. The mutex is
+			// per-(repo, agent), so two different agents pause in
+			// parallel; one agent never has concurrent stop+
+			// restart races.
+			mu := d.agentLifecycleMutex(repoName, agentName)
+			mu.Lock()
+
+			// Re-read inside the critical section to catch a
+			// concurrent restart that landed between PID-zero
+			// check above and lock acquisition. If the record
+			// vanished (a concurrent remove_agent), bail.
+			cur, stillExists := d.state.GetAgent(repoName, agentName)
+			if !stillExists {
+				mu.Unlock()
+				continue
+			}
+
+			windowName := cur.WindowName
+			if windowName == "" {
+				windowName = agentName
+			}
+			if err := d.backend.StopAgent(d.ctx, repo.SessionName, windowName); err != nil {
+				// Same forgiving behaviour as handleStopAgent:
+				// log the backend error but still flip the
+				// state record. The most common cause is the
+				// process already exited; the state update is
+				// what the user sees in the side panel.
+				d.logger.Warn("pause_web_agents: backend.StopAgent failed for %s/%s: %v", repoName, agentName, err)
+			} else {
+				d.logger.Info("pause_web_agents: stopped agent process %s/%s", repoName, agentName)
+			}
+
+			// Symmetric with handleStopAgent: stop the assistant-
+			// turn tailer for browser-agents.
+			if usesBrowserBridge(cur.Type) {
+				d.stopAssistantTurnTailer(repo.SessionName, agentName)
+			}
+
+			if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+				a.PID = 0
+				// Distinct from "stopped by user" so a future
+				// audit / log scan can attribute pauses caused
+				// by the side-panel global button vs an
+				// individual Stop click. Keeps the assistant
+				// turn-tailer suppression and recovery-skip
+				// logic intact (those check for non-empty
+				// LastError + the non-canonical "stopped by
+				// user" string).
+				a.LastError = "paused by user (pause_web_agents)"
+			}); err != nil {
+				mu.Unlock()
+				results = append(results, pauseResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(cur.Type),
+					Status: "failed",
+					Error:  err.Error(),
+				})
+				failedCount++
+				continue
+			}
+
+			// Publish lifecycle frame so the side panel's
+			// Status-tab cards refresh reactively without a
+			// follow-up list_agents poll.
+			if after, ok := d.state.GetAgent(repoName, agentName); ok {
+				d.publishAgentLifecycle(
+					lifecycleKindAgentStopped,
+					repoName, agentName, string(after.Type),
+					0, after.Model, after.LastError,
+				)
+			}
+
+			mu.Unlock()
+
+			results = append(results, pauseResult{
+				Repo:   repoName,
+				Agent:  agentName,
+				Type:   string(cur.Type),
+				Status: "stopped",
+			})
+			stoppedCount++
+		}
+	}
+
+	d.logger.Info("pause_web_agents: stopped=%d already_stopped=%d failed=%d total_results=%d",
+		stoppedCount, skippedCount, failedCount, len(results))
+
+	return socket.SuccessResponse(map[string]interface{}{
+		"results":         results,
+		"stopped_count":   stoppedCount,
+		"skipped_count":   skippedCount,
+		"failed_count":    failedCount,
 	})
 }
 
