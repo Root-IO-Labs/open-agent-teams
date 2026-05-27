@@ -320,6 +320,26 @@ func (c *CLI) assistantStop(args []string) error {
 // assistantRestart wraps restart_agent. --fresh wipes the session
 // JSONL first, surfacing the "I want a clean conversation" semantic
 // without needing two commands.
+//
+// Restart-from-stopped fall-through: today `oat assistant stop` runs
+// `remove_agent` which deletes the state.Agent record entirely
+// (Commit 7.1 will rewire stop to a pause that preserves the record).
+// Until that lands, a Restart issued from the side panel after a
+// Stop hits a daemon "agent not found" error because there is no
+// record to restart. Smoke-testing reported this as confusing
+// ("Restart still says stopped"). The fall-through here forwards
+// the call to the Start path so a user clicking Restart on a stopped
+// assistant gets the intuitive outcome (it comes back up) without
+// having to know the underlying lifecycle quirk.
+//
+// Idempotency guard: before falling through, re-check that nothing
+// is alive under the same name. If the agent raced into a running
+// state between Restart firing and the daemon error (e.g. a second
+// click finished registering it first), we treat that as success
+// instead of redundantly creating a duplicate. This matters because
+// rage-clicking Stop+Restart in the side panel produces overlapping
+// RPCs; without the guard, the second click would error with
+// "duplicate agent" and surface as a noisy banner.
 func (c *CLI) assistantRestart(args []string) error {
 	flags, remaining := ParseFlags(args)
 	name := resolveAssistantName(remaining)
@@ -344,7 +364,22 @@ func (c *CLI) assistantRestart(args []string) error {
 		"agent": agent,
 	})
 	if err != nil {
-		return err
+		if !isAgentNotFoundError(err) {
+			return err
+		}
+		// Idempotency check: did something race into running state
+		// while restart_agent was making its decision? If so, treat
+		// as success and report.
+		if pid, alive := c.lookupAliveAssistant(repoKey, agent); alive {
+			fmt.Printf("✓ Assistant '%s' is running (PID %d).\n", name, pid)
+			return nil
+		}
+		// Nothing alive — fall through to the Start path. Re-use the
+		// existing entry point so flag plumbing (model, open-panel,
+		// daemon auto-start, etc.) stays in exactly one place.
+		startArgs := []string{name}
+		fmt.Printf("Assistant '%s' was not registered; starting it now.\n", name)
+		return c.assistantStart(startArgs)
 	}
 	if data, ok := resp.Data.(map[string]interface{}); ok {
 		if pid, ok := data["pid"].(float64); ok {
@@ -463,9 +498,7 @@ func (c *CLI) assistantStatus(args []string) error {
 		pid = int(v)
 	}
 	status.PID = pid
-	if m, _ := rec["model"].(string); m != "" {
-		status.Model = m
-	}
+	status.Model = pickModelEcho(rec)
 	status.ModelSwappedOnRestart, _ = rec["model_swapped_on_restart"].(bool)
 	status.ModelSwapReason, _ = rec["model_swap_reason"].(string)
 	if pid > 0 && isProcessAlive(pid) {
@@ -833,6 +866,49 @@ func (c *CLI) assistantList(args []string) error {
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
+
+// isAgentNotFoundError classifies a daemon error as the
+// "no such agent" / "agent not found" family vs anything else.
+// Used by assistantRestart's fall-through path to distinguish
+// "the agent record was deleted, fall through to Start" from
+// "some other daemon error, surface it". Centralised + tested as
+// a pure helper because the substring match is the only thing
+// that's at risk of subtle drift if the daemon ever changes its
+// error wording — a regression here would silently turn the
+// fall-through off and the smoke-test bug returns.
+func isAgentNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "no such agent")
+}
+
+// pickModelEcho returns the model string to surface in
+// AssistantStatusJSON given the raw rich-list_agents row for an
+// assistant. Precedence:
+//
+//  1. `resolved_model` — the spawn-time `-M` value frozen onto
+//     the state.Agent at first spawn / restart. This is what's
+//     ACTUALLY running, regardless of any subsequent daemon-
+//     default shift. Preferred so the side panel doesn't lie.
+//  2. `model` — the explicit agent-level override (set via
+//     `--model` or `oat assistant set-model`). Used when the
+//     agent record exists but has never been spawned, so
+//     ResolvedModel hasn't been populated yet.
+//  3. "" — first-run case (no override, never spawned).
+//
+// Extracted as a pure function so the precedence is unit-
+// testable without a daemon harness.
+func pickModelEcho(rec map[string]interface{}) string {
+	if rm, _ := rec["resolved_model"].(string); rm != "" {
+		return rm
+	}
+	if m, _ := rec["model"].(string); m != "" {
+		return m
+	}
+	return ""
+}
 
 // lookupAliveAssistant returns (pid, true) iff the agent record
 // exists, has a non-zero PID, and the PID is alive. Centralized so

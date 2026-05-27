@@ -3072,6 +3072,15 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 				detail["model_swap_reason"] = agent.ModelSwapReason
 				detail["model_swap_previous"] = agent.ModelSwapPrevious
 			}
+			// Frozen-at-spawn resolved model. Lets callers (e.g. the
+			// side-panel Assistant section) show the LITERAL model
+			// running, including the case where the user never passed
+			// --model and the repo default is what got handed to the
+			// agent runtime. Empty until the agent has been spawned at
+			// least once.
+			if agent.ResolvedModel != "" {
+				detail["resolved_model"] = agent.ResolvedModel
+			}
 
 			// Log file path — so TUI doesn't have to compute it client-side
 			isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
@@ -6172,6 +6181,25 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		}
 	}
 
+	// Freeze the spawn-time model on the agent record so the side panel
+	// (and any other observer) can read the LITERAL value that's running
+	// without having to re-resolve through the same router chain. If the
+	// daemon default later changes (e.g. operator runs `oat config <repo>
+	// model <other>`), this field keeps showing what this specific agent
+	// process was actually started with. Set BEFORE the backend spawn so
+	// the value is persisted even if the spawn races with a status read.
+	if resolvedModel != "" {
+		if err := d.state.ModifyAgent(repoName, cfg.agentName, func(a *state.Agent) {
+			a.ResolvedModel = resolvedModel
+		}); err != nil {
+			// Persistence failure is non-fatal — the spawn proceeds with
+			// the in-memory resolvedModel; the side panel just won't see
+			// the frozen value until a later state mutation. Log so
+			// operators notice if it happens consistently.
+			d.logger.Warn("failed to persist ResolvedModel for %s/%s: %v", repoName, cfg.agentName, err)
+		}
+	}
+
 	// Capture prompt metadata BEFORE the backend-spawn block so test-mode
 	// agents (which skip backend) still get hashes. Reading the prompt file
 	// here is a duplicate of the read inside StartAgent below; it's cheap
@@ -6840,6 +6868,18 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 			agent.ModelSwapReason = ""
 			agent.ModelSwapPrevious = ""
 			_ = d.state.UpdateAgent(repoName, agentName, agent)
+		}
+	}
+	// Freeze the restart-time resolved model on the agent record so the
+	// side panel reflects the LITERAL value running after a restart, even
+	// if the daemon default has shifted in the meantime. Mirrors the same
+	// persistence done in startAgentWithConfig at first spawn. Best-effort:
+	// a persistence failure is logged but doesn't block the restart.
+	if resolvedModel != "" {
+		if mErr := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+			a.ResolvedModel = resolvedModel
+		}); mErr != nil {
+			d.logger.Warn("failed to persist ResolvedModel on restart for %s/%s: %v", repoName, agentName, mErr)
 		}
 	}
 	if resolvedModel != "" {

@@ -26,6 +26,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -400,6 +401,104 @@ func TestAssistantListEntryJSON_Schema_Part6Slice1(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestIsAgentNotFoundError_Part7Commit0 pins the error-string
+// classification that drives `oat assistant restart`'s fall-through
+// to Start when the agent record was deleted (i.e. the user ran
+// `oat assistant stop` first; Commit 7.1 will preserve the record
+// on Stop so the fall-through becomes a safety net rather than the
+// primary path, but until then this classification is load-bearing).
+// Regressions here silently turn the fall-through off and the
+// smoke-test bug "Restart still says stopped" returns.
+func TestIsAgentNotFoundError_Part7Commit0(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil → false", nil, false},
+		{"plain 'agent X not found' → true", errors.New("agent personal not found"), true},
+		{"'no such agent' → true", errors.New("no such agent personal"), true},
+		{"case-insensitive 'AGENT NOT FOUND' → true", errors.New("AGENT NOT FOUND"), true},
+		{"daemon-wrapper 'restart_agent failed: agent not found' → true", errors.New("restart_agent failed: agent personal not found"), true},
+		{"permission denied → false", errors.New("permission denied"), false},
+		{"unrelated error with 'found' substring → false", errors.New("found multiple matches"), false},
+		{"empty string → false", errors.New(""), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAgentNotFoundError(tc.err); got != tc.want {
+				t.Errorf("isAgentNotFoundError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPickModelEcho_Part7Commit0 pins the precedence logic for the
+// model surfaced via `oat assistant status --json`. Two requirements:
+//
+//  1. Default-model echo at spawn: when the user didn't pass --model
+//     (so agent.Model == ""), the side panel must still see the
+//     model the agent runtime actually received. That's the frozen
+//     `resolved_model` set by the daemon at spawn time.
+//  2. Daemon-default changes don't affect existing status: if the
+//     repo / daemon default shifts AFTER an assistant has spawned,
+//     the running agent's status keeps showing what it's actually
+//     using. ResolvedModel is the persisted spawn-time value, so
+//     reading it directly satisfies this — but the precedence
+//     guarantees it isn't shadowed by a later-edited agent.Model
+//     override (which would be the NEXT-restart's plan, not the
+//     current run's reality).
+func TestPickModelEcho_Part7Commit0(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  map[string]interface{}
+		want string
+	}{
+		{
+			name: "default-model echo: resolved_model set, model empty (user never passed --model) → resolved_model wins",
+			rec:  map[string]interface{}{"resolved_model": "anthropic:claude-sonnet-4-6", "model": ""},
+			want: "anthropic:claude-sonnet-4-6",
+		},
+		{
+			name: "explicit override + spawn-time freeze: BOTH set with different values → resolved_model wins (frozen-at-spawn is the source of truth)",
+			rec:  map[string]interface{}{"resolved_model": "anthropic:claude-opus-4-7", "model": "anthropic:claude-sonnet-4-6"},
+			want: "anthropic:claude-opus-4-7",
+		},
+		{
+			name: "registered but never spawned: only model set → model is the fallback",
+			rec:  map[string]interface{}{"model": "anthropic:claude-sonnet-4-6"},
+			want: "anthropic:claude-sonnet-4-6",
+		},
+		{
+			name: "first-run state: neither field set → empty",
+			rec:  map[string]interface{}{},
+			want: "",
+		},
+		{
+			name: "empty resolved_model treated as absent",
+			rec:  map[string]interface{}{"resolved_model": "", "model": "anthropic:claude-sonnet-4-6"},
+			want: "anthropic:claude-sonnet-4-6",
+		},
+		{
+			name: "wrong-typed resolved_model (number) is ignored, model wins",
+			rec:  map[string]interface{}{"resolved_model": 42, "model": "anthropic:claude-sonnet-4-6"},
+			want: "anthropic:claude-sonnet-4-6",
+		},
+		{
+			name: "wrong-typed model is ignored, neither populates → empty",
+			rec:  map[string]interface{}{"model": 42},
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pickModelEcho(tc.rec); got != tc.want {
+				t.Errorf("pickModelEcho(%v) = %q, want %q", tc.rec, got, tc.want)
+			}
+		})
+	}
 }
 
 // TestEmitAssistantJSON_Indentation_Part6Slice1 pins the indentation

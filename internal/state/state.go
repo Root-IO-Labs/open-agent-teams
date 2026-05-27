@@ -177,6 +177,7 @@ type Agent struct {
 	NudgeResetUsed              bool      `json:"nudge_reset_used,omitempty"`               // Whether supervisor has used their one-time nudge reset
 	LastBranchSHA               string    `json:"last_branch_sha,omitempty"`                // Last known commit SHA on the worker's branch
 	Model                       string    `json:"model,omitempty"`                          // LLM model override (agent-level; takes precedence over repo default)
+	ResolvedModel               string    `json:"resolved_model,omitempty"`                 // Spawn-time resolved model — the literal `-M` value handed to the agent runtime. Frozen at spawn so subsequent daemon-default changes don't lie about what's actually running.
 	RoutingSource               string    `json:"routing_source,omitempty"`                 // How Model was chosen: operator-explicit | repo-default | router-auto | restart-fallback | unknown
 	RoutingDecisionReason       string    `json:"routing_decision_reason,omitempty"`        // human-readable reason from the router (e.g. "complexity=complex floor=9 chose haiku")
 	RoutingCandidates           []string  `json:"routing_candidates,omitempty"`             // ranked candidate model IDs at decision time, first = the pick — needed for counterfactual replay
