@@ -80,6 +80,8 @@ func (sh *streamHandler) HandleStream(req socket.Request, conn net.Conn) {
 		sh.handleStreamAssistantTurns(req, conn)
 	case "stream_context_capacity":
 		sh.handleStreamContextCapacity(req, conn)
+	case "stream_agent_lifecycle":
+		sh.handleStreamAgentLifecycle(req, conn)
 	default:
 		// Unknown streaming command — send error and close
 		resp := socket.Response{Success: false, Error: "unknown stream command: " + req.Command}
@@ -720,6 +722,111 @@ func (sh *streamHandler) handleStreamContextCapacity(req socket.Request, conn ne
 			}
 		case <-connDead:
 			sh.d.logger.Debug("stream_context_capacity client disconnected for %s/%s", sessionName, agentName)
+			return
+		}
+	}
+}
+
+// handleStreamAgentLifecycle (Part 7 Commit 7.4) subscribes the
+// caller to the global agentLifecycleBroadcaster: every
+// add/start/stop/remove event the daemon observes becomes a JSON
+// frame on this stream.
+//
+// Single global stream (not per-(session, agent)) because the
+// side-panel Status tab wants ONE feed covering every agent so
+// the per-agent cards refresh reactively. The bridge fans the
+// stream out to connected side-panel WS clients via the new
+// `agent_lifecycle` WS frame.
+//
+// Protocol mirrors stream_context_capacity:
+//  1. Server sends handshake: {"success":true,"stream":true}
+//  2. Server sends one "snapshot" frame per CURRENT agent so a
+//     freshly-connected panel learns the full set without an
+//     extra list_agents round-trip. Snapshot frames carry
+//     kind="snapshot" + all the per-agent fields (repo, agent,
+//     type, pid, model, last_error).
+//  3. Server streams JSON agentLifecycleFrame lines on every
+//     subsequent lifecycle event.
+//  4. On broadcaster close / daemon shutdown: {"done":true}.
+//  5. On error: {"error":"msg"} then close.
+//
+// NOT scoped by AgentType — the bridge needs to see ALL agents
+// because the side panel's chat-tab picker (Commit 7.5) wants
+// the same feed to drive its dropdown. Filtering happens in the
+// extension by kind/AgentType, not at the daemon.
+func (sh *streamHandler) handleStreamAgentLifecycle(req socket.Request, conn net.Conn) {
+	defer conn.Close()
+	_ = req // no args required today; future filter args slot in here
+	enc := json.NewEncoder(conn)
+
+	broadcaster := sh.d.agentLifecycleBroadcaster
+	if broadcaster == nil {
+		enc.Encode(socket.Response{Success: false, Error: "agent lifecycle broadcaster not initialised"}) //nolint:errcheck
+		return
+	}
+
+	ch, cancel := broadcaster.Subscribe()
+	defer cancel()
+	sh.d.logger.Info("stream_agent_lifecycle: bridge subscribed")
+
+	// Handshake.
+	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+	if err := enc.Encode(socket.Response{Success: true, Stream: true}); err != nil {
+		return
+	}
+
+	// Snapshot: one frame per CURRENT agent across all repos so
+	// a freshly-connected panel learns the full lifecycle state
+	// in O(N) sends. We grab the snapshot BEFORE entering the
+	// stream loop so any concurrent publishes show up on the
+	// channel after our replay — at worst the panel sees the
+	// same agent twice (once as snapshot, once as event), which
+	// is idempotent in the keyed-render consumer.
+	for repoName, repo := range sh.d.state.GetAllRepos() {
+		for agentName, agent := range repo.Agents {
+			frame := agentLifecycleFrame{
+				Kind:      lifecycleKindSnapshot,
+				Repo:      repoName,
+				Agent:     agentName,
+				AgentType: string(agent.Type),
+				PID:       agent.PID,
+				Model:     agent.Model,
+				LastError: agent.LastError,
+				TS:        time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+			if err := enc.Encode(frame); err != nil {
+				return
+			}
+		}
+	}
+
+	// Detect client disconnect on idle.
+	connDead := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1)
+		conn.Read(buf) //nolint:errcheck
+		close(connDead)
+	}()
+
+	for {
+		select {
+		case frame, ok := <-ch:
+			if !ok {
+				conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+				enc.Encode(agentLifecycleFrame{Done: true})               //nolint:errcheck
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
+			if err := enc.Encode(frame); err != nil {
+				sh.d.logger.Debug("stream_agent_lifecycle write failed: %v", err)
+				return
+			}
+			if frame.Done {
+				return
+			}
+		case <-connDead:
+			sh.d.logger.Debug("stream_agent_lifecycle client disconnected")
 			return
 		}
 	}

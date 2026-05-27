@@ -308,6 +308,23 @@ type Daemon struct {
 	// instant-check / instant-update; never while doing I/O.
 	routeRateLimitMu sync.Mutex
 	routeRateLimit   map[string]time.Time
+
+	// agentLifecycleBroadcaster (Part 7 Commit 7.4) fans out
+	// agent-lifecycle events (add/start/stop/remove) to the
+	// stream_agent_lifecycle socket verb. Single GLOBAL
+	// broadcaster (not per-agent like capacityBroadcasters)
+	// because the side-panel renderer wants one stream that
+	// covers every agent across every repo — so it can
+	// reactively update the per-agent Status-tab cards
+	// without polling. Lazily initialised; never torn down
+	// (entry is tiny and GC'd at daemon exit).
+	//
+	// Initialised in New() so handler call sites can always
+	// publish without a nil check. The broadcaster's own
+	// internal locking handles concurrent publish from
+	// multiple goroutines (handleStopAgent, healthCheckLoop,
+	// etc.).
+	agentLifecycleBroadcaster *agentLifecycleBroadcaster
 }
 
 // routeRateLimitWindow is the minimum interval between
@@ -390,6 +407,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		capacityBroadcasters:        make(map[string]*capacityBroadcaster),
 		agentLifecycleMutexes:       make(map[string]*sync.Mutex),
 		routeRateLimit:              make(map[string]time.Time),
+		agentLifecycleBroadcaster:   newAgentLifecycleBroadcaster(logger.Debug),
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -692,6 +710,15 @@ func (d *Daemon) Stop() error {
 	// connected stream_assistant_turns subscriber observe a clean Done
 	// frame rather than a socket EOF.
 	d.stopAllAssistantTurnTailers()
+
+	// Part 7 Commit 7.4: close the lifecycle broadcaster so any
+	// connected stream_agent_lifecycle subscriber observes a
+	// clean Done frame rather than a socket EOF. Best-effort —
+	// it's safe to call multiple times and nil-safe for test
+	// daemons constructed without a broadcaster.
+	if d.agentLifecycleBroadcaster != nil {
+		d.agentLifecycleBroadcaster.Close()
+	}
 
 	// Cancel context to stop all loops
 	d.cancel()
@@ -2473,6 +2500,17 @@ func (d *Daemon) handleAddAgent(req socket.Request) socket.Response {
 	}
 
 	d.logger.Info("Added agent %s to repo %s", agentName, repoName)
+
+	// Part 7 Commit 7.4: emit agent_added on the lifecycle stream
+	// so any connected side-panel renders a card reactively. PID
+	// is whatever AddAgent recorded (often 0 for register-only
+	// flows; start follow-ups will emit agent_started).
+	d.publishAgentLifecycle(
+		lifecycleKindAgentAdded,
+		repoName, agentName, string(agent.Type),
+		agent.PID, agent.Model, agent.LastError,
+	)
+
 	return socket.SuccessResponse(nil)
 }
 
@@ -3108,6 +3146,21 @@ func (d *Daemon) handleStopAgent(req socket.Request) socket.Response {
 	}
 
 	d.logger.Info("stop_agent: marked %s/%s as stopped (record preserved)", repoName, agentName)
+
+	// Part 7 Commit 7.4: emit an agent_stopped lifecycle frame so
+	// the side-panel Status-tab cards refresh reactively. We
+	// re-read the agent record AFTER the ModifyAgent so the
+	// frame reflects the canonical post-mutation state (PID 0,
+	// LastError set). Best-effort: a missing record here would
+	// be a state-corruption symptom we don't want to mask.
+	if after, ok := d.state.GetAgent(repoName, agentName); ok {
+		d.publishAgentLifecycle(
+			lifecycleKindAgentStopped,
+			repoName, agentName, string(after.Type),
+			0, after.Model, after.LastError,
+		)
+	}
+
 	return socket.SuccessResponse(map[string]interface{}{
 		"repo":  repoName,
 		"agent": agentName,
@@ -3430,11 +3483,38 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 		}
 	}
 
+	// Capture lifecycle fields BEFORE wiping the record so the
+	// post-removal broadcast frame still carries useful info
+	// (type/model/last-error). Part 7 Commit 7.4.
+	var prevType, prevModel, prevLastError string
+	if agentExists {
+		prevType = string(agent.Type)
+		prevModel = agent.Model
+		prevLastError = agent.LastError
+	}
+
 	if err := d.state.RemoveAgent(repoName, agentName); err != nil {
 		return socket.ErrorResponse("%s", err.Error())
 	}
 
 	d.logger.Info("Removed agent %s from repo %s (reason: %s)", agentName, repoName, reason)
+
+	// Part 7 Commit 7.4: emit an agent_removed lifecycle frame
+	// so the side-panel card disappears reactively. The reason
+	// is encoded in LastError so the panel can distinguish a
+	// user-initiated cleanup ("user_cleanup_after_pause") from
+	// a daemon-side removal (workspace replacement, etc.).
+	lastErrorForFrame := prevLastError
+	if reason != RemovalReasonManual {
+		lastErrorForFrame = "removed: " + reason
+	}
+	if agentExists {
+		d.publishAgentLifecycle(
+			lifecycleKindAgentRemoved,
+			repoName, agentName, prevType,
+			0, prevModel, lastErrorForFrame,
+		)
+	}
 
 	// Recovery-path gate #1 (Part 7 Commit 7.2 audit): if the user
 	// explicitly cleaned this up, don't notify workspace to spawn
@@ -5101,6 +5181,19 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 
 	// Get updated PID from state
 	updatedAgent, _ := d.state.GetAgent(repoName, agentName)
+
+	// Part 7 Commit 7.4: emit agent_started on the lifecycle
+	// stream. Restart is the primary "I just brought this back"
+	// signal the side-panel cards key off — without this the
+	// stopped pill would linger until the next health-check
+	// snapshot cycle (which is reactive only on connect, not
+	// during a steady-state subscription).
+	d.publishAgentLifecycle(
+		lifecycleKindAgentStarted,
+		repoName, agentName, string(updatedAgent.Type),
+		updatedAgent.PID, updatedAgent.Model, updatedAgent.LastError,
+	)
+
 	return socket.SuccessResponse(map[string]interface{}{
 		"agent":   agentName,
 		"repo":    repoName,
