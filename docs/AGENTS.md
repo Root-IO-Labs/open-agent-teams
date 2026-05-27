@@ -27,6 +27,43 @@ Workers (parallel)                CI Gate                    Main Branch (progre
 
 ## Agent Types
 
+### Lifecycle controls (Part 7 summary)
+
+Each agent type has distinct pause / restart / remove
+semantics. Part 7 Commits 7.1 / 7.2 / 7.6 standardised these
+into a single matrix:
+
+| AgentType | `stop_agent` (pause) | `restart_agent` | `remove_agent` | `pause_web_agents` enumerates? | `route_user_message` target? |
+|-----------|----------------------|-----------------|----------------|--------------------------------|------------------------------|
+| **Assistant** | YES — process killed, record + session JSONL preserved | YES — resumes at preserved session | YES (with `RemovalReasonUserCleanupAfterPause` for the side-panel Delete path) | YES | YES |
+| **Browser** | YES | YES | YES | YES | YES |
+| **Worker** | NO — returns `RPC_AGENT_TYPE_NOT_PAUSABLE` | n/a (task-scoped) | YES (any reason) | NO | NO — returns `RPC_TARGET_NOT_ROUTABLE` |
+| **Supervisor** | NO | n/a (persistent; use `oat repo hibernate`) | YES | NO | NO |
+| **Merge-Queue** | NO | n/a | YES | NO | NO |
+| **Reviewer / Verification** | NO | n/a (task-scoped) | YES | NO | NO |
+| **PR-Shepherd** | NO | n/a | YES | NO | NO |
+| **Workspace** | NO | n/a | YES | NO | NO |
+
+The gate constants live in `internal/state`:
+- `AgentType.IsPausable()` — whitelist for `stop_agent` and
+  `pause_web_agents` (Assistant + Browser only).
+- `AgentType.IsRoutableTarget()` — whitelist for
+  `route_user_message` (Assistant + Browser only).
+
+Both are hard whitelists: a future `AgentType` added without
+explicitly opting in is denied by default. This is the
+security boundary for the Part 7 socket / NM surfaces — the
+side panel cannot route to or pause non-whitelisted types
+even from a compromised extension.
+
+**User-initiated cleanup with reason propagation (Part 7
+Commit 7.2):** the side-panel Delete flow calls
+`remove_agent` with `reason: "user_cleanup_after_pause"`.
+The workspace-replacement notifier is suppressed for this
+reason so the user's explicit Delete does not trigger a
+replacement worker spawn. Audit log captures every removal
+with the reason for forensic visibility.
+
 ### 1. Supervisor (`internal/prompts/supervisor.md`)
 
 **Role**: Orchestration and coordination (singleton)

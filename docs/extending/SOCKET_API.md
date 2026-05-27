@@ -12,6 +12,7 @@ add_agent
 remove_agent
 stop_agent
 route_user_message
+pause_web_agents
 list_agents
 complete_agent
 agent_waiting

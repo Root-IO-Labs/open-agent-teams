@@ -258,15 +258,56 @@ When modifying extension points (state, socket API):
 ├── state.json              # All state (repos, agents, config)
 ├── prompts/                # Generated prompt files for agents
 ├── repos/<repo>/           # Cloned repositories
+├── repos/_assistant-<name>/ # Virtual repo for an Assistant (no git;
+│                           # one per assistant; hidden from `oat repo list`)
+├── sessions/_assistant-<name>/<name>.session.jsonl     # Active session
+├── sessions/_assistant-<name>/<name>.session.jsonl.1   # Rotation archive #1
+├── sessions/_assistant-<name>/<name>.session.jsonl.2   # Rotation archive #2
+├── sessions/_assistant-<name>/<name>.session.jsonl.3   # Rotation archive #3
+│                           # (Part 7 Commit 7.0.5: --fresh rotates instead
+│                           # of deleting; 50 MB / 3-archive cap; older
+│                           # archives evicted oldest-first.)
 ├── wts/<repo>/<agent>/     # Git worktrees (one per agent)
 ├── messages/<repo>/<agent>/ # Message JSON files
 ├── output/<repo>/          # Agent output logs
 │   ├── workers/            # Worker-specific logs
-│   └── browser-agent-actions.jsonl  # Browser agent audit log
+│   ├── browser-agent-actions.jsonl  # Browser agent audit log
+│   └── <agent>.routes.jsonl  # route_user_message audit log
+│                           # (Part 7 Commit 7.3: per-route entries with
+│                           # ts + target + byte_count + sha256; full text
+│                           # NEVER persisted here -- lives in session JSONL.)
 ├── downloads/<repo>/       # Browser agent download directory
 └── agent-config/<repo>/<agent>/ # Per-agent OAT config directory
     └── commands/           # Slash command files (*.md)
 ```
+
+**Removal reasons** (`remove_agent` socket verb):
+- `(default)` — generic removal; recovery paths may attempt
+  to spawn a replacement worker if the original had an open
+  task.
+- `user_cleanup_after_pause` (Part 7 Commit 7.2) —
+  workspace-replacement notifier is **suppressed**: the
+  user explicitly chose Delete, so no replacement worker
+  is requested. Audit-logged for forensic visibility.
+
+**Agent pausability** (`AgentType.IsPausable()`, Part 7
+Commit 7.1) — the whitelist that gates `stop_agent` and
+`pause_web_agents`:
+
+| AgentType | Pausable? | Pause mechanism |
+|-----------|-----------|-----------------|
+| `Assistant` | YES | `oat assistant stop` / `oat agent stop` / side-panel Stop |
+| `Browser` | YES | `oat agent stop` / side-panel Stop |
+| `Worker` | NO | `oat repo hibernate` (repo-scoped pause) |
+| `Supervisor` | NO | `oat repo hibernate` |
+| `MergeQueue` | NO | `oat repo hibernate` |
+| `Reviewer` | NO | task-scoped; `oat agent remove` to cancel |
+| `Verification` | NO | task-scoped; `oat agent remove` to cancel |
+| `PRShepherd` | NO | `oat repo hibernate` |
+| `Workspace` | NO | `oat repo hibernate` |
+
+Non-pausable agents return `RPC_AGENT_TYPE_NOT_PAUSABLE`
+from `stop_agent` with a pointer at `oat repo hibernate`.
 
 ## Common Operations
 

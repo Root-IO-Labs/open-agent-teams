@@ -2,6 +2,46 @@
 
 How to stop OAT when you need your machine for other things, and pick up where you left off later.
 
+## Assistants (Part 7)
+
+Assistants are interactive, chat-style agents (the side-panel
+Chat tab's targets) that live alongside the autonomous worker
+/ supervisor agents in a repo. They have their own pause /
+delete semantics that differ from worker semantics:
+
+- **`oat assistant stop <name>`** — pause the assistant.
+  Process is killed but the `state.Agent` record (worktree
+  path, session JSONL, model preference) is **preserved**.
+  Subsequent `oat assistant restart <name>` resumes at the
+  same session JSONL.
+- **`oat assistant restart <name>` `[--fresh]`** — bring a
+  stopped assistant back. Without `--fresh`, the previous
+  session JSONL is reused. With `--fresh`, the JSONL is
+  **rotated**, not deleted: it becomes
+  `<name>.session.jsonl.1` (existing `.1` rotates to `.2`,
+  etc.). Default cap is 3 archives × 50 MB; older archives
+  evict oldest-first. The rotation policy is local-storage
+  only — there is no external backup.
+- **`oat assistant remove <name>`** — destroy the assistant.
+  State record wiped, virtual repo at `_assistant-<name>`
+  removed. This is the destructive flow; `stop` is the right
+  command for everyday "I'm done chatting for now".
+- **`oat agent stop --repo <repo> --agent <name>`** —
+  universal pause for any pausable agent (Assistant +
+  browser-agent). Same semantics as `oat assistant stop` but
+  also accepts a browser-agent target. Workers / supervisors
+  / merge-queues are rejected with
+  `RPC_AGENT_TYPE_NOT_PAUSABLE` — use `oat repo hibernate`
+  for those.
+
+The **side-panel "Pause OAT" button** wraps the bulk-pause
+verb (`pause_web_agents`) which enumerates every Assistant
++ browser-agent across every repo and stops them. Workers,
+supervisor, merge-queues, and the daemon itself **keep
+running** — pause those from the terminal with
+`oat repo hibernate`. See `docs/extending/SOCKET_API.md`
+for the wire schema.
+
 ## Quick Pause (Per-Repo)
 
 Stop workers only (persistent agents keep running but enter idle mode):
