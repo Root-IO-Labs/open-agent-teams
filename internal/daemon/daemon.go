@@ -3824,6 +3824,15 @@ func (d *Daemon) handleStartRepoAgents(req socket.Request) socket.Response {
 func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, agentName string, agent state.Agent, extraEnv []string) (int, error) {
 	repoPath := d.paths.RepoDir(repoName)
 
+	// Per-assistant session JSONL rotation (Part 7 Commit 7.0.5).
+	// Mirrors the rotation hook in startAgentWithConfig: runs
+	// BEFORE the agent process is started, so there is no live
+	// writer to race with. Same Assistant-type filter — the cap-
+	// at-restart story is assistant-specific.
+	if agent.Type == state.AgentTypeAssistant {
+		d.rotateAssistantSessionIfNeeded(repoName, agentName)
+	}
+
 	// Write prompt file
 	promptFile, err := d.writePromptFile(repoName, agent.Type, agentName)
 	if err != nil {
@@ -6102,6 +6111,17 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 		return fmt.Errorf("failed to generate session ID: %w", err)
 	}
 
+	// Per-assistant session JSONL rotation (Part 7 Commit 7.0.5).
+	// Bounds the on-disk transcript size BEFORE the agent process
+	// opens it for append — running here means there is no live
+	// writer to race with. Limited to AgentTypeAssistant because
+	// other agent types use the session file very differently and
+	// the cap-at-restart story doesn't apply to them. Failures are
+	// non-fatal: a botched rotation must NOT block the spawn.
+	if cfg.agentType == state.AgentTypeAssistant {
+		d.rotateAssistantSessionIfNeeded(repoName, cfg.agentName)
+	}
+
 	// Copy hooks config if needed
 	repoPath := d.paths.RepoDir(repoName)
 	if err := hooks.CopyConfig(repoPath, cfg.workDir); err != nil {
@@ -6995,6 +7015,39 @@ func resolveAgentModel(agent state.Agent, repo *state.Repository) string {
 		return agent.Model
 	}
 	return repo.Model
+}
+
+// rotateAssistantSessionIfNeeded is the spawn-time hook that
+// bounds the on-disk size of an assistant's session JSONL by
+// delegating to state.RotateSessionIfTooLarge. Best-effort:
+// any error is logged as a warning and the spawn continues.
+// Rotation MUST NOT block a spawn because the worst case for a
+// failed rotation (next restart has a large transcript to
+// re-ingest) is strictly less harmful than a failed restart.
+//
+// The path derivation mirrors `internal/cli/assistant.go`
+// `wipeAssistantSession` and `handleResetAssistantSession`.
+// Three call sites all use `.session.jsonl` suffixed onto the
+// no-`.log` version of `AgentLogFile`, so the convention is
+// documented in those places too; a future rename should
+// update all four locations in lockstep.
+func (d *Daemon) rotateAssistantSessionIfNeeded(repoName, agentName string) {
+	logPath := d.paths.AgentLogFile(repoName, agentName, false)
+	headPath := strings.TrimSuffix(logPath, ".log") + ".session.jsonl"
+	err := state.RotateSessionIfTooLarge(
+		headPath,
+		state.DefaultSessionRotateMaxBytes,
+		state.DefaultSessionRotateKeepArchives,
+	)
+	if err != nil {
+		// Log at WARN so an operator looking at a flaky restart
+		// can correlate "agent X had a big transcript" with the
+		// rotation that didn't happen. Common benign reason:
+		// EWOULDBLOCK because a concurrent spawn already
+		// rotated; that case is logged the same way and the
+		// spawn proceeds with the already-rotated head.
+		d.logger.Warn("session-JSONL rotation skipped for %s/%s (%s): %v", repoName, agentName, headPath, err)
+	}
 }
 
 // validateModelForAgentType applies the same checks resolveAndValidateModel
