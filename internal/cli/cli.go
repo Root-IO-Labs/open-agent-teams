@@ -828,6 +828,22 @@ func (c *CLI) registerCommands() {
 		Run:         c.restartAgentCmd,
 	}
 
+	// Part 7 Commit 7.2: universal `oat agent stop` for the
+	// pausable agent types {Assistant, Browser}. Delegates to the
+	// stop_agent daemon verb; non-pausable types (workers, review,
+	// supervisor, etc.) get the RPC_AGENT_TYPE_NOT_PAUSABLE
+	// error pointing them at `oat repo hibernate` or
+	// `oat agent remove`. Use case: a user sees a browser-agent
+	// doing something they didn't intend and wants to halt it
+	// while keeping its state for inspection.
+	agentCmd.Subcommands["stop"] = &Command{
+		Name: "stop",
+		Description: "Pause a pausable agent (Assistant + Browser): kills the process " +
+			"but preserves its state.Agent record so a later `oat agent restart` resumes it.",
+		Usage: "oat agent stop <name> [--repo <repo>]",
+		Run:   c.agentStopCmd,
+	}
+
 	agentCmd.Subcommands["set-model"] = &Command{
 		Name:        "set-model",
 		Description: "Change the LLM model an agent uses (e.g. anthropic:claude-opus-4-7)",
@@ -7012,6 +7028,48 @@ func (c *CLI) restartAgentCmd(args []string) error {
 		fmt.Printf("✓ Agent '%s' restarted successfully\n", agentName)
 	}
 
+	return nil
+}
+
+// agentStopCmd (Part 7 Commit 7.2) is the universal pause verb
+// for {Assistant, Browser} agents. Delegates to the stop_agent
+// daemon verb introduced in Commit 7.1; rejection comes back as
+// RPC_AGENT_TYPE_NOT_PAUSABLE for non-pausable types, which we
+// surface with the daemon's exact error message so the user
+// sees the documented "use oat repo hibernate / oat agent
+// remove" pointer.
+//
+// Repo inference mirrors restartAgentCmd: explicit --repo wins,
+// otherwise infer from cwd. The CLI never auto-pages a list of
+// agents — if the inference fails the user gets a focused
+// usage error, same as restart.
+func (c *CLI) agentStopCmd(args []string) error {
+	flags, remaining := ParseFlags(args)
+	if len(remaining) < 1 {
+		return errors.InvalidUsage("usage: oat agent stop <name> [--repo <repo>]")
+	}
+	agentName := remaining[0]
+
+	repoName := flags["repo"]
+	if repoName == "" {
+		inferred, err := c.inferRepoFromCwd()
+		if err != nil {
+			return errors.InvalidUsage("could not determine repository - use --repo flag or run from within a oat worktree")
+		}
+		repoName = inferred
+	}
+
+	fmt.Printf("Stopping agent '%s' in repository '%s'...\n", agentName, repoName)
+
+	resp, err := c.sendDaemonRequest("stop_agent", map[string]interface{}{
+		"repo":  repoName,
+		"agent": agentName,
+	})
+	if err != nil {
+		return err
+	}
+	_ = resp
+	fmt.Printf("✓ Agent '%s' stopped (record preserved; use `oat agent restart` to resume).\n", agentName)
 	return nil
 }
 

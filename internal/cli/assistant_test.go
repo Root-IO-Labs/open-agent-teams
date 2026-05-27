@@ -177,9 +177,12 @@ func TestRegisterAssistantCommands_Part5d(t *testing.T) {
 		t.Fatal("assistant command has no subcommands map")
 	}
 
+	// Part 7 Commit 7.2: added `remove` (Delete=nuke counterpart
+	// to Stop=pause) plus `delete` as a muscle-memory alias.
 	want := []string{
 		"start", "stop", "restart", "status", "attach",
 		"set-model", "reset", "compact", "logs", "list",
+		"remove", "delete",
 	}
 	for _, verb := range want {
 		t.Run(verb, func(t *testing.T) {
@@ -648,6 +651,123 @@ func TestAssistantStop_NotRunningIsSoftSuccess_Part7Commit1(t *testing.T) {
 
 	if err := c.assistantStop([]string{"personal"}); err != nil {
 		t.Errorf("Stop against a non-running agent must be soft-success; got error: %v", err)
+	}
+}
+
+// TestIsSafeAssistantRepoDir_Part7Commit2 pins the path-
+// traversal guard. The name is already validated by
+// validateVirtualRepoName upstream; this is the defence-in-
+// depth check that catches the regression-class case where
+// a future caller (e.g. a new NM RPC verb) bypasses the
+// regex check and reaches the os.RemoveAll directly.
+func TestIsSafeAssistantRepoDir_Part7Commit2(t *testing.T) {
+	cases := []struct {
+		name      string
+		dir       string
+		reposRoot string
+		repoKey   string
+		want      bool
+	}{
+		{
+			name:      "happy path: exact match",
+			dir:       "/home/u/.oat/repos/_assistant-personal",
+			reposRoot: "/home/u/.oat/repos",
+			repoKey:   "_assistant-personal",
+			want:      true,
+		},
+		{
+			name:      "trailing slash on dir is normalised",
+			dir:       "/home/u/.oat/repos/_assistant-work/",
+			reposRoot: "/home/u/.oat/repos",
+			repoKey:   "_assistant-work",
+			want:      true,
+		},
+		{
+			name:      "parent traversal attempt — basename wrong",
+			dir:       "/home/u/.oat/repos/_assistant-evil/../etc",
+			reposRoot: "/home/u/.oat/repos",
+			repoKey:   "_assistant-evil",
+			want:      false,
+		},
+		{
+			name:      "absolute escape — parent is not reposRoot",
+			dir:       "/etc/passwd",
+			reposRoot: "/home/u/.oat/repos",
+			repoKey:   "passwd",
+			want:      false,
+		},
+		{
+			name:      "subdir inside the right repo — not exactly repoKey",
+			dir:       "/home/u/.oat/repos/_assistant-personal/inner",
+			reposRoot: "/home/u/.oat/repos",
+			repoKey:   "_assistant-personal",
+			want:      false,
+		},
+		{
+			name:      "basename matches but parent doesn't",
+			dir:       "/home/u/elsewhere/_assistant-personal",
+			reposRoot: "/home/u/.oat/repos",
+			repoKey:   "_assistant-personal",
+			want:      false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSafeAssistantRepoDir(tc.dir, tc.reposRoot, tc.repoKey); got != tc.want {
+				t.Errorf("isSafeAssistantRepoDir(%q, %q, %q) = %v, want %v",
+					tc.dir, tc.reposRoot, tc.repoKey, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWipeAssistantSessionArchives_Part7Commit2 pins the
+// archive cleanup helper. Plant a head + 3 archives + a stray
+// .4 (which should NOT be cleaned because keepArchives=3) and
+// verify the right four files are gone and the stray survives.
+func TestWipeAssistantSessionArchives_Part7Commit2(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("/tmp", "oat-archive-")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	paths := &config.Paths{
+		Root:      tmpDir,
+		OutputDir: filepath.Join(tmpDir, "output"),
+		ReposDir:  filepath.Join(tmpDir, "repos"),
+	}
+	if err := os.MkdirAll(paths.AgentMessagesDir("_assistant-personal", "personal"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outputRepoDir := filepath.Join(paths.OutputDir, "_assistant-personal")
+	if err := os.MkdirAll(outputRepoDir, 0o755); err != nil {
+		t.Fatalf("mkdir output: %v", err)
+	}
+	headPath := filepath.Join(outputRepoDir, "personal.session.jsonl")
+	writeArchive := func(suffix string) string {
+		p := headPath + suffix
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		return p
+	}
+	dot1 := writeArchive(".1")
+	dot2 := writeArchive(".2")
+	dot3 := writeArchive(".3")
+	dot4 := writeArchive(".4") // out-of-range; must survive
+
+	c := NewWithPaths(paths)
+	c.wipeAssistantSessionArchives("_assistant-personal", "personal")
+
+	for _, p := range []string{dot1, dot2, dot3} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("archive %s should have been deleted, but stat returned: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(dot4); err != nil {
+		t.Errorf("stray .4 should NOT have been deleted; got stat error: %v", err)
 	}
 }
 

@@ -38,6 +38,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -66,8 +67,8 @@ func (c *CLI) registerAssistantCommands() {
 			"you through the side panel of the oat-browser-agent Chrome\n" +
 			"extension. Unlike browser-agents, they do not complete after a\n" +
 			"single task; they stay alive until you `oat assistant stop` them.\n\n" +
-			"Subcommands: start | stop | restart | status | attach | set-model |\n" +
-			"             reset | compact | logs | list\n\n" +
+			"Subcommands: start | stop | restart | remove | status | attach |\n" +
+			"             set-model | reset | compact | logs | list\n\n" +
 			"The default assistant name is `" + defaultAssistantName + "`. Provide a\n" +
 			"different name to run multiple assistants in parallel (e.g.\n" +
 			"`oat assistant start work` alongside `oat assistant start personal`).",
@@ -91,6 +92,18 @@ func (c *CLI) registerAssistantCommands() {
 		Usage:       "oat assistant restart [name] [--fresh]",
 		Run:         c.assistantRestart,
 	}
+	assistantCmd.Subcommands["remove"] = &Command{
+		Name: "remove",
+		Description: "Delete an assistant completely: stop process, wipe session JSONL + " +
+			"rotation archives, remove state record, delete virtual repo dir. NOT recoverable.",
+		Usage: "oat assistant remove [name] [--yes]",
+		Run:   c.assistantRemove,
+	}
+	// `delete` is an alias for `remove`. Discovered the operator
+	// muscle memory split during smoke testing — half the testers
+	// reach for `remove`, half for `delete`. Both go to the same
+	// function so neither group hits a "no such subcommand" wall.
+	assistantCmd.Subcommands["delete"] = assistantCmd.Subcommands["remove"]
 	assistantCmd.Subcommands["status"] = &Command{
 		Name:        "status",
 		Description: "Show assistant state: model, PID, last activity",
@@ -323,6 +336,177 @@ func (c *CLI) assistantStop(args []string) error {
 	}
 	fmt.Printf("✓ Assistant '%s' stopped (record preserved; use `oat assistant restart` to resume).\n", name)
 	return nil
+}
+
+// assistantRemove (Part 7 Commit 7.2) is the Delete=nuke
+// counterpart to Stop=pause. Unlike `oat assistant stop` (which
+// preserves the state.Agent record + session JSONL), this verb
+// removes EVERYTHING associated with the named assistant:
+//
+//   1. Confirmation prompt unless --yes (interactive only;
+//      non-interactive callers MUST pass --yes).
+//   2. stop_agent best-effort (so the process tree is down
+//      BEFORE we wipe the session file). "Not found" is a soft
+//      success: it just means no live process is in the way.
+//   3. wipeAssistantSession to delete the head session.jsonl.
+//   4. Wipe the rotation archives (.1, .2, .3) introduced in
+//      Commit 7.0.5 so they don't outlive their owner.
+//   5. remove_agent with reason="user_cleanup_after_pause"
+//      so the daemon's recovery-suppression gates (Commit 7.2
+//      audit: workspace-replacement, health-check restore) all
+//      short-circuit. Otherwise the next 2-min health-check
+//      cycle would notice the missing agent and try to bring
+//      it back, defeating the user's cleanup intent.
+//   6. Delete the virtual repo dir
+//      `~/.oat/repos/_assistant-<name>` AFTER canonicalising
+//      the path and verifying it is under c.paths.ReposDir.
+//      The canonicalisation matters because <name> is user-
+//      controlled; a future caller that accepts assistant
+//      names from a remote source (e.g. a future NM RPC verb)
+//      could otherwise be tricked into `os.RemoveAll` against
+//      anywhere on disk. validateVirtualRepoName already
+//      restricts <name> to [a-zA-Z0-9_-]{1,32}, but the
+//      defense-in-depth check belongs here too because the
+//      blast radius of a regression is unbounded.
+//
+// On any error after step 1 we keep going (each step logs
+// independently) so a partial cleanup leaves the user as close
+// to a deleted state as we can manage — re-running `remove`
+// against a half-deleted assistant must idempotently finish
+// the job.
+func (c *CLI) assistantRemove(args []string) error {
+	flags, remaining := ParseFlags(args)
+	name := resolveAssistantName(remaining)
+	if err := validateVirtualRepoName(name); err != nil {
+		return err
+	}
+	if err := c.ensureDaemonRunning(); err != nil {
+		return err
+	}
+	repoKey := virtualRepoNameFor(name)
+	agent := agentSlug(name)
+
+	// Confirmation gate. Skip when --yes is passed (CI / test /
+	// scripted cleanup); otherwise a typo on the name field
+	// shouldn't be irreversibly destructive. The wording mentions
+	// every category we're about to delete so the user has a
+	// chance to back out.
+	if flags["yes"] != "true" {
+		fmt.Printf(
+			"This will permanently delete assistant '%s':\n"+
+				"  - its session JSONL transcript (+ rotation archives .1, .2, .3)\n"+
+				"  - its state.Agent record (PID, model, worktree path)\n"+
+				"  - its virtual repo directory (~/.oat/repos/%s)\n"+
+				"This is NOT recoverable. Type 'yes' to confirm: ",
+			name, repoKey,
+		)
+		reader := bufio.NewReader(os.Stdin)
+		line, _ := reader.ReadString('\n')
+		if strings.TrimSpace(line) != "yes" {
+			fmt.Println("Aborted (no changes made).")
+			return nil
+		}
+	}
+
+	// Step 2: best-effort stop_agent. Errors here are non-fatal
+	// — if the process is already gone, the rest of the cleanup
+	// is still desirable.
+	if _, err := c.sendDaemonRequest("stop_agent", map[string]interface{}{
+		"repo":  repoKey,
+		"agent": agent,
+	}); err != nil && !isAgentNotFoundError(err) {
+		// Type-not-pausable wouldn't fire for an Assistant — we
+		// validated that via virtualRepoNameFor. Anything else
+		// is logged but we still attempt the remove_agent below
+		// (state.Agent record might exist with PID 0).
+		fmt.Printf("  Warning: stop_agent before remove returned: %v (continuing)\n", err)
+	}
+
+	// Step 3 + 4: wipe session JSONL head + rotation archives.
+	if err := c.wipeAssistantSession(repoKey, agent); err != nil {
+		fmt.Printf("  Warning: %v (continuing)\n", err)
+	}
+	c.wipeAssistantSessionArchives(repoKey, agent)
+
+	// Step 5: remove_agent with the canonical reason so every
+	// recovery-suppression gate downstream short-circuits.
+	if _, err := c.sendDaemonRequest("remove_agent", map[string]interface{}{
+		"repo":   repoKey,
+		"agent":  agent,
+		"reason": "user_cleanup_after_pause",
+	}); err != nil && !isAgentNotFoundError(err) {
+		// remove_agent failure is more serious than the others —
+		// without the state record being gone, the daemon will
+		// keep listing this assistant. Surface but don't return
+		// early; the virtual-repo-dir cleanup below is still
+		// independently useful.
+		fmt.Printf("  Warning: remove_agent returned: %v (continuing with on-disk cleanup)\n", err)
+	}
+
+	// Step 6: delete the virtual repo dir with a canonicalisation
+	// guard. The check enforces: (a) the path is exactly
+	// <reposDir>/<basename> with NO extra slashes or `..` segments
+	// after Clean, and (b) the basename matches the validated
+	// virtual repo name. A user-provided name like `../etc/passwd`
+	// would have been rejected by validateVirtualRepoName above
+	// already; this check is the second line of defense.
+	repoDir := c.paths.RepoDir(repoKey)
+	if !isSafeAssistantRepoDir(repoDir, c.paths.ReposDir, repoKey) {
+		fmt.Printf("  Warning: refusing to delete suspicious path %q (escape attempt?); manual cleanup required\n", repoDir)
+	} else {
+		removeDirectoryIfExists(repoDir, "virtual repo dir")
+	}
+
+	fmt.Printf("✓ Assistant '%s' removed.\n", name)
+	return nil
+}
+
+// wipeAssistantSessionArchives deletes the rotation archives
+// (`<agent>.session.jsonl.1` through `.3`) produced by
+// state.RotateSessionIfTooLarge (Part 7 Commit 7.0.5). Best-
+// effort and idempotent: any missing archive is fine, the
+// caller logs unexpected errors at WARN.
+//
+// Kept package-private (not a method on CLI) because the path
+// derivation is identical to wipeAssistantSession's; if the
+// runtime ever renames the JSONL suffix we update both helpers
+// in lockstep. The keepArchives bound (3) is wired from
+// state.DefaultSessionRotateKeepArchives so a future bump
+// auto-cleans the wider set without an edit here.
+func (c *CLI) wipeAssistantSessionArchives(repoKey, agent string) {
+	jsonlPath := c.paths.AgentLogFile(repoKey, agent, false)
+	headPath := strings.TrimSuffix(jsonlPath, ".log") + ".session.jsonl"
+	for i := 1; i <= state.DefaultSessionRotateKeepArchives; i++ {
+		archivePath := fmt.Sprintf("%s.%d", headPath, i)
+		if err := os.Remove(archivePath); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("  Warning: failed to remove archive %s: %v\n", archivePath, err)
+		}
+	}
+}
+
+// isSafeAssistantRepoDir validates that `dir` resolves cleanly
+// to `<reposRoot>/<repoKey>` and nothing else. Returns false
+// for any of:
+//   - dir contains symlink traversal escaping reposRoot,
+//   - dir's parent is not exactly reposRoot,
+//   - dir's basename is not exactly repoKey.
+//
+// Used by assistantRemove as a defence-in-depth check before
+// os.RemoveAll. The earlier validateVirtualRepoName restricts
+// repoKey to [a-zA-Z0-9_-]{1,32} so a typical exploit (e.g.
+// `..` in the name) can't reach here, but this second gate
+// closes the regression risk of a future change that loosens
+// the validator or wires the name from a non-CLI source.
+func isSafeAssistantRepoDir(dir, reposRoot, repoKey string) bool {
+	cleanDir := filepath.Clean(dir)
+	cleanRoot := filepath.Clean(reposRoot)
+	if filepath.Dir(cleanDir) != cleanRoot {
+		return false
+	}
+	if filepath.Base(cleanDir) != repoKey {
+		return false
+	}
+	return true
 }
 
 // assistantRestart wraps restart_agent. --fresh wipes the session

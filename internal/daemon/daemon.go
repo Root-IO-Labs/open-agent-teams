@@ -1029,6 +1029,34 @@ func (d *Daemon) checkAgentHealth() {
 				continue
 			}
 
+			// Recovery-path gate #2 (Part 7 Commit 7.2): if the user
+			// deliberately stopped this agent via stop_agent, the
+			// LastError marker tells us NOT to auto-restore. Without
+			// this, the 2-min health-check loop would fight the
+			// user's pause intent by spinning the agent back up
+			// every cycle — exactly the "I clicked Stop, why is it
+			// running again?" smoke-test bug Part 7 set out to fix.
+			//
+			// Why a string match instead of an enum: the LastError
+			// field is documented as free-form (state.go), and the
+			// stop_agent verb is the sole writer of this exact
+			// literal. A future refactor that adds more lifecycle
+			// states should promote LastError to a typed enum and
+			// update both stop_agent + this gate in lockstep.
+			//
+			// Cleared via: an explicit restart_agent (which calls
+			// startRegisteredAgent and writes a fresh PID), or the
+			// user clicking Restart, which goes through
+			// handleRestartAgent and would ModifyAgent the field
+			// back to empty as part of bringing the agent up.
+			// (Today restartAgent doesn't clear LastError yet;
+			// the next Stop cycle would just re-write it. The
+			// next slice of this commit will clear it on restart.)
+			if agentLastErrorSaysUserStopped(agent) {
+				d.logger.Debug("health-check: skipping %s/%s — user-stopped (LastError=%q)", repoName, agentName, agent.LastError)
+				continue
+			}
+
 			// Check if agent was re-adopted (alive but no PTY). Persistent agents
 			// should be stopped and restarted to regain full control; transient
 			// agents are left alone since they'll finish on their own.
@@ -3063,6 +3091,16 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 		return errResp
 	}
 
+	// Reason hoisted to the top of the handler so every downstream
+	// recovery-suppression gate (workspace replacement below; health-
+	// check restore in restoreAgents; supervisor re-spawn) can read
+	// the same canonical value. Defaults to "manual" for the bare
+	// `oat agent remove` path. Part 7 Commit 7.2 introduces
+	// RemovalReasonUserCleanupAfterPause as the discriminant for
+	// "user deliberately deleted this; do not auto-restore".
+	reason := getOptionalStringArg(req.Args, "reason", RemovalReasonManual)
+	userInitiatedCleanup := reason == RemovalReasonUserCleanupAfterPause
+
 	// Kill the agent process via the daemon's backend before removing state.
 	// The daemon backend owns the PTY, so it can reliably terminate the process.
 	agent, agentExists := d.state.GetAgent(repoName, agentName)
@@ -3097,10 +3135,6 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 			outcome = ""
 		}
 		if outcome != "" {
-			// Reason source priority: explicit `reason` arg (supervisor /
-			// budget-cap / re-route flows pass it) → fall back to "manual"
-			// for the bare CLI `oat agent remove` path.
-			reason := getOptionalStringArg(req.Args, "reason", RemovalReasonManual)
 			d.logOutcome(repoName, agentName, agent, outcome, reason)
 		}
 	}
@@ -3109,11 +3143,19 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 		return socket.ErrorResponse("%s", err.Error())
 	}
 
-	d.logger.Info("Removed agent %s from repo %s", agentName, repoName)
+	d.logger.Info("Removed agent %s from repo %s (reason: %s)", agentName, repoName, reason)
 
-	// If a worker with an unfinished task was removed (not through normal
-	// completion), notify workspace so it can spawn a replacement.
-	if agentExists && agent.Type == state.AgentTypeWorker && !agent.ReadyForCleanup && agent.Task != "" {
+	// Recovery-path gate #1 (Part 7 Commit 7.2 audit): if the user
+	// explicitly cleaned this up, don't notify workspace to spawn
+	// a replacement worker. The bare CLI path (`oat agent remove`
+	// without --reason) still defaults to "manual" and the existing
+	// behaviour kicks in for the worker case.
+	//
+	// Workers aren't pausable today (state.AgentType.IsPausable()
+	// rejects them), so a worker reaching this branch with reason=
+	// user_cleanup_after_pause means the operator passed the reason
+	// flag explicitly — the right behaviour is still to honour it.
+	if agentExists && agent.Type == state.AgentTypeWorker && !agent.ReadyForCleanup && agent.Task != "" && !userInitiatedCleanup {
 		msgMgr := d.getMessageManager()
 		msg := fmt.Sprintf("[daemon] Worker '%s' was removed before completing task: '%s'.", agentName, agent.Task)
 		if agent.IssueNumber != "" {
@@ -3127,6 +3169,11 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 		if _, err := msgMgr.Send(repoName, "daemon", "default", msg); err != nil {
 			d.logger.Warn("Failed to notify workspace about removed worker %s: %v", agentName, err)
 		}
+	} else if agentExists && agent.Type == state.AgentTypeWorker && userInitiatedCleanup {
+		// Audit-friendly log so an operator reading daemon.log can
+		// see that the workspace-replacement notifier was
+		// deliberately skipped (vs. silently never fired).
+		d.logger.Info("Skipping workspace-replacement notification for worker %s/%s: user-initiated cleanup", repoName, agentName)
 	}
 
 	return socket.SuccessResponse(nil)
@@ -7177,6 +7224,25 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		d.logger.Warn("Failed to update agent PID: %v", err)
 	}
 
+	// Clear the "stopped by user" marker (Part 7 Commit 7.2): a
+	// successful restart is the user's affirmative "bring it back"
+	// signal, so the next Stop cycle must start from a clean slate.
+	// Without this, the health-check gate added in the same commit
+	// would short-circuit on stale LastError after a Stop→Restart
+	// cycle and refuse to auto-restore the agent on a genuine
+	// crash. Best-effort: failure to clear is logged but doesn't
+	// fail the restart, because the next backend.StartAgent has
+	// already committed.
+	if pid > 0 {
+		if err := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+			if agentLastErrorSaysUserStopped(*a) {
+				a.LastError = ""
+			}
+		}); err != nil {
+			d.logger.Warn("Failed to clear LastError on restart for %s/%s: %v", repoName, agentName, err)
+		}
+	}
+
 	// Re-attach OutputWatcher so token / PR / error events flow again after
 	// a restart. Without this, the agent emits [OAT_TOKENS] but nobody is
 	// reading the log file and state.json stays frozen.
@@ -7201,6 +7267,31 @@ func resolveAgentModel(agent state.Agent, repo *state.Repository) string {
 		return agent.Model
 	}
 	return repo.Model
+}
+
+// userStoppedMarker is the exact LastError value that
+// handleStopAgent writes onto the state.Agent record. Recovery-
+// path gates (health-check loop, supervisor re-spawn, workspace
+// replacement audit) compare against it to decide "don't restore
+// this; the user paused it on purpose." Exported via the
+// agentLastErrorSaysUserStopped helper rather than as a top-
+// level const so future audits can add more dimensions (e.g. an
+// "until-T" timeout) without renaming the constant.
+//
+// Part 7 Commit 7.2 audit notes: a Delete (remove_agent with
+// reason=user_cleanup_after_pause) wipes the state.Agent record
+// entirely, so health-check never sees it — Delete doesn't need
+// the marker. Stop without Delete is the case where the record
+// stays around with PID=0 and this marker prevents zombie
+// auto-restore.
+const userStoppedMarker = "stopped by user"
+
+// agentLastErrorSaysUserStopped centralises the gate so callers
+// can't accidentally diverge on the comparison (case, whitespace,
+// substring vs exact). One-line helper; exists for grep-ability
+// + as a single place to extend if the marker grows fields.
+func agentLastErrorSaysUserStopped(agent state.Agent) bool {
+	return agent.LastError == userStoppedMarker
 }
 
 // rotateAssistantSessionIfNeeded is the spawn-time hook that
@@ -7715,6 +7806,17 @@ const (
 	RemovalReasonTimeout        = "timeout"         // worker exceeded a wall-clock budget
 	RemovalReasonBudgetExceeded = "budget_exceeded" // spend cap tripped (--max-spend / --max-tokens)
 	RemovalReasonDaemonRestart  = "daemon_restart"  // daemon shutdown / cleanup, not a per-agent decision
+	// RemovalReasonUserCleanupAfterPause (Part 7 Commit 7.2) is set
+	// when the operator deliberately deletes a paused assistant or
+	// browser-agent via `oat assistant remove` / `oat agent remove
+	// --reason user_cleanup_after_pause`. Recovery paths
+	// (workspace-replacement notifier, supervisor re-spawn,
+	// health-check restore) MUST short-circuit on this value
+	// because re-creating the agent would defy the user's explicit
+	// cleanup intent — the whole point of Delete is "make it go
+	// away and stay away." See the audit at handleRemoveAgent
+	// around line 3115 and at restoreAgents in this file.
+	RemovalReasonUserCleanupAfterPause = "user_cleanup_after_pause"
 )
 
 // logOutcome appends a routing-history record for the given agent. Called at

@@ -577,7 +577,11 @@ class OATClient {
 
 #### remove_agent
 
-**Description:** Remove/kill an agent
+**Description:** Remove/kill an agent. Optional `reason` arg classifies WHY for the outcome log AND for downstream recovery suppression:
+
+- `"manual"` (default if `reason` omitted) — bare CLI `oat agent remove`.
+- `"failed"` / `"superseded"` / `"timeout"` / `"budget_exceeded"` / `"daemon_restart"` — supervisor / budget-cap / re-route / shutdown flows. See `internal/daemon/daemon.go` for the canonical constant set.
+- `"user_cleanup_after_pause"` — set by `oat assistant remove` (Part 7 Commit 7.2). Suppresses the workspace-replacement notifier so a paused-then-deleted worker does NOT cause a replacement to be spawned. The other recovery paths (health-check restore, supervisor re-spawn) are also gated on this reason via the same audit; integrators who fire `remove_agent` programmatically should pass this reason when the human operator has explicitly asked to delete an agent.
 
 **Request:**
 ```json
@@ -585,7 +589,8 @@ class OATClient {
   "command": "remove_agent",
   "args": {
     "repo": "my-app",
-    "name": "clever-fox"
+    "name": "clever-fox",
+    "reason": "user_cleanup_after_pause"
   }
 }
 ```

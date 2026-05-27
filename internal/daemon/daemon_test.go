@@ -1142,6 +1142,144 @@ func TestHandleStopAgent_ConcurrentSerializesViaMutex(t *testing.T) {
 	}
 }
 
+// TestHandleRemoveAgentUserCleanupReason_Part7Commit2 pins the
+// recovery-suppression contract: when remove_agent is called
+// with reason="user_cleanup_after_pause", the workspace-
+// replacement notification path MUST short-circuit. Without
+// this gate, deleting a paused worker would trigger workspace
+// to spawn a replacement worker that the user explicitly
+// didn't want — the whole point of Delete is "make it go away
+// and stay away."
+//
+// The other recovery paths (health-check restore, supervisor
+// re-spawn) are gated via agent.LastError instead of via the
+// removal reason because Delete wipes the state.Agent record
+// entirely and those paths never see it. The recovery-paths
+// audit comment in handleRemoveAgent documents the split.
+func TestHandleRemoveAgentUserCleanupReason_Part7Commit2(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+
+	// Plant a worker with an unfinished task — this is the case
+	// the workspace-replacement notifier targets. Without the
+	// new reason gate, remove_agent would always send a message
+	// to "default" in the workspace's message inbox.
+	worker := state.Agent{
+		Type:        state.AgentTypeWorker,
+		WindowName:  "worker-win",
+		SessionID:   "worker-sid",
+		CreatedAt:   time.Now(),
+		Task:        "Some unfinished task",
+		IssueNumber: "42",
+	}
+
+	getWorkspaceInbox := func() string {
+		// Workspace message inbox is at
+		// <messagesDir>/<repo>/default/. Walk the directory and
+		// concatenate any JSON files we find — the notifier
+		// writes one JSON per message.
+		inboxDir := d.paths.AgentMessagesDir("test-repo", "default")
+		entries, err := os.ReadDir(inboxDir)
+		if err != nil {
+			return ""
+		}
+		var combined string
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(inboxDir, entry.Name()))
+			if err != nil {
+				continue
+			}
+			combined += string(data) + "\n"
+		}
+		return combined
+	}
+
+	t.Run("default reason still notifies workspace", func(t *testing.T) {
+		if err := d.state.AddAgent("test-repo", "worker-default", worker); err != nil {
+			t.Fatalf("AddAgent: %v", err)
+		}
+		resp := d.handleRemoveAgent(socket.Request{
+			Command: "remove_agent",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "worker-default",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("remove_agent (default reason): %s", resp.Error)
+		}
+		inbox := getWorkspaceInbox()
+		if !strings.Contains(inbox, "worker-default") || !strings.Contains(inbox, "Some unfinished task") {
+			t.Errorf("workspace inbox MUST contain the replacement notification for default reason; got: %q", inbox)
+		}
+	})
+
+	t.Run("user_cleanup_after_pause suppresses workspace replacement", func(t *testing.T) {
+		// Clean the workspace inbox between sub-tests so we can
+		// assert "nothing new was added" precisely.
+		inboxDir := d.paths.AgentMessagesDir("test-repo", "default")
+		_ = os.RemoveAll(inboxDir)
+
+		if err := d.state.AddAgent("test-repo", "worker-cleanup", worker); err != nil {
+			t.Fatalf("AddAgent: %v", err)
+		}
+		resp := d.handleRemoveAgent(socket.Request{
+			Command: "remove_agent",
+			Args: map[string]interface{}{
+				"repo":   "test-repo",
+				"agent":  "worker-cleanup",
+				"reason": RemovalReasonUserCleanupAfterPause,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("remove_agent (user_cleanup reason): %s", resp.Error)
+		}
+		inbox := getWorkspaceInbox()
+		if strings.Contains(inbox, "worker-cleanup") {
+			t.Errorf("workspace inbox MUST NOT contain a replacement notification when reason=user_cleanup_after_pause; got: %q", inbox)
+		}
+	})
+}
+
+// TestAgentLastErrorSaysUserStopped_Part7Commit2 pins the
+// health-check gate helper. Pure-function check so it can be
+// inverted by a future refactor without surprising the
+// recovery loop (which is far harder to test end-to-end).
+func TestAgentLastErrorSaysUserStopped_Part7Commit2(t *testing.T) {
+	cases := []struct {
+		name string
+		agent state.Agent
+		want  bool
+	}{
+		{"exact match", state.Agent{LastError: "stopped by user"}, true},
+		{"empty", state.Agent{LastError: ""}, false},
+		{"different reason", state.Agent{LastError: "crashed"}, false},
+		{"different case (must be exact)", state.Agent{LastError: "Stopped By User"}, false},
+		{"leading whitespace (must be exact)", state.Agent{LastError: " stopped by user"}, false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agentLastErrorSaysUserStopped(tc.agent); got != tc.want {
+				t.Errorf("agentLastErrorSaysUserStopped(%q) = %v, want %v",
+					tc.agent.LastError, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestHandleStartVerificationAgentValidation(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
