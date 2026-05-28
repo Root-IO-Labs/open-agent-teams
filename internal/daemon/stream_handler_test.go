@@ -337,6 +337,92 @@ func TestStreamHandlerAssistantTurns_SupervisorRejected_Part8Commit2(t *testing.
 	}
 }
 
+// Part 8 Commit 8.2, test (c) from the plan: the tailer broadcaster
+// fans out a fixture turn to a real subscriber once the 8.2 gate
+// allows the assistant subscription through. Injects a fake tailer
+// with a working turnBroadcaster directly into d.assistantTurnTailers,
+// subscribes via the socket, publishes a fixture AssistantTurn, and
+// asserts the wire frame arrives on the subscriber connection. This
+// proves the daemon pipeline end-to-end for the assistant lift, not
+// just the gate.
+func TestStreamHandlerAssistantTurns_AssistantBroadcasterFanout_Part8Commit2(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "_assistant-personal"
+	sessionName := "oat-_assistant-personal"
+	agentName := "personal"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			agentName: {
+				Type:       state.AgentTypeAssistant,
+				WindowName: agentName,
+				PID:        12345,
+			},
+		},
+	})
+
+	// Manually register a tailer + broadcaster for this assistant.
+	// The real startAssistantTurnTailer opens an OAT_TOOL_LOG file;
+	// we don't need the tailer goroutine running for this test —
+	// just a broadcaster wired into the lookup path.
+	broadcaster := newTurnBroadcaster(d.logger.Info)
+	d.assistantTurnTailersMu.Lock()
+	d.assistantTurnTailers[turnKey(sessionName, agentName)] = &assistantTurnTailer{
+		broadcaster: broadcaster,
+	}
+	d.assistantTurnTailersMu.Unlock()
+	defer broadcaster.Close()
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamAssistantTurns(socket.Request{
+		Command: "stream_assistant_turns",
+		Args: map[string]interface{}{
+			"session": sessionName,
+			"agent":   agentName,
+		},
+	}, server)
+
+	dec := json.NewDecoder(client)
+
+	// Read handshake.
+	var handshake socket.Response
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := dec.Decode(&handshake); err != nil {
+		t.Fatalf("Failed to decode handshake: %v", err)
+	}
+	if !handshake.Success {
+		t.Fatalf("Assistant handshake should have succeeded; got error: %s", handshake.Error)
+	}
+	if !handshake.Stream {
+		t.Fatal("Handshake should have Stream=true")
+	}
+
+	// Publish a fixture turn. The broadcaster's subscriber-buf is
+	// 16 so we don't need to race the reader.
+	broadcaster.Publish(AssistantTurn{
+		SanitizedText: "hello from the fixture tailer",
+		Kind:          "final",
+	})
+
+	// Read the wire frame.
+	var frame assistantTurnFrame
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := dec.Decode(&frame); err != nil {
+		t.Fatalf("Failed to decode turn frame: %v", err)
+	}
+	if frame.Text != "hello from the fixture tailer" {
+		t.Errorf("Unexpected frame text: %q", frame.Text)
+	}
+	if frame.Kind != "final" {
+		t.Errorf("Unexpected frame kind: %q", frame.Kind)
+	}
+}
+
 func TestStreamHandlerAssistantTurns_WorkerRejected_Part8Commit2(t *testing.T) {
 	d, _, cleanup := setupStreamTestDaemon(t)
 	defer cleanup()
