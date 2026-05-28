@@ -220,6 +220,20 @@ type Daemon struct {
 	bridgeUnreachable   map[string][]time.Time
 	bridgeUnreachableMu sync.Mutex
 
+	// chatCapableNudgeSkipLogged tracks "<repo>/<agent>" entries we have
+	// already emitted the once-per-boot "skipped wake-loop nudge"
+	// debug line for. The wake loop already excludes chat-capable
+	// agents (browser-agent, assistant) via the default arm of
+	// nudgeAgentsInRepo's switch, but Part 8 Commit 8.7 adds an
+	// explicit early-return guard at the top of the loop for
+	// grep-friendliness + regression prevention. This map ensures we
+	// only emit one debug breadcrumb per agent per daemon process
+	// lifetime rather than once every 2-minute nudge tick. Cleared
+	// implicitly by daemon restart; the entries are bounded by the
+	// chat-capable agent count.
+	chatCapableNudgeSkipLogged   map[string]bool
+	chatCapableNudgeSkipLoggedMu sync.Mutex
+
 	// assistantTurnTailers maps "<session>/<agent>" → per-agent log
 	// tailer that watches OAT_TOOL_LOG, parses ASSISTANT blocks, and
 	// fans them out to stream_assistant_turns subscribers. Created
@@ -284,7 +298,7 @@ type Daemon struct {
 	// mutex is held while a per-agent mutex is locked. Per-
 	// agent mutexes are NEVER held in a goroutine; only synch-
 	// ronously inside a single handler.
-	agentLifecycleMu     sync.Mutex
+	agentLifecycleMu      sync.Mutex
 	agentLifecycleMutexes map[string]*sync.Mutex
 
 	// Part 7 Commit 7.3: per-target write throttle for the
@@ -402,6 +416,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		mainCIAlertTime:             make(map[string]time.Time),
 		restartCooldown:             make(map[string]time.Time),
 		bridgeUnreachable:           make(map[string][]time.Time),
+		chatCapableNudgeSkipLogged:  make(map[string]bool),
 		assistantTurnTailers:        make(map[string]*assistantTurnTailer),
 		contextCap:                  newContextCapacityState(),
 		capacityBroadcasters:        make(map[string]*capacityBroadcaster),
@@ -1704,12 +1719,52 @@ func (d *Daemon) shouldNudgeAgent(repo *state.Repository, agentName string, agen
 	return true
 }
 
+// maybeLogChatCapableNudgeSkip emits a one-time debug breadcrumb
+// (per agent per daemon process lifetime) confirming that the
+// defense-in-depth early-skip in nudgeAgentsInRepo fired for a
+// chat-capable agent. The wake loop runs every 2 minutes; without
+// this dedup the same log line would emit roughly 720 times per
+// agent per day. The breadcrumb gives ops grep evidence that the
+// guard is reached without polluting daemon.log.
+//
+// Added in Part 8 Commit 8.7 alongside the explicit early-skip
+// guard. Keeping the log + the guard together so a future grep
+// for "chat-capable nudge skip" finds both the policy decision
+// and the audit trail.
+func (d *Daemon) maybeLogChatCapableNudgeSkip(repoName, agentName string, agentType state.AgentType) {
+	key := repoName + "/" + agentName
+	d.chatCapableNudgeSkipLoggedMu.Lock()
+	if d.chatCapableNudgeSkipLogged[key] {
+		d.chatCapableNudgeSkipLoggedMu.Unlock()
+		return
+	}
+	d.chatCapableNudgeSkipLogged[key] = true
+	d.chatCapableNudgeSkipLoggedMu.Unlock()
+	d.logger.Debug("chat-capable nudge skip: %s/%s (type=%s) excluded from wake-loop nudges (Part 8 Commit 8.7 defense-in-depth)", repoName, agentName, agentType)
+}
+
 // nudgeAgentsInRepo sends status-check nudges to all non-workspace agents.
 // For workers, it delegates to the escalating nudge ladder.
 func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now time.Time) {
 	repoPath := d.paths.RepoDir(repoName)
 
 	for agentName, agent := range repo.Agents {
+		// Part 8 Commit 8.7 (defense-in-depth): chat-capable agents
+		// (browser-agent + assistant) wait for user input via the
+		// side-panel chat, not for periodic daemon nudges. The switch
+		// statement below already excludes them via its `default:
+		// continue` arm, but this explicit early-return guard is
+		// grep-friendly and prevents a regression if a future change
+		// adds a new nudge case for one of those types without
+		// realising it would re-introduce idle token burn. Confirmed
+		// by the 2026-05-28 idle audit: steady-state idle nudge cost
+		// for chat-capable agents is ~0 tokens/day with this guard
+		// in place.
+		if agent.Type == state.AgentTypeBrowser || agent.Type == state.AgentTypeAssistant {
+			d.maybeLogChatCapableNudgeSkip(repoName, agentName, agent.Type)
+			continue
+		}
+
 		if !d.shouldNudgeAgent(repo, agentName, agent, now) {
 			continue
 		}
@@ -2264,15 +2319,15 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 		}
 
 		repoDetails = append(repoDetails, map[string]interface{}{
-			"name":               repoName,
-			"github_url":         repo.GithubURL,
-			"session_name":       repo.SessionName,
-			"total_agents":       totalAgents,
-			"worker_count":       workerCount,
-			"session_healthy":    sessionHealthy,
-			"is_fork":            repo.ForkConfig.IsFork,
-			"upstream_owner":     repo.ForkConfig.UpstreamOwner,
-			"upstream_repo":      repo.ForkConfig.UpstreamRepo,
+			"name":                repoName,
+			"github_url":          repo.GithubURL,
+			"session_name":        repo.SessionName,
+			"total_agents":        totalAgents,
+			"worker_count":        workerCount,
+			"session_healthy":     sessionHealthy,
+			"is_fork":             repo.ForkConfig.IsFork,
+			"upstream_owner":      repo.ForkConfig.UpstreamOwner,
+			"upstream_repo":       repo.ForkConfig.UpstreamRepo,
 			"pr_management_mode":  prManagementMode,
 			"idle_mode":           repo.IdleMode,
 			"swapped_model_count": swappedModelCount,
@@ -3366,10 +3421,10 @@ func (d *Daemon) handlePauseWebAgents(req socket.Request) socket.Response {
 		stoppedCount, skippedCount, failedCount, len(results))
 
 	return socket.SuccessResponse(map[string]interface{}{
-		"results":         results,
-		"stopped_count":   stoppedCount,
-		"skipped_count":   skippedCount,
-		"failed_count":    failedCount,
+		"results":       results,
+		"stopped_count": stoppedCount,
+		"skipped_count": skippedCount,
+		"failed_count":  failedCount,
 	})
 }
 
@@ -3429,8 +3484,8 @@ const emergencyResumeNoticeText = "[SYSTEM NOTICE - EMERGENCY RESUME] " +
 // button. It is structurally similar to handlePauseWebAgents
 // (Part 7 Commit 7.6) but with completely different semantics:
 //
-//   pause_web_agents:        STOP THE PROCESS    (graceful, slow)
-//   emergency_stop_all:      BLOCK ALL TOOL CALLS (instant)
+//	pause_web_agents:        STOP THE PROCESS    (graceful, slow)
+//	emergency_stop_all:      BLOCK ALL TOOL CALLS (instant)
 //
 // Pause kills the PTY; agent state is lost between pause and
 // resume. Emergency Stop leaves the agent process alive but
@@ -3457,10 +3512,11 @@ const emergencyResumeNoticeText = "[SYSTEM NOTICE - EMERGENCY RESUME] " +
 // turns.
 //
 // Args:
-//   reason (optional): short string describing why the stop was
-//     triggered. Surfaced in the lifecycle frame's Reason field
-//     and in each bridge's panicState reason. Capped at
-//     emergencyStopMaxReasonBytes.
+//
+//	reason (optional): short string describing why the stop was
+//	  triggered. Surfaced in the lifecycle frame's Reason field
+//	  and in each bridge's panicState reason. Capped at
+//	  emergencyStopMaxReasonBytes.
 //
 // Returns: per-agent results (which received the notice, which
 // errored), total counts, and the broadcasted lifecycle frame's
@@ -3610,12 +3666,12 @@ func (d *Daemon) handleEmergencyStopAll(req socket.Request) socket.Response {
 		noticedCount, skippedCount, failedCount, reason)
 
 	return socket.SuccessResponse(map[string]interface{}{
-		"results":              results,
-		"noticed_count":        noticedCount,
+		"results":               results,
+		"noticed_count":         noticedCount,
 		"already_stopped_count": skippedCount,
-		"failed_count":         failedCount,
-		"broadcast_ts":         now,
-		"reason":               reason,
+		"failed_count":          failedCount,
+		"broadcast_ts":          now,
+		"reason":                reason,
 	})
 }
 
