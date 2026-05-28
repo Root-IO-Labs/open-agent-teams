@@ -525,10 +525,22 @@ func (sh *streamHandler) handleStreamAgentOutput(req socket.Request, conn net.Co
 //
 // Identity model matches stream_agent_output: addressed by
 // (session, agent_name) so the bridge doesn't have to reverse-resolve
-// the repository name. Restricted to AgentTypeBrowser for the same
-// reason the byte-level stream is — the parsed turn feed is intended
-// for side-panel chat only and exposing it for other agent types
-// would change the audit-surface of those agents.
+// the repository name. Restricted to chat-capable agent types (the
+// `usesBrowserBridge()` helper — assistant + browser today; see
+// daemon.go) for the same reason the byte-level stream is — the
+// parsed turn feed is intended for side-panel chat only and exposing
+// it for non-chat-capable agent types (worker/supervisor/etc.) would
+// change the audit-surface of those agents.
+//
+// Part 8 Commit 8.2: the pre-8.2 gate was `agent.Type !=
+// AgentTypeBrowser` which rejected assistant-bonded bridges even
+// though the daemon's assistantTurnTailer infrastructure was ALREADY
+// running for them. Symptom: bridge stderr log was spammed with
+// "stream_assistant_turns is restricted to browser-agent type;
+// _assistant-personal/personal is assistant" and the panel never
+// saw assistant replies. usesBrowserBridge is the same helper that
+// already gates tailer startup, so this swap brings the wire-level
+// gate in sync with the infrastructure-level gate.
 //
 // Protocol:
 //  1. Server sends handshake: {"success":true,"stream":true}
@@ -559,8 +571,8 @@ func (sh *streamHandler) handleStreamAssistantTurns(req socket.Request, conn net
 		enc.Encode(socket.Response{Success: false, Error: "agent '" + agentName + "' not found in session " + sessionName}) //nolint:errcheck
 		return
 	}
-	if agent.Type != state.AgentTypeBrowser {
-		enc.Encode(socket.Response{Success: false, Error: "stream_assistant_turns is restricted to browser-agent type; " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
+	if !usesBrowserBridge(agent.Type) {
+		enc.Encode(socket.Response{Success: false, Error: "stream_assistant_turns is restricted to chat-capable agents (assistant + browser); " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
 		return
 	}
 

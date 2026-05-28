@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,6 +224,158 @@ func TestStreamHandlerSuccessfulStream(t *testing.T) {
 		// Agent exited and channel closed — stream handler should have sent done
 		// (may not always receive it due to timing, so this is a soft check)
 		t.Log("Note: did not receive explicit done message (agent may have exited before stream established)")
+	}
+}
+
+// Part 8 Commit 8.2: handleStreamAssistantTurns now accepts both
+// assistant and browser agent types (the chat-capable whitelist
+// already used by daemon.usesBrowserBridge). Pre-8.2 only browser
+// agents passed, which spammed the bridge stderr log of assistant
+// bridges with "stream_assistant_turns is restricted to browser-agent
+// type; ... is assistant".
+//
+// These tests pin the new gate semantics:
+//  1. Assistant subscription does NOT get the type-restriction
+//     error (it may get "no tailer active" depending on whether
+//     the tailer has been registered — that's a separate path).
+//  2. Supervisor/worker still fail with the new "chat-capable
+//     agents (assistant + browser)" error message.
+func TestStreamHandlerAssistantTurns_AssistantPassesGate_Part8Commit2(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "test-repo"
+	sessionName := "oat-test-session"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"personal": {
+				Type:       state.AgentTypeAssistant,
+				WindowName: "personal",
+				PID:        12345,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamAssistantTurns(socket.Request{
+		Command: "stream_assistant_turns",
+		Args: map[string]interface{}{
+			"session": sessionName,
+			"agent":   "personal",
+		},
+	}, server)
+
+	var resp socket.Response
+	dec := json.NewDecoder(client)
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	// Assistant must NOT receive the pre-8.2 type-restriction error.
+	// It may receive "no tailer active" (the tailer is not running
+	// in this test harness) but that's a separate path.
+	if resp.Success {
+		// Handshake succeeded — tailer was somehow active. That's
+		// fine, the gate passed.
+		return
+	}
+	if contains := strings.Contains(resp.Error, "restricted to"); contains {
+		t.Errorf("Assistant should pass the type gate; got restriction error: %s", resp.Error)
+	}
+	// "no tailer active" is the expected outcome for assistant in
+	// this test fixture (no tailer registered), proving the gate
+	// passed but the lookup failed downstream.
+	if !strings.Contains(resp.Error, "no assistant-turn tailer active") {
+		t.Logf("Note: assistant passed gate; downstream error: %s", resp.Error)
+	}
+}
+
+func TestStreamHandlerAssistantTurns_SupervisorRejected_Part8Commit2(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "test-repo"
+	sessionName := "oat-test-session"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"supervisor": {
+				Type:       state.AgentTypeSupervisor,
+				WindowName: "supervisor",
+				PID:        12345,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamAssistantTurns(socket.Request{
+		Command: "stream_assistant_turns",
+		Args: map[string]interface{}{
+			"session": sessionName,
+			"agent":   "supervisor",
+		},
+	}, server)
+
+	var resp socket.Response
+	dec := json.NewDecoder(client)
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("Supervisor subscription must be rejected")
+	}
+	// New error message references "chat-capable agents (assistant + browser)"
+	// instead of the pre-8.2 "browser-agent type".
+	if !strings.Contains(resp.Error, "chat-capable agents (assistant + browser)") {
+		t.Errorf("Expected new error message 'chat-capable agents (assistant + browser)'; got: %s", resp.Error)
+	}
+}
+
+func TestStreamHandlerAssistantTurns_WorkerRejected_Part8Commit2(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "test-repo"
+	sessionName := "oat-test-session"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"worker": {
+				Type:       state.AgentTypeWorker,
+				WindowName: "worker",
+				PID:        12345,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamAssistantTurns(socket.Request{
+		Command: "stream_assistant_turns",
+		Args: map[string]interface{}{
+			"session": sessionName,
+			"agent":   "worker",
+		},
+	}, server)
+
+	var resp socket.Response
+	dec := json.NewDecoder(client)
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("Worker subscription must be rejected")
+	}
+	if !strings.Contains(resp.Error, "chat-capable agents (assistant + browser)") {
+		t.Errorf("Expected new error message 'chat-capable agents (assistant + browser)'; got: %s", resp.Error)
 	}
 }
 
