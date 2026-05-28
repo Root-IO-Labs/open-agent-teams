@@ -1595,6 +1595,125 @@ func TestHandleRouteUserMessage_Part7Commit3(t *testing.T) {
 			t.Errorf("target_agent = %q, want audit-target", got)
 		}
 	})
+
+	// Part 8 Commit 8.1: bridge_bonded_* + cross_agent_route audit
+	// fields. Cross-agent route means the bridge's bonded identity
+	// differs from the picker-selected target (the post-Part-8
+	// normal case for "browser-agent bridge chatting with personal
+	// assistant"). Same-agent routes set the flag to false.
+	t.Run("audit log records bridge_bonded_* + cross_agent_route=true", func(t *testing.T) {
+		addAgent(t, "cross-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "cross-target") })
+
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":                "test-repo",
+				"agent":               "cross-target",
+				"text":                "cross-agent route",
+				"bridge_bonded_repo":  "other-repo",
+				"bridge_bonded_agent": "browser-agent",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("cross-agent route should succeed; got: %s", resp.Error)
+		}
+
+		auditPath := filepath.Join(d.paths.RepoOutputDir("test-repo"), "cross-target.routes.jsonl")
+		data, err := os.ReadFile(auditPath)
+		if err != nil {
+			t.Fatalf("audit file %s not written: %v", auditPath, err)
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &rec); err != nil {
+			t.Fatalf("audit line is not JSON: %v", err)
+		}
+		if got, _ := rec["bridge_bonded_repo"].(string); got != "other-repo" {
+			t.Errorf("bridge_bonded_repo = %q, want other-repo", got)
+		}
+		if got, _ := rec["bridge_bonded_agent"].(string); got != "browser-agent" {
+			t.Errorf("bridge_bonded_agent = %q, want browser-agent", got)
+		}
+		if got, _ := rec["cross_agent_route"].(bool); !got {
+			t.Errorf("cross_agent_route = false, want true (other-repo/browser-agent ≠ test-repo/cross-target)")
+		}
+		if _, ok := rec["text_bytes"]; !ok {
+			t.Errorf("audit record missing text_bytes field: %v", rec)
+		}
+	})
+
+	t.Run("audit log records cross_agent_route=false when bonded == target", func(t *testing.T) {
+		addAgent(t, "same-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "same-target") })
+
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":                "test-repo",
+				"agent":               "same-target",
+				"text":                "same-agent route",
+				"bridge_bonded_repo":  "test-repo",
+				"bridge_bonded_agent": "same-target",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("same-agent route should succeed; got: %s", resp.Error)
+		}
+
+		auditPath := filepath.Join(d.paths.RepoOutputDir("test-repo"), "same-target.routes.jsonl")
+		data, err := os.ReadFile(auditPath)
+		if err != nil {
+			t.Fatalf("audit file not written: %v", err)
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &rec); err != nil {
+			t.Fatalf("audit line is not JSON: %v", err)
+		}
+		if got, _ := rec["cross_agent_route"].(bool); got {
+			t.Errorf("cross_agent_route = true, want false (bonded == target)")
+		}
+	})
+
+	t.Run("audit log omits bridge_bonded_* when bridge sends no identity (pre-8.1 back-compat)", func(t *testing.T) {
+		addAgent(t, "legacy-bridge-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "legacy-bridge-target") })
+
+		// Wait long enough for the per-target rate-limit window to
+		// not bite us — the earlier sub-tests used different agent
+		// names so their key is independent, but each new agent
+		// gets a fresh key by construction.
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "legacy-bridge-target",
+				"text":  "no bonded identity",
+				// Deliberately NO bridge_bonded_* fields.
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("legacy-bridge route should succeed; got: %s", resp.Error)
+		}
+
+		auditPath := filepath.Join(d.paths.RepoOutputDir("test-repo"), "legacy-bridge-target.routes.jsonl")
+		data, err := os.ReadFile(auditPath)
+		if err != nil {
+			t.Fatalf("audit file not written: %v", err)
+		}
+		var rec map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &rec); err != nil {
+			t.Fatalf("audit line is not JSON: %v", err)
+		}
+		if _, ok := rec["bridge_bonded_repo"]; ok {
+			t.Errorf("audit record should OMIT bridge_bonded_repo when bridge sends no identity: %v", rec)
+		}
+		if _, ok := rec["bridge_bonded_agent"]; ok {
+			t.Errorf("audit record should OMIT bridge_bonded_agent when bridge sends no identity: %v", rec)
+		}
+		if _, ok := rec["cross_agent_route"]; ok {
+			t.Errorf("audit record should OMIT cross_agent_route when bridge sends no identity: %v", rec)
+		}
+	})
 }
 
 // TestHandleRouteUserMessage_RateLimit_Part7Commit3 pins the

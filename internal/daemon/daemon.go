@@ -3838,6 +3838,15 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	if !ok {
 		return errResp
 	}
+	// Part 8 Commit 8.1: capture the bridge's bonded identity for
+	// the audit log. Optional — pre-8.1 bridges omit these args.
+	// Strings only; the daemon does not authenticate that the
+	// claimed bonded identity matches the actual socket session
+	// (the audit log is for forensics, not authorisation — the
+	// trust model is "bridges run trusted local code; the audit
+	// trail records what they claim about themselves").
+	bridgeBondedRepo := getOptionalStringArg(req.Args, "bridge_bonded_repo", "")
+	bridgeBondedAgent := getOptionalStringArg(req.Args, "bridge_bonded_agent", "")
 
 	// Size cap (gate #5) FIRST — cheapest check, doesn't touch
 	// state, so a 50 MB junk payload doesn't even cost a map
@@ -3953,7 +3962,22 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// that's what the agent actually received. A future forensic
 	// analysis asking "did agent X see exactly this text?" needs
 	// the sanitised form, not the wire form.
-	if err := d.appendRouteAuditLog(repoName, agentName, sanitized); err != nil {
+	//
+	// Part 8 Commit 8.1: enrich with bridge_bonded_* + flag
+	// `cross_agent_route: true` when the picker-selected target
+	// differs from the sending bridge's bonded identity. This
+	// is normal post-Part-8 (the picker is the whole feature)
+	// but flagging it makes incident-response log greps easier.
+	crossAgentRoute := bridgeBondedRepo != "" && bridgeBondedAgent != "" &&
+		(bridgeBondedRepo != repoName || bridgeBondedAgent != agentName)
+	if err := d.appendRouteAuditLog(
+		repoName,
+		agentName,
+		sanitized,
+		bridgeBondedRepo,
+		bridgeBondedAgent,
+		crossAgentRoute,
+	); err != nil {
 		d.logger.Warn("route_user_message: audit-log append failed for %s/%s: %v", repoName, agentName, err)
 	}
 
@@ -3976,7 +4000,11 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 // truncate each other's lines; the kernel guarantees
 // single-write atomicity up to PIPE_BUF (typically 4 KiB),
 // and our line is ~120 bytes, well under that.
-func (d *Daemon) appendRouteAuditLog(repoName, agentName, sanitizedText string) error {
+func (d *Daemon) appendRouteAuditLog(
+	repoName, agentName, sanitizedText string,
+	bridgeBondedRepo, bridgeBondedAgent string,
+	crossAgentRoute bool,
+) error {
 	dir := d.paths.RepoOutputDir(repoName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
@@ -3989,7 +4017,17 @@ func (d *Daemon) appendRouteAuditLog(repoName, agentName, sanitizedText string) 
 		"target_repo":  repoName,
 		"target_agent": agentName,
 		"byte_count":   len(sanitizedText),
+		"text_bytes":   len(sanitizedText), // Part 8 Commit 8.1 alias matching plan body field-name; kept alongside byte_count for back-compat with existing log consumers.
 		"sha256":       hex.EncodeToString(sum[:]),
+	}
+	// Part 8 Commit 8.1: include bridge bonded identity + cross-
+	// agent flag when known. Pre-Part-8 bridges omit these args
+	// entirely; the resulting log record then carries the
+	// pre-Part-8 shape (no extra fields) for back-compat.
+	if bridgeBondedRepo != "" && bridgeBondedAgent != "" {
+		record["bridge_bonded_repo"] = bridgeBondedRepo
+		record["bridge_bonded_agent"] = bridgeBondedAgent
+		record["cross_agent_route"] = crossAgentRoute
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
