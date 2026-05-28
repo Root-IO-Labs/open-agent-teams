@@ -1596,11 +1596,11 @@ func TestHandleRouteUserMessage_Part7Commit3(t *testing.T) {
 		}
 	})
 
-	// Part 8 Commit 8.1: bridge_bonded_* + cross_agent_route audit
-	// fields. Cross-agent route means the bridge's bonded identity
-	// differs from the picker-selected target (the post-Part-8
-	// normal case for "browser-agent bridge chatting with personal
-	// assistant"). Same-agent routes set the flag to false.
+	// bridge_bonded_* + cross_agent_route audit fields. Cross-agent
+	// route means the bridge's bonded identity differs from the
+	// picker-selected target (the normal case for "browser-agent
+	// bridge chatting with personal assistant"). Same-agent routes
+	// set the flag to false.
 	t.Run("audit log records bridge_bonded_* + cross_agent_route=true", func(t *testing.T) {
 		addAgent(t, "cross-target", state.AgentTypeAssistant, 9999)
 		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "cross-target") })

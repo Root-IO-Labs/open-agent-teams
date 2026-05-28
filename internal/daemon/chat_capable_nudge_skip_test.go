@@ -7,8 +7,8 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
-// TestNudgeAgentsInRepo_ChatCapableSkip confirms that the Part 8
-// Commit 8.7 defense-in-depth early-skip guard is reached for
+// TestNudgeAgentsInRepo_ChatCapableSkip confirms that the
+// defense-in-depth early-skip guard is reached for
 // AgentTypeBrowser + AgentTypeAssistant, and that the one-time
 // debug-log tracking map records both. The wake loop's pre-existing
 // `default: continue` switch arm already excluded these types; this

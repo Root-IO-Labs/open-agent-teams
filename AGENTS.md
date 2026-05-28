@@ -211,7 +211,7 @@ See `docs/AGENTS.md` for detailed agent documentation including:
 
 **Token use / idle mode:** When a repo has no active workers, `repo.IdleMode` is set and the wake loop skips the entire repo — supervisor / merge-queue / PR-shepherd receive no periodic nudges. `oat daemon status` and `oat status` show idle vs active by repo. Chat-capable agents (browser-agent + assistant) are excluded from wake-loop nudges entirely regardless of repo idle state, since they receive their work via inter-agent messaging and side-panel chat respectively (see `nudgeAgentsInRepo` in `internal/daemon/daemon.go` — explicit early-skip for `AgentTypeBrowser` + `AgentTypeAssistant` plus a `default: continue` belt-and-suspenders).
 
-> **Note on env-var naming:** `OAT_WORKER_DORMANCY_CAP_MINUTES` (default 15) configures **PR force-merge timing** in `pr_monitor.go` (how long a worker can sit dormant on a green PR before the daemon force-merges it). It does NOT control wake-loop idle suppression — that gate is `repo.IdleMode + repoHasActiveWorkers()` in `daemon.go` with no env-var knob. Verified by the 2026-05-28 idle audit; documented in `docs/ASSISTANT_IDLE_AUDIT.md`.
+> **Note on env-var naming:** `OAT_WORKER_DORMANCY_CAP_MINUTES` (default 15) configures **PR force-merge timing** in `pr_monitor.go` (how long a worker can sit dormant on a green PR before the daemon force-merges it). It does NOT control wake-loop idle suppression — that gate is `repo.IdleMode + repoHasActiveWorkers()` in `daemon.go` with no env-var knob.
 
 **Rejection cap:** Workers are auto-completed after repeated verification rejections (default: 3, configurable via `OAT_MAX_REJECTIONS`). The daemon escalates to the supervisor for task reassignment, preventing unbounded token waste from stuck workers.
 

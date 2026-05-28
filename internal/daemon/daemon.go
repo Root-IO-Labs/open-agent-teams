@@ -224,13 +224,13 @@ type Daemon struct {
 	// already emitted the once-per-boot "skipped wake-loop nudge"
 	// debug line for. The wake loop already excludes chat-capable
 	// agents (browser-agent, assistant) via the default arm of
-	// nudgeAgentsInRepo's switch, but Part 8 Commit 8.7 adds an
-	// explicit early-return guard at the top of the loop for
-	// grep-friendliness + regression prevention. This map ensures we
-	// only emit one debug breadcrumb per agent per daemon process
-	// lifetime rather than once every 2-minute nudge tick. Cleared
-	// implicitly by daemon restart; the entries are bounded by the
-	// chat-capable agent count.
+	// nudgeAgentsInRepo's switch; the top-of-loop early-return guard
+	// is grep-friendly defense-in-depth that prevents a regression
+	// if someone adds a new nudge case for one of those types. This
+	// map ensures we only emit one debug breadcrumb per agent per
+	// daemon process lifetime rather than once every 2-minute nudge
+	// tick. Cleared implicitly by daemon restart; the entries are
+	// bounded by the chat-capable agent count.
 	chatCapableNudgeSkipLogged   map[string]bool
 	chatCapableNudgeSkipLoggedMu sync.Mutex
 
@@ -1725,12 +1725,9 @@ func (d *Daemon) shouldNudgeAgent(repo *state.Repository, agentName string, agen
 // chat-capable agent. The wake loop runs every 2 minutes; without
 // this dedup the same log line would emit roughly 720 times per
 // agent per day. The breadcrumb gives ops grep evidence that the
-// guard is reached without polluting daemon.log.
-//
-// Added in Part 8 Commit 8.7 alongside the explicit early-skip
-// guard. Keeping the log + the guard together so a future grep
-// for "chat-capable nudge skip" finds both the policy decision
-// and the audit trail.
+// guard is reached without polluting daemon.log. Keeping the log
+// + the guard together so a future grep for "chat-capable nudge
+// skip" finds both the policy decision and the audit trail.
 func (d *Daemon) maybeLogChatCapableNudgeSkip(repoName, agentName string, agentType state.AgentType) {
 	key := repoName + "/" + agentName
 	d.chatCapableNudgeSkipLoggedMu.Lock()
@@ -1740,7 +1737,7 @@ func (d *Daemon) maybeLogChatCapableNudgeSkip(repoName, agentName string, agentT
 	}
 	d.chatCapableNudgeSkipLogged[key] = true
 	d.chatCapableNudgeSkipLoggedMu.Unlock()
-	d.logger.Debug("chat-capable nudge skip: %s/%s (type=%s) excluded from wake-loop nudges (Part 8 Commit 8.7 defense-in-depth)", repoName, agentName, agentType)
+	d.logger.Debug("chat-capable nudge skip: %s/%s (type=%s) excluded from wake-loop nudges (defense-in-depth)", repoName, agentName, agentType)
 }
 
 // nudgeAgentsInRepo sends status-check nudges to all non-workspace agents.
@@ -1749,15 +1746,14 @@ func (d *Daemon) nudgeAgentsInRepo(repoName string, repo *state.Repository, now 
 	repoPath := d.paths.RepoDir(repoName)
 
 	for agentName, agent := range repo.Agents {
-		// Part 8 Commit 8.7 (defense-in-depth): chat-capable agents
-		// (browser-agent + assistant) wait for user input via the
-		// side-panel chat, not for periodic daemon nudges. The switch
-		// statement below already excludes them via its `default:
-		// continue` arm, but this explicit early-return guard is
-		// grep-friendly and prevents a regression if a future change
-		// adds a new nudge case for one of those types without
-		// realising it would re-introduce idle token burn. Confirmed
-		// by the 2026-05-28 idle audit: steady-state idle nudge cost
+		// Defense-in-depth: chat-capable agents (browser-agent +
+		// assistant) wait for user input via the side-panel chat,
+		// not for periodic daemon nudges. The switch statement below
+		// already excludes them via its `default: continue` arm, but
+		// this explicit early-return guard is grep-friendly and
+		// prevents a regression if a future change adds a new nudge
+		// case for one of those types without realising it would
+		// re-introduce idle token burn. Steady-state idle nudge cost
 		// for chat-capable agents is ~0 tokens/day with this guard
 		// in place.
 		if agent.Type == state.AgentTypeBrowser || agent.Type == state.AgentTypeAssistant {
@@ -3894,13 +3890,13 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	if !ok {
 		return errResp
 	}
-	// Part 8 Commit 8.1: capture the bridge's bonded identity for
-	// the audit log. Optional — pre-8.1 bridges omit these args.
-	// Strings only; the daemon does not authenticate that the
-	// claimed bonded identity matches the actual socket session
-	// (the audit log is for forensics, not authorisation — the
-	// trust model is "bridges run trusted local code; the audit
-	// trail records what they claim about themselves").
+	// Capture the bridge's bonded identity for the audit log.
+	// Optional — older bridges omit these args. Strings only; the
+	// daemon does not authenticate that the claimed bonded
+	// identity matches the actual socket session (the audit log
+	// is for forensics, not authorisation — the trust model is
+	// "bridges run trusted local code; the audit trail records
+	// what they claim about themselves").
 	bridgeBondedRepo := getOptionalStringArg(req.Args, "bridge_bonded_repo", "")
 	bridgeBondedAgent := getOptionalStringArg(req.Args, "bridge_bonded_agent", "")
 
@@ -4019,11 +4015,11 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// analysis asking "did agent X see exactly this text?" needs
 	// the sanitised form, not the wire form.
 	//
-	// Part 8 Commit 8.1: enrich with bridge_bonded_* + flag
-	// `cross_agent_route: true` when the picker-selected target
-	// differs from the sending bridge's bonded identity. This
-	// is normal post-Part-8 (the picker is the whole feature)
-	// but flagging it makes incident-response log greps easier.
+	// Enrich with bridge_bonded_* + flag `cross_agent_route: true`
+	// when the picker-selected target differs from the sending
+	// bridge's bonded identity. This is normal whenever the user
+	// is talking to a non-bonded agent via the chat-tab picker;
+	// the flag makes incident-response log greps easier.
 	crossAgentRoute := bridgeBondedRepo != "" && bridgeBondedAgent != "" &&
 		(bridgeBondedRepo != repoName || bridgeBondedAgent != agentName)
 	if err := d.appendRouteAuditLog(
@@ -4073,13 +4069,13 @@ func (d *Daemon) appendRouteAuditLog(
 		"target_repo":  repoName,
 		"target_agent": agentName,
 		"byte_count":   len(sanitizedText),
-		"text_bytes":   len(sanitizedText), // Part 8 Commit 8.1 alias matching plan body field-name; kept alongside byte_count for back-compat with existing log consumers.
+		"text_bytes":   len(sanitizedText), // alias for byte_count; kept alongside for back-compat with existing log consumers.
 		"sha256":       hex.EncodeToString(sum[:]),
 	}
-	// Part 8 Commit 8.1: include bridge bonded identity + cross-
-	// agent flag when known. Pre-Part-8 bridges omit these args
-	// entirely; the resulting log record then carries the
-	// pre-Part-8 shape (no extra fields) for back-compat.
+	// Include bridge bonded identity + cross-agent flag when known.
+	// Older bridges omit these args entirely; the resulting log
+	// record then carries the older shape (no extra fields) for
+	// back-compat.
 	if bridgeBondedRepo != "" && bridgeBondedAgent != "" {
 		record["bridge_bonded_repo"] = bridgeBondedRepo
 		record["bridge_bonded_agent"] = bridgeBondedAgent

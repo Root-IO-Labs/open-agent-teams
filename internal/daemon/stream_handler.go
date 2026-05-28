@@ -532,10 +532,10 @@ func (sh *streamHandler) handleStreamAgentOutput(req socket.Request, conn net.Co
 // it for non-chat-capable agent types (worker/supervisor/etc.) would
 // change the audit-surface of those agents.
 //
-// Part 8 Commit 8.2: the pre-8.2 gate was `agent.Type !=
-// AgentTypeBrowser` which rejected assistant-bonded bridges even
-// though the daemon's assistantTurnTailer infrastructure was ALREADY
-// running for them. Symptom: bridge stderr log was spammed with
+// The original gate was `agent.Type != AgentTypeBrowser` which
+// rejected assistant-bonded bridges even though the daemon's
+// assistantTurnTailer infrastructure was ALREADY running for them.
+// Symptom: bridge stderr log was spammed with
 // "stream_assistant_turns is restricted to browser-agent type;
 // _assistant-personal/personal is assistant" and the panel never
 // saw assistant replies. usesBrowserBridge is the same helper that

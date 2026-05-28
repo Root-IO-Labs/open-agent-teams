@@ -227,20 +227,20 @@ func TestStreamHandlerSuccessfulStream(t *testing.T) {
 	}
 }
 
-// Part 8 Commit 8.2: handleStreamAssistantTurns now accepts both
-// assistant and browser agent types (the chat-capable whitelist
-// already used by daemon.usesBrowserBridge). Pre-8.2 only browser
-// agents passed, which spammed the bridge stderr log of assistant
-// bridges with "stream_assistant_turns is restricted to browser-agent
+// handleStreamAssistantTurns accepts both assistant and browser
+// agent types (the chat-capable whitelist already used by
+// daemon.usesBrowserBridge). An earlier gate only allowed browser
+// agents and spammed the bridge stderr log of assistant bridges
+// with "stream_assistant_turns is restricted to browser-agent
 // type; ... is assistant".
 //
-// These tests pin the new gate semantics:
+// These tests pin the current gate semantics:
 //  1. Assistant subscription does NOT get the type-restriction
 //     error (it may get "no tailer active" depending on whether
 //     the tailer has been registered — that's a separate path).
-//  2. Supervisor/worker still fail with the new "chat-capable
-//     agents (assistant + browser)" error message.
-func TestStreamHandlerAssistantTurns_AssistantPassesGate_Part8Commit2(t *testing.T) {
+//  2. Supervisor/worker still fail with the "chat-capable agents
+//     (assistant + browser)" error message.
+func TestStreamHandlerAssistantTurns_AssistantPassesGate(t *testing.T) {
 	d, _, cleanup := setupStreamTestDaemon(t)
 	defer cleanup()
 
@@ -274,9 +274,9 @@ func TestStreamHandlerAssistantTurns_AssistantPassesGate_Part8Commit2(t *testing
 	if err := dec.Decode(&resp); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
-	// Assistant must NOT receive the pre-8.2 type-restriction error.
-	// It may receive "no tailer active" (the tailer is not running
-	// in this test harness) but that's a separate path.
+	// Assistant must NOT receive the type-restriction error. It
+	// may receive "no tailer active" (the tailer is not running in
+	// this test harness) but that's a separate path.
 	if resp.Success {
 		// Handshake succeeded — tailer was somehow active. That's
 		// fine, the gate passed.
@@ -293,7 +293,7 @@ func TestStreamHandlerAssistantTurns_AssistantPassesGate_Part8Commit2(t *testing
 	}
 }
 
-func TestStreamHandlerAssistantTurns_SupervisorRejected_Part8Commit2(t *testing.T) {
+func TestStreamHandlerAssistantTurns_SupervisorRejected(t *testing.T) {
 	d, _, cleanup := setupStreamTestDaemon(t)
 	defer cleanup()
 
@@ -330,22 +330,22 @@ func TestStreamHandlerAssistantTurns_SupervisorRejected_Part8Commit2(t *testing.
 	if resp.Success {
 		t.Fatal("Supervisor subscription must be rejected")
 	}
-	// New error message references "chat-capable agents (assistant + browser)"
-	// instead of the pre-8.2 "browser-agent type".
+	// Error message references "chat-capable agents (assistant + browser)"
+	// (was "browser-agent type" before the gate widened).
 	if !strings.Contains(resp.Error, "chat-capable agents (assistant + browser)") {
 		t.Errorf("Expected new error message 'chat-capable agents (assistant + browser)'; got: %s", resp.Error)
 	}
 }
 
-// Part 8 Commit 8.2, test (c) from the plan: the tailer broadcaster
-// fans out a fixture turn to a real subscriber once the 8.2 gate
-// allows the assistant subscription through. Injects a fake tailer
-// with a working turnBroadcaster directly into d.assistantTurnTailers,
-// subscribes via the socket, publishes a fixture AssistantTurn, and
-// asserts the wire frame arrives on the subscriber connection. This
-// proves the daemon pipeline end-to-end for the assistant lift, not
-// just the gate.
-func TestStreamHandlerAssistantTurns_AssistantBroadcasterFanout_Part8Commit2(t *testing.T) {
+// The tailer broadcaster fans out a fixture turn to a real
+// subscriber once the chat-capable gate allows the assistant
+// subscription through. Injects a fake tailer with a working
+// turnBroadcaster directly into d.assistantTurnTailers, subscribes
+// via the socket, publishes a fixture AssistantTurn, and asserts
+// the wire frame arrives on the subscriber connection. This proves
+// the daemon pipeline end-to-end for the assistant lift, not just
+// the gate.
+func TestStreamHandlerAssistantTurns_AssistantBroadcasterFanout(t *testing.T) {
 	d, _, cleanup := setupStreamTestDaemon(t)
 	defer cleanup()
 
@@ -423,7 +423,7 @@ func TestStreamHandlerAssistantTurns_AssistantBroadcasterFanout_Part8Commit2(t *
 	}
 }
 
-func TestStreamHandlerAssistantTurns_WorkerRejected_Part8Commit2(t *testing.T) {
+func TestStreamHandlerAssistantTurns_WorkerRejected(t *testing.T) {
 	d, _, cleanup := setupStreamTestDaemon(t)
 	defer cleanup()
 

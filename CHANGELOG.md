@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Part 8 — Multi-agent chat parity (daemon half; 2026-05-28).**
+
+  Companion to the oat-browser-agent Part 8 work. Closes the
+  daemon-side gaps that broke multi-agent chat: lifts
+  `stream_assistant_turns` from a browser-only gate to any
+  chat-capable agent (via the `usesBrowserBridge` helper —
+  assistant + browser pass, supervisor / worker / merge-queue /
+  pr-shepherd rejected with `"stream_assistant_turns is
+  restricted to chat-capable agents (assistant + browser)"`);
+  enriches the `route_user_message` audit log with the bridge's
+  bonded identity and a `cross_agent_route` flag so cross-agent
+  picker traffic is grep-able after the fact; adds an explicit
+  defense-in-depth early-skip for chat-capable agents in
+  `nudgeAgentsInRepo` so a future regression that adds a new
+  nudge case for one of those types cannot silently re-introduce
+  idle token burn.
+
+  **Commits:**
+
+  | SHA | Title |
+  |-----|-------|
+  | `12f5804` | Commit 8.1 daemon half: `route_user_message` audit-log enrichment (`bridge_bonded_repo`, `bridge_bonded_agent`, `cross_agent_route`) |
+  | `eb08a7f` + `fe97b35` | Commit 8.2: lift `stream_assistant_turns` gate to chat-capable agents + tailer-broadcaster fanout test |
+  | `38bc5a6` + _this commit_ | Commit 8.7 daemon half: defense-in-depth nudge skip for `AgentTypeBrowser` + `AgentTypeAssistant` in `nudgeAgentsInRepo` + docs |
+
+  **Wire-level additions:**
+  - `stream_assistant_turns` accepts assistant + browser agent
+    types (was browser-only). See
+    `docs/extending/SOCKET_API.md` for the full schema.
+  - `route_user_message` records `bridge_bonded_repo`,
+    `bridge_bonded_agent`, `cross_agent_route` on every call.
+    Older bridges that don't advertise their bonded identity
+    keep the older log shape (no extra fields) for back-compat.
+
+  **Token-burn / idle behaviour:** an audit confirmed that
+  chat-capable agents (browser + assistant) already had ~0
+  tokens/day at steady idle — they're excluded from the wake
+  loop both by the `default: continue` arm of
+  `nudgeAgentsInRepo`'s switch AND by `repo.IdleMode +
+  repoHasActiveWorkers()`. Commit 8.7 adds an explicit early-skip
+  guard + once-per-boot debug log so the policy is grep-friendly
+  and regression-resistant. Carryover items for future work:
+  per-agent token budgets, assistant-side restart-storm backoff
+  independent of bridge reachability, and gating the 75%
+  context-capacity PTY hint on a user-active-recently check.
+
+  **Naming correction:** `OAT_WORKER_DORMANCY_CAP_MINUTES`
+  (default 15) configures **PR force-merge timing** in
+  `pr_monitor.go`, NOT wake-loop idle suppression. The actual
+  wake-loop gate is `repo.IdleMode + repoHasActiveWorkers()` in
+  `daemon.go` with no env-var knob. The "Token use / idle mode"
+  blurb in `AGENTS.md` previously conflated the two; this commit
+  fixes it.
+
 ### Changed
 
 - **`browser.md` teaches the framing rule for tall pages on
