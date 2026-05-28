@@ -23,6 +23,21 @@
 //   - "agent_stopped"   — handleStopAgent set PID to 0 with the
 //     LastError marker.
 //   - "agent_removed"   — handleRemoveAgent deleted the record.
+//   - "emergency_stop"  — (Part 7 panic-redesign slice 3a, 2026-05-28)
+//     global emergency-stop fired. Every bridge that sees this
+//     frame must immediately invoke its local panicState.trigger(),
+//     blocking all in-flight + future tool calls at the MCP layer.
+//     Carries no per-agent identity — it's a process-wide signal,
+//     not an agent-specific one. Optional Reason field describes
+//     why (e.g. "sidepanel button"). Companion to the per-agent
+//     PTY notice injection so even an LLM that ignores the bridge
+//     block sees an explicit "user halted you — await new
+//     instructions" message in its conversation context.
+//   - "emergency_resume" — (Part 7 panic-redesign slice 3a)
+//     global emergency-stop cleared. Bridges call panicState.resume()
+//     to re-enable tool dispatch. NOT a license to retry — slice 1's
+//     AGENT_PANIC error directive + slice 3a's PTY notice both tell
+//     the LLM to wait for explicit user instructions before acting.
 //
 // Mirrors the structural pattern of capacityBroadcaster in
 // context_capacity_stream.go — same Subscribe/Publish/Close API,
@@ -40,11 +55,13 @@ import (
 // Frame kind constants. Stable strings on the wire — the bridge
 // and the extension match against them by string compare.
 const (
-	lifecycleKindSnapshot     = "snapshot"
-	lifecycleKindAgentAdded   = "agent_added"
-	lifecycleKindAgentStarted = "agent_started"
-	lifecycleKindAgentStopped = "agent_stopped"
-	lifecycleKindAgentRemoved = "agent_removed"
+	lifecycleKindSnapshot       = "snapshot"
+	lifecycleKindAgentAdded     = "agent_added"
+	lifecycleKindAgentStarted   = "agent_started"
+	lifecycleKindAgentStopped   = "agent_stopped"
+	lifecycleKindAgentRemoved   = "agent_removed"
+	lifecycleKindEmergencyStop  = "emergency_stop"
+	lifecycleKindEmergencyResume = "emergency_resume"
 )
 
 // agentLifecycleFrame is the wire shape sent over
@@ -74,8 +91,15 @@ type agentLifecycleFrame struct {
 	Model     string `json:"model,omitempty"`
 	LastError string `json:"last_error,omitempty"`
 	TS        string `json:"ts,omitempty"`
-	Done      bool   `json:"done,omitempty"`
-	Err       string `json:"error,omitempty"`
+	// Reason is set only on Kind == "emergency_stop" /
+	// "emergency_resume" frames. Free-form short string surfaced
+	// in audit logs + the bridge's panicState.reason. Omitted
+	// (zero string elided by omitempty) on every other kind. The
+	// extension may render this on the side-panel banner so users
+	// see "stopped via side panel" vs "stopped via CLI".
+	Reason string `json:"reason,omitempty"`
+	Done   bool   `json:"done,omitempty"`
+	Err    string `json:"error,omitempty"`
 }
 
 // lifecycleSubscriberBuf is the per-subscriber channel buffer.

@@ -2093,6 +2093,12 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 	case "pause_web_agents":
 		return d.handlePauseWebAgents(req)
 
+	case "emergency_stop_all":
+		return d.handleEmergencyStopAll(req)
+
+	case "emergency_resume_all":
+		return d.handleEmergencyResumeAll(req)
+
 	case "list_agents":
 		return d.handleListAgents(req)
 
@@ -3364,6 +3370,385 @@ func (d *Daemon) handlePauseWebAgents(req socket.Request) socket.Response {
 		"stopped_count":   stoppedCount,
 		"skipped_count":   skippedCount,
 		"failed_count":    failedCount,
+	})
+}
+
+// emergencyStopMaxReasonBytes caps the optional `reason` arg on
+// emergency_stop_all / emergency_resume_all. 1 KiB is plenty for
+// the realistic copy ("sidepanel button", "keyboard shortcut",
+// "CLI override"); anything longer is almost certainly garbage
+// or an attempt to pad the lifecycle frame.
+const emergencyStopMaxReasonBytes = 1024
+
+// emergencyStopNoticeText is the system notice injected into each
+// pausable agent's PTY when the user triggers Emergency Stop. The
+// LLM sees it as a turn-boundary user message because we route it
+// through backend.SendMessage just like a real user_message.
+//
+// The text is the BELT-AND-SUSPENDERS companion to the bridge's
+// MCP-layer AGENT_PANIC error (Part 7 panic-redesign slice 1):
+//   - The AGENT_PANIC error fires every time a tool call is
+//     attempted while panicState is set. It blocks the action
+//     and embeds a behavioral directive in the error response.
+//   - This PTY notice arrives even when the LLM is not in a
+//     tool-call state (e.g. mid-thinking), so the directive
+//     reaches the agent's conversation history even without a
+//     tool attempt. Critical for the "user halts you between
+//     turns" scenario.
+//
+// Wording is intentionally aligned with bridge/src/panic-state.ts
+// buildPanicErrorMessage so the agent's conversation context
+// carries one consistent directive, not two conflicting copies.
+// The bracketed [SYSTEM NOTICE - EMERGENCY STOP] header is a
+// hint to the LLM that this is operator-injected, not a
+// hallucinated tool result -- many model families treat tagged
+// system messages with higher authority than untagged turns.
+const emergencyStopNoticeText = "[SYSTEM NOTICE - EMERGENCY STOP] " +
+	"The user has triggered an emergency stop on all web agents. " +
+	"This means the action you were about to perform was likely dangerous, wrong, or undesired. " +
+	"Do NOT retry the halted action under any circumstances. " +
+	"Wait for the user to send an explicit new message before performing any further actions. " +
+	"If they resume you without sending a new message, ask them what they want you to do next instead of continuing the previous task."
+
+// emergencyResumeNoticeText fires on emergency_resume_all. It's
+// deliberately shorter than the stop notice -- the stop notice
+// already established the directive; this one just confirms the
+// halt was cleared and restates the wait-for-instructions ask
+// so the agent doesn't autopilot back into the halted action.
+//
+// Why inject anything at all on resume (as opposed to nothing):
+// some model families read "panic cleared" as "resume work". The
+// notice is a small but consistent reinforcement that resume is
+// NOT consent to continue.
+const emergencyResumeNoticeText = "[SYSTEM NOTICE - EMERGENCY RESUME] " +
+	"The user has cleared the emergency stop. You may use tools again, but DO NOT retry the action that was halted. " +
+	"Wait for an explicit new instruction from the user before doing anything related to the previously-halted task."
+
+// handleEmergencyStopAll (Part 7 panic-redesign slice 3a) is the
+// daemon-side of the side panel's always-visible Emergency Stop
+// button. It is structurally similar to handlePauseWebAgents
+// (Part 7 Commit 7.6) but with completely different semantics:
+//
+//   pause_web_agents:        STOP THE PROCESS    (graceful, slow)
+//   emergency_stop_all:      BLOCK ALL TOOL CALLS (instant)
+//
+// Pause kills the PTY; agent state is lost between pause and
+// resume. Emergency Stop leaves the agent process alive but
+// makes its bridge refuse every tool call at the MCP layer until
+// emergency_resume_all is called. This means:
+//   - The agent's conversation context is preserved.
+//   - The user can read what the agent was about to do, then
+//     decide whether to allow it.
+//   - Resume is instant; no agent-restart latency.
+//
+// The signal flows on the existing stream_agent_lifecycle
+// channel (slice 3a wire-extension). Every connected bridge
+// receives one emergency_stop frame and calls its local
+// panicState.trigger() — same mechanism as the legacy single-
+// bridge panic button, just fanned out across all bridges.
+//
+// On top of the bridge-side block, this verb ALSO injects a
+// system notice into every pausable agent's PTY (via
+// backend.SendMessage, the same primitive route_user_message
+// uses). The notice tells the LLM what just happened and forbids
+// retry-after-resume. Belt-and-suspenders with the AGENT_PANIC
+// error message from slice 1 -- one mechanism reaches the agent
+// during a tool attempt, the other reaches the agent between
+// turns.
+//
+// Args:
+//   reason (optional): short string describing why the stop was
+//     triggered. Surfaced in the lifecycle frame's Reason field
+//     and in each bridge's panicState reason. Capped at
+//     emergencyStopMaxReasonBytes.
+//
+// Returns: per-agent results (which received the notice, which
+// errored), total counts, and the broadcasted lifecycle frame's
+// timestamp. The side panel doesn't need to follow up with a
+// list_agents poll because all UI state flows through the
+// lifecycle stream.
+//
+// Best-effort by design (same as pause_web_agents): a single
+// agent's notice-injection failure does not abort the broadcast.
+// The user clicked Emergency Stop and gets immediate UI feedback
+// + the bridge-level block regardless of per-agent PTY write
+// outcomes.
+func (d *Daemon) handleEmergencyStopAll(req socket.Request) socket.Response {
+	type emergencyResult struct {
+		Repo   string `json:"repo"`
+		Agent  string `json:"agent"`
+		Type   string `json:"agent_type"`
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}
+
+	// Optional reason. Untrusted user input -- size-cap to avoid
+	// padding attacks against the lifecycle frame stream. Empty
+	// is fine; the broadcast still fires, just without context.
+	reason := ""
+	if rawReason, ok := req.Args["reason"]; ok {
+		if s, isString := rawReason.(string); isString {
+			reason = s
+		}
+	}
+	if len(reason) > emergencyStopMaxReasonBytes {
+		return socket.ErrorResponse(
+			"reason exceeds %d bytes (RPC_PAYLOAD_TOO_LARGE); got %d",
+			emergencyStopMaxReasonBytes, len(reason),
+		)
+	}
+
+	// STEP 1: broadcast first, inject notices second.
+	//
+	// Order matters: the lifecycle frame is what flips every
+	// bridge's panicState (instant, programmatic block). The
+	// PTY notice is the slower belt-and-suspenders. We want the
+	// instant block to land BEFORE any agent has a chance to
+	// see the notice and react -- otherwise an unlucky LLM
+	// could read the notice, decide to "comply gracefully",
+	// and slip in one final tool call before its bridge blocks.
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if d.agentLifecycleBroadcaster != nil {
+		d.agentLifecycleBroadcaster.Publish(agentLifecycleFrame{
+			Kind:   lifecycleKindEmergencyStop,
+			Reason: reason,
+			TS:     now,
+		})
+	}
+
+	// STEP 2: per-agent PTY notice injection.
+	results := make([]emergencyResult, 0)
+	noticedCount := 0
+	skippedCount := 0
+	failedCount := 0
+
+	repos := d.state.GetAllRepos()
+	for repoName, repo := range repos {
+		agentNames, err := d.state.ListAgents(repoName)
+		if err != nil {
+			d.logger.Debug("emergency_stop_all: ListAgents(%s) failed: %v", repoName, err)
+			continue
+		}
+		for _, agentName := range agentNames {
+			agent, exists := d.state.GetAgent(repoName, agentName)
+			if !exists {
+				continue
+			}
+			// Same whitelist as pause_web_agents -- only inject
+			// notices into agent types that participate in the
+			// browser-agent surface. A worker / supervisor that
+			// somehow ended up in this loop would receive a
+			// confusing message about an action they were never
+			// going to perform.
+			if !agent.Type.IsPausable() {
+				continue
+			}
+			// Skip agents with no live PTY. The agent isn't
+			// running, so there's no LLM to deliver the notice
+			// to and the bridge-side block already covers any
+			// future tool call after restart (panicState is
+			// process-local, but slice 3b will make the bridge
+			// re-fetch panicState on connect — TODO in slice 3b).
+			if agent.PID == 0 {
+				results = append(results, emergencyResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "already_stopped",
+				})
+				skippedCount++
+				continue
+			}
+
+			windowName := agent.WindowName
+			if windowName == "" {
+				windowName = agentName
+			}
+			// Sanitise as a defence-in-depth pass even though
+			// the notice text is daemon-controlled. Matches the
+			// trust-boundary discipline route_user_message uses;
+			// keeps a single PTY-input policy across all writers.
+			sanitized, sanitizeErr := socket.SanitizePTYInput(emergencyStopNoticeText, socket.SanitizeOpts{})
+			if sanitizeErr != nil {
+				// Should never fire for a hardcoded string; log
+				// loudly and continue (the broadcast already
+				// blocked the agent at the bridge layer).
+				d.logger.Error("emergency_stop_all: SanitizePTYInput failed for hardcoded notice: %v", sanitizeErr)
+				results = append(results, emergencyResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "failed",
+					Error:  sanitizeErr.Error(),
+				})
+				failedCount++
+				continue
+			}
+			if err := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); err != nil {
+				d.logger.Warn("emergency_stop_all: SendMessage failed for %s/%s: %v", repoName, agentName, err)
+				results = append(results, emergencyResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "failed",
+					Error:  err.Error(),
+				})
+				failedCount++
+				continue
+			}
+			results = append(results, emergencyResult{
+				Repo:   repoName,
+				Agent:  agentName,
+				Type:   string(agent.Type),
+				Status: "noticed",
+			})
+			noticedCount++
+		}
+	}
+
+	d.logger.Info("emergency_stop_all: noticed=%d already_stopped=%d failed=%d reason=%q",
+		noticedCount, skippedCount, failedCount, reason)
+
+	return socket.SuccessResponse(map[string]interface{}{
+		"results":              results,
+		"noticed_count":        noticedCount,
+		"already_stopped_count": skippedCount,
+		"failed_count":         failedCount,
+		"broadcast_ts":         now,
+		"reason":               reason,
+	})
+}
+
+// handleEmergencyResumeAll (Part 7 panic-redesign slice 3a) is
+// the inverse of handleEmergencyStopAll. It broadcasts an
+// emergency_resume lifecycle frame so every bridge clears its
+// local panicState, then injects a short follow-up notice into
+// each pausable agent's PTY restating the no-retry directive.
+//
+// The notice exists because some model families treat "panic
+// cleared" as "resume the previous task". The PTY note + the
+// bridge-already-cleared-panic combo restate slice 1's directive
+// at the moment the LLM is most likely to act on it.
+//
+// Order of operations:
+//  1. Broadcast emergency_resume (unblocks tool dispatch on
+//     every bridge).
+//  2. Inject the resume notice into each live agent's PTY.
+//
+// Step 1 first because the user clicked Resume and expects
+// immediate UI affordance ("tools now work"). Step 2 is the
+// slower follow-up that reinforces the wait-for-instructions
+// directive in the conversation context.
+func (d *Daemon) handleEmergencyResumeAll(req socket.Request) socket.Response {
+	type resumeResult struct {
+		Repo   string `json:"repo"`
+		Agent  string `json:"agent"`
+		Type   string `json:"agent_type"`
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}
+
+	reason := ""
+	if rawReason, ok := req.Args["reason"]; ok {
+		if s, isString := rawReason.(string); isString {
+			reason = s
+		}
+	}
+	if len(reason) > emergencyStopMaxReasonBytes {
+		return socket.ErrorResponse(
+			"reason exceeds %d bytes (RPC_PAYLOAD_TOO_LARGE); got %d",
+			emergencyStopMaxReasonBytes, len(reason),
+		)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if d.agentLifecycleBroadcaster != nil {
+		d.agentLifecycleBroadcaster.Publish(agentLifecycleFrame{
+			Kind:   lifecycleKindEmergencyResume,
+			Reason: reason,
+			TS:     now,
+		})
+	}
+
+	results := make([]resumeResult, 0)
+	noticedCount := 0
+	skippedCount := 0
+	failedCount := 0
+
+	repos := d.state.GetAllRepos()
+	for repoName, repo := range repos {
+		agentNames, err := d.state.ListAgents(repoName)
+		if err != nil {
+			d.logger.Debug("emergency_resume_all: ListAgents(%s) failed: %v", repoName, err)
+			continue
+		}
+		for _, agentName := range agentNames {
+			agent, exists := d.state.GetAgent(repoName, agentName)
+			if !exists {
+				continue
+			}
+			if !agent.Type.IsPausable() {
+				continue
+			}
+			if agent.PID == 0 {
+				results = append(results, resumeResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "not_running",
+				})
+				skippedCount++
+				continue
+			}
+			windowName := agent.WindowName
+			if windowName == "" {
+				windowName = agentName
+			}
+			sanitized, sanitizeErr := socket.SanitizePTYInput(emergencyResumeNoticeText, socket.SanitizeOpts{})
+			if sanitizeErr != nil {
+				d.logger.Error("emergency_resume_all: SanitizePTYInput failed for hardcoded notice: %v", sanitizeErr)
+				results = append(results, resumeResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "failed",
+					Error:  sanitizeErr.Error(),
+				})
+				failedCount++
+				continue
+			}
+			if err := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); err != nil {
+				d.logger.Warn("emergency_resume_all: SendMessage failed for %s/%s: %v", repoName, agentName, err)
+				results = append(results, resumeResult{
+					Repo:   repoName,
+					Agent:  agentName,
+					Type:   string(agent.Type),
+					Status: "failed",
+					Error:  err.Error(),
+				})
+				failedCount++
+				continue
+			}
+			results = append(results, resumeResult{
+				Repo:   repoName,
+				Agent:  agentName,
+				Type:   string(agent.Type),
+				Status: "noticed",
+			})
+			noticedCount++
+		}
+	}
+
+	d.logger.Info("emergency_resume_all: noticed=%d not_running=%d failed=%d reason=%q",
+		noticedCount, skippedCount, failedCount, reason)
+
+	return socket.SuccessResponse(map[string]interface{}{
+		"results":           results,
+		"noticed_count":     noticedCount,
+		"not_running_count": skippedCount,
+		"failed_count":      failedCount,
+		"broadcast_ts":      now,
+		"reason":            reason,
 	})
 }
 

@@ -6436,3 +6436,468 @@ func TestHandlePauseWebAgents_MultiRepoEnumeration_Part7Commit6(t *testing.T) {
 		t.Errorf("stopped_count = %d, want 6 (3 repos x 2 assistants)", stopped)
 	}
 }
+
+// -----------------------------------------------------------------------
+// Part 7 panic-redesign slice 3a (2026-05-28): emergency_stop_all /
+// emergency_resume_all daemon verbs.
+//
+// The architectural shape is documented at handleEmergencyStopAll's
+// doc comment. These tests pin the load-bearing contracts that the
+// bridge (slice 3b) and the extension (slice 3c/d) will rely on:
+//
+//   1. The verbs publish a lifecycle frame so every connected bridge
+//      flips panicState immediately (instant block, doesn't wait for
+//      the per-agent PTY-write loop to finish).
+//
+//   2. The PTY-injection loop respects the same whitelist as
+//      pause_web_agents (state.AgentType.IsPausable()) and the same
+//      "already not running" handling. Workers / Supervisors NEVER
+//      receive the emergency notice — they're not part of the
+//      browser-agent surface and the notice would confuse their
+//      task-execution loop.
+//
+//   3. The notice text contains the load-bearing behavioral directive
+//      that slice 1 baked into the AGENT_PANIC error. Same words,
+//      same intent, delivered via PTY instead of MCP error body —
+//      so the LLM sees ONE consistent directive regardless of
+//      which mechanism reached it first.
+//
+//   4. The optional `reason` arg flows through to the lifecycle
+//      frame so the side panel can render "Stopped via sidepanel
+//      button" vs "Stopped via CLI" without a separate metadata
+//      round-trip. Size-capped to defend the lifecycle stream from
+//      padding attacks.
+//
+// Test discipline: substring-based assertions on the notice text,
+// not exact-string equality. The notice copy may evolve to address
+// future model-family quirks; the load-bearing PHRASES are the
+// contract, not the exact sentence ordering.
+// -----------------------------------------------------------------------
+
+// TestHandleEmergencyStopAll_BroadcastsLifecycleFrame_Part7PanicSlice3a
+// pins the most important guarantee: clicking Emergency Stop fires a
+// lifecycle frame that every connected bridge will see and use to
+// invoke panicState.trigger() locally. The broadcast happens BEFORE
+// the per-agent PTY loop because the broadcast is the fast block;
+// the PTY notice is the belt-and-suspenders.
+func TestHandleEmergencyStopAll_BroadcastsLifecycleFrame_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// Subscribe BEFORE firing the verb so we catch the frame.
+	// Buffer is 16 internally; one frame easily fits.
+	ch, unsub := d.agentLifecycleBroadcaster.Subscribe()
+	defer unsub()
+
+	resp := d.handleEmergencyStopAll(socket.Request{Command: "emergency_stop_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_stop_all failed: %v", resp.Error)
+	}
+
+	select {
+	case frame := <-ch:
+		if frame.Kind != lifecycleKindEmergencyStop {
+			t.Errorf("lifecycle frame Kind = %q, want %q", frame.Kind, lifecycleKindEmergencyStop)
+		}
+		if frame.TS == "" {
+			t.Errorf("lifecycle frame TS is empty; the side panel relies on this for ordering")
+		}
+		// Per-agent fields should NOT be set on a global frame —
+		// it's a process-wide signal, not an agent-scoped event.
+		if frame.Repo != "" || frame.Agent != "" || frame.PID != 0 {
+			t.Errorf("global frame leaked per-agent fields: repo=%q agent=%q pid=%d",
+				frame.Repo, frame.Agent, frame.PID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no lifecycle frame received within 2s — the broadcast did NOT fire (bridges would not see the emergency stop)")
+	}
+}
+
+// TestHandleEmergencyStopAll_InjectsNoticeIntoPausableAgentsOnly pins
+// the security boundary that mirrors pause_web_agents: only Assistants
+// and Browser agents receive the emergency PTY notice. Workers /
+// Supervisors / Reviewers / Merge-Queues are NEVER written to —
+// they're not part of the browser-agent surface and an emergency
+// notice in their PTY would derail a half-completed task.
+func TestHandleEmergencyStopAll_InjectsNoticeIntoPausableAgentsOnly_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	fakeBackend := &routeTestBackend{}
+	d.backend = fakeBackend
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "sess-1",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	for _, ag := range []struct {
+		name string
+		typ  state.AgentType
+	}{
+		{name: "assistant-1", typ: state.AgentTypeAssistant},
+		{name: "browser-1", typ: state.AgentTypeBrowser},
+		{name: "worker-1", typ: state.AgentTypeWorker},
+		{name: "supervisor", typ: state.AgentTypeSupervisor},
+	} {
+		a := state.Agent{
+			Type:       ag.typ,
+			WindowName: ag.name,
+			SessionID:  ag.name + "-sid",
+			CreatedAt:  time.Now(),
+			PID:        9999,
+		}
+		if err := d.state.AddAgent("test-repo", ag.name, a); err != nil {
+			t.Fatalf("AddAgent %s: %v", ag.name, err)
+		}
+	}
+
+	resp := d.handleEmergencyStopAll(socket.Request{Command: "emergency_stop_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_stop_all failed: %v", resp.Error)
+	}
+
+	calls := fakeBackend.calls()
+	if len(calls) != 2 {
+		t.Fatalf("SendMessage called %d times, want exactly 2 (Assistant + Browser only); calls=%+v", len(calls), calls)
+	}
+	got := map[string]bool{}
+	for _, c := range calls {
+		got[c.Agent] = true
+		if !strings.Contains(c.Message, "EMERGENCY STOP") {
+			t.Errorf("notice to %s missing the load-bearing header phrase: %q", c.Agent, c.Message)
+		}
+	}
+	if !got["assistant-1"] {
+		t.Errorf("assistant-1 did NOT receive the emergency notice (pausable-whitelist regression)")
+	}
+	if !got["browser-1"] {
+		t.Errorf("browser-1 did NOT receive the emergency notice (pausable-whitelist regression)")
+	}
+	if got["worker-1"] {
+		t.Errorf("worker-1 received the emergency notice — non-pausable agent leaked through whitelist (SECURITY REGRESSION)")
+	}
+	if got["supervisor"] {
+		t.Errorf("supervisor received the emergency notice — non-pausable agent leaked through whitelist (SECURITY REGRESSION)")
+	}
+}
+
+// TestHandleEmergencyStopAll_NoticeTextContainsLoadBearingDirective is
+// the cross-slice consistency guard. The PTY notice must carry the
+// same behavioral directive that slice 1 baked into the AGENT_PANIC
+// error message: don't retry after resume, wait for explicit
+// instructions, ask if resume happens without new instruction. If
+// these phrases drift across the two delivery channels the LLM gets
+// two slightly-conflicting copies of the same intent, which weakens
+// the directive's authority.
+//
+// Substring assertions, not exact-string equality, so a future copy
+// edit can rephrase as long as the directive's load-bearing phrases
+// stay intact. Mirrors the test discipline in
+// tests/unit/panic-state.test.ts for the bridge-side message.
+func TestHandleEmergencyStopAll_NoticeTextContainsLoadBearingDirective_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	fakeBackend := &routeTestBackend{}
+	d.backend = fakeBackend
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "sess-1",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	a := state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "personal",
+		SessionID:  "personal-sid",
+		CreatedAt:  time.Now(),
+		PID:        9999,
+	}
+	if err := d.state.AddAgent("test-repo", "personal", a); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	resp := d.handleEmergencyStopAll(socket.Request{Command: "emergency_stop_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_stop_all failed: %v", resp.Error)
+	}
+	calls := fakeBackend.calls()
+	if len(calls) != 1 {
+		t.Fatalf("SendMessage called %d times, want 1", len(calls))
+	}
+	msg := calls[0].Message
+
+	// These five phrases are the contract. If you intentionally
+	// rephrase the notice, replace the assertion with a substring
+	// that matches your new wording -- DON'T just delete the
+	// assertion. Each phrase blocks a specific LLM failure mode:
+	mustContain := []struct {
+		phrase, why string
+	}{
+		{"EMERGENCY STOP", "system-message header — tells the LLM this is operator-injected, not a hallucinated tool result"},
+		{"likely dangerous, wrong, or undesired", "frames the halted action; without this the LLM might default to 'system glitch, retry'"},
+		{"Do NOT retry the halted action", "the load-bearing directive; without this the LLM may resume the dangerous action on next turn"},
+		{"Wait for the user to send an explicit new message", "the affirmative side of the no-retry directive — gives the LLM a clear next step"},
+		{"ask them what they want you to do next", "covers the resume-without-message edge case (otherwise the LLM may guess and act)"},
+	}
+	for _, mc := range mustContain {
+		if !strings.Contains(msg, mc.phrase) {
+			t.Errorf("notice missing load-bearing phrase %q\n  why it matters: %s\n  full message: %q", mc.phrase, mc.why, msg)
+		}
+	}
+}
+
+// TestHandleEmergencyStopAll_SkipsPidZeroAgents pins the
+// "already_stopped" fast path. An agent with PID==0 has no live
+// PTY to write the notice into, AND the bridge-level block already
+// covers any future tool call after the agent is restarted (see
+// slice 3b for the snapshot-on-connect behavior). So we record the
+// no-op and move on.
+func TestHandleEmergencyStopAll_SkipsPidZeroAgents_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	fakeBackend := &routeTestBackend{}
+	d.backend = fakeBackend
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "sess-1",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	for name, pid := range map[string]int{
+		"already-stopped": 0,
+		"running":         9999,
+	} {
+		a := state.Agent{
+			Type:       state.AgentTypeAssistant,
+			WindowName: name,
+			SessionID:  name + "-sid",
+			CreatedAt:  time.Now(),
+			PID:        pid,
+		}
+		if err := d.state.AddAgent("test-repo", name, a); err != nil {
+			t.Fatalf("AddAgent %s: %v", name, err)
+		}
+	}
+
+	resp := d.handleEmergencyStopAll(socket.Request{Command: "emergency_stop_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_stop_all failed: %v", resp.Error)
+	}
+	data := resp.Data.(map[string]interface{})
+	noticed, _ := data["noticed_count"].(int)
+	skipped, _ := data["already_stopped_count"].(int)
+	if noticed != 1 {
+		t.Errorf("noticed_count = %d, want 1 (only the PID=9999 agent)", noticed)
+	}
+	if skipped != 1 {
+		t.Errorf("already_stopped_count = %d, want 1 (the PID=0 agent)", skipped)
+	}
+
+	// And the backend write should have only fired once.
+	calls := fakeBackend.calls()
+	if len(calls) != 1 || calls[0].Agent != "running" {
+		t.Errorf("SendMessage calls = %+v, want exactly 1 call to the running agent", calls)
+	}
+}
+
+// TestHandleEmergencyStopAll_ReasonPropagatesInFrame pins the
+// optional `reason` arg's flow into the lifecycle frame. The side
+// panel uses this to render context-aware banners ("stopped via
+// sidepanel button" vs "stopped via keyboard shortcut").
+func TestHandleEmergencyStopAll_ReasonPropagatesInFrame_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	ch, unsub := d.agentLifecycleBroadcaster.Subscribe()
+	defer unsub()
+
+	resp := d.handleEmergencyStopAll(socket.Request{
+		Command: "emergency_stop_all",
+		Args:    map[string]interface{}{"reason": "sidepanel button"},
+	})
+	if !resp.Success {
+		t.Fatalf("emergency_stop_all failed: %v", resp.Error)
+	}
+
+	select {
+	case frame := <-ch:
+		if frame.Reason != "sidepanel button" {
+			t.Errorf("lifecycle frame Reason = %q, want %q", frame.Reason, "sidepanel button")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no lifecycle frame received within 2s")
+	}
+
+	// And it must also be echoed in the verb's response payload
+	// so the calling extension can confirm the value the daemon
+	// recorded (avoids "I sent X but the daemon stored Y" confusion).
+	data := resp.Data.(map[string]interface{})
+	if got, _ := data["reason"].(string); got != "sidepanel button" {
+		t.Errorf("response.reason = %q, want %q", got, "sidepanel button")
+	}
+}
+
+// TestHandleEmergencyStopAll_RejectsOversizedReason pins the padding
+// defence. A 2 KiB reason exceeds the 1 KiB cap and must be rejected
+// up front with RPC_PAYLOAD_TOO_LARGE, before any state mutation or
+// broadcast. Without this gate a malicious extension could pump
+// the lifecycle stream with huge frames (cheap denial-of-service on
+// every subscribed bridge).
+func TestHandleEmergencyStopAll_RejectsOversizedReason_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// 2 KiB of repeated 'A' — well over the 1 KiB cap.
+	big := strings.Repeat("A", 2048)
+	resp := d.handleEmergencyStopAll(socket.Request{
+		Command: "emergency_stop_all",
+		Args:    map[string]interface{}{"reason": big},
+	})
+	if resp.Success {
+		t.Fatalf("emergency_stop_all unexpectedly succeeded with oversized reason; expected RPC_PAYLOAD_TOO_LARGE rejection")
+	}
+	if !strings.Contains(resp.Error, "RPC_PAYLOAD_TOO_LARGE") {
+		t.Errorf("rejection message missing RPC_PAYLOAD_TOO_LARGE code: %q", resp.Error)
+	}
+}
+
+// TestHandleEmergencyResumeAll_BroadcastsResumeFrame is the inverse
+// of the stop test. The bridge listens for both kinds; missing
+// either is a UI deadlock (user clicks Resume but bridges stay
+// blocked).
+func TestHandleEmergencyResumeAll_BroadcastsResumeFrame_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	ch, unsub := d.agentLifecycleBroadcaster.Subscribe()
+	defer unsub()
+
+	resp := d.handleEmergencyResumeAll(socket.Request{Command: "emergency_resume_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_resume_all failed: %v", resp.Error)
+	}
+
+	select {
+	case frame := <-ch:
+		if frame.Kind != lifecycleKindEmergencyResume {
+			t.Errorf("lifecycle frame Kind = %q, want %q", frame.Kind, lifecycleKindEmergencyResume)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("no lifecycle frame received within 2s — Resume broadcast did NOT fire")
+	}
+}
+
+// TestHandleEmergencyResumeAll_InjectsResumeNoticeWithDirective is
+// the slice-3a end of the belt-and-suspenders. After clearing the
+// bridge-side block, we inject a PTY notice that restates the
+// don't-retry directive at the moment the LLM is most likely to
+// act on it.
+func TestHandleEmergencyResumeAll_InjectsResumeNoticeWithDirective_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	fakeBackend := &routeTestBackend{}
+	d.backend = fakeBackend
+
+	repo := &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "sess-1",
+		Agents:      make(map[string]state.Agent),
+	}
+	if err := d.state.AddRepo("test-repo", repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	a := state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "personal",
+		SessionID:  "personal-sid",
+		CreatedAt:  time.Now(),
+		PID:        9999,
+	}
+	if err := d.state.AddAgent("test-repo", "personal", a); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	resp := d.handleEmergencyResumeAll(socket.Request{Command: "emergency_resume_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_resume_all failed: %v", resp.Error)
+	}
+	calls := fakeBackend.calls()
+	if len(calls) != 1 {
+		t.Fatalf("SendMessage called %d times, want 1", len(calls))
+	}
+	msg := calls[0].Message
+
+	mustContain := []struct {
+		phrase, why string
+	}{
+		{"EMERGENCY RESUME", "header — tells the LLM this is the operator-injected resume notice, not the stop notice"},
+		{"DO NOT retry the action that was halted", "the load-bearing directive — without it the LLM may resume the halted action on next turn"},
+		{"Wait for an explicit new instruction", "tells the LLM what to do INSTEAD of retrying"},
+	}
+	for _, mc := range mustContain {
+		if !strings.Contains(msg, mc.phrase) {
+			t.Errorf("resume notice missing load-bearing phrase %q\n  why it matters: %s\n  full message: %q", mc.phrase, mc.why, msg)
+		}
+	}
+}
+
+// TestHandleEmergencyStopAll_MultiRepoEnumeration pins the
+// cross-repo enumeration contract. Mirrors the equivalent test for
+// pause_web_agents: three repos × two assistants each → 6 notice
+// injections.
+func TestHandleEmergencyStopAll_MultiRepoEnumeration_Part7PanicSlice3a(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	fakeBackend := &routeTestBackend{}
+	d.backend = fakeBackend
+
+	for _, repoName := range []string{"r1", "r2", "r3"} {
+		repo := &state.Repository{
+			GithubURL:   "https://github.com/test/" + repoName,
+			SessionName: "sess-" + repoName,
+			Agents:      make(map[string]state.Agent),
+		}
+		if err := d.state.AddRepo(repoName, repo); err != nil {
+			t.Fatalf("AddRepo %s: %v", repoName, err)
+		}
+		for _, agentName := range []string{"personal", "work"} {
+			a := state.Agent{
+				Type:       state.AgentTypeAssistant,
+				WindowName: agentName,
+				SessionID:  agentName + "-sid",
+				CreatedAt:  time.Now(),
+				PID:        9999,
+			}
+			if err := d.state.AddAgent(repoName, agentName, a); err != nil {
+				t.Fatalf("AddAgent %s/%s: %v", repoName, agentName, err)
+			}
+		}
+	}
+
+	resp := d.handleEmergencyStopAll(socket.Request{Command: "emergency_stop_all"})
+	if !resp.Success {
+		t.Fatalf("emergency_stop_all failed: %v", resp.Error)
+	}
+	data := resp.Data.(map[string]interface{})
+	noticed, _ := data["noticed_count"].(int)
+	if noticed != 6 {
+		t.Errorf("noticed_count = %d, want 6 (3 repos × 2 assistants)", noticed)
+	}
+	if len(fakeBackend.calls()) != 6 {
+		t.Errorf("SendMessage call count = %d, want 6", len(fakeBackend.calls()))
+	}
+}
