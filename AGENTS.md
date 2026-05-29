@@ -44,7 +44,29 @@ OAT_WORKER_DORMANCY_CAP_MINUTES=30 # Extend worker dormancy cap (default: 15)
 OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (default: 5)
 OAT_ASSISTANT_WAKEUP_MARKER_INTERVAL_MIN=10  # Minutes between wake-up markers for the same assistant (default: 10)
 OAT_ASSISTANT_WAKEUP_MARKER_DISABLED=1       # Disable autonomous wake-up safeguard (dev/test only; default: off)
+OAT_MODEL_CONTEXT_<normalized-modelID>=128000 # Runtime override for an agent's max input tokens; clamped to [1024, 16000000]
 ```
+
+**`OAT_MODEL_CONTEXT_<modelID>` env override.** Highest-precedence
+context-window source consulted by the daemon: env override >
+`ModelProfile` > 128K fallback. Normalization rule for the env-var
+suffix: lowercase the model ID + replace `:` and `/` with `_`.
+Examples:
+
+| Model ID                       | Env var                                            |
+|--------------------------------|----------------------------------------------------|
+| `google_genai:gemini-2.5-flash`| `OAT_MODEL_CONTEXT_google_genai_gemini-2.5-flash`  |
+| `anthropic:claude-opus-4-7`    | `OAT_MODEL_CONTEXT_anthropic_claude-opus-4-7`      |
+| `openai/gpt-5-mini`            | `OAT_MODEL_CONTEXT_openai_gpt-5-mini`              |
+
+Out-of-range values are clamped to `[1024, 16_000_000]` tokens
+with a startup WARN. Non-numeric values are rejected (the daemon
+falls through to profile / 128K fallback like the env var wasn't
+set). The recommended setup path for any model is `oat model
+onboard <modelID>`; this env override is the escape hatch for
+bring-your-own-model setups (local Ollama, custom routers,
+internal proxies) and unattended CI workflows where the onboard
+probe is impractical.
 
 ## Architecture Overview
 

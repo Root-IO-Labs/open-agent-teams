@@ -267,10 +267,24 @@ The Personal Assistant is a separate agent type from the workflow-helper Browser
 - **Differs from Browser Agent in tool catalog**: assistant keeps `compact_conversation` (denied for browser). The 95% context-capacity safety net relies on it.
 - **Defense-in-depth**: if the assistant ever calls `oat agent complete`, the daemon returns success/no-op + WARN instead of actually completing it. The assistant prompt teaches it not to call complete; the daemon enforces.
 
-**Context capacity safety net**: the daemon polls `[OAT_TOKENS]` events vs effective context limit (`min(profile.MaxInputTokens, 128 K)`) and:
+**Context capacity safety net**: the daemon polls `[OAT_TOKENS]` events vs the effective context limit (see below) and:
 
 - At ≥ 75 %: silent PTY hint instructing the assistant to call `compact_conversation`. Suppressed 5 min after fire.
 - At ≥ 95 %: synthetic compact-conversation directive injected as a separate PTY message before forwarding any pending user message. Gated by `OAT_CONTEXT_SAFETY_NET` (default ON).
+
+**Effective context limit (precedence order, highest first):**
+
+1. **`OAT_MODEL_CONTEXT_<normalized-modelID>` env override** — operator escape hatch for bring-your-own-model setups and CI workflows. Normalization: lowercase + `:` and `/` replaced with `_`. Clamped to `[1024, 16_000_000]` tokens (out-of-range values emit a startup WARN; non-numeric values are rejected and fall through). See `AGENTS.md` for examples.
+2. **`ModelProfile.MaxInputTokens`** when a profile is loaded for the agent's model (the daemon's `routing.ProfileStore`, created from `~/.oat/model-profiles/`). The 128 K attention-degradation ceiling caps profiles that report a larger window — past 128 K the "lost-in-the-middle" effect degrades reliability faster than the extra budget helps for chat use cases, so the safety net triggers compaction earlier.
+3. **128 K fallback** when neither (1) nor (2) applies. Emits a once-per-agent-process WARN naming the model ID + the literal `oat model onboard <modelID>` recovery command for copy-paste. 128 K is the modern shipping-model floor (Anthropic / OpenAI / Google flagships all support ≥ 128 K in 2026); the older 32 K fallback turned 1 M-context models into 100%-effective-capacity wedges the instant a single large tool result landed in history.
+
+**Context-overflow protections (three layers, defense-in-depth):**
+
+| Layer | Lives in | What it does |
+|---|---|---|
+| **Daemon: effective limit + env override** | `internal/daemon/context_capacity.go` | Sources the budget that the 75 %/95 % tiers compute against. Env override gives operators a hot-fix path that doesn't require re-running `oat model onboard`. |
+| **Bridge: tool-result cap** | `oat-browser-agent/bridge` (B.1) | Bounds individual tool-call response sizes (default ~20 % of effective budget; static `32_000` chars until the bridge sees the first capacity frame). Read-only tools only; action tools (`browser_click`, `browser_navigate`, …) are not capped. Truncation marker names recovery tools (`browser_extract`, `browser_find`, `browser_fetch_blob`). |
+| **Bridge: blob cache + `browser_fetch_blob` recovery tool** | `oat-browser-agent/bridge` (B.2) | When B.1 truncates, the bridge keeps the full pre-truncation output in an in-process LRU blob cache (50 MB hard cap, 5-min TTL). The truncation marker hands the agent an opaque blob ID; `browser_fetch_blob(id, range)` fetches additional bytes without re-running the original tool. Side-effect tools never opt into the cache. |
 
 **Autonomous wake-up safeguard** (lives in `internal/daemon/wakeup_marker.go`): the daemon prepends an `[OAT-system]` "you just (re)started, any rehydrated history is from a previous session, wait for a fresh trigger" PTY message on every (re)spawn of `AgentTypeAssistant` agents. Three properties make it load-bearing:
 

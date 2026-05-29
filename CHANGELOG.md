@@ -7,7 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Effective context limit bumped from 32 K → 128 K when no `ModelProfile` exists for an agent's model (2026-05-29).**
+
+  Context-overflow protection layer in the daemon. The same smoke
+  test that motivated the wake-up safeguard (above) wedged a
+  `google_genai:gemini-2.5-flash` agent (real ctx: 1 M tokens) at
+  >100% "effective capacity" the instant a 600 K-char Wikipedia
+  article landed in its history. Investigation showed the agent
+  had no loaded `ModelProfile` (gemini-2.5-flash hadn't been
+  through `oat model onboard`), so the daemon fell back to the
+  legacy `contextFallbackTokens = 32_000` constant, and the
+  capacity safety net (`internal/daemon/context_capacity.go`)
+  computed everything against 32 K. 128 K is the modern shipping-
+  model floor — every flagship from Anthropic / OpenAI / Google
+  supports at least 128 K in 2026 — so an unprofiled model now
+  gets a budget that's right for the common case. Operators with
+  a true bring-your-own-model setup can bypass this with the new
+  `OAT_MODEL_CONTEXT_<modelID>` env var (see below); the
+  recommended fix for any model is `oat model onboard <id>`,
+  which the new WARN names verbatim.
+
 ### Added
+
+- **`OAT_MODEL_CONTEXT_<normalized-modelID>` env override for the daemon's effective context limit (2026-05-29).**
+
+  Operator escape hatch + CI hook for bring-your-own-model
+  setups (local Ollama, custom routers, internal proxies, etc.)
+  where the `oat model onboard <id>` probe is impractical.
+  Precedence order in `internal/daemon/context_capacity.go`:
+  env override > `ModelProfile.MaxInputTokens` > 128 K fallback.
+  Env-var name normalization: lowercase + replace `:` and `/`
+  with `_`. Examples:
+
+  - `google_genai:gemini-2.5-flash` →
+    `OAT_MODEL_CONTEXT_google_genai_gemini-2.5-flash`
+  - `anthropic:claude-opus-4-7` →
+    `OAT_MODEL_CONTEXT_anthropic_claude-opus-4-7`
+  - `openai/gpt-5-mini` →
+    `OAT_MODEL_CONTEXT_openai_gpt-5-mini`
+
+  Values are clamped to `[1024, 16_000_000]` tokens with a
+  startup WARN (an operator who accidentally exports
+  `=2000000000` doesn't poison the agent's budget). Non-numeric
+  values are rejected outright — the helper returns
+  `(0, false)` so the caller falls through to profile / 128 K
+  fallback like the env var wasn't set, instead of clamping
+  garbage to a surprise number. The "no profile" WARN now
+  includes both recovery paths (the literal
+  `oat model onboard <modelID>` command + the
+  `OAT_MODEL_CONTEXT_<id>` env var) in one place so an operator
+  doesn't have to chase docs.
 
 - **Autonomous wake-up safeguard for assistant agents (2026-05-28).**
 

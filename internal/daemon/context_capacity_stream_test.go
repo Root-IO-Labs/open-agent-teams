@@ -387,23 +387,24 @@ func TestMaybeNudgeContextCapacity_EmitsClearFrame_Part5eSliceB(t *testing.T) {
 	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
 	defer subCancel()
 
-	// Climb to hint (80%).
+	// Climb to hint (80% of 128K fallback = 102_400).
 	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
 		Type:        state.AgentTypeAssistant,
-		TotalTokens: 26_000,
-		Model:       "", // forces 32K fallback → 80%
+		TotalTokens: 102_400,
+		Model:       "", // forces 128K fallback → 80%
 	})
-	expectFrameWithin(t, sub, "climb to hint", 100*time.Millisecond, capacityTierHint, 0, 26_000, 32_000)
+	expectFrameWithin(t, sub, "climb to hint", 100*time.Millisecond, capacityTierHint, 0, 102_400, 128_000)
 
-	// Drop back to 20% (after a successful compact). MUST emit a
-	// clear-the-UI frame even though it's below the contextTierHint
-	// threshold the PTY-hint path uses for its own gating.
+	// Drop back to 20% of 128K = 25_600 (after a successful
+	// compact). MUST emit a clear-the-UI frame even though it's
+	// below the contextTierHint threshold the PTY-hint path uses
+	// for its own gating.
 	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
 		Type:        state.AgentTypeAssistant,
-		TotalTokens: 6_400,
+		TotalTokens: 25_600,
 		Model:       "",
 	})
-	expectFrameWithin(t, sub, "drop to ok", 100*time.Millisecond, capacityTierOK, 0, 6_400, 32_000)
+	expectFrameWithin(t, sub, "drop to ok", 100*time.Millisecond, capacityTierOK, 0, 25_600, 128_000)
 }
 
 // subscribeForTest wires a fresh subscriber to the (session, agent)

@@ -20,9 +20,12 @@
 package daemon
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/Root-IO-Labs/open-agent-teams/internal/logging"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
@@ -188,10 +191,10 @@ func TestMaybeNudgeContextCapacity_Suppression_Part5e(t *testing.T) {
 	}
 
 	assistant := state.Agent{
-		Type:         state.AgentTypeAssistant,
-		WindowName:   "personal",
-		TotalTokens:  96_000, // 75 % of contextFallbackTokens? no, 32K fallback
-		Model:        "",     // forces fallback → 32 K limit → 96K/32K is way over 75%
+		Type:        state.AgentTypeAssistant,
+		WindowName:  "personal",
+		TotalTokens: 96_000, // 75 % of the 128 K fallback exactly
+		Model:       "",     // forces fallback → 128 K limit → 75 %
 	}
 
 	// First call: should record a lastHintAt entry.
@@ -238,7 +241,7 @@ func TestMaybeNudgeContextCapacity_BelowTier_Part5e(t *testing.T) {
 		t.Fatalf("AddRepo: %v", err)
 	}
 
-	// 74 % of 32 K fallback ≈ 23 680 tokens. Below tier → no
+	// 74 % of the 128 K fallback ≈ 94 720 tokens. Below tier → no
 	// hint, no dedupe entry recorded.
 	d.maybeNudgeContextCapacity("repo", "personal", state.Agent{
 		Type:        state.AgentTypeAssistant,
@@ -258,19 +261,19 @@ func TestShouldInjectContextSafetyNet_Part5e(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
 
-	// 95 % of 32 K fallback = 30 400. Use 31 000 to clearly cross.
+	// 95 % of 128 K fallback = 121 600. Use 122 000 to clearly cross.
 	hot := state.Agent{
 		Type:        state.AgentTypeAssistant,
-		TotalTokens: 31_000,
+		TotalTokens: 122_000,
 	}
-	// 90 % of 32 K fallback ≈ 28 800. Below tier → no inject.
+	// 90 % of 128 K fallback = 115 200. Below tier → no inject.
 	warm := state.Agent{
 		Type:        state.AgentTypeAssistant,
-		TotalTokens: 28_000,
+		TotalTokens: 115_000,
 	}
 	browser := state.Agent{
 		Type:        state.AgentTypeBrowser,
-		TotalTokens: 31_000,
+		TotalTokens: 122_000,
 	}
 
 	t.Run("assistant at 95% with safety net ON → inject", func(t *testing.T) {
@@ -320,3 +323,322 @@ func TestShouldInjectContextSafetyNet_Part5e(t *testing.T) {
 }
 
 // (Substring `contains` helper is shared from daemon_test.go.)
+
+// ---------------------------------------------------------------------
+// Context-overflow protections: the env-override layer.
+//
+// Verifies the precedence path of effectiveContextLimit:
+//
+//   1. OAT_MODEL_CONTEXT_<normalized-modelID> env override wins.
+//   2. ModelProfile wins when env unset.
+//   3. 128K fallback fires when both miss.
+//
+// Plus the supporting machinery: env-var name normalization,
+// out-of-range clamping with WARN, and the load-bearing WARN
+// content (the literal `oat model onboard <modelID>` copy-paste
+// recovery string).
+// ---------------------------------------------------------------------
+
+const testProfileGeminiFlash = `model_id: "google_genai:gemini-2.5-flash"
+status: known
+provider:
+  name: google_genai
+capabilities:
+  tool_reliability: 1.0
+  shell_reliability: 1.0
+  shell_recovery: 1.0
+  file_write_reliability: 1.0
+  multi_turn: 1.0
+routing:
+  autonomy_tier: full
+  overall_score: 90
+max_input_tokens: 1000000
+contract:
+  onboarding_passed: true
+  worker_eligible: true
+  orchestrator_eligible: true
+`
+
+// TestNormalizeModelIDForEnv pins the env-var name shape for the
+// real-world ID styles operators are likely to type. If anyone ever
+// adds aggressive sanitization (e.g. mapping `-` or `.` to `_`),
+// silent collisions become possible (`gemini-2.5` and `gemini.2.5`
+// both mapping to the same env var) -- this test breaks first so a
+// reviewer can think about whether that's actually desired.
+func TestNormalizeModelIDForEnv(t *testing.T) {
+	cases := []struct {
+		modelID string
+		want    string
+	}{
+		{"anthropic:claude-opus-4-7", "anthropic_claude-opus-4-7"},
+		{"google_genai:gemini-2.5-flash", "google_genai_gemini-2.5-flash"},
+		{"openai/gpt-5-mini", "openai_gpt-5-mini"},
+		{"OPENAI:GPT-5", "openai_gpt-5"},
+		{"ollama:qwen3-coder:32b", "ollama_qwen3-coder_32b"},
+		{"local-ollama/llama3.2:3b-instruct", "local-ollama_llama3.2_3b-instruct"},
+		{"plainmodelname", "plainmodelname"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.modelID, func(t *testing.T) {
+			if got := normalizeModelIDForEnv(tc.modelID); got != tc.want {
+				t.Errorf("normalizeModelIDForEnv(%q) = %q, want %q", tc.modelID, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestContextEnvOverride_ParseValid pins that valid integer values
+// pass through unchanged and the helper reports `clamped=false`. The
+// caller distinguishes "operator set a sane value" from "clamped"
+// by the second return slot's truthiness combined with the value, so
+// it must remain false for in-range inputs.
+func TestContextEnvOverride_ParseValid(t *testing.T) {
+	t.Setenv("OAT_MODEL_CONTEXT_anthropic_claude-opus-4-7", "200000")
+	got, ok := contextEnvOverride("anthropic:claude-opus-4-7", nil)
+	if !ok {
+		t.Fatal("contextEnvOverride returned ok=false for valid integer")
+	}
+	if got != 200_000 {
+		t.Errorf("got = %d, want 200000", got)
+	}
+}
+
+// TestContextEnvOverride_ClampBelowMin verifies sub-1K values clamp
+// to contextEnvOverrideMin AND emit a WARN. The WARN content matters
+// because operators reading the log need to see the actual env var
+// name + bad value so they know what to fix.
+func TestContextEnvOverride_ClampBelowMin(t *testing.T) {
+	t.Setenv("OAT_MODEL_CONTEXT_anthropic_claude-opus-4-7", "5")
+	var captured []string
+	sink := func(format string, args ...any) {
+		captured = append(captured, fmt.Sprintf(format, args...))
+	}
+	got, ok := contextEnvOverride("anthropic:claude-opus-4-7", sink)
+	if !ok {
+		t.Fatal("contextEnvOverride returned ok=false for too-small (should clamp + ok)")
+	}
+	if got != contextEnvOverrideMin {
+		t.Errorf("got = %d, want clamped %d", got, contextEnvOverrideMin)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected 1 WARN, got %d: %v", len(captured), captured)
+	}
+	if !contains(captured[0], "below minimum") {
+		t.Errorf("WARN missing 'below minimum': %q", captured[0])
+	}
+	if !contains(captured[0], "OAT_MODEL_CONTEXT_anthropic_claude-opus-4-7") {
+		t.Errorf("WARN missing env-var name: %q", captured[0])
+	}
+}
+
+// TestContextEnvOverride_ClampAboveMax pins the same shape but on
+// the high side -- including the "billions" scenario from the plan
+// where someone accidentally exports 2_000_000_000. The agent never
+// sees the bad value.
+func TestContextEnvOverride_ClampAboveMax(t *testing.T) {
+	t.Setenv("OAT_MODEL_CONTEXT_openai_gpt-5", "2000000000")
+	var captured []string
+	sink := func(format string, args ...any) {
+		captured = append(captured, fmt.Sprintf(format, args...))
+	}
+	got, ok := contextEnvOverride("openai:gpt-5", sink)
+	if !ok {
+		t.Fatal("contextEnvOverride returned ok=false for too-large (should clamp + ok)")
+	}
+	if got != contextEnvOverrideMax {
+		t.Errorf("got = %d, want clamped %d", got, contextEnvOverrideMax)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected 1 WARN, got %d: %v", len(captured), captured)
+	}
+	if !contains(captured[0], "above maximum") {
+		t.Errorf("WARN missing 'above maximum': %q", captured[0])
+	}
+}
+
+// TestContextEnvOverride_NonNumeric pins that a garbage value
+// (typo, accidental shell expansion, etc.) does NOT clamp to a
+// surprise value -- the helper returns (0, false) so the caller
+// can fall through to profile / fallback like the env var wasn't
+// set at all. WARN explains why so the operator can fix the typo.
+func TestContextEnvOverride_NonNumeric(t *testing.T) {
+	t.Setenv("OAT_MODEL_CONTEXT_openai_gpt-5", "lots")
+	var captured []string
+	sink := func(format string, args ...any) {
+		captured = append(captured, fmt.Sprintf(format, args...))
+	}
+	got, ok := contextEnvOverride("openai:gpt-5", sink)
+	if ok {
+		t.Errorf("contextEnvOverride returned ok=true for non-numeric (got %d); should fall through", got)
+	}
+	if got != 0 {
+		t.Errorf("got = %d, want 0 (fall-through)", got)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected 1 WARN, got %d: %v", len(captured), captured)
+	}
+	if !contains(captured[0], "not a valid integer") {
+		t.Errorf("WARN missing 'not a valid integer': %q", captured[0])
+	}
+}
+
+// TestContextEnvOverride_Unset pins that the env helper is silent
+// when the var isn't set -- no WARN, no log spam.
+func TestContextEnvOverride_Unset(t *testing.T) {
+	// Clear out anything a sibling test may have left set.
+	t.Setenv("OAT_MODEL_CONTEXT_unset_test", "")
+	var captured []string
+	sink := func(format string, args ...any) {
+		captured = append(captured, fmt.Sprintf(format, args...))
+	}
+	got, ok := contextEnvOverride("unset:test", sink)
+	if ok || got != 0 {
+		t.Errorf("got (%d, %v), want (0, false) for unset env var", got, ok)
+	}
+	if len(captured) != 0 {
+		t.Errorf("expected 0 WARN, got %d: %v", len(captured), captured)
+	}
+}
+
+// TestEffectiveContextLimit_EnvWinsOverProfile is the precedence
+// test the plan body calls out (B.0 test (a)): an env override
+// must beat a present-and-valid ModelProfile so an operator can
+// hot-fix a wrong profile without re-running `oat model onboard`.
+func TestEffectiveContextLimit_EnvWinsOverProfile(t *testing.T) {
+	d, cleanup := setupDaemonWithProfiles(t, map[string]string{
+		"gemini-flash.yaml": testProfileGeminiFlash, // profile says 1M
+	})
+	defer cleanup()
+
+	// Env override pins it to 300K instead.
+	t.Setenv("OAT_MODEL_CONTEXT_google_genai_gemini-2.5-flash", "300000")
+
+	limit, source := d.effectiveContextLimit(
+		"google_genai:gemini-2.5-flash", "repo", "agent",
+	)
+	if source != "env" {
+		t.Errorf("source = %q, want %q (env override should beat profile)", source, "env")
+	}
+	if limit != 300_000 {
+		t.Errorf("limit = %d, want 300000 (env override value)", limit)
+	}
+}
+
+// TestEffectiveContextLimit_ProfileWinsWhenEnvUnset is B.0 test
+// (b): if the operator hasn't set an env override, the loaded
+// profile must take over -- not silently fall back to 128K.
+func TestEffectiveContextLimit_ProfileWinsWhenEnvUnset(t *testing.T) {
+	d, cleanup := setupDaemonWithProfiles(t, map[string]string{
+		"gemini-flash.yaml": testProfileGeminiFlash,
+	})
+	defer cleanup()
+	// Ensure no env override is set for this model.
+	t.Setenv("OAT_MODEL_CONTEXT_google_genai_gemini-2.5-flash", "")
+
+	limit, source := d.effectiveContextLimit(
+		"google_genai:gemini-2.5-flash", "repo", "agent",
+	)
+	// Profile says 1M, ceiling is 128K → ceiling wins (path = "ceiling").
+	if source != "ceiling" {
+		t.Errorf("source = %q, want %q (profile MaxInputTokens > ceiling)", source, "ceiling")
+	}
+	if limit != contextCeilingTokens {
+		t.Errorf("limit = %d, want ceiling %d", limit, contextCeilingTokens)
+	}
+}
+
+// TestEffectiveContextLimit_FallbackIs128K is B.0 test (c): the
+// fallback bump from 32K to 128K. The whole point of the change.
+// Locks the value as a constant cross-check so a future refactor
+// that flips the constant the wrong way trips this test first.
+func TestEffectiveContextLimit_FallbackIs128K(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	limit, source := d.effectiveContextLimit("unknown:model-9999", "repo", "agent")
+	if source != "fallback" {
+		t.Errorf("source = %q, want %q", source, "fallback")
+	}
+	if limit != 128_000 {
+		t.Errorf("limit = %d, want 128000 (the 2026 modern floor)", limit)
+	}
+	if limit != contextFallbackTokens {
+		t.Errorf("limit = %d, contextFallbackTokens = %d; constants should agree", limit, contextFallbackTokens)
+	}
+}
+
+// TestEffectiveContextLimit_WarnContainsRecoveryCommand is B.0
+// test (e): the WARN message must contain the LITERAL
+// `oat model onboard <modelID>` text so an operator can copy-paste
+// the command directly from the log without ambiguity. This is
+// load-bearing -- if the WARN message ever drifts to a generic
+// "no profile found" without the recovery command, operators have
+// to chase docs that may have moved.
+func TestEffectiveContextLimit_WarnContainsRecoveryCommand(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// Swap in a buffer-backed logger so we can inspect the WARN
+	// body. *logging.Logger writes to any io.Writer; a bytes.Buffer
+	// captures everything without race surfaces (single-test, no
+	// other writers contending).
+	var buf bytes.Buffer
+	d.logger = logging.New(&buf)
+
+	const modelID = "google_genai:gemini-2.5-flash"
+	_, _ = d.effectiveContextLimit(modelID, "repo", "agent")
+
+	msg := buf.String()
+	if msg == "" {
+		t.Fatal("no WARN emitted for fallback path")
+	}
+	wantCmd := "oat model onboard " + modelID
+	if !contains(msg, wantCmd) {
+		t.Errorf("WARN missing recovery command %q in body:\n%s", wantCmd, msg)
+	}
+	wantEnv := "OAT_MODEL_CONTEXT_google_genai_gemini-2.5-flash"
+	if !contains(msg, wantEnv) {
+		t.Errorf("WARN missing env-override hint %q in body:\n%s", wantEnv, msg)
+	}
+}
+
+// TestEffectiveContextLimit_EmptyModelIDStillFallsBack pins that an
+// empty model ID short-circuits BOTH the env-override lookup AND the
+// profile lookup -- no empty-string env-var lookup, no nil-pointer
+// surprises in ProfileStore.Get.
+func TestEffectiveContextLimit_EmptyModelIDStillFallsBack(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// Even if someone left OAT_MODEL_CONTEXT_ (literal prefix) set,
+	// an empty model ID must not key off it.
+	t.Setenv("OAT_MODEL_CONTEXT_", "1")
+
+	limit, source := d.effectiveContextLimit("", "repo", "agent")
+	if source != "fallback" {
+		t.Errorf("source = %q, want %q (empty modelID must not match any env var)", source, "fallback")
+	}
+	if limit != contextFallbackTokens {
+		t.Errorf("limit = %d, want fallback %d", limit, contextFallbackTokens)
+	}
+}
+
+// TestEffectiveContextLimit_EnvOverrideClampedEndToEnd is B.0 test
+// (f): a wildly-out-of-range env value (e.g. someone exported
+// MAX_INT or a number they thought was bytes not tokens) gets
+// clamped before the agent's budget is computed against it.
+func TestEffectiveContextLimit_EnvOverrideClampedEndToEnd(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	t.Setenv("OAT_MODEL_CONTEXT_anthropic_claude-opus-4-7", "5000000000")
+	limit, source := d.effectiveContextLimit(
+		"anthropic:claude-opus-4-7", "repo", "agent",
+	)
+	if source != "env" {
+		t.Errorf("source = %q, want %q", source, "env")
+	}
+	if limit != contextEnvOverrideMax {
+		t.Errorf("limit = %d, want clamped %d", limit, contextEnvOverrideMax)
+	}
+}
