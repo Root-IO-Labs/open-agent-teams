@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`route_user_message` prepends side-panel sentinel (2026-05-28).**
+
+  Root cause for "user message reaches the agent, agent replies in
+  the TUI, panel never sees a bubble" — the third bug found during
+  multi-agent chat smoke. `handleAgentInput` (bonded user_message
+  path) has prepended the `[SIDE-PANEL CHAT] ` sentinel since
+  Part 2b; the assistantTurnTailer gates assistant-reply broadcast
+  on having seen at least one of these in a USER block. The new
+  `route_user_message` verb (Part 7 Commit 7.3) was missing the
+  same prepend, so cross-agent picker traffic delivered the user's
+  text successfully but the tailer's `sidePanelActive` flag never
+  flipped, every reply was suppressed as "pre-side-panel" noise,
+  and the smoke test's "testing are you receiving this message"
+  reply was visible in the daemon log line
+  `assistantTurnTailer: suppressed pre-side-panel turn (Yes,
+  receiving you loud and clear. Ready when you are.)` but never
+  reached the panel. The handler now prepends the sentinel and
+  honours an optional `active_tab_id` arg the same way
+  `handleAgentInput` does. New tests:
+  `TestHandleRouteUserMessage_Part7Commit3/PTY_write_prepends_side-panel_sentinel`
+  + `.../PTY_write_includes_active-tab-id_prefix_when_supplied`.
+
+- **`stream_assistant_turns` accepts `repo` arg (2026-05-28).**
+
+  Hotfix for Part 8 multi-agent chat. The bridge's
+  `AssistantTurnMultiplexer` opens one daemon subscription per
+  chat-capable agent from its lifecycle inventory. Lifecycle frames
+  carry only `repo` (the canonical OAT key), never the tmux session
+  name. The multiplexer was passing `session: <repo>` to
+  `stream_assistant_turns`; the daemon's `findRepoBySession` lookup
+  could not resolve repo values (session names are typically
+  `oat-<repo>`), so every subscription handshake failed silently and
+  no `chat_response` frames ever reached the side panel — including
+  for the bonded agent, because Commit 8.4 removed the bonded
+  `assistantStream` and routed even bonded traffic through the
+  multiplexer.
+
+  Handler now accepts `agent` plus either `session` OR `repo`; the
+  `repo` path is the new multiplexer wire format. When `repo` is
+  supplied the daemon ALWAYS derives `sessionName` from the repo
+  record — defense-in-depth against a client that sends both `repo`
+  and a stale / env-derived `session` referring to a different
+  agent (real bug surfaced in post-fix smoke: bonded bridges leaked
+  their `OAT_BROWSER_AGENT_SESSION` into multiplexer fan-out calls,
+  the daemon trusted the leaked session, and the broadcaster lookup
+  resolved to the wrong tailer). The bonded path is unchanged
+  (still passes `session` from `OAT_BROWSER_AGENT_SESSION`).
+  Regression tests added: `TestStreamHandlerAssistantTurns_AcceptsRepoArg`,
+  `TestStreamHandlerAssistantTurns_RejectsMissingArgs`, and
+  `TestStreamHandlerAssistantTurns_RepoWinsOverConflictingSession`.
+  `SOCKET_API.md` updated to describe the dual addressing model.
+
 ### Added
 
 - **Part 8 — Multi-agent chat parity (daemon half; 2026-05-28).**

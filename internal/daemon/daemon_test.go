@@ -1601,6 +1601,73 @@ func TestHandleRouteUserMessage_Part7Commit3(t *testing.T) {
 	// picker-selected target (the normal case for "browser-agent
 	// bridge chatting with personal assistant"). Same-agent routes
 	// set the flag to false.
+	// Regression: route_user_message MUST prepend the
+	// `[SIDE-PANEL CHAT] ` sentinel before the PTY write. Without
+	// it, the assistantTurnTailer's sidePanelActive gate never
+	// flips on, every assistant reply is suppressed as
+	// "pre-side-panel" noise, and the side panel never sees a
+	// bubble — even though the agent really did reply.
+	t.Run("PTY write prepends side-panel sentinel", func(t *testing.T) {
+		addAgent(t, "sentinel-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "sentinel-target") })
+
+		fake.mu.Lock()
+		startIdx := len(fake.sent)
+		fake.mu.Unlock()
+
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":  "test-repo",
+				"agent": "sentinel-target",
+				"text":  "hello assistant",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("route should succeed; got: %s", resp.Error)
+		}
+		calls := fake.calls()
+		if len(calls) <= startIdx {
+			t.Fatalf("expected a backend SendMessage call; got none")
+		}
+		got := calls[startIdx].Message
+		want := sidePanelInputSentinel + "hello assistant"
+		if got != want {
+			t.Errorf("SendMessage payload = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("PTY write includes active-tab-id prefix when supplied", func(t *testing.T) {
+		addAgent(t, "tab-target", state.AgentTypeAssistant, 9999)
+		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "tab-target") })
+
+		fake.mu.Lock()
+		startIdx := len(fake.sent)
+		fake.mu.Unlock()
+
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":           "test-repo",
+				"agent":          "tab-target",
+				"text":           "what tab am I on",
+				"active_tab_id":  float64(42),
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("route should succeed; got: %s", resp.Error)
+		}
+		calls := fake.calls()
+		if len(calls) <= startIdx {
+			t.Fatalf("expected a backend SendMessage call")
+		}
+		got := calls[startIdx].Message
+		want := sidePanelInputSentinel + "[active-tab-id: 42] what tab am I on"
+		if got != want {
+			t.Errorf("SendMessage payload = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("audit log records bridge_bonded_* + cross_agent_route=true", func(t *testing.T) {
 		addAgent(t, "cross-target", state.AgentTypeAssistant, 9999)
 		t.Cleanup(func() { _ = d.state.RemoveAgent("test-repo", "cross-target") })
@@ -1838,11 +1905,13 @@ func TestRouteUserMessageConcurrent_Part7Commit3(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Every recorded message MUST be exactly one of the inputs;
-	// any spliced/interleaved string would fail the membership
-	// check.
+	// Every recorded message MUST be exactly one of the inputs
+	// (after stripping the side-panel sentinel prefix that the
+	// handler unconditionally prepends); any spliced/interleaved
+	// payload would fail the membership check.
 	for _, call := range fake.calls() {
-		if !inputs[call.Message] {
+		body := strings.TrimPrefix(call.Message, sidePanelInputSentinel)
+		if !inputs[body] {
 			t.Errorf("recorded message %q is not a verbatim input — interleaving detected", call.Message)
 		}
 	}

@@ -3987,6 +3987,18 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 		return socket.ErrorResponse("text failed sanitisation: %v", err)
 	}
 
+	// Prepend the side-panel sentinel + optional active-tab-id
+	// prefix. The assistantTurnTailer gates assistant-reply
+	// broadcast on having seen at least one `[SIDE-PANEL CHAT]`
+	// sentinel in a USER block — without it every reply is
+	// suppressed as "pre-side-panel" noise. handleAgentInput
+	// (the bonded user_message path) has done this since Part 2b;
+	// the route_user_message verb must do the same or the
+	// multi-agent picker delivers user messages successfully but
+	// the agent's reply never reaches the side panel.
+	prefix := buildActiveTabPrefix(req.Args["active_tab_id"])
+	sanitized = sidePanelInputSentinel + prefix + sanitized
+
 	// Backend write. We do NOT hold any daemon mutex during the
 	// PTY write — backend.SendMessage uses its own per-window
 	// serialisation inside DirectBackend, so concurrent routes

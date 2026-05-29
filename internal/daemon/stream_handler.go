@@ -523,14 +523,21 @@ func (sh *streamHandler) handleStreamAgentOutput(req socket.Request, conn net.Co
 //     chat_response frames to the side panel automatically, regardless
 //     of whether the model called browser_emit_to_user.
 //
-// Identity model matches stream_agent_output: addressed by
-// (session, agent_name) so the bridge doesn't have to reverse-resolve
-// the repository name. Restricted to chat-capable agent types (the
-// `usesBrowserBridge()` helper — assistant + browser today; see
-// daemon.go) for the same reason the byte-level stream is — the
-// parsed turn feed is intended for side-panel chat only and exposing
-// it for non-chat-capable agent types (worker/supervisor/etc.) would
-// change the audit-surface of those agents.
+// Identity model: addressed by (session, agent_name) for the bonded-
+// bridge path (OAT_BROWSER_AGENT_SESSION) and by (repo, agent_name)
+// for the multiplexer fan-out path (the bridge's lifecycle stream
+// only carries repo, not session). The handler accepts either: if
+// `repo` is present it wins; otherwise `session` is reverse-resolved
+// to a repo via findRepoBySession. The broadcaster lookup below is
+// keyed on (sessionName, agentName), so we backfill sessionName from
+// the repository record when the caller only supplied `repo`.
+//
+// Restricted to chat-capable agent types (the `usesBrowserBridge()`
+// helper — assistant + browser today; see daemon.go) for the same
+// reason the byte-level stream is — the parsed turn feed is intended
+// for side-panel chat only and exposing it for non-chat-capable
+// agent types (worker/supervisor/etc.) would change the
+// audit-surface of those agents.
 //
 // The original gate was `agent.Type != AgentTypeBrowser` which
 // rejected assistant-bonded bridges even though the daemon's
@@ -552,19 +559,35 @@ func (sh *streamHandler) handleStreamAssistantTurns(req socket.Request, conn net
 	enc := json.NewEncoder(conn)
 
 	sessionName, _ := req.Args["session"].(string)
+	repoArg, _ := req.Args["repo"].(string)
 	agentName, _ := req.Args["agent"].(string)
-	if sessionName == "" || agentName == "" {
-		enc.Encode(socket.Response{Success: false, Error: "session and agent are required"}) //nolint:errcheck
+	if agentName == "" || (sessionName == "" && repoArg == "") {
+		enc.Encode(socket.Response{Success: false, Error: "agent and (session or repo) are required"}) //nolint:errcheck
 		return
 	}
 
-	// Translate (session, agent_name) → state.Agent so we can enforce
-	// the AgentTypeBrowser boundary. The error responses mirror
-	// stream_agent_output for consistency on the client side.
-	repoName, _, found := sh.d.findRepoBySession(sessionName)
-	if !found {
-		enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
-		return
+	// Resolve to (repoName, sessionName). The broadcaster lookup is
+	// keyed on sessionName so we always derive it from the repo
+	// record when the caller supplied `repo` — this also defends
+	// against a buggy client that sends both `repo` and a stale /
+	// env-derived `session` that names a different agent (the
+	// repo-supplied identity wins).
+	var repoName string
+	if repoArg != "" {
+		repo, exists := sh.d.state.GetRepo(repoArg)
+		if !exists {
+			enc.Encode(socket.Response{Success: false, Error: "repository '" + repoArg + "' not found"}) //nolint:errcheck
+			return
+		}
+		repoName = repoArg
+		sessionName = repo.SessionName
+	} else {
+		var found bool
+		repoName, _, found = sh.d.findRepoBySession(sessionName)
+		if !found {
+			enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
+			return
+		}
 	}
 	agent, exists := sh.d.state.GetAgent(repoName, agentName)
 	if !exists {

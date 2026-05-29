@@ -293,6 +293,165 @@ func TestStreamHandlerAssistantTurns_AssistantPassesGate(t *testing.T) {
 	}
 }
 
+// Regression: the AssistantTurnMultiplexer addresses subscriptions by
+// `repo` (the canonical OAT key from lifecycle frames) rather than
+// `session` (tmux session name; unknown to the multiplexer). The
+// handler must accept either; previously it required `session`,
+// findRepoBySession returned "not found" for the multiplexer-supplied
+// repo value, and every chat-capable subscription failed its handshake
+// silently — no agent replies ever reached the side panel.
+func TestStreamHandlerAssistantTurns_AcceptsRepoArg(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "_assistant-personal"
+	sessionName := "oat-_assistant-personal"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"personal": {
+				Type:       state.AgentTypeAssistant,
+				WindowName: "personal",
+				PID:        12345,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamAssistantTurns(socket.Request{
+		Command: "stream_assistant_turns",
+		Args: map[string]interface{}{
+			"repo":  repoName,
+			"agent": "personal",
+		},
+	}, server)
+
+	var resp socket.Response
+	dec := json.NewDecoder(client)
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp.Success {
+		// Handshake succeeded — gate passed. Done.
+		return
+	}
+	if strings.Contains(resp.Error, "not found") || strings.Contains(resp.Error, "no repository is bound") {
+		t.Fatalf("repo arg should resolve directly without findRepoBySession; got: %s", resp.Error)
+	}
+	if strings.Contains(resp.Error, "restricted to") {
+		t.Fatalf("Assistant should pass the type gate; got restriction error: %s", resp.Error)
+	}
+	// "no assistant-turn tailer active" is the expected downstream
+	// outcome in this fixture — proves the repo arg resolved and the
+	// gate passed; only the tailer (out of scope here) was missing.
+	if !strings.Contains(resp.Error, "no assistant-turn tailer active") {
+		t.Logf("Note: repo arg resolved + gate passed; downstream error: %s", resp.Error)
+	}
+}
+
+// Regression: when both `repo` and `session` are supplied and they
+// disagree (e.g. a multiplexer subscription supplying a target repo
+// alongside the bridge's bonded env session), `repo` MUST win. The
+// bridge's bonded `OAT_BROWSER_AGENT_SESSION` names one agent; the
+// multiplexer subscribes to many, and a buggy fallback that mixed
+// the two would resolve the broadcaster to the wrong tailer
+// (handshake then fails with "no tailer active for X in session Y"
+// even though X is in a DIFFERENT session Z). Defensive on the
+// daemon side because the bridge can't always strip the stale arg.
+func TestStreamHandlerAssistantTurns_RepoWinsOverConflictingSession(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	// Two repos; the bonded session names repo A, the multiplexer
+	// target names repo B (the agent only exists in B).
+	d.state.AddRepo("_assistant-personal", &state.Repository{
+		SessionName: "oat-_assistant-personal",
+		Agents: map[string]state.Agent{
+			"personal": {Type: state.AgentTypeAssistant, WindowName: "personal", PID: 1},
+		},
+	})
+	d.state.AddRepo("oat-browser-test", &state.Repository{
+		SessionName: "oat-oat-browser-test",
+		Agents: map[string]state.Agent{
+			"browser-agent": {Type: state.AgentTypeBrowser, WindowName: "browser-agent", PID: 2},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	// Bridge sends both: bonded session=oat-_assistant-personal,
+	// multiplexer-supplied repo=oat-browser-test, agent=browser-agent.
+	go sh.handleStreamAssistantTurns(socket.Request{
+		Command: "stream_assistant_turns",
+		Args: map[string]interface{}{
+			"session": "oat-_assistant-personal",
+			"repo":    "oat-browser-test",
+			"agent":   "browser-agent",
+		},
+	}, server)
+
+	var resp socket.Response
+	if err := json.NewDecoder(client).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// Must NOT report "agent 'browser-agent' not found in session
+	// oat-_assistant-personal" — that's the bug this test guards.
+	// Acceptable downstream errors: "no tailer active" (no tailer
+	// registered in fixture) or success.
+	if strings.Contains(resp.Error, "not found in session oat-_assistant-personal") {
+		t.Fatalf("daemon used stale session arg instead of repo-derived session; got: %s", resp.Error)
+	}
+	if strings.Contains(resp.Error, "restricted to") {
+		t.Fatalf("type gate should pass for browser; got: %s", resp.Error)
+	}
+}
+
+// Regression: missing `agent` is rejected with a clear message even
+// when `repo` is supplied (and vice versa). The new acceptance
+// criterion is "agent AND (session OR repo)".
+func TestStreamHandlerAssistantTurns_RejectsMissingArgs(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	cases := []struct {
+		name string
+		args map[string]interface{}
+		want string
+	}{
+		{"no args", map[string]interface{}{}, "agent and (session or repo) are required"},
+		{"only session", map[string]interface{}{"session": "oat-x"}, "agent and (session or repo) are required"},
+		{"only repo", map[string]interface{}{"repo": "x"}, "agent and (session or repo) are required"},
+		{"only agent", map[string]interface{}{"agent": "a"}, "agent and (session or repo) are required"},
+		{"unknown repo", map[string]interface{}{"repo": "no-such-repo", "agent": "a"}, "repository 'no-such-repo' not found"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sh := &streamHandler{d: d}
+			server, client := net.Pipe()
+			defer client.Close()
+			go sh.handleStreamAssistantTurns(socket.Request{
+				Command: "stream_assistant_turns",
+				Args:    tc.args,
+			}, server)
+			var resp socket.Response
+			if err := json.NewDecoder(client).Decode(&resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if resp.Success {
+				t.Fatalf("expected rejection for %s", tc.name)
+			}
+			if !strings.Contains(resp.Error, tc.want) {
+				t.Errorf("error = %q, want substring %q", resp.Error, tc.want)
+			}
+		})
+	}
+}
+
 func TestStreamHandlerAssistantTurns_SupervisorRejected(t *testing.T) {
 	d, _, cleanup := setupStreamTestDaemon(t)
 	defer cleanup()
