@@ -272,6 +272,27 @@ The Personal Assistant is a separate agent type from the workflow-helper Browser
 - At ≥ 75 %: silent PTY hint instructing the assistant to call `compact_conversation`. Suppressed 5 min after fire.
 - At ≥ 95 %: synthetic compact-conversation directive injected as a separate PTY message before forwarding any pending user message. Gated by `OAT_CONTEXT_SAFETY_NET` (default ON).
 
+**Model onboarding workflow.** Before spawning any agent against a model, run the one-time capability probe:
+
+```bash
+oat model onboard <provider:model>          # auto-probes the model
+oat model onboard <provider:model> --context-window 200000   # CI / scripted: skip context detection
+```
+
+The probe writes a YAML capability profile to `~/.oat/model-profiles/` (and the source-tree mirror at `model-routing/profiles/`). `oat agent add --model <id>` and friends preflight that this file exists; if it does not, the CLI fails with the exact `oat model onboard <id>` command to copy-paste, plus the `OAT_MODEL_CONTEXT_<normalized-id>=<tokens>` env-var alternative for operators who want to skip capability probing entirely.
+
+Provider-API coverage for context-window detection inside `benchmarks/probe-model.py`:
+
+| Provider | Auto-detect? | Source |
+|---|---|---|
+| OpenAI | yes | `/v1/models/{id}.context_window` (requires `OPENAI_API_KEY`) |
+| OpenRouter | yes | `/api/v1/models[*].context_length` (public; no auth) |
+| Google Gemini | yes | `generativelanguage.googleapis.com/v1beta/models/{name}.inputTokenLimit` (`GOOGLE_API_KEY` or `GEMINI_API_KEY`) |
+| Ollama | yes | local `POST {OLLAMA_HOST}/api/show` (default `http://localhost:11434`) |
+| Anthropic / Bedrock / Azure / others | no | defaults to 128 K + honest WARNING with the YAML file path the operator can edit |
+
+The "no" cases are deliberate: those providers do not expose context window via API, and the old approach of maintaining a hardcoded table bit-rotted as providers shipped new model versions. The honest default lets the agent run; the WARNING tells the operator how to set the right value (edit the YAML, re-run with `--context-window <N>`, or set `OAT_MODEL_CONTEXT_<normalized-id>=<tokens>`).
+
 **Effective context limit (precedence order, highest first):**
 
 1. **`OAT_MODEL_CONTEXT_<normalized-modelID>` env override** — operator escape hatch for bring-your-own-model setups and CI workflows. Normalization: lowercase + `:` and `/` replaced with `_`. Clamped to `[1024, 16_000_000]` tokens (out-of-range values emit a startup WARN; non-numeric values are rejected and fall through). See `AGENTS.md` for examples.

@@ -114,6 +114,32 @@ Model format: bare name (`claude-sonnet-4-6`) or provider-prefixed (`anthropic:c
 
 See [SUPPORTED_LLM_PROVIDERS.md](SUPPORTED_LLM_PROVIDERS.md) for the full list of 17+ providers, custom provider setup via `config.toml`, and auto-detect behavior.
 
+### Onboard your chosen model
+
+Before spawning any agent (especially via `oat agent add --model <id>` for the browser agent), run the one-time model onboarding probe so the daemon knows your model's context window, tool-calling reliability, and other capabilities:
+
+```bash
+oat model onboard anthropic:claude-sonnet-4-6   # or whatever model string you picked above
+```
+
+The probe takes ~3 minutes and writes a YAML capability profile to `~/.oat/model-profiles/`. For most providers (OpenAI, OpenRouter, Google Gemini, Ollama) it auto-detects context window via the provider API. For other providers (Anthropic, Bedrock, Azure) it defaults the context window to 128K and prints a WARNING with the exact YAML file path you can edit to set the right value, plus the env-var shortcut.
+
+**Using local models via Ollama.** OAT supports local Ollama setups. Pull the model first (`ollama pull llama3:70b`), make sure the Ollama server is running (`OLLAMA_HOST` defaults to `http://localhost:11434`), then run `oat model onboard ollama:llama3:70b`. The probe auto-detects context window via `POST /api/show` against your local Ollama server. Per-model `num_ctx` customizations (e.g. via a custom Modelfile) are respected.
+
+**Don't want to wait for a full probe?** For CI / scripted onboarding, pass `--context-window <N>` to skip the context detection step and write the value directly:
+
+```bash
+oat model onboard <id> --context-window 200000
+```
+
+Or skip onboarding entirely with the daemon-side env override:
+
+```bash
+export OAT_MODEL_CONTEXT_<normalized-id>=200000   # see AGENTS.md for the normalization rules
+```
+
+If you forget to onboard before `oat agent add --model <id>`, the CLI fails with the exact `oat model onboard` command you need to run — copy-paste and proceed.
+
 ## Start the Daemon
 
 ```bash

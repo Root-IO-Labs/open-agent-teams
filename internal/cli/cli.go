@@ -7309,6 +7309,34 @@ func (c *CLI) addAgentCmd(args []string) error {
 		fmt.Printf("Found stopped %s record (PID %d); will respawn.\n", agentName, existing.PID)
 	}
 
+	// Model-profile preflight. When the operator pins this agent to a
+	// specific model via --model, refuse to register until that model
+	// has been onboarded -- the alternative is a silent fallback path
+	// where the daemon assumes a 128K context window for an
+	// uncharacterized model and the operator only finds out something
+	// is wrong when an agent wedges mid-conversation. Surface the
+	// exact `oat model onboard <id>` recovery command in the error so
+	// copy-paste works without docs-chasing. Use the model ID exactly
+	// as the operator typed it (no normalization) so the command they
+	// see is the command they can paste verbatim.
+	if model := strings.TrimSpace(flags["model"]); model != "" {
+		if !c.modelProfileExists(model) {
+			envSuffix := normalizeModelIDForEnv(model)
+			return errors.Wrap(
+				errors.CategoryRuntime,
+				fmt.Sprintf("model %q is not onboarded; agent NOT added", model),
+				fmt.Errorf(
+					"to onboard this model and add the agent, run:\n\n"+
+						"    oat model onboard %s\n"+
+						"    oat agent add %s %s --model %s\n\n"+
+						"Or set this env var for a quick override (skips capability probing):\n\n"+
+						"    export OAT_MODEL_CONTEXT_%s=<tokens>",
+					model, rawType, agentName, model, envSuffix,
+				),
+			)
+		}
+	}
+
 	worktreePath := c.paths.AgentWorktree(repoName, agentName)
 	if _, statErr := os.Stat(worktreePath); statErr != nil {
 		repoPath := c.paths.RepoDir(repoName)
@@ -9592,6 +9620,45 @@ func (c *CLI) modelProfileDirs() []string {
 	}
 	dirs = append(dirs, filepath.Join(c.findRepoRoot(), "model-routing", "profiles"))
 	return dirs
+}
+
+// modelProfileExists reports whether an `oat model onboard <modelID>`
+// has already produced a YAML profile for the given model. Used by
+// `oat agent add --model <id>` to fail fast with a copy-pasteable
+// recovery command instead of silently spinning up an agent against an
+// uncharacterized model.
+//
+// The filename convention mirrors the probe-model.py writer
+// (`model-routing/profiles/<safe_name>.yaml` where `safe_name` is the
+// model ID with `:` and `/` replaced by `__`). Same dirs as
+// `modelShow` so the operator's mental model is consistent across
+// commands.
+func (c *CLI) modelProfileExists(modelID string) bool {
+	filename := strings.ReplaceAll(modelID, ":", "__")
+	filename = strings.ReplaceAll(filename, "/", "__") + ".yaml"
+	for _, dir := range c.modelProfileDirs() {
+		if _, err := os.Stat(filepath.Join(dir, filename)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeModelIDForEnv mirrors `internal/daemon.normalizeModelIDForEnv`
+// so the env-var name we tell operators (in CLI error messages, in the
+// probe script WARNING block) is the exact suffix the daemon reads at
+// runtime. Single source of truth lives in the daemon package; this is
+// a local copy that imports avoidance (cli has no daemon dep).
+//
+// Lowercase + replace `:` and `/` with `_`. Examples:
+//   - google_genai:gemini-2.5-flash → google_genai_gemini-2.5-flash
+//   - anthropic:claude-sonnet-4     → anthropic_claude-sonnet-4
+//   - openrouter:meta-llama/llama-3 → openrouter_meta-llama_llama-3
+func normalizeModelIDForEnv(modelID string) string {
+	lowered := strings.ToLower(modelID)
+	lowered = strings.ReplaceAll(lowered, ":", "_")
+	lowered = strings.ReplaceAll(lowered, "/", "_")
+	return lowered
 }
 
 func (c *CLI) modelShow(args []string) error {

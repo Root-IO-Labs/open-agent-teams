@@ -31,6 +31,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`oat model onboard` reliability: Google Gemini + Ollama API probes, honest 128K fallback, `--context-window` flag, `oat agent add` preflight (2026-05-29).**
+
+  Closes the upstream gap behind the daemon-side 128K fallback bump:
+  the script `oat model onboard` runs (`benchmarks/probe-model.py`)
+  often failed to determine a model's context window, leaving the
+  YAML profile with `max_input_tokens: unknown` and the daemon
+  falling back at runtime. Two specific provider gaps closed; for
+  everything else we accept that we can't probe reliably and surface
+  that clearly to the operator with an honest default + a
+  copy-pasteable recovery path.
+
+  - **Google Gemini API probe** in
+    `benchmarks/probe-model.py::_fetch_google_gemini_context_length`.
+    Queries
+    `generativelanguage.googleapis.com/v1beta/models/{name}` for
+    `inputTokenLimit`. Honors `GOOGLE_API_KEY` first, then
+    `GEMINI_API_KEY`. Strips a leading `models/` prefix
+    defensively. Incident driver: 2026-05 Wikipedia overflow with
+    `google_genai:gemini-2.5-flash`.
+  - **Ollama API probe** in
+    `benchmarks/probe-model.py::_fetch_ollama_context_length`.
+    `POST {OLLAMA_HOST}/api/show` (default
+    `http://localhost:11434`; HTTP, local-only by design). Parses
+    both newer Ollama versions
+    (`model_info["<arch>.context_length"]`) and older
+    (`parameters` text block scanned for `num_ctx`). OAT supports
+    local-model workflows; this closes the bring-your-own-model
+    onboarding hole.
+  - **Honest-default fallback** when neither LangChain's built-in
+    profile nor a provider-API probe can determine the window:
+    `max_input_tokens` is written as `DEFAULT_CONTEXT_WINDOW`
+    (128 K, matches the daemon-side `contextFallbackTokens`),
+    plus structured `context_window_source: default_fallback` and
+    `context_window_defaulted: true` markers in the YAML for
+    future audit tooling. A WARNING block prints to stderr at the
+    end of the probe run naming the absolute YAML file path the
+    operator can edit, the `--context-window <N>` CLI form, and
+    the `OAT_MODEL_CONTEXT_<normalized-id>=<tokens>` env-var
+    override. No more silent "I'll just guess 32K at runtime"
+    surprise.
+  - **`--context-window <N>` flag** for non-interactive operators
+    who already know the answer (CI, scripted onboarding,
+    bring-your-own-model providers whose API doesn't expose the
+    value). Clamped to `[1024, 16_000_000]`; lands as
+    `context_window_source: cli_override` in the YAML.
+  - **`oat agent add --model <id>` preflight** in
+    `internal/cli/cli.go`. When `--model` is set, the CLI now
+    refuses to register the agent unless an onboarded YAML
+    profile exists for that model. The error message contains
+    the exact `oat model onboard <id>` recovery command (with
+    the original model ID verbatim so copy-paste works regardless
+    of casing) AND the `export OAT_MODEL_CONTEXT_<normalized>=<tokens>`
+    alternative for operators who want to skip probing. No new
+    flags — the error message itself is the path forward.
+  - **CLI / daemon / probe normalization parity.** New helper
+    `internal/cli/cli.go::normalizeModelIDForEnv` mirrors the
+    daemon's `internal/daemon/context_capacity.go::normalizeModelIDForEnv`
+    and the probe-script's `_normalize_model_id_for_env`. Pinned
+    by tests in all three surfaces so a future drift in one
+    place would be caught by the others.
+  - **Stale `_generate_recommendations` text retired** —
+    previously told operators to add `[models.providers.<p>.profile."<m>"] max_input_tokens = ...`
+    to `config.toml`, a syntax that no longer matches the
+    YAML-profile format. Now points at the YAML file + the
+    `OAT_MODEL_CONTEXT_<id>` env override.
+
+  Tests: 30 new tests in `benchmarks/test_probe_context_detection.py`
+  cover Google Gemini fetcher (env-var auth precedence, URL shape,
+  `models/` prefix stripping, silent-None on failure), Ollama
+  fetcher (both response shapes, `OLLAMA_HOST` env handling,
+  connection-failure silence), `probe_context_profile` precedence
+  (CLI override beats LangChain beats API beats default), structured
+  markers in YAML, `_normalize_model_id_for_env` shape match with
+  the daemon, and the stderr WARNING block formatting. 4 new tests
+  in `internal/cli/agent_add_preflight_test.go` cover the
+  CLI-side normalization + profile-existence helpers, including
+  the openrouter-style "org/model" slash-bearing IDs. Full Go
+  suite (all packages) + full Python suite green.
+
+  Docs updated: `AGENTS.md` Quick Reference env-var table already
+  carried `OAT_MODEL_CONTEXT_<id>` from B.0; `docs/AGENTS.md`
+  gains a "Model onboarding workflow" subsection naming the
+  provider coverage matrix; `docs/QUICKSTART.md` gets an "Onboard
+  your chosen model" section with a "Using local models via
+  Ollama" subsection; `benchmarks/README.md` documents the
+  context-window precedence + the new flag + the provider matrix.
+
 - **Bridge-side tool-result cap + LRU blob cache + `browser_fetch_blob` recovery tool (2026-05-29; ships in oat-browser-agent).**
 
   Source-side defense-in-depth for the same context-overflow

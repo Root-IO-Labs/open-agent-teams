@@ -1386,45 +1386,262 @@ def _fetch_openai_context_length(model_id: str) -> int | None:
     return None
 
 
-def probe_context_profile(model, *, provider: str = "", model_name: str = "") -> ProbeResult:
-    """What does the model's LangChain profile report?"""
-    profile = getattr(model, "profile", None)
+def _fetch_google_gemini_context_length(model_id: str) -> int | None:
+    """Query the Google generativelanguage API for a Gemini model's
+    ``inputTokenLimit``.
 
+    Honors ``GOOGLE_API_KEY`` first, then ``GEMINI_API_KEY`` (Google's
+    own docs mention both env-var names in different SDKs). Returns the
+    context window size in tokens, or None on any failure -- the caller
+    falls through to the honest 128K default.
+
+    Incident driver: 2026-05 Wikipedia overflow incident with
+    ``google_genai:gemini-2.5-flash``. LangChain's built-in profile did
+    not have a max_input_tokens for that specific version, so the daemon
+    hit the 32K legacy fallback and a single full-page browser_get_text
+    blew the agent's effective context window. Closing this probe gap
+    means the operator's first `oat model onboard` run writes the
+    correct value into the YAML profile and the runtime defaults stay
+    honest.
+    """
+    import urllib.request
+    import urllib.error
+
+    api_key = os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return None
+
+    # Google's API expects the model id WITHOUT a leading "models/"
+    # prefix, but the endpoint path includes one. LangChain's
+    # google_genai model IDs are bare (e.g. "gemini-2.5-flash"); strip
+    # any prefix the operator may have included defensively.
+    bare_id = model_id
+    if bare_id.startswith("models/"):
+        bare_id = bare_id[len("models/"):]
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{bare_id}?key={api_key}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "oat-probe/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        ctx = data.get("inputTokenLimit")
+        if isinstance(ctx, int) and ctx > 0:
+            return ctx
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def _fetch_ollama_context_length(model_id: str) -> int | None:
+    """Query a local Ollama server's ``POST /api/show`` for a model's
+    context size.
+
+    Reads ``OLLAMA_HOST`` env (default ``http://localhost:11434``). No
+    auth -- local-only by design. Returns the context window in tokens,
+    or None on any failure (server unreachable, model not pulled, etc.).
+    Falls through to the honest 128K default + warning.
+
+    Ollama exposes context size in two places depending on version:
+
+      * Older: ``parameters`` field, which is a free-form text block
+        containing ``num_ctx <integer>`` (along with other model-file
+        directives). We scan for the ``num_ctx`` line.
+      * Newer (~Ollama 0.5+): structured ``model_info`` dict keyed by
+        architecture, with a ``<arch>.context_length`` entry. We grab
+        the first one we find.
+
+    The fetcher handles both shapes so OAT works across the Ollama
+    versions our local-model users actually run.
+    """
+    import urllib.request
+    import urllib.error
+
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    # Some operators set OLLAMA_HOST to just the host:port without a
+    # scheme; tolerate that.
+    if not host.startswith(("http://", "https://")):
+        host = "http://" + host
+
+    url = f"{host}/api/show"
+    payload = json.dumps({"name": model_id}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "oat-probe/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        return None
+
+    # Newer Ollama: model_info dict with <arch>.context_length keys.
+    model_info = data.get("model_info")
+    if isinstance(model_info, dict):
+        for key, value in model_info.items():
+            if isinstance(key, str) and key.endswith(".context_length"):
+                if isinstance(value, int) and value > 0:
+                    return value
+
+    # Older Ollama: parameters as a free-form block. Look for
+    # `num_ctx <int>` lines (whitespace-separated, like a Modelfile).
+    parameters = data.get("parameters")
+    if isinstance(parameters, str):
+        for line in parameters.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "num_ctx":
+                try:
+                    ctx = int(parts[1])
+                    if ctx > 0:
+                        return ctx
+                except ValueError:
+                    pass
+
+    return None
+
+
+# Honest default context window when neither LangChain's built-in profile
+# nor a provider-specific API probe can determine the real value. Matches
+# the daemon-side `contextFallbackTokens` in
+# `internal/daemon/context_capacity.go` so the YAML profile that the
+# operator sees on disk agrees with the value the daemon would otherwise
+# default to at runtime. Sized to cover the long tail of "modern" models
+# (Sonnet 4, Gemini 2.5, GPT-4o) without overstating local-model
+# capabilities; operator can edit the YAML or set `OAT_MODEL_CONTEXT_<id>`
+# to override.
+DEFAULT_CONTEXT_WINDOW = 128_000
+
+# Clamp bounds for `--context-window`, mirroring the daemon-side
+# `contextEnvOverrideMin` / `contextEnvOverrideMax`. Floor blocks
+# misconfiguration that would silently turn off context tracking; ceiling
+# blocks `--context-window 1000000000000` typos.
+CONTEXT_WINDOW_MIN = 1_024
+CONTEXT_WINDOW_MAX = 16_000_000
+
+# Module-level overrides set by main() so probe functions don't need a
+# wider signature change. Kept narrow — only the two cases the operator
+# explicitly opted into via CLI flags.
+_explicit_context_window: int | None = None
+
+
+def probe_context_profile(model, *, provider: str = "", model_name: str = "") -> ProbeResult:
+    """Report a model's context window + tool-calling capabilities.
+
+    Resolution order (highest priority first):
+
+      1. ``--context-window <N>`` CLI override (operator says "use
+         exactly this value"; skips API probes entirely).
+      2. ``model.profile["max_input_tokens"]`` from LangChain's
+         built-in per-model registry.
+      3. Provider-specific API probe:
+            - openrouter: /api/v1/models[*].context_length
+            - openai:     /v1/models/{id}.context_window
+            - google_genai: generativelanguage.googleapis.com/v1beta/models/{name}.inputTokenLimit
+            - ollama:     POST {OLLAMA_HOST}/api/show
+      4. ``DEFAULT_CONTEXT_WINDOW`` (128K) + honest warning + structured
+         markers (``context_window_defaulted: true`` plus an entry in
+         the YAML profile's ``warnings:`` list) so the operator knows
+         to edit the YAML or set ``OAT_MODEL_CONTEXT_<id>``.
+
+    The honest-default path is the central UX improvement here: rather
+    than maintain an ever-staling table of per-provider hardcoded values
+    (Anthropic ships new model versions multiple times a year), we
+    accept that we can't probe everything reliably and surface that
+    clearly to the operator.
+    """
+    profile = getattr(model, "profile", None)
     if profile is None or not isinstance(profile, dict):
+        # Operator may still have set --context-window explicitly even
+        # without a LangChain profile. Honor that single override.
+        if _explicit_context_window is not None:
+            return ProbeResult(
+                name="context_profile", passed=True, score=70,
+                details={
+                    "has_profile": False,
+                    "max_input_tokens": _explicit_context_window,
+                    "context_window_source": "cli_override",
+                },
+            )
         return ProbeResult(
             name="context_profile", passed=False, score=30,
-            details={"has_profile": False},
-            error="No model profile available — context limits unknown. Set via config.toml.",
+            details={"has_profile": False, "context_window_source": "none"},
+            error="No model profile available — context limits unknown. Re-run with --context-window <N> or set OAT_MODEL_CONTEXT_<id>=<tokens>.",
         )
 
-    context_limit = profile.get("max_input_tokens")
     tool_calling = profile.get("tool_calling")
     supports_thinking = profile.get("supports_thinking")
 
-    # Fallback: fetch context window from provider API if not in profile
-    if not context_limit and model_name:
-        if provider == "openrouter":
-            fetched = _fetch_openrouter_context_length(model_name)
-            if fetched:
-                context_limit = fetched
-        elif provider == "openai":
-            fetched = _fetch_openai_context_length(model_name)
+    context_limit: int | None = None
+    source: str = "unknown"
+
+    # 1. Explicit CLI override beats everything (operator intent).
+    if _explicit_context_window is not None:
+        context_limit = _explicit_context_window
+        source = "cli_override"
+    else:
+        # 2. LangChain's built-in profile.
+        raw = profile.get("max_input_tokens")
+        if isinstance(raw, int) and raw > 0:
+            context_limit = raw
+            source = "langchain_profile"
+        # 3. Provider-specific API probe.
+        if context_limit is None and model_name:
+            fetched: int | None = None
+            if provider == "openrouter":
+                fetched = _fetch_openrouter_context_length(model_name)
+                if fetched:
+                    source = "openrouter_api"
+            elif provider == "openai":
+                fetched = _fetch_openai_context_length(model_name)
+                if fetched:
+                    source = "openai_api"
+            elif provider in ("google_genai", "google", "gemini"):
+                fetched = _fetch_google_gemini_context_length(model_name)
+                if fetched:
+                    source = "google_gemini_api"
+            elif provider == "ollama":
+                fetched = _fetch_ollama_context_length(model_name)
+                if fetched:
+                    source = "ollama_api"
             if fetched:
                 context_limit = fetched
 
+    # 4. Honest default + structured markers. Recorded in the probe
+    # details; `_generate_yaml_profile` reads them to emit
+    # `context_window_defaulted: true` + a `warnings:` entry, and
+    # `_print_report` prints the stderr WARNING block with the YAML
+    # file path the operator can edit.
+    defaulted = False
+    if context_limit is None:
+        context_limit = DEFAULT_CONTEXT_WINDOW
+        source = "default_fallback"
+        defaulted = True
+
     score = 30  # base for having a profile
-    if context_limit and isinstance(context_limit, int):
+    if context_limit and isinstance(context_limit, int) and not defaulted:
         score += 40
+    elif defaulted:
+        # Defaulted scores lower than a real probed value -- this is the
+        # signal in the overall_score that something is unverified, but
+        # not a critical failure (the agent can still run).
+        score += 20
     if tool_calling is True:
         score += 20
     if tool_calling is False:
         score = 0  # Critical failure
 
-    details = {
+    details: dict[str, Any] = {
         "has_profile": True,
         "max_input_tokens": context_limit,
         "tool_calling": tool_calling,
+        "context_window_source": source,
     }
+    if defaulted:
+        details["context_window_defaulted"] = True
     if supports_thinking is not None:
         details["supports_thinking"] = supports_thinking
 
@@ -1489,13 +1706,31 @@ def _generate_recommendations(report: ModelReport) -> None:
     if st and not st.passed and st.score > 0:
         report.warnings.append("Streaming works but doesn't report usage_metadata per-chunk")
 
-    # Context profile
+    # Context profile. The honest-default path (context_window_defaulted)
+    # gets its own stderr WARNING block printed at the end of the run
+    # by _print_default_context_warning(); here we just surface the
+    # short summary in the report's recommendations so a human reading
+    # the report later still gets the pointer.
     cp = probe_map.get("context_profile")
-    if cp and not cp.details.get("max_input_tokens"):
+    if cp and cp.details.get("context_window_defaulted"):
         report.recommendations.append(
-            "No context window limit in model profile. Add to config.toml:\n"
-            f'  [models.providers.{report.provider}.profile."{report.model_name}"]\n'
-            "  max_input_tokens = <context_window_size>"
+            f"Context window defaulted to {DEFAULT_CONTEXT_WINDOW} tokens for {report.model_string}. "
+            f"To set the correct value, edit max_input_tokens in the YAML profile "
+            f"(written to model-routing/profiles/), re-run with `--context-window <N>`, "
+            f"or set OAT_MODEL_CONTEXT_<normalized-modelID>=<tokens>."
+        )
+        report.warnings.append(
+            f"context_window_defaulted_to_{DEFAULT_CONTEXT_WINDOW // 1000}k: could not determine "
+            f"context window via API probe; edit max_input_tokens in the YAML profile to override"
+        )
+    elif cp and not cp.details.get("max_input_tokens"):
+        # Defensive: context_profile produced no value AND didn't go
+        # through the default-fallback path. Shouldn't happen post-8.11
+        # but keep the legacy warning shape for old report consumers.
+        report.recommendations.append(
+            "No context window limit in model profile. Re-run with:\n"
+            f"  oat model onboard {report.model_string} --context-window <N>\n"
+            "or set OAT_MODEL_CONTEXT_<normalized-modelID>=<tokens>"
         )
 
     # Reasoning effort
@@ -1896,6 +2131,26 @@ def _generate_yaml_profile(report: ModelReport) -> str:
         f"",
     ]
 
+    # Surface the honest-default marker structurally so future audit
+    # tooling can distinguish "operator probed and got real value" from
+    # "we defaulted because no API probe worked." The daemon's parser
+    # tolerates unknown keys; this is purely informational on disk for
+    # now. context_window_source values: "cli_override" | "langchain_profile"
+    # | "openrouter_api" | "openai_api" | "google_gemini_api" | "ollama_api"
+    # | "default_fallback".
+    cp = next((p for p in report.probes if p.name == "context_profile"), None)
+    if cp and cp.details:
+        # Strip the trailing "" from the section we just emitted so the
+        # YAML doesn't double-space when we add our marker rows.
+        if lines and lines[-1] == "":
+            lines.pop()
+        source = cp.details.get("context_window_source")
+        if source:
+            lines.append(f"  context_window_source: {source}")
+        if cp.details.get("context_window_defaulted"):
+            lines.append(f"  context_window_defaulted: true")
+        lines.append("")
+
     # Latency section (from probe durations)
     if latency_probes or ttft_ms is not None:
         lines.append("latency:")
@@ -2020,7 +2275,33 @@ def main():
             "model' error."
         ),
     )
+    parser.add_argument(
+        "--context-window", type=int, default=None, metavar="N",
+        help=(
+            "Override context window detection with an explicit value (in "
+            "tokens). Use this for CI / scripted onboarding when you already "
+            f"know the answer, or for any model whose context the probe "
+            f"can't determine. Clamped to [{CONTEXT_WINDOW_MIN}, {CONTEXT_WINDOW_MAX}]; "
+            "the probe still runs but skips LangChain / API probes for the "
+            "context-profile probe. The YAML profile records "
+            "context_window_source: cli_override so future audits can "
+            "distinguish operator overrides from probed values."
+        ),
+    )
     args = parser.parse_args()
+
+    # Validate + apply --context-window. Done before run_probes() so the
+    # context_profile probe sees the override on its first call.
+    if args.context_window is not None:
+        if args.context_window < CONTEXT_WINDOW_MIN or args.context_window > CONTEXT_WINDOW_MAX:
+            print(
+                f"--context-window must be in [{CONTEXT_WINDOW_MIN}, {CONTEXT_WINDOW_MAX}] "
+                f"(got {args.context_window})",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        global _explicit_context_window
+        _explicit_context_window = args.context_window
 
     report = asyncio.run(run_probes(
         args.model,
@@ -2054,6 +2335,56 @@ def main():
             print(f"Profile saved to {filepath}", file=sys.stderr)
             print(f"\nProfile contents:", file=sys.stderr)
             print(yaml_content, file=sys.stderr)
+
+            # Honest-default WARNING block: prints a copy-pasteable
+            # recovery block when the probe couldn't determine the
+            # model's real context window. Path is the actual absolute
+            # path on disk so the operator can $EDITOR straight to it.
+            _print_default_context_warning(report, filepath)
+
+
+def _normalize_model_id_for_env(model_id: str) -> str:
+    """Mirror the daemon's `normalizeModelIDForEnv` (Go) so the env-var
+    name we tell the operator matches exactly what the daemon reads.
+
+    Lowercase + replace ``:`` and ``/`` with ``_``. The result is the
+    suffix to append after ``OAT_MODEL_CONTEXT_``.
+    """
+    return model_id.lower().replace(":", "_").replace("/", "_")
+
+
+def _print_default_context_warning(report: ModelReport, profile_path: str) -> None:
+    """Emit the operator-facing WARNING block when the context window
+    was defaulted to 128K rather than probed.
+
+    Format matches the daemon's runtime WARN (see
+    `internal/daemon/context_capacity.go::effectiveContextLimit`) so
+    the operator sees the same recovery commands in both surfaces.
+    """
+    cp = next((p for p in report.probes if p.name == "context_profile"), None)
+    if not cp or not cp.details:
+        return
+    if not cp.details.get("context_window_defaulted"):
+        return
+
+    env_suffix = _normalize_model_id_for_env(report.model_string)
+    block = (
+        f"\n{'=' * 70}\n"
+        f"  WARNING: Could not determine context window for\n"
+        f"           \"{report.model_string}\" via API probe.\n"
+        f"           Defaulted to {DEFAULT_CONTEXT_WINDOW} tokens. To override:\n"
+        f"\n"
+        f"             • Edit max_input_tokens in:\n"
+        f"                 {profile_path}\n"
+        f"\n"
+        f"             • Or re-run with:\n"
+        f"                 oat model onboard {report.model_string} --context-window <N>\n"
+        f"\n"
+        f"             • Or set env var (no file edit needed):\n"
+        f"                 OAT_MODEL_CONTEXT_{env_suffix}=<tokens>\n"
+        f"{'=' * 70}\n"
+    )
+    print(block, file=sys.stderr)
 
 
 if __name__ == "__main__":

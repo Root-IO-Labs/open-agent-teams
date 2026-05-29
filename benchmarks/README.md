@@ -595,6 +595,32 @@ cd agent-runtime/libs/cli && uv pip install langchain-ollama
 
 **Orchestrator vs worker:** Ollama models are best suited as **worker** models via `--available-worker-models`. The orchestrator (`--model`) should be a capable hosted model (e.g., `anthropic:claude-sonnet-4-6`) since it handles complex multi-step coordination that small local models struggle with.
 
+## `probe-model.py` — model capability onboarding
+
+`probe-model.py` is the script that backs `oat model onboard`. It probes a model's tool-calling reliability, streaming behavior, shell-roundtrip success, file-write reliability, and context window, and writes a YAML capability profile to `model-routing/profiles/` (mirrored into `~/.oat/model-profiles/` for the daemon to load).
+
+### Context-window detection
+
+The probe pulls a model's context window from the first source that responds:
+
+1. **`--context-window <N>`** CLI override (operator says "use exactly this; skip the probes"). Clamped to `[1024, 16_000_000]`.
+2. **LangChain's built-in per-model profile** (`model.profile["max_input_tokens"]`).
+3. **Provider-specific API probe:** OpenAI (`/v1/models/{id}.context_window`), OpenRouter (`/api/v1/models[*].context_length`), Google Gemini (`generativelanguage.googleapis.com/v1beta/models/{name}.inputTokenLimit`, honors `GOOGLE_API_KEY` or `GEMINI_API_KEY`), Ollama (local `POST {OLLAMA_HOST}/api/show`, default `http://localhost:11434`).
+4. **Honest default of 128 K** for any provider whose API does not expose the value (Anthropic, Bedrock, Azure, custom routers). The probe prints a WARNING block naming the absolute path to the YAML profile the operator can edit, the `--context-window <N>` CLI form, and the `OAT_MODEL_CONTEXT_<normalized-id>=<tokens>` env override. The structured marker `context_window_source: default_fallback` plus `context_window_defaulted: true` lands in the YAML so future audit tooling can spot defaulted profiles without parsing log output.
+
+Why not maintain a per-provider hardcoded table? Providers ship new model versions multiple times a year. A hardcoded table bit-rots silently; a 128 K honest default with a clear "here's where to edit the value" pointer ages better.
+
+### Common flags
+
+| Flag | Purpose |
+|---|---|
+| `--probe-set minimum` | Fast gate (~1 min). Runs the smallest set that still produces a `worker_eligible` verdict. |
+| `--probe-set default` | Full probe (~3 min). Includes streaming, multi-turn, large-output, routing decision, etc. |
+| `--context-window <N>` | Skip context-window detection; write `N` to the YAML directly. For CI / scripted onboarding. |
+| `--save` | Write the YAML profile to `model-routing/profiles/` (and the daemon copy). |
+| `--per-probe-timeout <secs>` | Bump per-probe timeout (default 60). Local Ollama cold-starts can need more. |
+| `--no-fallback` | Don't fall back to `init_chat_model` when `create_model` fails. Useful for debugging `~/.oat/config.toml` shape issues. |
+
 ## Files
 
 | File | Purpose |
