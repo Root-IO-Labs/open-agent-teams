@@ -179,10 +179,13 @@ func TestRegisterAssistantCommands_Part5d(t *testing.T) {
 
 	// Part 7 Commit 7.2: added `remove` (Delete=nuke counterpart
 	// to Stop=pause) plus `delete` as a muscle-memory alias.
+	// 2026-05-29: added `rm` as a third alias for parity with
+	// `oat worker rm` / `oat repo rm` / `oat agent rm`. All three
+	// (`remove`, `delete`, `rm`) point at the same Command struct.
 	want := []string{
 		"start", "stop", "restart", "status", "attach",
 		"set-model", "reset", "compact", "logs", "list",
-		"remove", "delete",
+		"remove", "delete", "rm",
 	}
 	for _, verb := range want {
 		t.Run(verb, func(t *testing.T) {

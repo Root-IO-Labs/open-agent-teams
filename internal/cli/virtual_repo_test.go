@@ -105,3 +105,93 @@ func TestVirtualRepoNameFor_Part5c(t *testing.T) {
 		})
 	}
 }
+
+// TestAssistantNameFromVirtualRepo pins the reverse direction
+// used by the generic `oat agent remove` router to delegate
+// assistant removals through the existing `oat assistant
+// remove` flow. virtualRepoNameFor + assistantNameFromVirtualRepo
+// must round-trip for every valid assistant name; non-virtual
+// repo keys must return "" so the router falls through to its
+// default branch.
+func TestAssistantNameFromVirtualRepo(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"_assistant-personal", "personal"},
+		{"_assistant-work", "work"},
+		{"_assistant-a", "a"},
+		{"_assistant-with-dashes", "with-dashes"},
+		// A non-virtual repo (regular GitHub-style name) doesn't
+		// start with the prefix → empty so the router knows to
+		// fall through to the default daemon-remove path.
+		{"my-real-repo", ""},
+		{"oat-browser-agent", ""},
+		// Empty + the bare prefix both round-trip back to ""
+		// (the empty-name case would have been rejected by
+		// validateVirtualRepoName upstream).
+		{"", ""},
+		{"_assistant-", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got := assistantNameFromVirtualRepo(tc.input)
+			if got != tc.want {
+				t.Errorf("assistantNameFromVirtualRepo(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			// Round-trip: virtualRepoNameFor(assistantNameFromVirtualRepo(x)) == x
+			// when x is a non-empty virtual repo key.
+			if tc.want != "" {
+				if back := virtualRepoNameFor(got); back != tc.input {
+					t.Errorf("round-trip failed: virtualRepoNameFor(%q) = %q, want %q",
+						got, back, tc.input)
+				}
+			}
+		})
+	}
+}
+
+// TestFindAgentTypeInListing pins the daemon-response walk used
+// by removeAgentGeneric to pick the right cleanup path. The
+// shape comes from handleListAgents (a JSON array of
+// {name, type, …} maps); this test guards the field-extraction
+// against a daemon response-shape drift breaking the router
+// silently.
+func TestFindAgentTypeInListing(t *testing.T) {
+	listing := []interface{}{
+		map[string]interface{}{"name": "personal", "type": "assistant", "pid": 12345.0},
+		map[string]interface{}{"name": "browser-agent", "type": "browser", "pid": 67890.0},
+		map[string]interface{}{"name": "worker-swift-eagle", "type": "worker"},
+	}
+	cases := []struct {
+		agent string
+		want  string
+	}{
+		{"personal", "assistant"},
+		{"browser-agent", "browser"},
+		{"worker-swift-eagle", "worker"},
+		// Unknown agent → empty (router turns this into a clear
+		// "not found in repo" error rather than walking blindly
+		// into the assistant cleanup path).
+		{"does-not-exist", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.agent, func(t *testing.T) {
+			if got := findAgentTypeInListing(listing, tc.agent); got != tc.want {
+				t.Errorf("findAgentTypeInListing(_, %q) = %q, want %q", tc.agent, got, tc.want)
+			}
+		})
+	}
+
+	// Defensive: a non-list payload returns "" without panic.
+	// Older daemons or a swapped-in mock might return a
+	// map-shape; the router should fall through cleanly.
+	t.Run("non-list-payload", func(t *testing.T) {
+		if got := findAgentTypeInListing("oops", "anything"); got != "" {
+			t.Errorf("non-list payload should return empty; got %q", got)
+		}
+		if got := findAgentTypeInListing(nil, "anything"); got != "" {
+			t.Errorf("nil payload should return empty; got %q", got)
+		}
+	})
+}

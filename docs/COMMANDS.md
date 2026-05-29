@@ -325,10 +325,39 @@ oat agent complete                          # Worker says "I'm done, clean me up
 oat agent complete --worker <worker-name>   # Supervisor completes a worker on its behalf
 oat agent waiting                           # Worker enters dormant state (PR or verification)
 oat agent restart <name>                    # Restart a stuck agent
+oat agent stop <name>                       # Pause a pausable agent (Assistant + Browser)
+oat agent remove <name> [--repo <repo>]     # Remove any agent type (alias: `oat agent rm`)
 oat agent set-model <name> --model <id>     # Change the LLM model the agent uses
 oat agent tell <name> "message"             # Send a message to an agent
 oat agent interrupt <name>                  # Send Ctrl-C to an agent
 ```
+
+### `oat agent remove`
+
+Generic remove for any agent type. The agent name is positional; the repository is passed as a `--repo` flag.
+
+```bash
+oat agent remove <name> [--repo <repo>] [--yes] [--force]
+oat agent rm     <name> [--repo <repo>] [--yes] [--force]   # alias
+```
+
+Examples:
+
+```bash
+oat agent rm browser-agent --repo fizzbuzz       # remove the browser-agent in the fizzbuzz repo
+oat agent rm merge-queue   --repo fizzbuzz       # remove the merge-queue in the fizzbuzz repo
+oat agent rm personal                            # assistants are unique; --repo can be omitted
+oat agent rm worker-swift-eagle --repo fizzbuzz --force   # workers require --force
+oat agent rm my-worker --yes                     # skip the interactive y/n prompt
+```
+
+**Note the syntax:** it is `<name> --repo <repo>`, NOT `<repo>/<name>`. The slash form is not supported.
+
+**Repo resolution** (used when `--repo` is omitted): the command first tries to infer the repo from the current working directory (when run inside a oat worktree); failing that, it scans every repo for an agent with that name and uses the first match. This is why `oat agent rm personal` works without `--repo` — assistant names are globally unique.
+
+**What "remove" actually does:** for assistants, it runs the same cleanup as `oat assistant remove` (wipes the chat-history JSONL + rotation archives + the virtual repo directory). For workers, it runs the same cleanup as `oat worker rm` (cleans the worktree + requires `--force`). For everything else — browser-agents, merge-queues, supervisors, pr-shepherds, workspaces, reviewers, verification agents, generic-persistent agents, agent-builders — it kills the agent process, removes its `state.Agent` record, and emits an `agent_removed` lifecycle frame that subscribers (like the side panel) use to drop the agent card reactively. Those latter types don't own a per-agent worktree, so there's no on-disk teardown beyond the state-record removal.
+
+You can still use the per-type CLIs directly (`oat assistant remove`, `oat worker rm`); `oat agent remove` is the convenience wrapper that picks the right one based on the agent's type. `oat assistant rm` is also accepted as a muscle-memory alias for `oat assistant remove`.
 
 ### `oat agent set-model`
 

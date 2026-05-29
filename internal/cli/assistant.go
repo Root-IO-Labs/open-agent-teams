@@ -104,6 +104,11 @@ func (c *CLI) registerAssistantCommands() {
 	// reach for `remove`, half for `delete`. Both go to the same
 	// function so neither group hits a "no such subcommand" wall.
 	assistantCmd.Subcommands["delete"] = assistantCmd.Subcommands["remove"]
+	// `rm` alias for muscle-memory parity with `oat worker rm` /
+	// `oat repo rm` (and the new generic `oat agent rm`). Both
+	// aliases point at the same Command struct so help-text +
+	// future flag additions stay in lockstep automatically.
+	assistantCmd.Subcommands["rm"] = assistantCmd.Subcommands["remove"]
 	assistantCmd.Subcommands["status"] = &Command{
 		Name:        "status",
 		Description: "Show assistant state: model, PID, last activity",

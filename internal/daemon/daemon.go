@@ -1202,23 +1202,43 @@ func (d *Daemon) checkAgentHealth() {
 				if agent.Type.IsPersistent() {
 					cooldownKey := fmt.Sprintf("%s/%s", repoName, agentName)
 
-					// Browser-agent back-off: if the bridge has been
-					// found dead repeatedly within a 10-min window
-					// (typically: Chrome closed, extension
-					// uninstalled, NM host missing), stop
-					// auto-restarting. The user re-engages via
-					// `oat agent restart browser-agent`, which both
-					// restarts the agent and clears this counter.
-					// Without this guard, the 2-min health-check
-					// loop spawns a doomed bridge subprocess every
-					// cycle and burns tokens on its startup banner.
+					// Persistent-restart back-off: applies to any
+					// agent type that uses the browser bridge
+					// (browser-agent + assistant — see
+					// `usesBrowserBridge`). If the process has
+					// died repeatedly within a 10-min window
+					// (typically: Chrome closed / extension
+					// uninstalled / NM host missing for browser;
+					// crash-loop or LLM-runtime auth failure for
+					// assistant), stop auto-restarting. The user
+					// re-engages with an agent-type-specific
+					// command (see warning text below), which
+					// both restarts the agent and clears this
+					// counter. Without this guard, the 2-min
+					// health-check loop respawns a doomed
+					// subprocess every cycle and burns tokens on
+					// its startup banner.
 					if usesBrowserBridge(agent.Type) {
 						failures := d.recordBridgeUnreachable(cooldownKey, time.Now())
 						if failures >= bridgeUnreachableThreshold {
+							// Tailor the user-facing remediation
+							// to the agent type — telling an
+							// operator to run
+							// `oat agent restart browser-agent`
+							// when the failing agent is actually
+							// their `personal` assistant would
+							// have them chasing the wrong subsystem.
+							var label, remedy string
+							if agent.Type == state.AgentTypeAssistant {
+								label = "Assistant"
+								remedy = fmt.Sprintf("oat assistant restart %s", agentName)
+							} else {
+								label = "Browser-agent"
+								remedy = fmt.Sprintf("oat agent restart browser-agent --repo %s", repoName)
+							}
 							d.logger.Warn(
-								"Browser-agent %s/%s unreachable %d times in last %s; auto-restart disabled. "+
-									"Run `oat agent restart browser-agent --repo %s` after the bridge is reachable.",
-								repoName, agentName, failures, bridgeUnreachableWindow, repoName,
+								"%s %s/%s failed %d times in last %s; auto-restart disabled. Run `%s` after the underlying cause is fixed.",
+								label, repoName, agentName, failures, bridgeUnreachableWindow, remedy,
 							)
 							appendToSliceMap(deadAgents, repoName, agentName)
 							continue
@@ -8084,13 +8104,18 @@ func (d *Daemon) writePromptFileWithPrefix(repoName string, agentType state.Agen
 }
 
 // bridgeUnreachableThreshold and bridgeUnreachableWindow define the
-// back-off policy for browser-agent auto-restart. Per Part 2 of
-// mcp-and-opt-in-browser-agent_a10544be.plan.md: if the health check
-// finds the browser-agent dead this many times within the window, stop
-// respawning and require the user to manually `oat agent restart
-// browser-agent`. Prevents the 2-min health-check loop from spinning a
-// doomed bridge subprocess every cycle when Chrome is closed or the
-// extension is uninstalled.
+// restart-storm back-off applied to every persistent agent that
+// shares the browser-bridge code path — i.e. both browser-agents
+// AND assistants (see `usesBrowserBridge`). Original motivation
+// (Part 2 of mcp-and-opt-in-browser-agent_a10544be.plan.md) was
+// the doomed-bridge-subprocess case (Chrome closed, extension
+// uninstalled, NM host missing); the same guardrail extends to
+// assistant crash-loops (e.g. an LLM-runtime auth failure that
+// causes the agent to exit on every startup). After this many
+// failures within the window the daemon stops auto-respawning
+// and emits a one-line warning naming the agent-type-specific
+// remediation command. The names retain "bridge" for legacy
+// reasons; treat them as "persistent-agent restart" semantically.
 const (
 	bridgeUnreachableThreshold = 3
 	bridgeUnreachableWindow    = 10 * time.Minute

@@ -663,8 +663,13 @@ func (c *CLI) registerCommands() {
 	modelCmd.Subcommands["list"] = &Command{
 		Name:        "list",
 		Description: "List checked-in model profiles",
-		Usage:       "oat model list",
-		Run:         c.modelList,
+		Usage: "oat model list [--json]\n\n" +
+			"Flags:\n" +
+			"  --json    Emit a sorted JSON array of {model_id, status, overall_score,\n" +
+			"            worker_eligible, orchestrator_eligible}. Always an array (never\n" +
+			"            null), so consumers can iterate without special-casing empty.\n" +
+			"            Used by the side-panel model combobox in oat-browser-agent.",
+		Run: c.modelList,
 	}
 
 	modelCmd.Subcommands["show"] = &Command{
@@ -843,6 +848,35 @@ func (c *CLI) registerCommands() {
 		Usage: "oat agent stop <name> [--repo <repo>]",
 		Run:   c.agentStopCmd,
 	}
+
+	// Generic per-agent remove. Routes to the right type-specific
+	// cleanup so callers don't have to remember which sub-CLI
+	// (oat assistant remove / oat worker rm) matches which type.
+	// Pre-this-commit, removing a browser-agent or a merge-queue
+	// required either editing state.json or going through the
+	// daemon socket directly — both undocumented. The user-facing
+	// pain point was the side-panel browser-agent card having no
+	// Delete affordance because no CLI verb backed it (smoke-test
+	// feedback 2026-05-29).
+	agentRemoveCmd := &Command{
+		Name: "remove",
+		Description: "Remove an agent of any type (assistants, workers, browser-agents, merge-queues, …). " +
+			"Routes to the right type-specific cleanup automatically; --yes skips confirmation prompts.",
+		Usage: "oat agent remove <name> [--repo <repo>] [--yes] [--force]\n\n" +
+			"Routes by agent type (read from state):\n" +
+			"  - Assistant   → equivalent to `oat assistant remove <name> --yes` (wipes session JSONL\n" +
+			"                  + rotation archives + virtual repo dir).\n" +
+			"  - Worker      → equivalent to `oat worker rm <name> --force` (also cleans the\n" +
+			"                  worktree). --force is required here too.\n" +
+			"  - Browser /   → kills the process + removes the state.Agent record + emits the\n" +
+			"    Merge-queue   `agent_removed` lifecycle frame. No on-disk worktree teardown\n" +
+			"    / others      (these types don't own a per-agent worktree).\n\n" +
+			"--yes skips the interactive confirmation; pass it from scripts / the side-panel\n" +
+			"Delete modal (where the type-to-confirm gate IS the confirmation).",
+		Run: c.removeAgentGeneric,
+	}
+	agentCmd.Subcommands["remove"] = agentRemoveCmd
+	agentCmd.Subcommands["rm"] = agentRemoveCmd
 
 	agentCmd.Subcommands["set-model"] = &Command{
 		Name:        "set-model",
@@ -7073,6 +7107,269 @@ func (c *CLI) agentStopCmd(args []string) error {
 	return nil
 }
 
+// removeAgentGeneric is the type-aware router behind
+// `oat agent remove` / `oat agent rm`. It looks up the agent in
+// state, then delegates to the type-appropriate cleanup path:
+//
+//   - Assistant   → reuses assistantRemove (wipes session JSONL +
+//     rotation archives + virtual repo dir on top of the
+//     state-record removal). The richest cleanup path; reusing
+//     it ensures the generic verb produces an indistinguishable
+//     end-state from `oat assistant remove`.
+//   - Worker      → reuses removeWorker (worktree teardown +
+//     state cleanup). Requires --force just like the worker-
+//     specific verb, since destroying a worktree mid-task is
+//     not the kind of thing we want a typo to do.
+//   - Other types → daemon `remove_agent` socket verb directly.
+//     Covers browser-agent, merge-queue, supervisor, pr-shepherd,
+//     workspace, review, verification, generic-persistent,
+//     agent-builder. The daemon handler already stops the
+//     process, removes the state record, and emits the
+//     `agent_removed` lifecycle frame the side panel listens
+//     for — sufficient for any type that doesn't own a per-
+//     agent worktree.
+//
+// Confirmation: --yes skips both the assistant flow's typed
+// confirmation AND the interactive y/n prompt this command
+// itself emits for "other" types. Passes through to the
+// per-type CLI so behaviour matches what users already know
+// from the per-type verbs.
+func (c *CLI) removeAgentGeneric(args []string) error {
+	flags, remaining := ParseFlags(args)
+	if len(remaining) < 1 {
+		return errors.InvalidUsage("usage: oat agent remove <name> [--repo <repo>] [--yes] [--force]")
+	}
+	agentName := remaining[0]
+	yes := flags["yes"] == "true"
+	force := flags["force"] == "true"
+
+	if err := c.ensureDaemonRunning(); err != nil {
+		return err
+	}
+
+	// Repo resolution. Mirrors what every other `oat agent <verb>`
+	// does: explicit --repo wins; otherwise try to infer from the
+	// cwd's worktree path; otherwise (most likely for assistant
+	// agents whose names are unambiguous globally) fall back to
+	// asking the daemon for the agent's owning repo.
+	repoName := flags["repo"]
+	if repoName == "" {
+		if inferred, err := c.inferRepoFromCwd(); err == nil {
+			repoName = inferred
+		}
+	}
+	if repoName == "" {
+		// Last resort: scan all repos for the agent name. Common
+		// case: a side-panel UI invokes this without knowing what
+		// repo owns the agent (assistants live in virtual repos
+		// named `_assistant-<n>`, not memorable to the operator).
+		found, err := c.findRepoForAgent(agentName)
+		if err != nil {
+			return err
+		}
+		if found == "" {
+			return errors.InvalidUsage(fmt.Sprintf(
+				"could not determine repository for agent '%s' (use --repo or run from within its worktree)",
+				agentName,
+			))
+		}
+		repoName = found
+	}
+
+	// Look up the type. The agent must exist for us to know which
+	// cleanup path to route to.
+	client := socket.NewClient(c.paths.DaemonSock)
+	resp, err := client.Send(socket.Request{
+		Command: "list_agents",
+		Args:    map[string]interface{}{"repo": repoName},
+	})
+	if err != nil {
+		return errors.DaemonCommunicationFailed("looking up agent type", err)
+	}
+	if !resp.Success {
+		return errors.Wrap(errors.CategoryRuntime, "failed to list agents", fmt.Errorf("%s", resp.Error))
+	}
+	agentType := findAgentTypeInListing(resp.Data, agentName)
+	if agentType == "" {
+		return errors.Wrap(
+			errors.CategoryNotFound,
+			fmt.Sprintf("agent '%s' not found in repository '%s'", agentName, repoName),
+			fmt.Errorf("no such agent"),
+		)
+	}
+
+	switch state.AgentType(agentType) {
+	case state.AgentTypeAssistant:
+		// Pull the user-facing assistant name back out of the
+		// virtual repo key (`_assistant-<name>` → `<name>`); the
+		// assistantRemove sub-handler expects the bare name.
+		userName := assistantNameFromVirtualRepo(repoName)
+		if userName == "" {
+			userName = agentName
+		}
+		sub := []string{userName}
+		if yes {
+			sub = append(sub, "--yes")
+		}
+		return c.assistantRemove(sub)
+
+	case state.AgentTypeWorker:
+		// `oat worker rm` requires --force for safety; we honour
+		// the same gate here rather than silently widening the
+		// blast radius of the generic verb.
+		if !force && !yes {
+			return errors.InvalidUsage(fmt.Sprintf(
+				"refusing to remove worker '%s' without --force (workers carry uncommitted work; pass --force to confirm)",
+				agentName,
+			))
+		}
+		sub := []string{agentName, "--force"}
+		if repoName != "" {
+			sub = append(sub, "--repo", repoName)
+		}
+		return c.removeWorker(sub)
+
+	default:
+		// Catch-all: kill + remove via the daemon. Covers
+		// browser, merge-queue, pr-shepherd, supervisor,
+		// workspace, review, verification,
+		// generic-persistent, agent-builder. The daemon
+		// handler emits the `agent_removed` lifecycle frame so
+		// any subscriber (incl. the side panel) reactively
+		// drops its card.
+		if !yes {
+			fmt.Printf(
+				"This will remove agent '%s' (type=%s) from repo '%s':\n"+
+					"  - kills the running process (if any)\n"+
+					"  - removes the state.Agent record\n"+
+					"  - emits an agent_removed lifecycle frame to subscribers\n"+
+					"No on-disk teardown (this agent type doesn't own a per-agent worktree).\n"+
+					"Type 'yes' to confirm: ",
+				agentName, agentType, repoName,
+			)
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			if strings.TrimSpace(line) != "yes" {
+				fmt.Println("Aborted (no changes made).")
+				return nil
+			}
+		}
+		// reason="manual" matches the canonical
+		// daemon.RemovalReasonManual; using the string literal
+		// keeps the cli package from importing daemon (would be a
+		// layering violation — cli already drives daemon via
+		// socket calls, not direct types). See daemon.go
+		// `RemovalReasonManual = "manual"` for the authoritative
+		// constant; keep in sync if that ever changes.
+		removeResp, err := c.sendDaemonRequest("remove_agent", map[string]interface{}{
+			"repo":   repoName,
+			"agent":  agentName,
+			"reason": "manual",
+		})
+		if err != nil {
+			return err
+		}
+		_ = removeResp
+		fmt.Printf("✓ Agent '%s' (type=%s) removed.\n", agentName, agentType)
+		return nil
+	}
+}
+
+// findRepoForAgent scans the daemon's full agent listing for the
+// repo that owns `agentName`. Used by removeAgentGeneric as the
+// last-resort repo fallback when neither --repo nor cwd-inference
+// could resolve it. Returns "" if the agent isn't found in any
+// repo; the caller turns that into an InvalidUsage error with a
+// clearer message than a raw "agent not found".
+func (c *CLI) findRepoForAgent(agentName string) (string, error) {
+	client := socket.NewClient(c.paths.DaemonSock)
+	resp, err := client.Send(socket.Request{Command: "list_agents"})
+	if err != nil {
+		return "", errors.DaemonCommunicationFailed("scanning repos for agent", err)
+	}
+	if !resp.Success {
+		return "", errors.Wrap(errors.CategoryRuntime, "failed to list agents across repos", fmt.Errorf("%s", resp.Error))
+	}
+	// The list_agents response without a repo arg can return
+	// either a flat agent list (each entry carrying its repo
+	// field) or a map keyed by repo, depending on daemon
+	// version. Handle both shapes defensively.
+	switch v := resp.Data.(type) {
+	case []interface{}:
+		for _, raw := range v {
+			a, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := a["name"].(string)
+			if name != agentName {
+				continue
+			}
+			repo, _ := a["repo"].(string)
+			if repo != "" {
+				return repo, nil
+			}
+		}
+	case map[string]interface{}:
+		for repo, raw := range v {
+			list, ok := raw.([]interface{})
+			if !ok {
+				continue
+			}
+			for _, item := range list {
+				a, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if name, _ := a["name"].(string); name == agentName {
+					return repo, nil
+				}
+			}
+		}
+	}
+	return "", nil
+}
+
+// findAgentTypeInListing extracts the `type` field for the
+// agent named `agentName` from a list_agents response payload.
+// Returns "" if not found. Helper so removeAgentGeneric (and
+// any future router) doesn't duplicate the response-shape
+// walk inline.
+func findAgentTypeInListing(data interface{}, agentName string) string {
+	list, ok := data.([]interface{})
+	if !ok {
+		return ""
+	}
+	for _, raw := range list {
+		a, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := a["name"].(string)
+		if name != agentName {
+			continue
+		}
+		t, _ := a["type"].(string)
+		return t
+	}
+	return ""
+}
+
+// assistantNameFromVirtualRepo unwraps the `_assistant-<name>`
+// virtual-repo key back to the bare name the user sees in
+// `oat assistant list`. Returns "" if the key doesn't have the
+// expected prefix (i.e. this isn't a virtual assistant repo).
+// Pulled out so the generic-remove path can route assistants
+// through the existing `assistantRemove` flow without
+// re-implementing the key parsing.
+func assistantNameFromVirtualRepo(repoName string) string {
+	const prefix = "_assistant-"
+	if !strings.HasPrefix(repoName, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(repoName, prefix)
+}
+
 // setAgentModelCmd changes which LLM model an agent uses. Thin
 // wrapper around the daemon's `set_agent_model` socket call (where
 // validation + atomic state update live) plus an optional chained
@@ -9566,18 +9863,33 @@ func (c *CLI) printOnboardSummary(modelStr, probeSet, stderr string) {
 }
 
 func (c *CLI) modelList(args []string) error {
+	flags, _ := ParseFlags(args)
+	asJSON := flags["json"] == "true"
+
 	profileDirs := c.modelProfileDirs()
 
+	// Walk the on-disk profiles first into an in-memory list so
+	// both renderers (table + JSON) operate on the same data
+	// shape. modelListEntry is intentionally kept tiny -- the
+	// side-panel combobox (the original driver for --json) only
+	// needs model_id + status, but exposing the same superset
+	// the table shows keeps callers free to ignore fields they
+	// don't care about.
+	type modelListEntry struct {
+		ModelID              string `json:"model_id"`
+		Status               string `json:"status"`
+		OverallScore         string `json:"overall_score,omitempty"`
+		WorkerEligible       string `json:"worker_eligible,omitempty"`
+		OrchestratorEligible string `json:"orchestrator_eligible,omitempty"`
+	}
 	seen := make(map[string]bool)
-	fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n", "MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR")
-	fmt.Println(strings.Repeat("─", 84))
-
+	var entries []modelListEntry
 	for _, profileDir := range profileDirs {
-		entries, err := os.ReadDir(profileDir)
+		dirEntries, err := os.ReadDir(profileDir)
 		if err != nil {
 			continue
 		}
-		for _, e := range entries {
+		for _, e := range dirEntries {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".yaml") {
 				continue
 			}
@@ -9587,7 +9899,7 @@ func (c *CLI) modelList(args []string) error {
 			}
 			fields := parseYAMLFlat(string(data))
 			modelID := fields["model_id"]
-			if seen[modelID] {
+			if modelID == "" || seen[modelID] {
 				continue
 			}
 			seen[modelID] = true
@@ -9595,14 +9907,45 @@ func (c *CLI) modelList(args []string) error {
 			if orchEligible == "" {
 				orchEligible = fields["supervisor_eligible"]
 			}
-			fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n",
-				modelID,
-				fields["status"],
-				fields["overall_score"],
-				fields["worker_eligible"],
-				orchEligible,
-			)
+			entries = append(entries, modelListEntry{
+				ModelID:              modelID,
+				Status:               fields["status"],
+				OverallScore:         fields["overall_score"],
+				WorkerEligible:       fields["worker_eligible"],
+				OrchestratorEligible: orchEligible,
+			})
 		}
+	}
+
+	if asJSON {
+		// Sort so the wire shape is deterministic across runs --
+		// makes diffing two `oat model list --json` outputs sane.
+		// Side-panel combobox already sorts on the JS side, so
+		// double-sort here is harmless.
+		sort.Slice(entries, func(i, j int) bool { return entries[i].ModelID < entries[j].ModelID })
+		// Always emit a JSON array (even when empty) so consumers
+		// don't have to special-case `null`.
+		if entries == nil {
+			entries = []modelListEntry{}
+		}
+		out, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal model list as JSON: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
+
+	fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n", "MODEL", "STATUS", "SCORE", "WORKER", "ORCHESTRATOR")
+	fmt.Println(strings.Repeat("─", 84))
+	for _, entry := range entries {
+		fmt.Printf("%-40s %-12s %-8s %-10s %-12s\n",
+			entry.ModelID,
+			entry.Status,
+			entry.OverallScore,
+			entry.WorkerEligible,
+			entry.OrchestratorEligible,
+		)
 	}
 
 	if len(seen) == 0 {

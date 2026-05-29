@@ -22,10 +22,11 @@ delete semantics that differ from worker semantics:
   etc.). Default cap is 3 archives × 50 MB; older archives
   evict oldest-first. The rotation policy is local-storage
   only — there is no external backup.
-- **`oat assistant remove <name>`** — destroy the assistant.
-  State record wiped, virtual repo at `_assistant-<name>`
-  removed. This is the destructive flow; `stop` is the right
-  command for everyday "I'm done chatting for now".
+- **`oat assistant remove <name>`** (alias **`rm`**) — destroy
+  the assistant. State record wiped, virtual repo at
+  `_assistant-<name>` removed. This is the destructive flow;
+  `stop` is the right command for everyday "I'm done chatting
+  for now".
 - **`oat agent stop --repo <repo> --agent <name>`** —
   universal pause for any pausable agent (Assistant +
   browser-agent). Same semantics as `oat assistant stop` but
@@ -33,6 +34,16 @@ delete semantics that differ from worker semantics:
   / merge-queues are rejected with
   `RPC_AGENT_TYPE_NOT_PAUSABLE` — use `oat repo hibernate`
   for those.
+- **`oat agent remove <name> [--repo <repo>]`** (alias **`rm`**)
+  — generic, type-aware remove. Routes to the right
+  type-specific cleanup automatically: assistants get the full
+  JSONL + virtual repo dir wipe, workers get worktree teardown
+  (still gated on `--force`), and other types
+  (browser-agent, merge-queue, supervisor, workspace, pr-shepherd,
+  review, verification, generic-persistent, agent-builder) get
+  process-kill + state-record removal + an `agent_removed`
+  lifecycle frame. The side-panel Delete buttons dispatch this
+  verb. See `docs/COMMANDS.md` for the full routing table.
 
 The **side-panel "Pause OAT" button** wraps the bulk-pause
 verb (`pause_web_agents`) which enumerates every Assistant
