@@ -27,11 +27,10 @@ Workers (parallel)                CI Gate                    Main Branch (progre
 
 ## Agent Types
 
-### Lifecycle controls (Part 7 summary)
+### Lifecycle controls
 
 Each agent type has distinct pause / restart / remove
-semantics. Part 7 Commits 7.1 / 7.2 / 7.6 standardised these
-into a single matrix:
+semantics, summarised into a single matrix:
 
 | AgentType | `stop_agent` (pause) | `restart_agent` | `remove_agent` | `pause_web_agents` enumerates? | `route_user_message` target? |
 |-----------|----------------------|-----------------|----------------|--------------------------------|------------------------------|
@@ -52,13 +51,13 @@ The gate constants live in `internal/state`:
 
 Both are hard whitelists: a future `AgentType` added without
 explicitly opting in is denied by default. This is the
-security boundary for the Part 7 socket / NM surfaces — the
-side panel cannot route to or pause non-whitelisted types
-even from a compromised extension.
+security boundary for the side-panel / native-messaging
+socket surface — the side panel cannot route to or pause
+non-whitelisted types even from a compromised extension.
 
-**User-initiated cleanup with reason propagation (Part 7
-Commit 7.2):** the side-panel Delete flow calls
-`remove_agent` with `reason: "user_cleanup_after_pause"`.
+**User-initiated cleanup with reason propagation:** the side-
+panel Delete flow calls `remove_agent` with
+`reason: "user_cleanup_after_pause"`.
 The workspace-replacement notifier is suppressed for this
 reason so the user's explicit Delete does not trigger a
 replacement worker spawn. Audit log captures every removal
@@ -268,10 +267,18 @@ The Personal Assistant is a separate agent type from the workflow-helper Browser
 - **Differs from Browser Agent in tool catalog**: assistant keeps `compact_conversation` (denied for browser). The 95% context-capacity safety net relies on it.
 - **Defense-in-depth**: if the assistant ever calls `oat agent complete`, the daemon returns success/no-op + WARN instead of actually completing it. The assistant prompt teaches it not to call complete; the daemon enforces.
 
-**Context capacity safety net** (Part 5e in plan): the daemon polls `[OAT_TOKENS]` events vs effective context limit (`min(profile.MaxInputTokens, 128 K)`) and:
+**Context capacity safety net**: the daemon polls `[OAT_TOKENS]` events vs effective context limit (`min(profile.MaxInputTokens, 128 K)`) and:
 
 - At ≥ 75 %: silent PTY hint instructing the assistant to call `compact_conversation`. Suppressed 5 min after fire.
 - At ≥ 95 %: synthetic compact-conversation directive injected as a separate PTY message before forwarding any pending user message. Gated by `OAT_CONTEXT_SAFETY_NET` (default ON).
+
+**Autonomous wake-up safeguard** (lives in `internal/daemon/wakeup_marker.go`): the daemon prepends an `[OAT-system]` "you just (re)started, any rehydrated history is from a previous session, wait for a fresh trigger" PTY message on every (re)spawn of `AgentTypeAssistant` agents. Three properties make it load-bearing:
+
+1. **Deterministic and daemon-enforced.** The agent's `assistant.md` prompt also carries a "Stale-intent guard" rule naming the same invariant, but LLMs ignore prompt rules under context pressure — the daemon-side marker is the hard layer, the prompt rule is defense-in-depth.
+2. **Fires on every (re)spawn path.** Fresh spawn (`oat assistant start`), auto-restart (health-check loop), manual restart (side-panel Restart button), and daemon-restart re-adoption (the agent's process survived the daemon's restart and the daemon discovers it alive in `handleStartRepoAgents`). Browser-agent (`AgentTypeBrowser`) is intentionally scoped out — workflow helpers are designed for single-task autonomous execution.
+3. **Rate-limited to prevent crash-loop PTY pollution.** Per-(repo, agent) cooldown via `~/.oat/runtime/<repo>/<agent>/wakeup-marker.ts` (atomic write, persists across daemon restarts). Env override: `OAT_ASSISTANT_WAKEUP_MARKER_INTERVAL_MIN` (default 10). Escape hatch for dev: `OAT_ASSISTANT_WAKEUP_MARKER_DISABLED=1` (the daemon emits a startup WARN if observed).
+
+Audit-log event: `wakeup_marker_injected: repo=<r> agent=<a> pid=<p> trigger=<fresh|restart|daemon-restart>`. Suppressed firings emit the same event with `trigger=rate-limited` so observability tools can detect crash-loop patterns.
 
 See [ASSISTANT.md](ASSISTANT.md) for the user-facing walkthrough and [MCP.md](MCP.md) for the bridge env-var contract (which now includes `OAT_AGENT_TYPE`, `OAT_REPO`, `OAT_MEMORY_ENABLED` for the future memory subsystem).
 

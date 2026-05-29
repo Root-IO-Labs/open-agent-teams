@@ -2,7 +2,7 @@
 
 How to stop OAT when you need your machine for other things, and pick up where you left off later.
 
-## Assistants (Part 7)
+## Assistants
 
 Assistants are interactive, chat-style agents (the side-panel
 Chat tab's targets) that live alongside the autonomous worker

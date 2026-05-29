@@ -99,19 +99,18 @@ oat agent stop --repo <repo> --agent <name>           # Universal pause (Assista
 
 Daemon auto-starts if missing. Assistants live in virtual repos (`_assistant-<name>`); hidden from `oat repo list` unless `--all`. Full walkthrough: [docs/ASSISTANT.md](ASSISTANT.md).
 
-**Stop vs Remove (Part 7):** Since Part 7 Commit 7.1, `oat
-assistant stop` is a *pause* — process killed, state record
-(worktree, session JSONL, model preference) preserved.
-`oat assistant restart <name>` resumes the same session.
-Use `oat assistant remove` (Part 7 Commit 7.2) for the
+**Stop vs Remove:** `oat assistant stop` is a *pause* —
+process killed, state record (worktree, session JSONL, model
+preference) preserved. `oat assistant restart <name>` resumes
+the same session. Use `oat assistant remove` for the
 destructive flow — wipes the `state.Agent` record AND the
 virtual repo. The side panel's Stop / Delete buttons map 1:1
 to these two verbs.
 
-**Universal stop (Part 7 Commit 7.1):** `oat agent stop`
-accepts any `AgentType.IsPausable()` agent (Assistant +
-browser-agent). Workers / supervisors / merge-queues are
-rejected with `RPC_AGENT_TYPE_NOT_PAUSABLE` and pointed at
+**Universal stop:** `oat agent stop` accepts any
+`AgentType.IsPausable()` agent (Assistant + browser-agent).
+Workers / supervisors / merge-queues are rejected with
+`RPC_AGENT_TYPE_NOT_PAUSABLE` and pointed at
 `oat repo hibernate`. The side-panel "Pause OAT" button wraps
 the bulk version (`pause_web_agents` socket verb) which
 enumerates Assistant + browser-agents across every repo.

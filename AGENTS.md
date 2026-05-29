@@ -42,6 +42,8 @@ OAT_TEST_MODE=1 go test ./test/...  # Skip agent startup
 OAT_FAST_MERGE=false               # Disable daemon auto-merge of green PRs (default: true)
 OAT_WORKER_DORMANCY_CAP_MINUTES=30 # Extend worker dormancy cap (default: 15)
 OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (default: 5)
+OAT_ASSISTANT_WAKEUP_MARKER_INTERVAL_MIN=10  # Minutes between wake-up markers for the same assistant (default: 10)
+OAT_ASSISTANT_WAKEUP_MARKER_DISABLED=1       # Disable autonomous wake-up safeguard (dev/test only; default: off)
 ```
 
 ## Architecture Overview
@@ -213,6 +215,8 @@ See `docs/AGENTS.md` for detailed agent documentation including:
 
 > **Note on env-var naming:** `OAT_WORKER_DORMANCY_CAP_MINUTES` (default 15) configures **PR force-merge timing** in `pr_monitor.go` (how long a worker can sit dormant on a green PR before the daemon force-merges it). It does NOT control wake-loop idle suppression — that gate is `repo.IdleMode + repoHasActiveWorkers()` in `daemon.go` with no env-var knob.
 
+**Autonomous wake-up safeguard:** the daemon prepends an `[OAT-system]` "you just (re)started, wait for a fresh trigger" PTY marker on every (re)spawn of assistant agents (fresh spawn, auto-restart from health check, manual restart from the side panel, daemon-restart-driven re-adoption of an alive process). This is the deterministic, daemon-enforced source of truth for "agent doesn't act without a fresh trigger this lifetime"; the matching "Stale-intent guard" rule in `internal/templates/agent-templates/assistant.md` is defense-in-depth. Rate-limited per-(repo, agent) via `~/.oat/runtime/<repo>/<agent>/wakeup-marker.ts` (atomic write, persists across daemon restarts) so a crash-loop doesn't spam the PTY with redundant markers. Browser-agent (`AgentTypeBrowser`) is scoped out — workflow helpers are designed for single-task autonomous execution. Parallel mechanism to the oat-browser-agent's `bridge-restart-marker` (the bridge fires its own one-shot notice for bridge restarts; the wake-up marker fires for agent restarts; both firing is by design — non-conflicting messages). Implementation in `internal/daemon/wakeup_marker.go`.
+
 **Rejection cap:** Workers are auto-completed after repeated verification rejections (default: 3, configurable via `OAT_MAX_REJECTIONS`). The daemon escalates to the supervisor for task reassignment, preventing unbounded token waste from stuck workers.
 
 ## Extensibility
@@ -266,18 +270,18 @@ When modifying extension points (state, socket API):
 ├── sessions/_assistant-<name>/<name>.session.jsonl.1   # Rotation archive #1
 ├── sessions/_assistant-<name>/<name>.session.jsonl.2   # Rotation archive #2
 ├── sessions/_assistant-<name>/<name>.session.jsonl.3   # Rotation archive #3
-│                           # (Part 7 Commit 7.0.5: --fresh rotates instead
-│                           # of deleting; 50 MB / 3-archive cap; older
-│                           # archives evicted oldest-first.)
+│                           # (--fresh rotates instead of deleting; 50 MB /
+│                           # 3-archive cap; older archives evicted
+│                           # oldest-first.)
 ├── wts/<repo>/<agent>/     # Git worktrees (one per agent)
 ├── messages/<repo>/<agent>/ # Message JSON files
 ├── output/<repo>/          # Agent output logs
 │   ├── workers/            # Worker-specific logs
 │   ├── browser-agent-actions.jsonl  # Browser agent audit log
 │   └── <agent>.routes.jsonl  # route_user_message audit log
-│                           # (Part 7 Commit 7.3: per-route entries with
-│                           # ts + target + byte_count + sha256; full text
-│                           # NEVER persisted here -- lives in session JSONL.)
+│                           # (per-route entries with ts + target + byte_count
+│                           # + sha256; full text NEVER persisted here -- lives
+│                           # in session JSONL.)
 ├── downloads/<repo>/       # Browser agent download directory
 └── agent-config/<repo>/<agent>/ # Per-agent OAT config directory
     └── commands/           # Slash command files (*.md)
@@ -287,14 +291,13 @@ When modifying extension points (state, socket API):
 - `(default)` — generic removal; recovery paths may attempt
   to spawn a replacement worker if the original had an open
   task.
-- `user_cleanup_after_pause` (Part 7 Commit 7.2) —
+- `user_cleanup_after_pause` —
   workspace-replacement notifier is **suppressed**: the
   user explicitly chose Delete, so no replacement worker
   is requested. Audit-logged for forensic visibility.
 
-**Agent pausability** (`AgentType.IsPausable()`, Part 7
-Commit 7.1) — the whitelist that gates `stop_agent` and
-`pause_web_agents`:
+**Agent pausability** (`AgentType.IsPausable()`) — the
+whitelist that gates `stop_agent` and `pause_web_agents`:
 
 | AgentType | Pausable? | Pause mechanism |
 |-----------|-----------|-----------------|

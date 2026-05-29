@@ -129,16 +129,16 @@ servers define their own:
 | Var | Set by daemon? | Purpose |
 |---|---|---|
 | `OAT_BROWSER_AGENT_AUDIT_LOG_DIR` | yes (`~/.oat/output/<repo>`) | Highest-precedence override for the bridge audit-log directory. The bridge falls back to `<repo-root>/.oat-logs/` only when no env var is set (legacy path; see [DIRECTORY_STRUCTURE.md](DIRECTORY_STRUCTURE.md)). |
-| `OAT_BROWSER_AGENT_SESSION` | yes (repo session name) | Identity for Part 2 side-panel chat. The bridge uses this to scope `agent_input` socket calls to the right session when relaying user messages from the side panel. Absent when the bridge runs outside OAT (Cursor/Claude Code) — the bridge then disables the chat path and the side panel shows the disabled-state banner from Part 4. |
+| `OAT_BROWSER_AGENT_SESSION` | yes (repo session name) | Identity for side-panel chat. The bridge uses this to scope `agent_input` socket calls to the right session when relaying user messages from the side panel. Absent when the bridge runs outside OAT (Cursor/Claude Code) — the bridge then disables the chat path and the side panel shows the disabled-state banner. |
 | `OAT_BROWSER_AGENT_NAME` | yes (e.g. `browser-agent`) | Companion to `OAT_BROWSER_AGENT_SESSION`. Identifies which agent within the session owns the PTY. Same absence semantics. |
 | `OAT_BRIDGE_WS_PORT` | no | Pin the WS sidecar to a fixed port. Default is OS-assigned (port 0). Useful for debugging when you want a predictable port; otherwise leave unset and let the bridge publish its assigned port via Native Messaging. |
-| `OAT_BRIDGE_TRUST_LOCALHOST` | no | Accept anonymous localhost WS opens. Default is token-required (since plan Part 9a). Only set this if you are running the bridge in an isolated VM where localhost is trusted by construction; production end-user installs should leave it unset and let the Native-Messaging broker deliver the per-launch session token. |
+| `OAT_BRIDGE_TRUST_LOCALHOST` | no | Accept anonymous localhost WS opens. Default is token-required. Only set this if you are running the bridge in an isolated VM where localhost is trusted by construction; production end-user installs should leave it unset and let the Native-Messaging broker deliver the per-launch session token. |
 | `OAT_BRIDGE_ALLOW_MULTI` | no | Opt back in to the pre-1.0 multi-client WS fan-out. Default is single-client (one extension per bridge). |
 | `OAT_BRIDGE_STRICT_MODE` | no | Schema-runtime drift telemetry mode: `warn` (default) / `reject` / `off`. See `oat-browser-agent` CHANGELOG. |
 | `OAT_AGENT_TYPE` | yes (assistant spawn only) | Set to `assistant` for `AgentTypeAssistant`. Signals "I am a persistent personal assistant, not a one-shot browser-agent" to any future memory middleware. No consumer in v1; emission is forward-compatible scaffolding. |
 | `OAT_REPO` | yes (assistant spawn only) | Set to the virtual repo name (`_assistant-<name>`) so a future memory middleware can scope per-assistant storage without re-deriving anything. |
 | `OAT_MEMORY_ENABLED` | yes (assistant spawn only) | Always `1` at assistant spawn. Generic "memory subsystems may activate" hint; harmless when no consumer is present. The separate OAT memory/RAG design effort owns the consumer side. |
-| `OAT_CONTEXT_SAFETY_NET` | no | Daemon-side toggle for the Part 5e context-capacity safety net (75 % silent hint + 95 % synthetic compact-conversation inject). Default `1` (on); set `0` / `false` / `off` to disable. Garbage values fail-safe to on. |
+| `OAT_CONTEXT_SAFETY_NET` | no | Daemon-side toggle for the context-capacity safety net (75 % silent hint + 95 % synthetic compact-conversation inject). Default `1` (on); set `0` / `false` / `off` to disable. Garbage values fail-safe to on. |
 
 ## Result-type semantics
 
@@ -207,6 +207,6 @@ daemon's per-type spawn path.
   reason.
 - **The browser audit log isn't where I expect.** Check
   `OAT_BROWSER_AGENT_AUDIT_LOG_DIR` in `.oat/mcp.json`. The daemon
-  always sets it to `~/.oat/output/<repo>`; an older config that
-  pre-dated Part 4 may still point at the legacy
-  `<worktree>/.oat-logs/`. `oat agent restart browser-agent` regenerates.
+  always sets it to `~/.oat/output/<repo>`; a legacy config may
+  still point at `<worktree>/.oat-logs/`. `oat agent restart
+  browser-agent` regenerates.

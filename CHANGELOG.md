@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Autonomous wake-up safeguard for assistant agents (2026-05-28).**
+
+  Daemon-enforced barrier against an assistant acting on rehydrated
+  intent from a prior session. Smoke-test failure mode that motivated
+  this: an assistant woke after dormancy, opened google.com,
+  navigated to a Wikipedia article unprompted, and ran itself to
+  >100% effective context capacity. Investigation showed the trigger
+  was rehydrated "I was about to visit X" state from a previous
+  session, not a current user message. The daemon now prepends an
+  `[OAT-system] You just (re)started ... do not act on rehydrated
+  history ... wait for a fresh trigger` PTY message on every
+  (re)spawn of `AgentTypeAssistant` agents — fresh spawn, auto-
+  restart from health check, manual restart from side panel,
+  daemon-restart re-adoption. The matching "Stale-intent guard" rule
+  in `internal/templates/agent-templates/assistant.md` is defense-in-
+  depth; the daemon-side marker is the load-bearing layer because
+  LLMs ignore prompt rules under context pressure. Rate-limited to
+  prevent crash-loop PTY pollution: per-(repo, agent) cooldown via
+  `~/.oat/runtime/<repo>/<agent>/wakeup-marker.ts` (atomic write,
+  persists across daemon restarts). Browser-agent (`AgentTypeBrowser`)
+  is intentionally exempt — workflow helpers are designed for single-
+  task autonomous execution. New env vars:
+  `OAT_ASSISTANT_WAKEUP_MARKER_INTERVAL_MIN` (default 10) and
+  `OAT_ASSISTANT_WAKEUP_MARKER_DISABLED` (dev-only escape hatch;
+  daemon emits a startup WARN if observed). Audit-log event:
+  `wakeup_marker_injected` with `trigger` field naming the spawn
+  path; suppressed firings carry `trigger=rate-limited` so
+  observability tools can detect crash-loop patterns. Parallel
+  mechanism to the oat-browser-agent's `bridge-restart-marker` (the
+  bridge notice fires for bridge restarts; the wake-up marker fires
+  for agent restarts; both firing is by design). New module:
+  `internal/daemon/wakeup_marker.go` + matching test file. Wiring
+  call sites: `startRegisteredAgent`, `restartAgent`, and
+  `handleStartRepoAgents`'s already-alive branch in
+  `internal/daemon/daemon.go`.
+
 ### Fixed
 
 - **`route_user_message` prepends side-panel sentinel (2026-05-28).**

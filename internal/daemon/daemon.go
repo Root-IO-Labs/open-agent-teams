@@ -339,6 +339,17 @@ type Daemon struct {
 	// multiple goroutines (handleStopAgent, healthCheckLoop,
 	// etc.).
 	agentLifecycleBroadcaster *agentLifecycleBroadcaster
+
+	// wakeUpMarkers tracks which assistant agent processes have
+	// already had a wake-up marker injected during their current
+	// process lifetime. Keyed by "<repo>/<agent>/<pid>". Persistent
+	// rate-limiting (across daemon restarts) lives in the per-(repo,
+	// agent) timestamp file under ~/.oat/runtime/; this in-process
+	// tracker is just the "once per pid lifetime" gate so two
+	// spawn-path callers (e.g. startRegisteredAgent + a racing
+	// already-alive branch) don't both fire the marker. See
+	// wakeup_marker.go for the full design.
+	wakeUpMarkers *wakeUpMarkerTracker
 }
 
 // routeRateLimitWindow is the minimum interval between
@@ -423,6 +434,14 @@ func New(paths *config.Paths) (*Daemon, error) {
 		agentLifecycleMutexes:       make(map[string]*sync.Mutex),
 		routeRateLimit:              make(map[string]time.Time),
 		agentLifecycleBroadcaster:   newAgentLifecycleBroadcaster(logger.Debug),
+		wakeUpMarkers:               newWakeUpMarkerTracker(),
+	}
+
+	if wakeUpMarkerDisabled() {
+		logger.Warn(
+			"%s=1 — autonomous wake-up protection is OFF (intended for dev/test only; assistants will not receive the [OAT-system] wake-up marker on (re)spawn)",
+			wakeUpMarkerDisabledEnv,
+		)
 	}
 
 	// Load model profiles for routing (non-fatal if missing).
@@ -5063,6 +5082,19 @@ func (d *Daemon) handleStartRepoAgents(req socket.Request) socket.Response {
 		// to spawn just it -- without this guard we'd double-spawn every
 		// existing supervisor / merge-queue / worker).
 		if agent.PID > 0 && isProcessAlive(agent.PID) {
+			// Even though we're NOT respawning here, this branch is
+			// hit during daemon-restart re-adoption (start_repo_agents
+			// is the entry point for both fresh "oat repo start" and
+			// the daemon's startup-time restoreRepoAgents path). The
+			// agent's process survived the daemon's restart but its
+			// conversation history is still rehydrated state from
+			// before — the same stale-intent risk the wake-up marker
+			// is designed to defuse. The in-process tracker ensures
+			// the marker fires at most once per (repo, agent, pid),
+			// so a subsequent "oat repo start" invocation in the same
+			// daemon lifetime is a no-op via the in-process gate. See
+			// wakeup_marker.go for details.
+			d.injectWakeUpMarker(repoName, agentName, agent, WakeUpMarkerTriggerDaemonRestart)
 			results = append(results, agentResult{Name: agentName, PID: agent.PID})
 			continue
 		}
@@ -5247,6 +5279,15 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 	}
 
 	d.logger.Info("Started registered agent %s/%s (PID=%d)", repoName, agentName, pid)
+
+	// Inject the autonomous wake-up safeguard marker for assistant
+	// agents (no-op for any other agent type). Fired AFTER the state
+	// update so the marker function reads the fresh (repo, agent,
+	// pid) tuple. The injection is the agent's first PTY write in
+	// the new process lifetime, so it lands ahead of any rehydrated
+	// user message or queued inter-agent message. See wakeup_marker.go
+	// for the full design — best-effort, must not block agent startup.
+	d.injectWakeUpMarker(repoName, agentName, agent, WakeUpMarkerTriggerFresh)
 
 	// Part 5g.5 Slice A (2026-05-22): operator-visible coexistence
 	// log for browser-agents. When a second (or third, ...)
@@ -8322,6 +8363,20 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	}
 
 	d.logger.Info("Restarted agent %s with PID %d (resumed=%v)", agentName, pid, hasHistory)
+
+	// Inject the wake-up marker for assistants after a restart. This
+	// path covers BOTH operator-driven restarts (handleRestartAgent /
+	// handleRestartBrowserAgent) AND health-check auto-restarts (the
+	// health-check loop calls into restartAgent directly). The marker
+	// doesn't distinguish the two at the call site — both indicate
+	// the agent's process restarted and any rehydrated history should
+	// not be acted on without a fresh trigger. Refresh the agent.PID
+	// from local 'pid' so the marker reads the new process identity
+	// (state was already updated above via UpdateAgentPID).
+	agentForMarker := agent
+	agentForMarker.PID = pid
+	d.injectWakeUpMarker(repoName, agentName, agentForMarker, WakeUpMarkerTriggerRestart)
+
 	return nil
 }
 
