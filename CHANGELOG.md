@@ -31,6 +31,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bridge-side tool-result cap + LRU blob cache + `browser_fetch_blob` recovery tool (2026-05-29; ships in oat-browser-agent).**
+
+  Source-side defense-in-depth for the same context-overflow
+  failure mode the daemon-side 128K bump addresses. A single
+  `browser_get_text` on a 600K-char Wikipedia article can blow
+  any reasonable budget in one call, and the daemon's 75% / 95%
+  compaction tiers have no chance to react because a single tool
+  result occupies the entire history. The bridge now bounds the
+  visible size of every read-tool response BEFORE it enters the
+  agent's MCP context, keeps the full pre-truncation content in
+  an in-process LRU cache, and exposes a new MCP tool that the
+  agent can use to fetch additional bytes without re-running the
+  original tool.
+
+  Three coordinated layers (ship together as one
+  oat-browser-agent commit):
+
+  - **Tool-result cap** (`bridge/src/tool-result-cap.ts`, new).
+    Read-tool whitelist: `browser_get_text`, `browser_snapshot`,
+    `browser_extract`, `browser_find`, `browser_observe`,
+    `browser_console_messages`, `browser_network_requests`,
+    `browser_evaluate`, `browser_cookies_list` (the same set
+    already wrapped by the bridge's `[UNTRUSTED-<nonce>:BEGIN]...
+    [:END]` envelope). Action tools are NEVER capped. Cap policy:
+    `OAT_BRIDGE_TOOL_OUTPUT_CAP_CHARS` (absolute, clamped to
+    `[4096, 8_000_000]`) wins over
+    `OAT_BRIDGE_TOOL_OUTPUT_CAP_FRACTION` (default `0.20` of the
+    effective context budget, clamped to `[0.01, 1.0]`; `0`
+    disables with a WARN). Static `32_000`-char default until the
+    bridge sees its first `stream_context_capacity` frame from
+    the daemon. UTF-8-safe truncation (never splits a surrogate
+    pair); cap applied to INNER content BEFORE the
+    `[UNTRUSTED-...]` wrap so the wrap stays the outermost
+    layer.
+
+  - **Truncation marker.** When a read-tool result is truncated,
+    the visible content gets a structured footer:
+
+        [TRUNCATED: original=612345 chars, showing=32768,
+         blob_id=<uuid>. Recovery: use browser_extract(selector)
+         for a scoped portion, browser_find(text) to locate a
+         section, browser_get_text(range=[N,M]) to paginate, OR
+         browser_fetch_blob(id="<uuid>", range=[N,M]) for
+         additional bytes from the cached full result (blob
+         expires in ~5 min or on bridge restart — if
+         BLOB_EXPIRED, re-run the original tool with a scoped
+         variant).]
+
+    Hardcoded text (template-string with only numeric +
+    blob-UUID interpolation), so the marker isn't a prompt-
+    injection vector. MCP-aware clients also see a structured
+    `_meta.truncation` block on the envelope so they can detect
+    truncation programmatically without parsing the marker.
+
+  - **In-process LRU blob cache** (`bridge/src/tool-result-blob-
+    cache.ts`, new). 50 MB hard cap
+    (`OAT_BRIDGE_BLOB_CACHE_MAX_BYTES`, clamped to
+    `[4096, 1_000_000_000]`), 5-minute TTL
+    (`OAT_BRIDGE_BLOB_CACHE_TTL_MS`, clamped to
+    `[1_000, 86_400_000]`). LRU eviction by total byte count;
+    TTL checked lazily at read time (no background sweep). UUID
+    v4 blob IDs (non-enumerable). Single-blob safety: a put
+    larger than the cache cap stores only the first cap-bytes
+    and reports `blobTruncated: true` so the marker can warn the
+    agent that even the "full" blob is bounded. Bridge restart
+    wipes the cache; agents that get `BLOB_EXPIRED` re-run the
+    original tool with a scoped variant (the error's recovery
+    hint says so).
+
+  - **New MCP tool `browser_fetch_blob(id, range)`.** Pure-bridge
+    tool (no extension hop, no tab context). `range` uses JS
+    string-slice semantics; out-of-bounds clamps with a flag;
+    reversed/negative ranges return `INVALID_RANGE`. Cache miss
+    returns `BLOB_EXPIRED` with the recovery hint. The fetched
+    slice is subject to the same source-side cap (so a large
+    slice itself gets a new blob ID + marker — bounded recursion
+    on demand). Side-effect tools NEVER opt into the cache.
+
+  New env vars: `OAT_BRIDGE_TOOL_OUTPUT_CAP_CHARS`,
+  `OAT_BRIDGE_TOOL_OUTPUT_CAP_FRACTION`,
+  `OAT_BRIDGE_BLOB_CACHE_MAX_BYTES`,
+  `OAT_BRIDGE_BLOB_CACHE_TTL_MS`. All clamped + WARN-on-bad
+  per the cap module's misconfiguration ergonomics.
+
+  Tests: 50 new bridge tests across `tool-result-cap.test.ts`
+  and `tool-result-blob-cache.test.ts` covering every precedence
+  path, clamp boundary, UTF-8 boundary, LRU eviction, TTL expiry,
+  and range-parameter shape. Full bridge suite (1963 tests) green.
+  Wired in `internal/templates/agent-templates/assistant.md` so
+  the assistant prompt teaches the recovery vocabulary.
+
 - **`OAT_MODEL_CONTEXT_<normalized-modelID>` env override for the daemon's effective context limit (2026-05-29).**
 
   Operator escape hatch + CI hook for bring-your-own-model

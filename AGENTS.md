@@ -45,6 +45,10 @@ OAT_CORE_AGENT_SOFT_TIMEOUT=10     # Minutes before nudging stuck core agents (d
 OAT_ASSISTANT_WAKEUP_MARKER_INTERVAL_MIN=10  # Minutes between wake-up markers for the same assistant (default: 10)
 OAT_ASSISTANT_WAKEUP_MARKER_DISABLED=1       # Disable autonomous wake-up safeguard (dev/test only; default: off)
 OAT_MODEL_CONTEXT_<normalized-modelID>=128000 # Runtime override for an agent's max input tokens; clamped to [1024, 16000000]
+OAT_BRIDGE_TOOL_OUTPUT_CAP_FRACTION=0.20      # Bridge cap on a single tool result as fraction of effective context (default: 0.20; clamped [0.01, 1.0]; 0 disables with WARN)
+OAT_BRIDGE_TOOL_OUTPUT_CAP_CHARS=32000        # Absolute char cap on a single tool result; takes precedence over fraction; clamped [4096, 8000000]
+OAT_BRIDGE_BLOB_CACHE_MAX_BYTES=50000000      # Bridge blob-cache hard cap for over-cap tool results (default 50 MB; clamped [4096, 1000000000])
+OAT_BRIDGE_BLOB_CACHE_TTL_MS=300000           # Blob cache entry TTL (default 5 min; clamped [1000, 86400000])
 ```
 
 **`OAT_MODEL_CONTEXT_<modelID>` env override.** Highest-precedence
@@ -67,6 +71,26 @@ onboard <modelID>`; this env override is the escape hatch for
 bring-your-own-model setups (local Ollama, custom routers,
 internal proxies) and unattended CI workflows where the onboard
 probe is impractical.
+
+**Bridge-side tool-result cap.** The bridge bounds every read-
+tool response (`browser_get_text`, `browser_snapshot`,
+`browser_extract`, `browser_find`, `browser_observe`,
+`browser_console_messages`, `browser_network_requests`,
+`browser_evaluate`, `browser_cookies_list`) so a single Wikipedia-
+class page can't blow the assistant's entire context window in
+one call. Default cap = `0.20` × effective context budget
+(`OAT_BRIDGE_TOOL_OUTPUT_CAP_FRACTION`); absolute override via
+`OAT_BRIDGE_TOOL_OUTPUT_CAP_CHARS`. Before the bridge has
+received its first `stream_context_capacity` frame from the
+daemon, a conservative `32_000`-char static default is used.
+When a response gets truncated, the bridge stashes the full
+content in an in-process LRU blob cache
+(`OAT_BRIDGE_BLOB_CACHE_MAX_BYTES`,
+`OAT_BRIDGE_BLOB_CACHE_TTL_MS`) and the agent gets a structured
+`[TRUNCATED: ... blob_id=<uuid> ...]` marker pointing at the new
+`browser_fetch_blob(id, range)` recovery tool. Action tools
+(`browser_click`, `browser_navigate`, ...) return small metadata
+and are NEVER capped or cached.
 
 ## Architecture Overview
 
