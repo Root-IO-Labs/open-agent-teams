@@ -195,3 +195,68 @@ func TestFindAgentTypeInListing(t *testing.T) {
 		}
 	})
 }
+
+// TestExtractAgentStatus pins the rich-mode list_agents walk
+// used by the assistantStart spawn-poll loop to surface
+// fast-failure diagnostics. The daemon writes a `last_error`
+// field when the agent's spawn / runtime errored; the helper
+// must surface both status and last_error in lock-step so the
+// CLI's stderr warning is actionable.
+func TestExtractAgentStatus(t *testing.T) {
+	listing := []interface{}{
+		map[string]interface{}{
+			"name":       "personal",
+			"type":       "assistant",
+			"status":     "running",
+			"last_error": "",
+		},
+		map[string]interface{}{
+			"name":       "broken",
+			"type":       "assistant",
+			"status":     "stopped",
+			"last_error": "model anthropic:bogus not onboarded",
+		},
+		map[string]interface{}{
+			// Older daemon that doesn't yet emit last_error.
+			"name":   "legacy",
+			"type":   "assistant",
+			"status": "running",
+		},
+	}
+	cases := []struct {
+		agent      string
+		wantStatus string
+		wantErr    string
+	}{
+		{"personal", "running", ""},
+		{"broken", "stopped", "model anthropic:bogus not onboarded"},
+		// last_error absent => "" (not the literal "<nil>" of a
+		// bad cast).
+		{"legacy", "running", ""},
+		// Unknown agent => both empty (caller treats as "no
+		// signal yet" and keeps polling).
+		{"does-not-exist", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.agent, func(t *testing.T) {
+			gotStatus, gotErr := extractAgentStatus(listing, tc.agent)
+			if gotStatus != tc.wantStatus {
+				t.Errorf("status = %q, want %q", gotStatus, tc.wantStatus)
+			}
+			if gotErr != tc.wantErr {
+				t.Errorf("last_error = %q, want %q", gotErr, tc.wantErr)
+			}
+		})
+	}
+
+	t.Run("non-list-payload", func(t *testing.T) {
+		s, e := extractAgentStatus("oops", "anything")
+		if s != "" || e != "" {
+			t.Errorf("non-list payload should return ('','') got (%q,%q)", s, e)
+		}
+		s, e = extractAgentStatus(nil, "anything")
+		if s != "" || e != "" {
+			t.Errorf("nil payload should return ('','') got (%q,%q)", s, e)
+		}
+	})
+}

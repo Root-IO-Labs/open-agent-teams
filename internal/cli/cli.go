@@ -5595,12 +5595,36 @@ func (c *CLI) getReposList() []string {
 
 func (c *CLI) tellAgent(args []string) error {
 	flags, posArgs := ParseFlags(args)
-	if len(posArgs) < 2 {
-		return errors.InvalidUsage("usage: oat agent tell <agent-name> <message> [--repo <repo>]")
+
+	// `tell` is the one verb with a SECOND positional (the
+	// message). When --name is in use, ALL positional args are
+	// the message; when --name isn't in use, the first
+	// positional is the agent name and the rest are the message.
+	// Validate the per-verb usage shape before delegating to the
+	// generic resolver so the error message points at the right
+	// shape.
+	var (
+		nameArgs []string
+		message  string
+	)
+	if strings.TrimSpace(flags["name"]) != "" {
+		if len(posArgs) < 1 {
+			return errors.InvalidUsage("usage: oat agent tell --name <agent-name> <message> [--repo <repo>]")
+		}
+		nameArgs = nil
+		message = strings.Join(posArgs, " ")
+	} else {
+		if len(posArgs) < 2 {
+			return errors.InvalidUsage("usage: oat agent tell <agent-name> <message> [--repo <repo>] OR oat agent tell --name <agent-name> <message> --repo <repo>")
+		}
+		nameArgs = posArgs[:1]
+		message = strings.Join(posArgs[1:], " ")
 	}
 
-	agentName := posArgs[0]
-	message := strings.Join(posArgs[1:], " ")
+	agentName, err := resolveAgentNameArg(flags, nameArgs)
+	if err != nil {
+		return err
+	}
 
 	repoName, err := c.resolveRepo(flags)
 	if err != nil {
@@ -5622,11 +5646,11 @@ func (c *CLI) tellAgent(args []string) error {
 
 func (c *CLI) interruptAgent(args []string) error {
 	flags, posArgs := ParseFlags(args)
-	if len(posArgs) < 1 {
-		return errors.InvalidUsage("usage: oat agent interrupt <agent-name> [--repo <repo>]")
-	}
 
-	agentName := posArgs[0]
+	agentName, err := resolveAgentNameArg(flags, posArgs)
+	if err != nil {
+		return err
+	}
 	repoName, err := c.resolveRepo(flags)
 	if err != nil {
 		return errors.NotInRepo()
@@ -7011,14 +7035,12 @@ func (c *CLI) refreshAgentPrompts(args []string) error {
 }
 
 func (c *CLI) restartAgentCmd(args []string) error {
-	// Parse flags
 	flags, remaining := ParseFlags(args)
 
-	// Get agent name from args
-	if len(remaining) < 1 {
-		return errors.InvalidUsage("usage: oat agent restart <name> [--repo <repo>] [--force]")
+	agentName, err := resolveAgentNameArg(flags, remaining)
+	if err != nil {
+		return err
 	}
-	agentName := remaining[0]
 
 	// Get repo from flag or infer from cwd
 	repoName := flags["repo"]
@@ -7079,10 +7101,11 @@ func (c *CLI) restartAgentCmd(args []string) error {
 // usage error, same as restart.
 func (c *CLI) agentStopCmd(args []string) error {
 	flags, remaining := ParseFlags(args)
-	if len(remaining) < 1 {
-		return errors.InvalidUsage("usage: oat agent stop <name> [--repo <repo>]")
+
+	agentName, err := resolveAgentNameArg(flags, remaining)
+	if err != nil {
+		return err
 	}
-	agentName := remaining[0]
 
 	repoName := flags["repo"]
 	if repoName == "" {
@@ -7136,10 +7159,11 @@ func (c *CLI) agentStopCmd(args []string) error {
 // from the per-type verbs.
 func (c *CLI) removeAgentGeneric(args []string) error {
 	flags, remaining := ParseFlags(args)
-	if len(remaining) < 1 {
-		return errors.InvalidUsage("usage: oat agent remove <name> [--repo <repo>] [--yes] [--force]")
+
+	agentName, err := resolveAgentNameArg(flags, remaining)
+	if err != nil {
+		return err
 	}
-	agentName := remaining[0]
 	yes := flags["yes"] == "true"
 	force := flags["force"] == "true"
 
@@ -7330,6 +7354,40 @@ func (c *CLI) findRepoForAgent(agentName string) (string, error) {
 	return "", nil
 }
 
+// extractAgentStatus pulls the rich-mode `status` and (optional)
+// `last_error` fields for an agent from a `list_agents`
+// response payload. Walks the same list shape as
+// findAgentTypeInListing — copy of the pattern rather than a
+// shared loop because the rich payload only carries these
+// fields when `rich=true` was passed in the request, so the
+// caller's contract differs from the non-rich
+// findAgentTypeInListing path.
+//
+// Returns ("", "") when the agent name isn't found, when the
+// payload isn't a list, or when the daemon is older than the
+// 2026-05-29 last_error surfacing change (status returns
+// normally; lastErr is empty).
+func extractAgentStatus(data interface{}, agentName string) (status, lastErr string) {
+	list, ok := data.([]interface{})
+	if !ok {
+		return "", ""
+	}
+	for _, raw := range list {
+		a, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := a["name"].(string)
+		if name != agentName {
+			continue
+		}
+		s, _ := a["status"].(string)
+		le, _ := a["last_error"].(string)
+		return s, le
+	}
+	return "", ""
+}
+
 // findAgentTypeInListing extracts the `type` field for the
 // agent named `agentName` from a list_agents response payload.
 // Returns "" if not found. Helper so removeAgentGeneric (and
@@ -7389,10 +7447,11 @@ func assistantNameFromVirtualRepo(repoName string) string {
 //     the spawn path.
 func (c *CLI) setAgentModelCmd(args []string) error {
 	flags, remaining := ParseFlags(args)
-	if len(remaining) < 1 {
-		return errors.InvalidUsage("usage: oat agent set-model <name> --model <id> [--repo <repo>] [--restart]")
+
+	agentName, err := resolveAgentNameArg(flags, remaining)
+	if err != nil {
+		return err
 	}
-	agentName := remaining[0]
 
 	model := strings.TrimSpace(flags["model"])
 	if model == "" {
@@ -8206,10 +8265,19 @@ func (c *CLI) attachAgent(args []string) error {
 
 	agents, _ := resp.Data.([]interface{})
 
-	// Determine agent name - from args or interactive selection
+	// Determine agent name - from args, --name flag, or
+	// interactive selection. Unlike the other agent verbs,
+	// attach falls through to an interactive picker when neither
+	// form is present, so we only delegate to
+	// resolveAgentNameArg when at least one is.
 	var agentName string
-	if len(remainingArgs) > 0 {
-		agentName = remainingArgs[0]
+	hasNameInput := len(remainingArgs) > 0 || strings.TrimSpace(flags["name"]) != ""
+	if hasNameInput {
+		resolved, resolveErr := resolveAgentNameArg(flags, remainingArgs)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		agentName = resolved
 	} else {
 		// Interactive selection - all agent types
 		items := agentsToSelectableItems(agents, nil)
@@ -9252,6 +9320,70 @@ func ParseFlags(args []string) (map[string]string, []string) {
 	}
 
 	return flags, positional
+}
+
+// resolveAgentNameArg lets every `oat agent <verb>` accept the
+// agent name either positionally (the today-canonical shape) OR
+// via an explicit `--name <name>` flag. Both forms are valid for
+// every verb that takes an agent name as its first positional;
+// the positional form stays the documented one-line synopsis to
+// keep muscle-memory parity with `oat agent stop`, `restart`,
+// `tell`, `interrupt`, `attach`, `set-model`, and `remove`. The
+// flag form reads more clearly in scripts ("remove --name foo")
+// where the reader can't tell what the positional refers to.
+//
+// Precedence rules (locked, 2026-05-29 smoke-test follow-up):
+//
+//   - positional only        -> return the positional.
+//   - --name only            -> return the flag value.
+//   - both set               -> ambiguous; return InvalidUsage so
+//     the operator picks one. Mixing the two in the same call is
+//     almost always a typo (operator copy-pasted a `--name`
+//     example on top of an existing positional invocation), and
+//     silently preferring one over the other has the worse
+//     failure mode of "command ran against the wrong agent".
+//   - neither                -> InvalidUsage; same one-liner the
+//     handlers used to print on their own.
+//
+// Callers replace the existing
+//
+//	if len(remaining) < 1 { return errors.InvalidUsage(...) }
+//	agentName := remaining[0]
+//
+// pattern with
+//
+//	agentName, err := resolveAgentNameArg(flags, remaining)
+//	if err != nil { return err }
+//
+// The flag map's `name` entry is consumed (deleted) on success so
+// callers passing the same map to a subsequent helper don't see
+// a stale --name and treat it as something else.
+func resolveAgentNameArg(flags map[string]string, remaining []string) (string, error) {
+	flagName := strings.TrimSpace(flags["name"])
+	var positional string
+	if len(remaining) >= 1 {
+		positional = strings.TrimSpace(remaining[0])
+	}
+
+	hasPositional := positional != ""
+	hasFlag := flagName != ""
+
+	if hasPositional && hasFlag {
+		return "", errors.InvalidUsage(fmt.Sprintf(
+			"provide the agent name either positionally OR via --name, not both (got positional=%q name=%q)",
+			positional, flagName,
+		))
+	}
+	if !hasPositional && !hasFlag {
+		return "", errors.InvalidUsage(
+			"agent name is required (positional or --name); usage: oat agent <verb> <name> [--repo <repo>] OR oat agent <verb> --name <name> --repo <repo>",
+		)
+	}
+	if hasFlag {
+		delete(flags, "name") // consume so callers don't re-read it as something else.
+		return flagName, nil
+	}
+	return positional, nil
 }
 
 // savePromptToFile writes prompt text to the prompts directory and returns the path.

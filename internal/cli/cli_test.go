@@ -113,6 +113,130 @@ func TestParseFlags(t *testing.T) {
 	}
 }
 
+// TestResolveAgentNameArg pins the resolver's four-branch
+// behavior for the `--name` dual-form alternative across every
+// `oat agent <verb>`. Locked precedence: positional XOR --name
+// produces the value; both = ambiguous (refuse); neither =
+// usage error.
+func TestResolveAgentNameArg(t *testing.T) {
+	cases := []struct {
+		name       string
+		flags      map[string]string
+		remaining  []string
+		wantName   string
+		wantErr    bool
+		wantErrSub string // substring of error message; "" = don't check
+	}{
+		{
+			name:      "positional only",
+			flags:     map[string]string{},
+			remaining: []string{"merge-queue"},
+			wantName:  "merge-queue",
+		},
+		{
+			name:      "--name only",
+			flags:     map[string]string{"name": "merge-queue"},
+			remaining: nil,
+			wantName:  "merge-queue",
+		},
+		{
+			name:      "--name and other flags coexist (--repo passthrough)",
+			flags:     map[string]string{"name": "browser-agent", "repo": "fizzbuzz"},
+			remaining: nil,
+			wantName:  "browser-agent",
+		},
+		{
+			name:       "both set is ambiguous (refuse rather than silently prefer)",
+			flags:      map[string]string{"name": "browser-agent"},
+			remaining:  []string{"merge-queue"},
+			wantErr:    true,
+			wantErrSub: "either positionally OR via --name, not both",
+		},
+		{
+			name:       "neither set returns usage error",
+			flags:      map[string]string{},
+			remaining:  nil,
+			wantErr:    true,
+			wantErrSub: "agent name is required",
+		},
+		{
+			name:       "positional is whitespace-only is treated as absent",
+			flags:      map[string]string{},
+			remaining:  []string{"   "},
+			wantErr:    true,
+			wantErrSub: "agent name is required",
+		},
+		{
+			name:       "--name is whitespace-only is treated as absent",
+			flags:      map[string]string{"name": "   "},
+			remaining:  nil,
+			wantErr:    true,
+			wantErrSub: "agent name is required",
+		},
+		{
+			name:      "--name is trimmed",
+			flags:     map[string]string{"name": "  merge-queue  "},
+			remaining: nil,
+			wantName:  "merge-queue",
+		},
+		{
+			name:      "positional is trimmed",
+			flags:     map[string]string{},
+			remaining: []string{"  merge-queue  "},
+			wantName:  "merge-queue",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Defensive copy: the function consumes flags["name"]
+			// on success and we don't want one case to mutate the
+			// next case's input.
+			flagsCopy := make(map[string]string, len(tc.flags))
+			for k, v := range tc.flags {
+				flagsCopy[k] = v
+			}
+			got, err := resolveAgentNameArg(flagsCopy, tc.remaining)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil (returned %q)", tc.wantErrSub, got)
+				}
+				if tc.wantErrSub != "" && !strings.Contains(err.Error(), tc.wantErrSub) {
+					t.Fatalf("error %q does not contain expected substring %q", err.Error(), tc.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.wantName {
+				t.Fatalf("got name %q, want %q", got, tc.wantName)
+			}
+		})
+	}
+}
+
+// TestResolveAgentNameArg_ConsumesNameOnSuccess pins that the
+// resolver removes flags["name"] when it returned successfully,
+// so downstream callers passing the same flags map to another
+// helper don't re-read a stale --name as something else.
+func TestResolveAgentNameArg_ConsumesNameOnSuccess(t *testing.T) {
+	flags := map[string]string{"name": "merge-queue", "repo": "fizzbuzz"}
+	got, err := resolveAgentNameArg(flags, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "merge-queue" {
+		t.Fatalf("got %q, want merge-queue", got)
+	}
+	if _, present := flags["name"]; present {
+		t.Fatalf("flags[\"name\"] should be removed on successful resolve, still present with value %q", flags["name"])
+	}
+	if flags["repo"] != "fizzbuzz" {
+		t.Fatalf("flags[\"repo\"] should be untouched, got %q", flags["repo"])
+	}
+}
+
 func TestFormatTime(t *testing.T) {
 	tests := []struct {
 		name     string

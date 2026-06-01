@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -286,6 +287,61 @@ func (c *CLI) assistantStart(args []string) error {
 	}
 	if _, err := c.sendDaemonRequest("start_repo_agents", startArgs); err != nil {
 		return err
+	}
+
+	// Poll for the agent to actually reach RUNNING.
+	// `start_repo_agents` returns the moment the spawn is
+	// dispatched, NOT when the agent is healthy. Fast-failure
+	// paths (bad API key, missing model profile, runtime import
+	// error, model probe failure) otherwise surface only as a
+	// STOPPED card in the side panel with no failure narrative.
+	// Polling here turns the fast-failure case into a clear
+	// at-create-time diagnostic on stderr that the side panel's
+	// chat-create form already plumbs through to the operator.
+	//
+	// Budget: 5s by default. Fast-failure errors surface within
+	// a second or two; the few-extra-seconds margin covers slow
+	// cold starts. Operators on consistently slow boxes can
+	// raise the cap via OAT_ASSISTANT_START_POLL_TIMEOUT_SECONDS;
+	// the warning is a soft signal either way (we don't gate
+	// the success print on the poll's outcome).
+	pollTimeoutSec := 5
+	if envVal := os.Getenv("OAT_ASSISTANT_START_POLL_TIMEOUT_SECONDS"); envVal != "" {
+		if v, parseErr := strconv.Atoi(envVal); parseErr == nil && v >= 0 {
+			pollTimeoutSec = v
+		}
+	}
+	if pollTimeoutSec > 0 {
+		deadline := time.Now().Add(time.Duration(pollTimeoutSec) * time.Second)
+		var lastStatus, lastErr string
+		reached := false
+		for time.Now().Before(deadline) {
+			resp, pollErr := c.sendDaemonRequest("list_agents", map[string]interface{}{
+				"repo": repoKey,
+				"rich": true,
+			})
+			if pollErr != nil {
+				break // best-effort; transient socket failures shouldn't gate the print.
+			}
+			lastStatus, lastErr = extractAgentStatus(resp.Data, agent)
+			if lastStatus == "running" {
+				reached = true
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if !reached && lastStatus != "" {
+			fmt.Fprintf(os.Stderr,
+				"⚠ Assistant '%s' was created but did not reach RUNNING within %ds.\n",
+				name, pollTimeoutSec,
+			)
+			fmt.Fprintf(os.Stderr, "  Last state: %s\n", lastStatus)
+			if lastErr != "" {
+				fmt.Fprintf(os.Stderr, "  Last error: %s\n", lastErr)
+			}
+			fmt.Fprintln(os.Stderr, "  Check daemon logs: tail ~/.oat/daemon.log")
+			fmt.Fprintf(os.Stderr, "  Try:               oat assistant restart %s\n", name)
+		}
 	}
 
 	fmt.Printf("✓ Assistant '%s' started.\n", name)

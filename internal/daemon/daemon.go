@@ -4334,6 +4334,15 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 				}
 			}
 			detail["status"] = status
+			// Surface the most recent spawn / runtime error so the
+			// `oat assistant start` CLI poll loop (and side-panel
+			// agent cards) can show "agent created but didn't reach
+			// RUNNING because: <reason>" instead of a silent STOPPED
+			// card. Only emit when non-empty so older callers that
+			// switch on the key's presence keep working.
+			if agent.LastError != "" {
+				detail["last_error"] = agent.LastError
+			}
 
 			// Get current branch from worktree
 			branch := ""
