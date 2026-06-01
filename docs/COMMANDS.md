@@ -178,6 +178,17 @@ surprises when you add new API keys.
 
 For the full list of supported providers, model format options, and custom provider setup, see [Supported LLM Providers](SUPPORTED_LLM_PROVIDERS.md).
 
+### `oat model list`
+
+Show the LLM models OAT has onboarded on this machine. By default emits an operator-readable table; pass `--json` for a machine-readable payload suitable for programmatic consumers.
+
+```bash
+oat model list                # operator-readable table
+oat model list --json         # JSON array; one object per onboarded model
+```
+
+The `--json` form's payload is the source of truth for the side-panel's "+ New assistant" model combobox: the extension calls `oat_model_list` via the NM broker, which shells out to `oat model list --json` and routes the parsed array back to the Chrome extension. New `--json` consumers should match its shape (`{id, family, profile_path, ...}`) and feature-detect rather than version-pin so older OAT binaries keep working.
+
 ## Observing
 
 Watch the magic happen.
