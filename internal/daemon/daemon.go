@@ -5309,6 +5309,28 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 
 	d.logger.Info("Started registered agent %s/%s (PID=%d)", repoName, agentName, pid)
 
+	// Publish the lifecycle frame so subscribers (side panel via the
+	// bridge's stream_agent_lifecycle) learn the agent transitioned
+	// from "added with PID=0" to "running with PID=N". Without this,
+	// handleAddAgent's preceding agent_added frame leaves the panel
+	// thinking the agent is stopped (PID=0) forever, and the user's
+	// Restart button just hits handleRestartAgent's "already running"
+	// short-circuit (line 5907) because the process really IS alive
+	// — there's just no follow-up frame telling the panel that.
+	// handleRestartAgent already publishes agent_started on its own
+	// success path (line ~5948); this mirror is for the FRESH start
+	// path that goes through start_repo_agents → startRegisteredAgent.
+	// Reported 2026-06-01: "Assistants are always stopped when first
+	// created, and I've tried pressing resume and restart and neither
+	// button gets them unstopped."
+	if pid > 0 {
+		d.publishAgentLifecycle(
+			lifecycleKindAgentStarted,
+			repoName, agentName, string(agent.Type),
+			pid, agent.Model, agent.LastError,
+		)
+	}
+
 	// Inject the autonomous wake-up safeguard marker for assistant
 	// agents (no-op for any other agent type). Fired AFTER the state
 	// update so the marker function reads the fresh (repo, agent,
