@@ -3,6 +3,7 @@ package planner
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,67 @@ func TestUpdatePlanDoesNotDeadlockAndPersistsExecutionMetadata(t *testing.T) {
 	}
 	if got := loaded.Tasks[0].PRNumber; got != 42 {
 		t.Fatalf("PRNumber = %d, want 42", got)
+	}
+}
+
+// A plan executed over a real session persists on every task transition. Each
+// save writes a full-document v{N}.json backup and appends to History. Without
+// caps these grow without bound (the production incident: ~4 GB / 1370 files
+// for one plan). This pins the retention behavior.
+func TestSavePlanCapsVersionFilesAndHistory(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := NewPlanStorage(dir)
+	if err != nil {
+		t.Fatalf("NewPlanStorage: %v", err)
+	}
+
+	plan := &PlanDocument{
+		ID:        "plan-grow",
+		Status:    "executing",
+		CreatedAt: time.Now(),
+		Requirement: RequirementDoc{
+			Title:       "Grow plan",
+			LastUpdated: time.Now(),
+		},
+		Tasks: []TaskDoc{{ID: "T1", Title: "Task 1", Wave: 1, Status: "pending"}},
+	}
+
+	saves := maxPlanVersionFiles + maxPlanHistory + 25
+	for i := 0; i < saves; i++ {
+		plan.Tasks[0].Status = "in_progress"
+		plan.Requirement.Refined = strings.Repeat("x", i+1) // force a detectable change
+		if err := storage.SavePlan(plan); err != nil {
+			t.Fatalf("SavePlan #%d: %v", i, err)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, "plan-grow"))
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	versionCount := 0
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "v") && strings.HasSuffix(name, ".json") {
+			versionCount++
+		}
+	}
+	if versionCount > maxPlanVersionFiles {
+		t.Fatalf("version files = %d, want <= %d", versionCount, maxPlanVersionFiles)
+	}
+
+	loaded, err := storage.LoadPlan("plan-grow")
+	if err != nil {
+		t.Fatalf("LoadPlan: %v", err)
+	}
+	if len(loaded.History) > maxPlanHistory {
+		t.Fatalf("History length = %d, want <= %d", len(loaded.History), maxPlanHistory)
+	}
+
+	// The newest backup must survive pruning (highest version number retained).
+	newest := filepath.Join(dir, "plan-grow", "v"+strconv.Itoa(loaded.Version)+".json")
+	if _, err := os.Stat(newest); err != nil {
+		t.Fatalf("newest version backup missing: %v", err)
 	}
 }
 

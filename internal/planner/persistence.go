@@ -6,9 +6,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"sync"
+)
+
+const (
+	// maxPlanVersionFiles caps how many v{N}.json backups are retained per
+	// plan. Each save writes a full-document backup; without a cap a long
+	// execution (every task transition persists) accumulates unbounded files.
+	maxPlanVersionFiles = 20
+	// maxPlanHistory caps the in-document revision history so plan.json itself
+	// cannot grow without bound across a long-running plan.
+	maxPlanHistory = 100
 )
 
 // PlanStorage handles persistent storage of plans with versioning
@@ -133,6 +145,9 @@ func (ps *PlanStorage) savePlanNoLock(plan *PlanDocument) error {
 				Changes:     ps.detectChanges(existing, plan),
 			}
 			plan.History = append(existing.History, revision)
+			if len(plan.History) > maxPlanHistory {
+				plan.History = plan.History[len(plan.History)-maxPlanHistory:]
+			}
 		} else {
 			if plan.Version == 0 {
 				plan.Version = 1
@@ -167,6 +182,10 @@ func (ps *PlanStorage) savePlanNoLock(plan *PlanDocument) error {
 	if err := atomicWriteFile(versionPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
+
+	// Retain only the most recent version backups. Pruning failure is
+	// non-fatal: the canonical plan.json and latest backup are already written.
+	pruneOldVersions(planDir, maxPlanVersionFiles)
 
 	// Generate and save markdown documentation
 	if err := ps.saveMarkdown(plan); err != nil {
@@ -413,6 +432,45 @@ waves:
 	}
 
 	return atomicWriteFile(graphPath, []byte(yaml), 0644)
+}
+
+// pruneOldVersions deletes the oldest v{N}.json backups in planDir, keeping the
+// `keep` highest-numbered ones. It is best-effort: any error is ignored because
+// the canonical plan.json is the source of truth and backups are advisory.
+func pruneOldVersions(planDir string, keep int) {
+	if keep <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(planDir)
+	if err != nil {
+		return
+	}
+	type versionFile struct {
+		name string
+		num  int
+	}
+	var versions []versionFile
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, "v") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		num, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "v"), ".json"))
+		if err != nil {
+			continue
+		}
+		versions = append(versions, versionFile{name: name, num: num})
+	}
+	if len(versions) <= keep {
+		return
+	}
+	sort.Slice(versions, func(i, j int) bool { return versions[i].num < versions[j].num })
+	for _, v := range versions[:len(versions)-keep] {
+		_ = os.Remove(filepath.Join(planDir, v.name))
+	}
 }
 
 func sortedWaveKeys(waveMap map[int][]TaskDoc) []int {
