@@ -22,6 +22,16 @@ delete semantics that differ from worker semantics:
   etc.). Default cap is 3 archives × 50 MB; older archives
   evict oldest-first. The rotation policy is local-storage
   only — there is no external backup.
+
+  **Memory continuity across daemon restarts** (as of 2026-06-02):
+  the daemon preserves `agent.SessionID` when re-spawning a
+  registered assistant during restore. The agent CLI then
+  rehydrates its conversation via `--resume <sessionID>` from
+  `~/.claude/projects/.../<sessionID>.jsonl`, so a user who
+  restarts the daemon (or their whole machine) sees the
+  assistant remember their prior exchange. To explicitly wipe
+  memory, the operator still has to opt in with
+  `oat assistant restart <name> --fresh`.
 - **`oat assistant remove <name>`** (alias **`rm`**) — destroy
   the assistant. State record wiped, virtual repo at
   `_assistant-<name>` removed. This is the destructive flow;
