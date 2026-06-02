@@ -327,6 +327,63 @@ func TestTrackWorkerAssignmentFromPlannerMarker(t *testing.T) {
 	}
 }
 
+// TrackWorkerAssignment is called every TUI poll (2s) for every live worker.
+// Without dedup, repeated identical assignments would re-persist the plan on
+// every tick — which in production accumulated 4 GB / 1370 version files for a
+// single plan. The fix is gating persistPlan on whether anything actually
+// changed; this test pins that contract.
+func TestApplyWorkerAssignments_DoesNotRepersistOnIdenticalCall(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	// First call mutates state and persists once.
+	p.applyWorkerAssignments(map[string]string{"T1": "worker-alpha"})
+	if p.persistCallCount != 1 {
+		t.Fatalf("first call persistCallCount = %d, want 1", p.persistCallCount)
+	}
+
+	// Second identical call must not re-persist.
+	p.applyWorkerAssignments(map[string]string{"T1": "worker-alpha"})
+	if p.persistCallCount != 1 {
+		t.Fatalf("idempotent call persistCallCount = %d, want 1 (no re-persist)", p.persistCallCount)
+	}
+
+	// New assignment must persist again.
+	p.applyWorkerAssignments(map[string]string{"T1": "worker-beta"})
+	if p.persistCallCount != 2 {
+		t.Fatalf("changed call persistCallCount = %d, want 2", p.persistCallCount)
+	}
+}
+
+// Same idempotency contract for UpdateWorkerStatus, which is also called every
+// TUI poll for waiting workers.
+func TestUpdateWorkerStatus_DoesNotRepersistOnIdenticalCall(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1, AssignedTo: "worker-alpha", Status: TaskStatusInProgress}}
+	p.taskWorkers = map[string]string{"T1": "worker-alpha"}
+	p.taskPRs = map[string]int{"T1": 42}
+
+	// First call with same PR + status must NOT persist (nothing changed).
+	p.UpdateWorkerStatus("worker-alpha", 42, false)
+	if p.persistCallCount != 0 {
+		t.Fatalf("no-op call persistCallCount = %d, want 0", p.persistCallCount)
+	}
+
+	// Completing the worker must persist once.
+	p.UpdateWorkerStatus("worker-alpha", 42, true)
+	if p.persistCallCount != 1 {
+		t.Fatalf("completion call persistCallCount = %d, want 1", p.persistCallCount)
+	}
+
+	// Re-completing must not persist again.
+	p.UpdateWorkerStatus("worker-alpha", 42, true)
+	if p.persistCallCount != 1 {
+		t.Fatalf("idempotent completion persistCallCount = %d, want 1", p.persistCallCount)
+	}
+}
+
 // tasksForWave must return only tasks in the given wave.
 func TestTasksForWave(t *testing.T) {
 	p := newTestPlanner()

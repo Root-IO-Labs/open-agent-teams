@@ -158,6 +158,12 @@ type PlannerView struct {
 	taskPRs     map[string]int    // task.ID → PR number (0 = no PR yet)
 	wavesDone   map[int]bool      // wave → all tasks complete
 
+	// persistCallCount counts persistPlan invocations. Test seam: lets the
+	// idempotency tests assert that no-op TUI ticks don't re-write the plan
+	// file. (TUI polls workers every 2s; without dedup the plan file would
+	// rewrite ~4×/sec per active repo and accumulate GB of version history.)
+	persistCallCount int
+
 	// Enhanced contextual awareness (Overlord integration)
 	context          *PlannerContext
 	currentGate      *PhaseGate
@@ -727,6 +733,7 @@ func (p *PlannerView) persistPlan() {
 	if p.requirement == nil || len(p.tasks) == 0 {
 		return
 	}
+	p.persistCallCount++
 	plansDir := filepath.Join(os.Getenv("HOME"), ".oat", "plans", p.repoName)
 	storage, err := planner.NewPlanStorage(plansDir)
 	if err != nil {
@@ -2111,24 +2118,38 @@ func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, comple
 		taskID = workerName
 	}
 
+	changed := false
 	if prNumber > 0 && p.taskPRs != nil {
-		p.taskPRs[taskID] = prNumber
+		if p.taskPRs[taskID] != prNumber {
+			p.taskPRs[taskID] = prNumber
+			changed = true
+		}
 	}
 
 	// Update the matching task status.
 	for i, t := range p.tasks {
 		if t.ID == taskID || t.AssignedTo == workerName {
+			newStatus := p.tasks[i].Status
 			if completed {
-				p.tasks[i].Status = TaskStatusCompleted
+				newStatus = TaskStatusCompleted
 			} else if prNumber > 0 {
 				// PR submitted but not merged yet
-				p.tasks[i].Status = TaskStatusInProgress
+				newStatus = TaskStatusInProgress
 			}
-			p.tasks[i].AssignedTo = workerName
+			if p.tasks[i].Status != newStatus {
+				p.tasks[i].Status = newStatus
+				changed = true
+			}
+			if p.tasks[i].AssignedTo != workerName {
+				p.tasks[i].AssignedTo = workerName
+				changed = true
+			}
 			break
 		}
 	}
-	p.persistPlan()
+	if changed {
+		p.persistPlan()
+	}
 
 	// Check if the current wave is complete and note it in conversation.
 	p.checkWaveCompletion()
@@ -2152,22 +2173,32 @@ func (p *PlannerView) applyWorkerAssignments(assignments map[string]string) {
 	if p.taskWorkers == nil {
 		p.taskWorkers = make(map[string]string)
 	}
+	changed := false
 	for taskID, workerName := range assignments {
 		if taskID == "" || workerName == "" {
 			continue
 		}
-		p.taskWorkers[taskID] = workerName
+		if p.taskWorkers[taskID] != workerName {
+			p.taskWorkers[taskID] = workerName
+			changed = true
+		}
 		for i := range p.tasks {
 			if p.tasks[i].ID == taskID {
-				p.tasks[i].AssignedTo = workerName
+				if p.tasks[i].AssignedTo != workerName {
+					p.tasks[i].AssignedTo = workerName
+					changed = true
+				}
 				if p.tasks[i].Status == TaskStatusPending {
 					p.tasks[i].Status = TaskStatusInProgress
+					changed = true
 				}
 				break
 			}
 		}
 	}
-	p.persistPlan()
+	if changed {
+		p.persistPlan()
+	}
 }
 
 func taskIDFromPlannerMarker(text string) string {
