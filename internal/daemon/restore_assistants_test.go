@@ -146,6 +146,99 @@ func TestRestoreVirtualRepoSurvivesDaemonRestart_2026_06_02(t *testing.T) {
 	}
 }
 
+// TestStartRegisteredAgentPreservesExistingSessionID_2026_06_02 pins
+// the memory-continuity contract that startRegisteredAgent must NOT
+// generate a fresh session ID when the agent record already carries
+// one. Reported 2026-06-02: "the agent can't see the old message" —
+// even though the conversation transcript still exists on disk under
+// ~/.claude/projects/.../<old-sessionID>.jsonl, a daemon restart
+// would silently rotate it onto a new SessionID and the agent CLI
+// would --resume nothing.
+//
+// Property under test: if agent.SessionID is non-empty when
+// startRegisteredAgent is entered, the post-call state record must
+// still carry the same SessionID. Empty SessionID is the fresh-
+// create path and gets a new one (asserted in the companion case).
+//
+// This is a state-level test (OAT_TEST_MODE=1 short-circuits the
+// real spawn) so it stays cheap and deterministic. The downstream
+// `--resume <sessionID>` arg-construction lives behind the spawn
+// branch; manual smoke test covers that the agent CLI actually
+// rehydrates the transcript.
+func TestStartRegisteredAgentPreservesExistingSessionID_2026_06_02(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	t.Setenv("OAT_TEST_MODE", "1")
+
+	const (
+		assistantName = "memory-keeper"
+		virtualRepo   = "_assistant-memory-keeper"
+		priorSession  = "00000000-0000-0000-0000-aaaaaaaaaaaa"
+	)
+
+	repo := &state.Repository{
+		SessionName: "oat-" + virtualRepo,
+		IsVirtual:   true,
+		Agents:      map[string]state.Agent{},
+	}
+	if err := d.state.AddRepo(virtualRepo, repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	wtPath := d.paths.AgentWorktree(virtualRepo, assistantName)
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+
+	// Pre-existing SessionID — the post-daemon-restart shape.
+	if err := d.state.AddAgent(virtualRepo, assistantName, state.Agent{
+		Type:         state.AgentTypeAssistant,
+		WorktreePath: wtPath,
+		WindowName:   assistantName,
+		SessionID:    priorSession,
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	gotRepo, _ := d.state.GetRepo(virtualRepo)
+	gotAgent := gotRepo.Agents[assistantName]
+	if _, err := d.startRegisteredAgent(virtualRepo, gotRepo, assistantName, gotAgent, nil); err != nil {
+		t.Fatalf("startRegisteredAgent: %v", err)
+	}
+
+	postRepo, _ := d.state.GetRepo(virtualRepo)
+	postAgent := postRepo.Agents[assistantName]
+	if postAgent.SessionID != priorSession {
+		t.Fatalf("SessionID was regenerated: got %q want %q (memory continuity broken)", postAgent.SessionID, priorSession)
+	}
+
+	// Companion case: empty SessionID → new one assigned (fresh-
+	// create path). Pin so a future "preserve unconditionally"
+	// refactor doesn't leave fresh-create agents with no
+	// SessionID at all (which breaks --resume on their FIRST
+	// daemon restart).
+	const freshName = "fresh-create"
+	if err := d.state.AddAgent(virtualRepo, freshName, state.Agent{
+		Type:         state.AgentTypeAssistant,
+		WorktreePath: wtPath,
+		WindowName:   freshName,
+	}); err != nil {
+		t.Fatalf("AddAgent fresh: %v", err)
+	}
+	freshRepo, _ := d.state.GetRepo(virtualRepo)
+	freshAgent := freshRepo.Agents[freshName]
+	if _, err := d.startRegisteredAgent(virtualRepo, freshRepo, freshName, freshAgent, nil); err != nil {
+		t.Fatalf("startRegisteredAgent fresh: %v", err)
+	}
+	postFreshRepo, _ := d.state.GetRepo(virtualRepo)
+	postFreshAgent := postFreshRepo.Agents[freshName]
+	if postFreshAgent.SessionID == "" {
+		t.Fatalf("fresh-create agent has empty SessionID after spawn — should have been generated")
+	}
+	if postFreshAgent.SessionID == priorSession {
+		t.Fatalf("fresh-create agent collided with prior assistant's SessionID (%q)", priorSession)
+	}
+}
+
 
 func TestAssistantRemoveStaysRemovedAcrossReload_R2(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "oat-r2-*")

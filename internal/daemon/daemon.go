@@ -5170,10 +5170,29 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		return 0, fmt.Errorf("failed to write prompt file: %w", err)
 	}
 
-	// Generate new session ID
-	sessionID, err := agent_pkg.GenerateSessionID()
-	if err != nil {
-		return 0, fmt.Errorf("failed to generate session ID: %w", err)
+	// Memory continuity (2026-06-02): if the agent already has a
+	// SessionID from a prior spawn (i.e. we're being called from the
+	// daemon-restart restore path or any other path where the
+	// state.Agent record survives between spawns), reuse it so the
+	// agent CLI can --resume from the existing JSONL. Generating a
+	// fresh SessionID would orphan the prior conversation transcript
+	// at ~/.claude/projects/.../<old-sessionID>.jsonl and the
+	// assistant would start with no memory — which is what the
+	// 2026-06-02 reporter hit: "I noticed that the agent can't see
+	// the old message" after a daemon restart. The CLI's
+	// `oat assistant restart --fresh` path explicitly rotates the
+	// JSONL and clears SessionID before re-entering this function,
+	// so the operator's explicit "wipe and start over" intent still
+	// works; only the implicit "I expect my conversation to survive
+	// a daemon restart" case changes here.
+	preservedSession := agent.SessionID != ""
+	sessionID := agent.SessionID
+	if !preservedSession {
+		var sErr error
+		sessionID, sErr = agent_pkg.GenerateSessionID()
+		if sErr != nil {
+			return 0, fmt.Errorf("failed to generate session ID: %w", sErr)
+		}
 	}
 
 	// Copy hooks config
@@ -5218,6 +5237,34 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
 		args = append(args, denyToolArgs(agent.Type)...)
 
+		// Memory continuity (2026-06-02 follow-up to SessionID
+		// preservation above). When we're reusing a prior
+		// SessionID AND a transcript exists on disk for it, pass
+		// `--resume <sessionID>` so the agent CLI rehydrates the
+		// conversation. Mirrors the warm-restart path in
+		// restartAgent (which already does this stat+resume dance
+		// for click-Restart and adopt-on-startup). The home-dir
+		// + .claude/projects path derivation is the same as
+		// restartAgent's. Best-effort: if the stat fails (file
+		// missing, permissions), fall through to the no-resume
+		// path so a missing transcript doesn't break the spawn —
+		// the agent will just start without prior context, which
+		// is strictly better than failing to start at all.
+		resumeFromSession := false
+		if preservedSession && agent.Type == state.AgentTypeAssistant {
+			if home, hErr := os.UserHomeDir(); hErr == nil {
+				encodedPath := strings.ReplaceAll(agent.WorktreePath, "/", "-")
+				sessionFile := filepath.Join(home, ".claude", "projects", encodedPath, sessionID+".jsonl")
+				if info, statErr := os.Stat(sessionFile); statErr == nil && info.Size() > 0 {
+					args = append(args, "--resume", sessionID)
+					resumeFromSession = true
+					d.logger.Info("Restore %s/%s: resuming session %s (transcript %d bytes)", repoName, agentName, sessionID, info.Size())
+				} else {
+					d.logger.Debug("Restore %s/%s: SessionID %s present but no transcript at %s — starting without --resume", repoName, agentName, sessionID, sessionFile)
+				}
+			}
+		}
+
 		isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
 		logFile := d.paths.AgentLogFile(repoName, agentName, isWorker)
 		logDir := filepath.Dir(logFile)
@@ -5228,6 +5275,15 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 			if data, readErr := os.ReadFile(promptFile); readErr == nil {
 				promptContent = string(data)
 			}
+		}
+		// Don't replay the system prompt when --resume rehydrates
+		// the prior conversation; the agent already has it from
+		// the rehydrated transcript, and re-sending would land as
+		// a second user-visible system message in the new turn.
+		// Mirrors restartAgent's hasHistory branch which skips
+		// the `-m <prompt>` arg in the same situation.
+		if resumeFromSession {
+			promptContent = ""
 		}
 
 		envVars := []string{fmt.Sprintf("OAT_AGENT_NAME=%s", agentName)}
@@ -5756,7 +5812,14 @@ func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
 		return socket.ErrorResponse("failed to check agent window: %v", err)
 	}
 	if !hasWindow {
-		return socket.ErrorResponse("agent window '%s' does not exist - the agent may need to be recreated", agentName)
+		// Side-panel-driven restart is restricted to bridge
+		// agents (gated at line ~5803 above), and bridge agents
+		// have their backend window destroyed by stop_agent.
+		// restartAgent's backend.StartAgent call recreates the
+		// window, so the absent window is the normal Resume-
+		// after-Pause state — not an error. See the parallel
+		// fix in handleRestartAgent for the full post-mortem.
+		d.logger.Info("restart_browser_agent: %s/%s window absent (pause→resume path); spawning fresh window", repoName, agentName)
 	}
 
 	// Always force from this path: see comment above.
@@ -5922,7 +5985,25 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 		return socket.ErrorResponse("failed to check agent window: %v", err)
 	}
 	if !hasWindow {
-		return socket.ErrorResponse("agent window '%s' does not exist - the agent may need to be recreated", agentName)
+		// Bridge-using agents (assistants + browser-agents)
+		// tear their backend window down on stop_agent, so a
+		// Resume click on a paused assistant arrives here with
+		// no window — prior to 2026-06-02 this returned the
+		// "agent window does not exist" error and the Resume
+		// button silently did nothing. restartAgent below calls
+		// backend.StartAgent which creates the window from
+		// scratch (same path as fresh spawn), so the window-
+		// absence is fine for this agent class. Non-bridge types
+		// (worker, supervisor, etc.) keep the existing
+		// safeguard because their tmux session/window structure
+		// is load-bearing on restart and a missing window
+		// genuinely means something went wrong upstream.
+		// Reported: "I paused test1 but the resume button in
+		// the chat doesn't do anything."
+		if !usesBrowserBridge(agent.Type) {
+			return socket.ErrorResponse("agent window '%s' does not exist - the agent may need to be recreated", agentName)
+		}
+		d.logger.Info("restart_agent: %s/%s window absent (pause→resume path); spawning fresh window", repoName, agentName)
 	}
 
 	// Check if agent is already running
