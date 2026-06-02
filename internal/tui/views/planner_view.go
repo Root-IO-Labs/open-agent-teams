@@ -142,6 +142,11 @@ type PlannerView struct {
 	client   *socket.Client
 	repoName string
 
+	// plansBaseDir is the root under which per-repo plans are persisted. Empty
+	// means derive from $HOME (production default); tests set a temp dir so
+	// persistence is hermetic and never touches the developer's real ~/.oat.
+	plansBaseDir string
+
 	// Feedback and collaboration
 	feedback        []FeedbackEntry
 	thinkingText    string
@@ -163,6 +168,11 @@ type PlannerView struct {
 	// file. (TUI polls workers every 2s; without dedup the plan file would
 	// rewrite ~4×/sec per active repo and accumulate GB of version history.)
 	persistCallCount int
+
+	// persistErrNotified latches once a persistPlan() failure has been
+	// surfaced to the user, so the every-tick save loop doesn't spam feedback.
+	// Reset on the next successful save.
+	persistErrNotified bool
 
 	// Enhanced contextual awareness (Overlord integration)
 	context          *PlannerContext
@@ -574,7 +584,7 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 	sb.WriteString("## Execution Contract\n")
 	sb.WriteString("- Workspace owns worker creation, wave advancement, and PR/issue coordination. The planner must not spawn workers.\n")
 	sb.WriteString("- Preserve each task ID exactly as written below.\n")
-	sb.WriteString("- When spawning a worker, include the marker `[planner-task:<task-id>]` at the start of the worker task text so planner progress can be mapped back deterministically.\n")
+	sb.WriteString("- When spawning a worker, you MUST include the marker `[planner-task:<task-id>]` verbatim at the start of the worker task text. This marker is the only link between a worker and its plan task: if it is omitted or altered, the planner cannot map that worker's progress or PR back to the task.\n")
 	sb.WriteString("- Do not start a wave until every dependency and every task in the previous wave is complete.\n\n")
 	sb.WriteString("## Workspace State\n")
 	sb.WriteString("Before spawning any workers, persist this execution state to yourself using your actual workspace agent name, usually `default`:\n")
@@ -598,7 +608,7 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 		}
 		for _, t := range tasks {
 			sb.WriteString(fmt.Sprintf("### %s: %s\n", t.ID, t.Title))
-			sb.WriteString("Task marker: " + plannerTaskMarker(t.ID) + "\n")
+			sb.WriteString("Task marker: " + plannerTaskMarker(p.planID(), t.ID) + "\n")
 			sb.WriteString(t.Description + "\n")
 			if len(t.Dependencies) > 0 {
 				sb.WriteString("Depends on: " + strings.Join(t.Dependencies, ", ") + "\n")
@@ -628,8 +638,16 @@ func (p *PlannerView) waveStateMessage() string {
 	return fmt.Sprintf("WAVE_STATE: current_wave=1 total_waves=%d tasks=%s requirement=%q", p.getMaxWave(), strings.Join(taskIDs, ","), requirement)
 }
 
-func plannerTaskMarker(taskID string) string {
-	return "[planner-task:" + taskID + "]"
+// planID returns the current plan's ID, or "" if no requirement exists yet.
+func (p *PlannerView) planID() string {
+	if p.requirement != nil {
+		return p.requirement.ID
+	}
+	return ""
+}
+
+func plannerTaskMarker(planID, taskID string) string {
+	return planner.TaskMarker(planID, taskID)
 }
 
 func sortedWaveKeys(waves map[int][]Task) []int {
@@ -734,10 +752,15 @@ func (p *PlannerView) persistPlan() {
 		return
 	}
 	p.persistCallCount++
-	plansDir := filepath.Join(os.Getenv("HOME"), ".oat", "plans", p.repoName)
+	base := p.plansBaseDir
+	if base == "" {
+		base = filepath.Join(os.Getenv("HOME"), ".oat", "plans")
+	}
+	plansDir := filepath.Join(base, p.repoName)
 	storage, err := planner.NewPlanStorage(plansDir)
 	if err != nil {
-		return // non-fatal — persistence is best-effort
+		p.notePersistError(err)
+		return
 	}
 
 	doc := &planner.PlanDocument{
@@ -782,7 +805,31 @@ func (p *PlannerView) persistPlan() {
 			PRNumber:           prNumber,
 		})
 	}
-	_ = storage.SavePlan(doc) // best-effort; failure is non-fatal
+	if err := storage.SavePlan(doc); err != nil {
+		p.notePersistError(err)
+		return
+	}
+	p.clearPersistError()
+}
+
+// notePersistError surfaces a plan-persistence failure to the user exactly once
+// per failure streak. persistPlan runs on every 2s TUI poll, so repeating the
+// message on each tick would flood the feedback pane; we latch on the first
+// failure and re-arm only after a subsequent success (clearPersistError).
+func (p *PlannerView) notePersistError(err error) {
+	if p.persistErrNotified {
+		return
+	}
+	p.persistErrNotified = true
+	p.feedback = append(p.feedback, FeedbackEntry{
+		Type:      "system",
+		Content:   fmt.Sprintf("⚠ Failed to save plan: %v. Execution progress may not survive a restart.", err),
+		Timestamp: time.Now(),
+	})
+}
+
+func (p *PlannerView) clearPersistError() {
+	p.persistErrNotified = false
 }
 
 func plannerStatusForState(state PlannerState) string {
@@ -2105,7 +2152,11 @@ func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, comple
 	if p.taskWorkers == nil || p.tasks == nil {
 		return
 	}
-	// Find which task this worker was assigned to.
+	// Find which task this worker was assigned to: explicit tracking first,
+	// then a task whose AssignedTo already matches. If the worker maps to no
+	// known task, ignore it — a worker spawned outside this plan (or one whose
+	// [planner-task:<id>] marker was dropped) must not create phantom taskPRs
+	// entries or trigger persistence keyed by an arbitrary worker name.
 	taskID := ""
 	for id, w := range p.taskWorkers {
 		if w == workerName {
@@ -2114,8 +2165,15 @@ func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, comple
 		}
 	}
 	if taskID == "" {
-		// Worker not tracked in this plan — record it by name.
-		taskID = workerName
+		for _, t := range p.tasks {
+			if t.AssignedTo == workerName {
+				taskID = t.ID
+				break
+			}
+		}
+	}
+	if taskID == "" {
+		return
 	}
 
 	changed := false
@@ -2155,12 +2213,33 @@ func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, comple
 	p.checkWaveCompletion()
 }
 
+// TrackWorkerAssignment maps a worker to a plan task using the
+// [planner-task:<plan-id>:<task-id>] marker embedded in the worker's task text.
+// Used as a fallback when structured linkage isn't available in worker state.
 func (p *PlannerView) TrackWorkerAssignment(workerName, taskText string) {
 	if workerName == "" || taskText == "" {
 		return
 	}
-	taskID := taskIDFromPlannerMarker(taskText)
-	if taskID == "" {
+	markerPlanID, taskID := taskIDFromPlannerMarker(taskText)
+	p.trackWorkerByID(workerName, markerPlanID, taskID)
+}
+
+// TrackWorkerAssignmentByID maps a worker to a plan task using the structured
+// plan/task IDs persisted in worker state. Preferred over text parsing.
+func (p *PlannerView) TrackWorkerAssignmentByID(workerName, planID, taskID string) {
+	p.trackWorkerByID(workerName, planID, taskID)
+}
+
+func (p *PlannerView) trackWorkerByID(workerName, planID, taskID string) {
+	if workerName == "" || taskID == "" {
+		return
+	}
+	// Ignore markers that belong to a different plan. Task IDs like "T1" are
+	// not unique across plans, so without this guard a worker from plan B
+	// could be mapped onto plan A's task with the same ID. An empty planID
+	// (legacy marker without a plan ID) is accepted as the current plan for
+	// backward compatibility.
+	if planID != "" && planID != p.planID() {
 		return
 	}
 	p.applyWorkerAssignments(map[string]string{taskID: workerName})
@@ -2201,18 +2280,10 @@ func (p *PlannerView) applyWorkerAssignments(assignments map[string]string) {
 	}
 }
 
-func taskIDFromPlannerMarker(text string) string {
-	const prefix = "[planner-task:"
-	start := strings.Index(text, prefix)
-	if start < 0 {
-		return ""
-	}
-	start += len(prefix)
-	end := strings.Index(text[start:], "]")
-	if end < 0 {
-		return ""
-	}
-	return strings.TrimSpace(text[start : start+end])
+// taskIDFromPlannerMarker parses the plan ID and task ID from a worker marker.
+// Delegates to the shared planner parser so the format stays in one place.
+func taskIDFromPlannerMarker(text string) (planID, taskID string) {
+	return planner.ParseTaskMarker(text)
 }
 
 // checkWaveCompletion checks if all tasks in the current execution wave are

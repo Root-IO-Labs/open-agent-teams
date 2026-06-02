@@ -45,7 +45,7 @@ A scientific CLI calculator in Python 3...
 
 ## Wave 1 — spawn immediately
 ### T1: Project scaffold
-Task marker: [planner-task:T1]
+Task marker: [planner-task:plan-1717160000:T1]
 Set up project structure and test harness.
 Acceptance criteria:
 - pytest discovers test files
@@ -60,7 +60,7 @@ Acceptance criteria:
 
 1. **Parse Wave 1 tasks** from the `## Wave 1 — spawn immediately` section
 2. **Create a GitHub issue for each Wave 1 task** using `oat issue create`
-3. **Spawn a worker for each Wave 1 issue** using `oat work "[planner-task:T1] task description" --issue N`
+3. **Spawn a worker for each Wave 1 issue** using `oat work "[planner-task:<plan-id>:T1] task description" --issue N`, copying the exact `Task marker:` value shown for that task
 4. **Track which wave you are on** — store the requirement and remaining waves in a note to yourself (use `oat message send "$OAT_AGENT_NAME" "WAVE_STATE: ..."` to persist state)
 5. **When all Wave 1 workers complete** (you receive daemon notifications), check `oat worker list` to confirm all Wave 1 workers are done or in waiting-for-PR state
 6. **Then spawn Wave 2 workers** using the same pattern: create issues, spawn workers
@@ -101,7 +101,7 @@ oat work rm <name>
 
 When spawning a worker for a GitHub issue, always pass `--issue <number>` so the system can auto-close the issue when the PR merges.
 
-When spawning a worker from a planner-approved plan, preserve the planner task marker at the beginning of the task text, for example `[planner-task:T1] Implement parser error handling...`. The TUI uses that marker to map worker status and PR progress back to the correct planner task.
+When spawning a worker from a planner-approved plan, you MUST copy the planner task marker verbatim to the beginning of the task text, for example `[planner-task:plan-1717160000:T1] Implement parser error handling...`. Use the exact `Task marker:` value the planner emitted for that task — it includes the plan ID, which scopes the task so the TUI maps status and PR progress back to the correct task even when multiple plans reuse task IDs like `T1`. If the marker is omitted or altered, that worker's progress cannot be mapped back to the plan.
 
 You get notified when workers complete.
 

@@ -23,6 +23,7 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/hooks"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/logging"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/messages"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/planner"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/prompts"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
@@ -1894,6 +1895,7 @@ func (d *Daemon) handleStatus(req socket.Request) socket.Response {
 	agentCount := 0
 	idleRepos := make([]string, 0)
 	activeRepos := make([]string, 0)
+	degradedRepos := make(map[string]interface{})
 	for name, repo := range repos {
 		agentCount += len(repo.Agents)
 		if repo.IdleMode {
@@ -1901,17 +1903,45 @@ func (d *Daemon) handleStatus(req socket.Request) socket.Response {
 		} else {
 			activeRepos = append(activeRepos, name)
 		}
+		if reasons := repoDegradedReasons(repo); len(reasons) > 0 {
+			degradedRepos[name] = reasons
+		}
 	}
 
 	return socket.SuccessResponse(map[string]interface{}{
-		"running":      true,
-		"pid":          os.Getpid(),
-		"repos":        len(repos),
-		"agents":       agentCount,
-		"socket_path":  d.paths.DaemonSock,
-		"idle_repos":   idleRepos,
-		"active_repos": activeRepos,
+		"running":        true,
+		"pid":            os.Getpid(),
+		"repos":          len(repos),
+		"agents":         agentCount,
+		"socket_path":    d.paths.DaemonSock,
+		"idle_repos":     idleRepos,
+		"active_repos":   activeRepos,
+		"degraded_repos": degradedRepos,
 	})
+}
+
+// repoDegradedReasons reports why a repo is operating in a degraded state.
+// A missing persistent agent does not stop worker execution, but it means a
+// first-class capability is unavailable and should be visible to the operator.
+// The planner is restored on every daemon startup (restoreRepoAgents), so its
+// absence indicates a restore failure worth surfacing rather than silently
+// logging.
+func repoDegradedReasons(repo *state.Repository) []string {
+	if repo == nil {
+		return nil
+	}
+	hasPlanner := false
+	for _, agent := range repo.Agents {
+		if agent.Type == state.AgentTypePlanner {
+			hasPlanner = true
+			break
+		}
+	}
+	var reasons []string
+	if !hasPlanner {
+		reasons = append(reasons, "planner agent not running")
+	}
+	return reasons
 }
 
 // handleListRepos lists all repositories with detailed status
@@ -2208,6 +2238,13 @@ func (d *Daemon) handleStartWorker(req socket.Request) socket.Response {
 	agent.Task = task
 	agent.IssueNumber = issueNumber
 	agent.IssueURL = issueURL
+	// Persist the planner linkage structurally so the planner TUI can map this
+	// worker back to its plan task without re-parsing the task text, and so the
+	// link survives in state.json for inspection/recovery.
+	if planID, taskID := planner.ParseTaskMarker(task); taskID != "" {
+		agent.PlannerPlanID = planID
+		agent.PlannerTaskID = taskID
+	}
 	if model != "" {
 		agent.Model = model
 	}
@@ -2425,14 +2462,16 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 		}
 
 		detail := map[string]interface{}{
-			"name":          agentName,
-			"type":          agent.Type,
-			"worktree_path": agent.WorktreePath,
-			"window_name":   agent.WindowName,
-			"task":          agent.Task,
-			"summary":       agent.Summary,
-			"model":         agent.Model,
-			"created_at":    agent.CreatedAt,
+			"name":            agentName,
+			"type":            agent.Type,
+			"worktree_path":   agent.WorktreePath,
+			"window_name":     agent.WindowName,
+			"task":            agent.Task,
+			"summary":         agent.Summary,
+			"model":           agent.Model,
+			"created_at":      agent.CreatedAt,
+			"planner_plan_id": agent.PlannerPlanID,
+			"planner_task_id": agent.PlannerTaskID,
 		}
 
 		// Add rich status information if requested

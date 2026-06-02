@@ -1,6 +1,7 @@
 package views
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -9,9 +10,16 @@ import (
 )
 
 func newTestPlanner() *PlannerView {
+	// Persist into an isolated temp dir so persistPlan() never writes to the
+	// developer's real ~/.oat/plans during unit tests.
+	dir, err := os.MkdirTemp("", "planner-test-")
+	if err != nil {
+		dir = ""
+	}
 	return &PlannerView{
-		state:    StateDefiningRequirement,
-		feedback: []FeedbackEntry{},
+		state:        StateDefiningRequirement,
+		feedback:     []FeedbackEntry{},
+		plansBaseDir: dir,
 	}
 }
 
@@ -255,7 +263,7 @@ func TestApprovePlan_WithTasks(t *testing.T) {
 // buildWorkspaceHandoff must include requirement and wave breakdown.
 func TestBuildWorkspaceHandoff(t *testing.T) {
 	p := newTestPlanner()
-	p.requirement = &Requirement{Refined: "A scientific CLI calculator in Python 3"}
+	p.requirement = &Requirement{ID: "plan-calc", Refined: "A scientific CLI calculator in Python 3"}
 	p.tasks = []Task{
 		{ID: "T1", Title: "Scaffold", Description: "Set up project", Wave: 1,
 			AcceptanceCriteria: []string{"runs without error"}},
@@ -279,8 +287,8 @@ func TestBuildWorkspaceHandoff(t *testing.T) {
 	if !strings.Contains(msg, "runs without error") {
 		t.Error("acceptance criteria missing")
 	}
-	if !strings.Contains(msg, "[planner-task:T1]") || !strings.Contains(msg, "[planner-task:T2]") {
-		t.Error("handoff should include stable planner task markers")
+	if !strings.Contains(msg, "[planner-task:plan-calc:T1]") || !strings.Contains(msg, "[planner-task:plan-calc:T2]") {
+		t.Error("handoff should include stable plan-scoped planner task markers")
 	}
 	if !strings.Contains(msg, "Workspace owns worker creation") {
 		t.Error("handoff should define the execution contract")
@@ -381,6 +389,152 @@ func TestUpdateWorkerStatus_DoesNotRepersistOnIdenticalCall(t *testing.T) {
 	p.UpdateWorkerStatus("worker-alpha", 42, true)
 	if p.persistCallCount != 1 {
 		t.Fatalf("idempotent completion persistCallCount = %d, want 1", p.persistCallCount)
+	}
+}
+
+// A worker that maps to no task in this plan (e.g. spawned manually, or one
+// whose [planner-task:<id>] marker was dropped by the workspace agent) must be
+// ignored: it must not create a phantom taskPRs entry keyed by the worker name,
+// and must not trigger persistence.
+func TestUpdateWorkerStatus_IgnoresUntrackedWorker(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+	p.taskWorkers = map[string]string{}
+	p.taskPRs = map[string]int{}
+
+	p.UpdateWorkerStatus("stray-worker", 99, true)
+
+	if _, ok := p.taskPRs["stray-worker"]; ok {
+		t.Fatalf("phantom taskPRs entry created for untracked worker: %v", p.taskPRs)
+	}
+	if len(p.taskPRs) != 0 {
+		t.Fatalf("taskPRs mutated for untracked worker: %v", p.taskPRs)
+	}
+	if p.persistCallCount != 0 {
+		t.Fatalf("persistCallCount = %d, want 0 (untracked worker must not persist)", p.persistCallCount)
+	}
+}
+
+// A worker discoverable only via an existing task AssignedTo (no taskWorkers
+// entry) must still be mapped to that task rather than ignored.
+func TestUpdateWorkerStatus_MatchesByAssignedTo(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1, AssignedTo: "worker-alpha", Status: TaskStatusInProgress}}
+	p.taskWorkers = map[string]string{}
+	p.taskPRs = map[string]int{}
+
+	p.UpdateWorkerStatus("worker-alpha", 0, true)
+
+	if p.tasks[0].Status != TaskStatusCompleted {
+		t.Fatalf("task status = %v, want completed", p.tasks[0].Status)
+	}
+	if p.persistCallCount != 1 {
+		t.Fatalf("persistCallCount = %d, want 1", p.persistCallCount)
+	}
+}
+
+// Two plans can both contain a task "T1". A worker carrying another plan's
+// marker must not be mapped onto the current plan's same-named task.
+func TestTrackWorkerAssignment_IgnoresMismatchedPlanID(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{ID: "plan-A", Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	// Marker for a different plan with the same task ID — must be ignored.
+	p.TrackWorkerAssignment("worker-x", "[planner-task:plan-B:T1] do work")
+	if _, ok := p.taskWorkers["T1"]; ok {
+		t.Fatalf("cross-plan marker leaked into current plan: %v", p.taskWorkers)
+	}
+	if p.persistCallCount != 0 {
+		t.Fatalf("persistCallCount = %d, want 0 for mismatched plan", p.persistCallCount)
+	}
+
+	// Marker for the current plan — must map.
+	p.TrackWorkerAssignment("worker-y", "[planner-task:plan-A:T1] do work")
+	if got := p.taskWorkers["T1"]; got != "worker-y" {
+		t.Fatalf("taskWorkers[T1] = %q, want worker-y", got)
+	}
+}
+
+// A legacy marker without a plan ID is accepted as belonging to the current plan.
+func TestTrackWorkerAssignment_AcceptsLegacyMarker(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{ID: "plan-A", Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	p.TrackWorkerAssignment("worker-legacy", "[planner-task:T1] do work")
+	if got := p.taskWorkers["T1"]; got != "worker-legacy" {
+		t.Fatalf("taskWorkers[T1] = %q, want worker-legacy", got)
+	}
+}
+
+// Structured linkage from worker state is honored and still plan-scoped.
+func TestTrackWorkerAssignmentByID(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{ID: "plan-A", Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	// Wrong plan — ignored.
+	p.TrackWorkerAssignmentByID("worker-x", "plan-B", "T1")
+	if _, ok := p.taskWorkers["T1"]; ok {
+		t.Fatalf("structured cross-plan assignment leaked: %v", p.taskWorkers)
+	}
+
+	// Right plan — mapped.
+	p.TrackWorkerAssignmentByID("worker-y", "plan-A", "T1")
+	if got := p.taskWorkers["T1"]; got != "worker-y" {
+		t.Fatalf("taskWorkers[T1] = %q, want worker-y", got)
+	}
+}
+
+// The handoff embeds the plan-scoped marker so workers can be linked back.
+func TestBuildWorkspaceHandoff_EmbedsPlanScopedMarker(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{ID: "plan-A", Refined: "build a calculator"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	handoff := p.buildWorkspaceHandoff()
+	if !strings.Contains(handoff, "[planner-task:plan-A:T1]") {
+		t.Fatalf("handoff missing plan-scoped marker:\n%s", handoff)
+	}
+}
+
+// persistPlan failures must be surfaced to the user exactly once per failure
+// streak (not on every 2s tick), and re-armed after a success.
+func TestPersistPlan_SurfacesErrorOnceThenRearms(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{ID: "plan-A", Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	// Force NewPlanStorage to fail: point the base dir at a path whose parent
+	// is a regular file so MkdirAll cannot create the plans directory.
+	f, err := os.CreateTemp("", "planner-not-a-dir-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	_ = f.Close()
+	p.plansBaseDir = f.Name() // a file, not a directory
+
+	p.persistPlan()
+	p.persistPlan()
+	failureMsgs := 0
+	for _, e := range p.feedback {
+		if e.Type == "system" && strings.Contains(e.Content, "Failed to save plan") {
+			failureMsgs++
+		}
+	}
+	if failureMsgs != 1 {
+		t.Fatalf("persistence-failure messages = %d, want exactly 1", failureMsgs)
+	}
+
+	// Recover: a writable dir should persist and re-arm the notifier.
+	p.plansBaseDir = t.TempDir()
+	p.persistPlan()
+	if p.persistErrNotified {
+		t.Fatalf("persistErrNotified should be cleared after a successful save")
 	}
 }
 

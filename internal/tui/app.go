@@ -36,6 +36,8 @@ type AgentInfo struct {
 	Type                   string
 	Alive                  bool
 	Task                   string
+	PlannerPlanID          string // plan this worker's task belongs to (from worker state)
+	PlannerTaskID          string // plan task this worker fulfills (from worker state)
 	TaskSummary            string // short (~60 char) description of current work
 	Waiting                bool
 	WaitingForVerification bool
@@ -300,7 +302,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.planner != nil && msg.daemonOK {
 			for _, ag := range msg.agents {
 				if ag.Type == "worker" {
-					a.planner.TrackWorkerAssignment(ag.Name, ag.Task)
+					// Prefer the structured planner linkage persisted in worker
+					// state; fall back to parsing the marker from task text for
+					// workers spawned before structured tracking existed.
+					if ag.PlannerTaskID != "" {
+						a.planner.TrackWorkerAssignmentByID(ag.Name, ag.PlannerPlanID, ag.PlannerTaskID)
+					} else {
+						a.planner.TrackWorkerAssignment(ag.Name, ag.Task)
+					}
 					if ag.Waiting {
 						// Worker submitted a PR — update task status
 						a.planner.UpdateWorkerStatus(ag.Name, 0, false)
@@ -1660,6 +1669,8 @@ func (a *App) pollDaemon() tea.Cmd {
 						}
 					}
 					info.Task = getString(agentMap, "task")
+					info.PlannerPlanID = getString(agentMap, "planner_plan_id")
+					info.PlannerTaskID = getString(agentMap, "planner_task_id")
 					info.TaskSummary = getString(agentMap, "summary")
 					info.Model = getString(agentMap, "model")
 					info.Alive = getString(agentMap, "status") == "running"
