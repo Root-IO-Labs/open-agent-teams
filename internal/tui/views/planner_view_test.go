@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func newTestPlanner() *PlannerView {
@@ -277,6 +279,109 @@ func TestBuildWorkspaceHandoff(t *testing.T) {
 	if !strings.Contains(msg, "runs without error") {
 		t.Error("acceptance criteria missing")
 	}
+	if !strings.Contains(msg, "[planner-task:T1]") || !strings.Contains(msg, "[planner-task:T2]") {
+		t.Error("handoff should include stable planner task markers")
+	}
+	if !strings.Contains(msg, "Workspace owns worker creation") {
+		t.Error("handoff should define the execution contract")
+	}
+	if !strings.Contains(msg, "The planner must not spawn workers") {
+		t.Error("handoff should explicitly forbid planner worker spawning")
+	}
+	if !strings.Contains(msg, "WAVE_STATE: current_wave=1 total_waves=2") {
+		t.Error("handoff should include persisted wave state")
+	}
+	if !strings.Contains(msg, `oat message send "$OAT_AGENT_NAME"`) {
+		t.Error("handoff should tell workspace to persist state to itself")
+	}
+}
+
+func TestWorkspaceDispatchTargetsPreferDefaultWorkspace(t *testing.T) {
+	targets := workspaceDispatchTargets()
+	if len(targets) < 2 {
+		t.Fatalf("expected default and legacy workspace targets, got %v", targets)
+	}
+	if targets[0] != "default" {
+		t.Fatalf("first workspace dispatch target = %q, want default", targets[0])
+	}
+	if targets[1] != "workspace" {
+		t.Fatalf("second workspace dispatch target = %q, want workspace", targets[1])
+	}
+}
+
+func TestTrackWorkerAssignmentFromPlannerMarker(t *testing.T) {
+	p := newTestPlanner()
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	p.TrackWorkerAssignment("worker-alpha", "[planner-task:T1] Scaffold the project")
+	p.UpdateWorkerStatus("worker-alpha", 0, false)
+
+	if got := p.taskWorkers["T1"]; got != "worker-alpha" {
+		t.Fatalf("taskWorkers[T1] = %q, want worker-alpha", got)
+	}
+	if p.tasks[0].AssignedTo != "worker-alpha" {
+		t.Fatalf("AssignedTo = %q, want worker-alpha", p.tasks[0].AssignedTo)
+	}
+	if p.tasks[0].Status != TaskStatusInProgress {
+		t.Fatalf("Status = %v, want TaskStatusInProgress", p.tasks[0].Status)
+	}
+}
+
+// TrackWorkerAssignment is called every TUI poll (2s) for every live worker.
+// Without dedup, repeated identical assignments would re-persist the plan on
+// every tick — which in production accumulated 4 GB / 1370 version files for a
+// single plan. The fix is gating persistPlan on whether anything actually
+// changed; this test pins that contract.
+func TestApplyWorkerAssignments_DoesNotRepersistOnIdenticalCall(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1}}
+
+	// First call mutates state and persists once.
+	p.applyWorkerAssignments(map[string]string{"T1": "worker-alpha"})
+	if p.persistCallCount != 1 {
+		t.Fatalf("first call persistCallCount = %d, want 1", p.persistCallCount)
+	}
+
+	// Second identical call must not re-persist.
+	p.applyWorkerAssignments(map[string]string{"T1": "worker-alpha"})
+	if p.persistCallCount != 1 {
+		t.Fatalf("idempotent call persistCallCount = %d, want 1 (no re-persist)", p.persistCallCount)
+	}
+
+	// New assignment must persist again.
+	p.applyWorkerAssignments(map[string]string{"T1": "worker-beta"})
+	if p.persistCallCount != 2 {
+		t.Fatalf("changed call persistCallCount = %d, want 2", p.persistCallCount)
+	}
+}
+
+// Same idempotency contract for UpdateWorkerStatus, which is also called every
+// TUI poll for waiting workers.
+func TestUpdateWorkerStatus_DoesNotRepersistOnIdenticalCall(t *testing.T) {
+	p := newTestPlanner()
+	p.requirement = &Requirement{Refined: "test"}
+	p.tasks = []Task{{ID: "T1", Title: "Scaffold", Wave: 1, AssignedTo: "worker-alpha", Status: TaskStatusInProgress}}
+	p.taskWorkers = map[string]string{"T1": "worker-alpha"}
+	p.taskPRs = map[string]int{"T1": 42}
+
+	// First call with same PR + status must NOT persist (nothing changed).
+	p.UpdateWorkerStatus("worker-alpha", 42, false)
+	if p.persistCallCount != 0 {
+		t.Fatalf("no-op call persistCallCount = %d, want 0", p.persistCallCount)
+	}
+
+	// Completing the worker must persist once.
+	p.UpdateWorkerStatus("worker-alpha", 42, true)
+	if p.persistCallCount != 1 {
+		t.Fatalf("completion call persistCallCount = %d, want 1", p.persistCallCount)
+	}
+
+	// Re-completing must not persist again.
+	p.UpdateWorkerStatus("worker-alpha", 42, true)
+	if p.persistCallCount != 1 {
+		t.Fatalf("idempotent completion persistCallCount = %d, want 1", p.persistCallCount)
+	}
 }
 
 // tasksForWave must return only tasks in the given wave.
@@ -308,6 +413,38 @@ func TestSummaryForList_Thinking(t *testing.T) {
 	p.state = StateDecomposingTasks
 	if !strings.Contains(p.SummaryForList(), "decomposing") {
 		t.Errorf("expected decomposing in summary, got %q", p.SummaryForList())
+	}
+}
+
+func TestHelpHintsExposeRefineAndBrainstormDuringDecomposition(t *testing.T) {
+	p := newTestPlanner()
+	p.state = StateDecomposingTasks
+	p.requirement = &Requirement{Refined: "Build calculator"}
+	p.brainstormThemes = []BrainstormTheme{{Name: "Tech Stack"}}
+
+	hints := p.HelpHints()
+	if !strings.Contains(hints, "^r:refine") {
+		t.Fatalf("expected refine hint in decomposing state, got %q", hints)
+	}
+	if !strings.Contains(hints, "^b:brainstorm") {
+		t.Fatalf("expected brainstorm hint in decomposing state, got %q", hints)
+	}
+}
+
+func TestRenderPlannerMarkdownFormatsCommonMarkdown(t *testing.T) {
+	rendered := renderPlannerMarkdown("## Title\n1. **UI Framework**: use `shadcn`\n- Save formulas", 80, lipgloss.NewStyle())
+
+	if strings.Contains(rendered, "**UI Framework**") {
+		t.Fatalf("bold markdown marker should be rendered, got %q", rendered)
+	}
+	if strings.Contains(rendered, "`shadcn`") {
+		t.Fatalf("inline code marker should be rendered, got %q", rendered)
+	}
+	if strings.Contains(rendered, "## Title") {
+		t.Fatalf("heading marker should be rendered, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "Title") || !strings.Contains(rendered, "UI Framework") || !strings.Contains(rendered, "shadcn") {
+		t.Fatalf("rendered output lost content: %q", rendered)
 	}
 }
 

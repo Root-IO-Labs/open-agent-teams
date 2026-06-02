@@ -23,6 +23,8 @@ When the user provides high-level requirements or vague requests that need decom
 3. **Create issues from the plan:** Use the planner's output to create GitHub issues
 4. **Spawn workers:** Create workers for each atomic task with proper dependencies
 
+The richest planner workflow is in `oat ui` (`ctrl+l` opens the planner). Plain `oat message send planner ...` is a manual workflow: read the planner response, wait for user approval when needed, then execute the approved plan.
+
 ## Executing Planner-Approved Plans
 
 When you receive a message starting with `[PLANNER-APPROVED]`, the planner has finished decomposing a requirement into a wave-based execution plan. **Execute it immediately.**
@@ -31,6 +33,7 @@ When you receive a message starting with `[PLANNER-APPROVED]`, the planner has f
 
 The message contains:
 - A `## Requirement` section — the refined description of what to build
+- A `## Execution Contract` section — exact tracking rules from the planner
 - One or more `## Wave N` sections — tasks grouped by execution order
 
 Example message format:
@@ -42,6 +45,7 @@ A scientific CLI calculator in Python 3...
 
 ## Wave 1 — spawn immediately
 ### T1: Project scaffold
+Task marker: [planner-task:T1]
 Set up project structure and test harness.
 Acceptance criteria:
 - pytest discovers test files
@@ -56,8 +60,8 @@ Acceptance criteria:
 
 1. **Parse Wave 1 tasks** from the `## Wave 1 — spawn immediately` section
 2. **Create a GitHub issue for each Wave 1 task** using `oat issue create`
-3. **Spawn a worker for each Wave 1 issue** using `oat work "task description" --issue N`
-4. **Track which wave you are on** — store the requirement and remaining waves in a note to yourself (use `oat message send workspace "WAVE_STATE: ..."` to persist state)
+3. **Spawn a worker for each Wave 1 issue** using `oat work "[planner-task:T1] task description" --issue N`
+4. **Track which wave you are on** — store the requirement and remaining waves in a note to yourself (use `oat message send "$OAT_AGENT_NAME" "WAVE_STATE: ..."` to persist state)
 5. **When all Wave 1 workers complete** (you receive daemon notifications), check `oat worker list` to confirm all Wave 1 workers are done or in waiting-for-PR state
 6. **Then spawn Wave 2 workers** using the same pattern: create issues, spawn workers
 7. Repeat until all waves are dispatched
@@ -67,7 +71,7 @@ Acceptance criteria:
 After parsing the plan, send yourself a state message so you can recover after restarts:
 
 ```bash
-oat message send workspace "WAVE_STATE: current_wave=1 total_waves=3 requirement='<requirement title>'"
+oat message send "$OAT_AGENT_NAME" "WAVE_STATE: current_wave=1 total_waves=3 requirement='<requirement title>'"
 ```
 
 When a worker completes, check this state to know which wave you are on and whether it is time to advance.
@@ -96,6 +100,8 @@ oat work rm <name>
 ```
 
 When spawning a worker for a GitHub issue, always pass `--issue <number>` so the system can auto-close the issue when the PR merges.
+
+When spawning a worker from a planner-approved plan, preserve the planner task marker at the beginning of the task text, for example `[planner-task:T1] Implement parser error handling...`. The TUI uses that marker to map worker status and PR progress back to the correct planner task.
 
 You get notified when workers complete.
 

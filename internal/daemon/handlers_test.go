@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/messages"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
@@ -56,6 +57,45 @@ func setupTestDaemonWithState(t *testing.T, setupFn func(*state.State)) (*Daemon
 	}
 
 	return d, cleanup
+}
+
+func TestPlannerAgentRoleAndCompletionGuard(t *testing.T) {
+	if got := roleForAgentType(state.AgentTypePlanner); got != routing.RoleOrchestrator {
+		t.Fatalf("roleForAgentType(planner) = %s, want %s", got, routing.RoleOrchestrator)
+	}
+
+	d, cleanup := setupTestDaemonWithState(t, func(s *state.State) {
+		if err := s.AddRepo("test-repo", &state.Repository{
+			GithubURL:   "https://github.com/test/repo",
+			SessionName: "test-session",
+			Agents:      make(map[string]state.Agent),
+		}); err != nil {
+			t.Fatalf("AddRepo: %v", err)
+		}
+		if err := s.AddAgent("test-repo", "planner", state.Agent{
+			Type:         state.AgentTypePlanner,
+			WorktreePath: "/tmp/planner",
+			WindowName:   "planner",
+			CreatedAt:    time.Now(),
+		}); err != nil {
+			t.Fatalf("AddAgent: %v", err)
+		}
+	})
+	defer cleanup()
+
+	resp := d.handleCompleteAgent(socket.Request{
+		Command: "complete_agent",
+		Args: map[string]interface{}{
+			"repo":  "test-repo",
+			"agent": "planner",
+		},
+	})
+	if resp.Success {
+		t.Fatal("planner should not be completable")
+	}
+	if !strings.Contains(resp.Error, "planner") || !strings.Contains(resp.Error, "cannot be completed") {
+		t.Fatalf("unexpected completion error: %s", resp.Error)
+	}
 }
 
 // TestHandleAddAgentTableDriven tests handleAddAgent with various argument combinations

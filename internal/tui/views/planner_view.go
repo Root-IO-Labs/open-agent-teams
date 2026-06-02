@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -44,10 +45,10 @@ type Task struct {
 	ID                 string
 	Title              string
 	Description        string
-	Type               string   // test|implementation|documentation (Overlord)
+	Type               string // test|implementation|documentation (Overlord)
 	Dependencies       []string
 	AcceptanceCriteria []string
-	Wave               int // Execution wave (parallel tasks have same wave, Wave 0 = foundation)
+	Wave               int    // Execution wave (parallel tasks have same wave, Wave 0 = foundation)
 	SpecReference      string // Reference to operational spec section (Overlord)
 	TestFirst          bool   // TDD flag for implementation tasks (Overlord)
 	Status             TaskStatus
@@ -69,8 +70,8 @@ const (
 // Unlike the raw PTY viewport, this shows only extracted user messages and
 // planner response text — no JSON, no tool calls, no terminal noise.
 type ConversationEntry struct {
-	Role    string // "user" | "planner" | "system"
-	Text    string
+	Role string // "user" | "planner" | "system"
+	Text string
 }
 
 // PlannerResponse is the structured JSON the planner agent emits every turn.
@@ -98,10 +99,10 @@ type PlannerRequirement struct {
 
 // TestStrategy defines the testing approach (Overlord methodology)
 type TestStrategy struct {
-	Unit       string `json:"unit"`
+	Unit        string `json:"unit"`
 	Integration string `json:"integration"`
-	Blackbox   string `json:"blackbox"`
-	GateScript string `json:"gate_script"`
+	Blackbox    string `json:"blackbox"`
+	GateScript  string `json:"gate_script"`
 }
 
 // PlannerTask is a single task inside a PlannerResponse.
@@ -109,11 +110,11 @@ type PlannerTask struct {
 	ID                 string   `json:"id"`
 	Title              string   `json:"title"`
 	Description        string   `json:"description"`
-	Type               string   `json:"type"`           // test|implementation|documentation
+	Type               string   `json:"type"` // test|implementation|documentation
 	Wave               int      `json:"wave"`
 	Dependencies       []string `json:"dependencies"`
-	SpecReference      string   `json:"spec_reference"`  // Reference to operational spec section
-	TestFirst          bool     `json:"test_first"`      // TDD flag for implementation tasks
+	SpecReference      string   `json:"spec_reference"` // Reference to operational spec section
+	TestFirst          bool     `json:"test_first"`     // TDD flag for implementation tasks
 	AcceptanceCriteria []string `json:"acceptance_criteria"`
 }
 
@@ -126,26 +127,26 @@ type PlannerView struct {
 	tasks        []Task
 	isLocked     bool
 	thinking     bool
-	
+
 	// Input handling
 	input       textinput.Model
 	inputPrompt string
-	
+
 	// UI state
-	width       int
-	height      int
-	scrollY     int
+	width        int
+	height       int
+	scrollY      int
 	selectedTask int
-	
+
 	// Communication
-	client      *socket.Client
-	repoName    string
-	
+	client   *socket.Client
+	repoName string
+
 	// Feedback and collaboration
-	feedback          []FeedbackEntry
-	thinkingText      string
-	plannerBuffer     string // accumulates planner output for JSON detection
-	clarifyingTurns   int   // turns in clarifying phase without advancing
+	feedback        []FeedbackEntry
+	thinkingText    string
+	plannerBuffer   string // accumulates planner output for JSON detection
+	clarifyingTurns int    // turns in clarifying phase without advancing
 
 	// Clean conversation: extracted message fields + user messages, shown
 	// instead of raw PTY output in the planner viewport.
@@ -156,19 +157,25 @@ type PlannerView struct {
 	taskWorkers map[string]string // task.ID → worker agent name
 	taskPRs     map[string]int    // task.ID → PR number (0 = no PR yet)
 	wavesDone   map[int]bool      // wave → all tasks complete
-	
+
+	// persistCallCount counts persistPlan invocations. Test seam: lets the
+	// idempotency tests assert that no-op TUI ticks don't re-write the plan
+	// file. (TUI polls workers every 2s; without dedup the plan file would
+	// rewrite ~4×/sec per active repo and accumulate GB of version history.)
+	persistCallCount int
+
 	// Enhanced contextual awareness (Overlord integration)
-	context           *PlannerContext
-	currentGate       *PhaseGate
-	pendingQuestions  []string
-	brainstormThemes  []BrainstormTheme
-	
+	context          *PlannerContext
+	currentGate      *PhaseGate
+	pendingQuestions []string
+	brainstormThemes []BrainstormTheme
+
 	// Key bindings
 	keyMap PlannerKeyMap
 }
 
 type FeedbackEntry struct {
-	Type      string    // "user", "ai", "system"
+	Type      string // "user", "ai", "system"
 	Content   string
 	Timestamp time.Time
 }
@@ -198,25 +205,25 @@ func NewPlannerView(client *socket.Client, repoName string) *PlannerView {
 	ti.Width = 80
 
 	p := &PlannerView{
-		state:       StateDefiningRequirement,
-		input:       ti,
-		inputPrompt: "Requirement",
-		client:      client,
-		repoName:    repoName,
+		state:        StateDefiningRequirement,
+		input:        ti,
+		inputPrompt:  "Requirement",
+		client:       client,
+		repoName:     repoName,
 		selectedTask: -1,
-		keyMap:      defaultPlannerKeys(),
-		feedback:    []FeedbackEntry{
+		keyMap:       defaultPlannerKeys(),
+		feedback: []FeedbackEntry{
 			{
-				Type:      "system", 
+				Type:      "system",
 				Content:   "Welcome to the OAT Planner! Describe your requirements and I'll help break them down into executable tasks.",
 				Timestamp: time.Now(),
 			},
 		},
 	}
-	
+
 	// Initialize enhanced fields
 	p.initializeEnhancements()
-	
+
 	return p
 }
 
@@ -295,6 +302,7 @@ func (p *PlannerView) Update(msg tea.Msg) (*PlannerView, tea.Cmd) {
 	case plannerDispatchedMsg:
 		p.thinking = false
 		p.state = StateExecuting
+		p.applyWorkerAssignments(msg.assignments)
 		target := msg.target
 		if target == "" {
 			target = "workspace"
@@ -463,11 +471,11 @@ func (p *PlannerView) stopAndPullPlan() tea.Cmd {
 	client := p.client
 	repoName := p.repoName
 	extractMsg := fmt.Sprintf(
-		"[planner-tui phase=ready_for_review]\n"+
-			"STOP all implementation work immediately. You are the PLANNER, not the implementer. "+
-			"Output your complete current plan as a single JSON code block (```json ... ```) "+
-			"in the required format with phase, message, requirement, and tasks fields. "+
-			"Include wave numbers, dependencies, and acceptance_criteria for every task. "+
+		"[planner-tui phase=ready_for_review]\n" +
+			"STOP all implementation work immediately. You are the PLANNER, not the implementer. " +
+			"Output your complete current plan as a single JSON code block (```json ... ```) " +
+			"in the required format with phase, message, requirement, and tasks fields. " +
+			"Include wave numbers, dependencies, and acceptance_criteria for every task. " +
 			"Do NOT create files, run commands, or implement anything.",
 	)
 
@@ -499,14 +507,12 @@ func (p *PlannerView) stopAndPullPlan() tea.Cmd {
 }
 
 // dispatchToWorkspace sends the approved plan to the workspace agent so it
-// can spawn workers in the correct waves. Falls back to direct spawn_agent
-// calls for Wave 1 if the workspace agent is unreachable.
+// can spawn workers in the correct waves. The planner must never spawn
+// workers directly; workspace owns execution and wave advancement.
 func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
 	client := p.client
 	repoName := p.repoName
 	handoffMsg := p.buildWorkspaceHandoff()
-	wave1Tasks := p.tasksForWave(1)
-	req := p.requirement
 
 	// Initialize execution tracking maps.
 	p.taskWorkers = make(map[string]string)
@@ -524,43 +530,34 @@ func (p *PlannerView) dispatchToWorkspace() tea.Cmd {
 			return plannerErrorMsg{err: fmt.Errorf("not connected to daemon")}
 		}
 
-		// Primary path: hand off to workspace agent.
-		resp, err := client.Send(socket.Request{
-			Command: "send_agent_input",
-			Args: map[string]interface{}{
-				"repo":    repoName,
-				"agent":   "workspace",
-				"message": handoffMsg,
-			},
-		})
-		if err == nil && resp.Success {
-			return plannerDispatchedMsg{target: "workspace"}
-		}
-
-		// Fallback: workspace not running — spawn Wave 1 workers directly.
-		var errs []string
-		for _, task := range wave1Tasks {
-			wr, werr := client.Send(socket.Request{
-				Command: "spawn_agent",
+		var lastErr string
+		for _, target := range workspaceDispatchTargets() {
+			resp, err := client.Send(socket.Request{
+				Command: "send_agent_input",
 				Args: map[string]interface{}{
-					"repo":   repoName,
-					"name":   fmt.Sprintf("worker-%s", task.ID),
-					"class":  "ephemeral",
-					"prompt": buildWorkerPrompt(task, req),
-					"task":   task.Title + ": " + task.Description,
+					"repo":    repoName,
+					"agent":   target,
+					"message": handoffMsg,
 				},
 			})
-			if werr != nil {
-				errs = append(errs, task.ID+": "+werr.Error())
-			} else if !wr.Success {
-				errs = append(errs, task.ID+": "+wr.Error)
+			if err == nil && resp.Success {
+				return plannerDispatchedMsg{target: target}
+			}
+			if err != nil {
+				lastErr = err.Error()
+			} else if !resp.Success {
+				lastErr = resp.Error
 			}
 		}
-		if len(errs) > 0 {
-			return plannerErrorMsg{err: fmt.Errorf("direct dispatch errors: %s", strings.Join(errs, "; "))}
+		if lastErr == "" {
+			lastErr = "workspace agent was not reachable"
 		}
-		return plannerDispatchedMsg{target: "direct"}
+		return plannerErrorMsg{err: fmt.Errorf("could not hand off plan to workspace/default; planner did not spawn workers directly: %s", lastErr)}
 	}
+}
+
+func workspaceDispatchTargets() []string {
+	return []string{"default", "workspace"}
 }
 
 // buildWorkspaceHandoff formats the approved plan as a structured message the
@@ -574,12 +571,22 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 		sb.WriteString(p.requirement.Refined)
 		sb.WriteString("\n\n")
 	}
+	sb.WriteString("## Execution Contract\n")
+	sb.WriteString("- Workspace owns worker creation, wave advancement, and PR/issue coordination. The planner must not spawn workers.\n")
+	sb.WriteString("- Preserve each task ID exactly as written below.\n")
+	sb.WriteString("- When spawning a worker, include the marker `[planner-task:<task-id>]` at the start of the worker task text so planner progress can be mapped back deterministically.\n")
+	sb.WriteString("- Do not start a wave until every dependency and every task in the previous wave is complete.\n\n")
+	sb.WriteString("## Workspace State\n")
+	sb.WriteString("Before spawning any workers, persist this execution state to yourself using your actual workspace agent name, usually `default`:\n")
+	sb.WriteString("```bash\n")
+	sb.WriteString(fmt.Sprintf("oat message send \"$OAT_AGENT_NAME\" %q\n", p.waveStateMessage()))
+	sb.WriteString("```\n\n")
 
 	waves := make(map[int][]Task)
 	for _, t := range p.tasks {
 		waves[t.Wave] = append(waves[t.Wave], t)
 	}
-	for wave := 1; wave <= p.getMaxWave(); wave++ {
+	for _, wave := range sortedWaveKeys(waves) {
 		tasks := waves[wave]
 		if len(tasks) == 0 {
 			continue
@@ -591,6 +598,7 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 		}
 		for _, t := range tasks {
 			sb.WriteString(fmt.Sprintf("### %s: %s\n", t.ID, t.Title))
+			sb.WriteString("Task marker: " + plannerTaskMarker(t.ID) + "\n")
 			sb.WriteString(t.Description + "\n")
 			if len(t.Dependencies) > 0 {
 				sb.WriteString("Depends on: " + strings.Join(t.Dependencies, ", ") + "\n")
@@ -606,6 +614,31 @@ func (p *PlannerView) buildWorkspaceHandoff() string {
 	}
 	sb.WriteString("Spawn Wave 1 workers immediately. Advance to the next wave when all tasks in the current wave are complete.")
 	return sb.String()
+}
+
+func (p *PlannerView) waveStateMessage() string {
+	requirement := ""
+	if p.requirement != nil {
+		requirement = p.requirement.Refined
+	}
+	var taskIDs []string
+	for _, task := range p.tasks {
+		taskIDs = append(taskIDs, fmt.Sprintf("%s:wave%d", task.ID, task.Wave))
+	}
+	return fmt.Sprintf("WAVE_STATE: current_wave=1 total_waves=%d tasks=%s requirement=%q", p.getMaxWave(), strings.Join(taskIDs, ","), requirement)
+}
+
+func plannerTaskMarker(taskID string) string {
+	return "[planner-task:" + taskID + "]"
+}
+
+func sortedWaveKeys(waves map[int][]Task) []int {
+	keys := make([]int, 0, len(waves))
+	for wave := range waves {
+		keys = append(keys, wave)
+	}
+	sort.Ints(keys)
+	return keys
 }
 
 func (p *PlannerView) lockPlan() {
@@ -678,6 +711,10 @@ func (p *PlannerView) buildPlannerMessage(userText string) string {
 }
 
 func (p *PlannerView) refineRequirement() tea.Cmd {
+	p.conversation = append(p.conversation, ConversationEntry{
+		Role: "system",
+		Text: "Asking planner to refine the current requirement.",
+	})
 	return p.sendToPlanner("Please refine the current requirement further.")
 }
 
@@ -690,13 +727,13 @@ func (p *PlannerView) rejectPlan() tea.Cmd {
 		"what changes would you like to make?")
 }
 
-
 // persistPlan saves the current approved plan to ~/.oat/plans/<repo>/ so it
 // survives TUI restarts and can be referenced later.
 func (p *PlannerView) persistPlan() {
 	if p.requirement == nil || len(p.tasks) == 0 {
 		return
 	}
+	p.persistCallCount++
 	plansDir := filepath.Join(os.Getenv("HOME"), ".oat", "plans", p.repoName)
 	storage, err := planner.NewPlanStorage(plansDir)
 	if err != nil {
@@ -708,7 +745,7 @@ func (p *PlannerView) persistPlan() {
 		Version:   p.requirement.Iteration,
 		CreatedAt: p.requirement.LastUpdated,
 		UpdatedAt: time.Now(),
-		Status:    "approved",
+		Status:    plannerStatusForState(p.state),
 		Requirement: planner.RequirementDoc{
 			Title:           p.requirement.Refined,
 			Original:        p.requirement.Original,
@@ -717,7 +754,19 @@ func (p *PlannerView) persistPlan() {
 			LastUpdated:     p.requirement.LastUpdated,
 		},
 	}
+	if p.testStrategy != nil {
+		doc.TestStrategy = planner.TestStrategyDoc{
+			Unit:        p.testStrategy.Unit,
+			Integration: p.testStrategy.Integration,
+			Blackbox:    p.testStrategy.Blackbox,
+			GateScript:  p.testStrategy.GateScript,
+		}
+	}
 	for _, t := range p.tasks {
+		prNumber := 0
+		if p.taskPRs != nil {
+			prNumber = p.taskPRs[t.ID]
+		}
 		doc.Tasks = append(doc.Tasks, planner.TaskDoc{
 			ID:                 t.ID,
 			Title:              t.Title,
@@ -728,9 +777,38 @@ func (p *PlannerView) persistPlan() {
 			SpecReference:      t.SpecReference,
 			TestFirst:          t.TestFirst,
 			AcceptanceCriteria: t.AcceptanceCriteria,
+			Status:             taskStatusString(t.Status),
+			AssignedTo:         t.AssignedTo,
+			PRNumber:           prNumber,
 		})
 	}
 	_ = storage.SavePlan(doc) // best-effort; failure is non-fatal
+}
+
+func plannerStatusForState(state PlannerState) string {
+	switch state {
+	case StateExecuting:
+		return "executing"
+	case StatePlanLocked:
+		return "approved"
+	default:
+		return "draft"
+	}
+}
+
+func taskStatusString(status TaskStatus) string {
+	switch status {
+	case TaskStatusInProgress:
+		return "in_progress"
+	case TaskStatusCompleted:
+		return "completed"
+	case TaskStatusFailed:
+		return "failed"
+	case TaskStatusBlocked:
+		return "blocked"
+	default:
+		return "pending"
+	}
 }
 
 // tasksForWave returns all tasks with the given wave number.
@@ -806,7 +884,6 @@ func (p *PlannerView) tickThinking() tea.Cmd {
 	})
 }
 
-
 func (p *PlannerView) getMaxWave() int {
 	maxWave := 0
 	for _, task := range p.tasks {
@@ -881,7 +958,7 @@ func (p *PlannerView) View() string {
 
 func (p *PlannerView) renderHeader() string {
 	title := "🚀 OAT Planner - Collaborative Task Planning"
-	
+
 	stateInfo := ""
 	switch p.state {
 	case StateDefiningRequirement:
@@ -966,7 +1043,7 @@ func (p *PlannerView) renderMainContent() string {
 	content.WriteString(p.renderFeedback())
 
 	return lipgloss.NewStyle().
-		Width(p.width - 2).
+		Width(p.width-2).
 		Height(contentHeight).
 		Padding(0, 1).
 		Render(content.String())
@@ -989,15 +1066,15 @@ func (p *PlannerView) renderRequirement() string {
 		Render(fmt.Sprintf("Requirement (v%d)", p.requirement.Iteration))
 
 	content := fmt.Sprintf("%s\n\n%s", title, p.requirement.Refined)
-	
+
 	if p.requirement.Original != p.requirement.Refined {
-		content += fmt.Sprintf("\n\nOriginal: %s", 
+		content += fmt.Sprintf("\n\nOriginal: %s",
 			lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(p.requirement.Original))
 	}
 
 	// Add operational spec if present
 	if p.requirement.OperationalSpec != "" {
-		content += fmt.Sprintf("\n\nOperational Spec: %s", 
+		content += fmt.Sprintf("\n\nOperational Spec: %s",
 			lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(p.requirement.OperationalSpec))
 	}
 
@@ -1024,7 +1101,7 @@ func (p *PlannerView) renderTestStrategy() string {
 	content += fmt.Sprintf("Unit Tests: %s\n", p.testStrategy.Unit)
 	content += fmt.Sprintf("Integration Tests: %s\n", p.testStrategy.Integration)
 	content += fmt.Sprintf("Blackbox Tests: %s\n", p.testStrategy.Blackbox)
-	content += fmt.Sprintf("Gate Script: %s", 
+	content += fmt.Sprintf("Gate Script: %s",
 		lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render(p.testStrategy.GateScript))
 
 	return style.Render(content)
@@ -1036,12 +1113,12 @@ func (p *PlannerView) renderTasks() string {
 	}
 
 	var content strings.Builder
-	
+
 	title := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("34")).
 		Render("📋 Task Breakdown")
-	
+
 	content.WriteString(title)
 	content.WriteString("\n\n")
 
@@ -1107,10 +1184,10 @@ func (p *PlannerView) renderTasks() string {
 				if task.EstimatedDuration > 0 {
 					taskLine += fmt.Sprintf(" (%s)", task.EstimatedDuration)
 				}
-				
+
 				content.WriteString(taskStyle.Render(taskLine))
 				content.WriteString("\n")
-				
+
 				if task.Description != "" {
 					desc := lipgloss.NewStyle().
 						Foreground(lipgloss.Color("8")).
@@ -1164,10 +1241,10 @@ func (p *PlannerView) renderFeedback() string {
 			content.WriteString("\n\n")
 
 		case "ai":
-			// AI messages: plain white text, no prefix, indented slightly
-			body := aiStyle.Render(entry.Content)
+			// AI messages: markdown-ish text, no prefix, indented slightly
+			body := renderPlannerMarkdown(entry.Content, wrapWidth-2, aiStyle)
 			if wrapWidth > 0 {
-				body = lipgloss.NewStyle().Width(wrapWidth - 2).Padding(0, 0, 0, 2).Render(body)
+				body = lipgloss.NewStyle().Width(wrapWidth-2).Padding(0, 0, 0, 2).Render(body)
 			}
 			content.WriteString(body)
 			content.WriteString("\n\n")
@@ -1189,6 +1266,142 @@ func (p *PlannerView) renderFeedback() string {
 	}
 
 	return content.String()
+}
+
+func renderPlannerMarkdown(text string, width int, base lipgloss.Style) string {
+	if width < 20 {
+		width = 80
+	}
+
+	headingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+	boldStyle := lipgloss.NewStyle().Bold(true)
+	codeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	listStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	quoteStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+
+	var out strings.Builder
+	lines := strings.Split(text, "\n")
+	inFence := false
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			out.WriteString("\n")
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			out.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Width(width).Render(line))
+			out.WriteString("\n")
+			continue
+		}
+
+		if headingText, ok := markdownHeadingText(trimmed); ok {
+			out.WriteString(headingStyle.Width(width).Render(headingText))
+			out.WriteString("\n")
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, ">") {
+			out.WriteString(quoteStyle.Width(width).Render(strings.TrimSpace(strings.TrimPrefix(trimmed, ">"))))
+			out.WriteString("\n")
+			continue
+		}
+
+		prefix, body := markdownListParts(line)
+		renderedBody := renderInlineMarkdown(body, base, boldStyle, codeStyle)
+		if prefix != "" {
+			out.WriteString(listStyle.Render(prefix))
+			out.WriteString(lipgloss.NewStyle().Width(width - lipgloss.Width(prefix)).Render(renderedBody))
+			out.WriteString("\n")
+			continue
+		}
+
+		out.WriteString(lipgloss.NewStyle().Width(width).Render(renderInlineMarkdown(line, base, boldStyle, codeStyle)))
+		out.WriteString("\n")
+	}
+
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func markdownHeadingText(line string) (string, bool) {
+	level := 0
+	for level < len(line) && line[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level >= len(line) || line[level] != ' ' {
+		return "", false
+	}
+	return strings.TrimSpace(line[level:]), true
+}
+
+func markdownListParts(line string) (string, string) {
+	indentLen := len(line) - len(strings.TrimLeft(line, " "))
+	trimmed := strings.TrimLeft(line, " ")
+	indent := strings.Repeat(" ", indentLen)
+	for _, marker := range []string{"- ", "* ", "+ "} {
+		if strings.HasPrefix(trimmed, marker) {
+			return indent + "• ", strings.TrimSpace(trimmed[len(marker):])
+		}
+	}
+	if dot := strings.Index(trimmed, ". "); dot > 0 && allDigits(trimmed[:dot]) {
+		return indent + trimmed[:dot+2], strings.TrimSpace(trimmed[dot+2:])
+	}
+	return "", line
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func renderInlineMarkdown(text string, base, boldStyle, codeStyle lipgloss.Style) string {
+	var out strings.Builder
+	for len(text) > 0 {
+		nextBold := strings.Index(text, "**")
+		nextCode := strings.Index(text, "`")
+		switch {
+		case nextCode >= 0 && (nextBold < 0 || nextCode < nextBold):
+			if nextCode > 0 {
+				out.WriteString(base.Render(text[:nextCode]))
+			}
+			rest := text[nextCode+1:]
+			end := strings.Index(rest, "`")
+			if end < 0 {
+				out.WriteString(base.Render("`" + rest))
+				return out.String()
+			}
+			out.WriteString(codeStyle.Render(rest[:end]))
+			text = rest[end+1:]
+		case nextBold >= 0:
+			if nextBold > 0 {
+				out.WriteString(base.Render(text[:nextBold]))
+			}
+			rest := text[nextBold+2:]
+			end := strings.Index(rest, "**")
+			if end < 0 {
+				out.WriteString(base.Render("**" + rest))
+				return out.String()
+			}
+			out.WriteString(boldStyle.Render(rest[:end]))
+			text = rest[end+2:]
+		default:
+			out.WriteString(base.Render(text))
+			return out.String()
+		}
+	}
+	return out.String()
 }
 
 // renderTasksCompact shows tasks as a dense single-line list by wave,
@@ -1229,7 +1442,7 @@ func (p *PlannerView) renderTasksCompact() string {
 func (p *PlannerView) renderThinking() string {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	frame := frames[(int(time.Now().UnixMilli()/200))%len(frames)]
-	
+
 	return lipgloss.NewStyle().
 		Foreground(lipgloss.Color("8")).
 		Render(fmt.Sprintf("%s %s", frame, p.thinkingText))
@@ -1241,7 +1454,7 @@ func (p *PlannerView) renderInputBar() string {
 		Render(p.inputPrompt + ": ")
 
 	input := p.input.View()
-	
+
 	return lipgloss.NewStyle().
 		Width(p.width).
 		Padding(0, 1).
@@ -1260,12 +1473,18 @@ func (p *PlannerView) renderHelp() string {
 			helps = append(helps, "^b: brainstorm")
 		}
 	case StateDecomposingTasks:
-		helps = []string{"Enter: reply", "^p: extract plan", "^n: restart", "esc: back"}
+		helps = []string{"Enter: reply", "^p: extract plan", "^r: refine", "^n: restart", "esc: back"}
+		if len(p.brainstormThemes) > 0 {
+			helps = append(helps, "^b: brainstorm")
+		}
 	case StateReviewingPlan:
 		if len(p.tasks) > 0 {
-			helps = []string{"^a: approve & dispatch", "^x: reject", "^p: re-extract", "Enter: feedback", "^n: restart", "esc: back"}
+			helps = []string{"^a: approve & dispatch", "^x: reject", "^p: re-extract", "^r: refine", "Enter: feedback", "^n: restart", "esc: back"}
 		} else {
-			helps = []string{"^p: extract plan as JSON", "^x: reject", "Enter: feedback", "^n: restart", "esc: back"}
+			helps = []string{"^p: extract plan as JSON", "^x: reject", "^r: refine", "Enter: feedback", "^n: restart", "esc: back"}
+		}
+		if len(p.brainstormThemes) > 0 {
+			helps = append(helps, "^b: brainstorm")
 		}
 	case StatePlanLocked:
 		helps = []string{"^a: dispatch to workspace", "Enter: feedback", "esc: back"}
@@ -1554,7 +1773,10 @@ type plannerSentMsg struct{}
 
 type plannerErrorMsg struct{ err error }
 
-type plannerDispatchedMsg struct{ target string } // "workspace" or "direct"
+type plannerDispatchedMsg struct {
+	target      string // "workspace" or "direct"
+	assignments map[string]string
+}
 
 type plannerTickMsg time.Time
 
@@ -1632,7 +1854,7 @@ func (p *PlannerView) RenderEmbeddedContent(width, height int) string {
 			out.WriteString(lipgloss.NewStyle().Width(wrapW).Render(line))
 			out.WriteString("\n\n")
 		case "planner":
-			body := plannerStyle.Render(entry.Text)
+			body := renderPlannerMarkdown(entry.Text, wrapW-2, plannerStyle)
 			out.WriteString(lipgloss.NewStyle().Width(wrapW).Padding(0, 0, 0, 2).Render(body))
 			out.WriteString("\n\n")
 		case "system":
@@ -1779,18 +2001,27 @@ func (p *PlannerView) HelpHints() string {
 	switch p.state {
 	case StateDefiningRequirement:
 		hints = []string{"^n:restart"}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
+		}
 	case StateRefiningRequirement:
 		hints = []string{"^p:extract", "^r:refine", "^n:restart"}
 		if len(p.brainstormThemes) > 0 {
 			hints = append(hints, "^b:brainstorm")
 		}
 	case StateDecomposingTasks:
-		hints = []string{"^p:extract", "^n:restart"}
+		hints = []string{"^p:extract", "^r:refine", "^n:restart"}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
+		}
 	case StateReviewingPlan:
 		if len(p.tasks) > 0 {
-			hints = []string{"^a:approve", "^x:reject", "^p:re-extract", "^n:restart"}
+			hints = []string{"^a:approve", "^x:reject", "^p:re-extract", "^r:refine", "^n:restart"}
 		} else {
-			hints = []string{"^p:extract", "^n:restart"}
+			hints = []string{"^p:extract", "^r:refine", "^n:restart"}
+		}
+		if len(p.brainstormThemes) > 0 {
+			hints = append(hints, "^b:brainstorm")
 		}
 	case StatePlanLocked:
 		hints = []string{"^a:dispatch"}
@@ -1838,6 +2069,7 @@ func (p *PlannerView) HandleStreamMsg(msg tea.Msg) tea.Cmd {
 	case plannerDispatchedMsg:
 		p.thinking = false
 		p.state = StateExecuting
+		p.applyWorkerAssignments(m.assignments)
 		target := m.target
 		if target == "" {
 			target = "workspace"
@@ -1886,26 +2118,101 @@ func (p *PlannerView) UpdateWorkerStatus(workerName string, prNumber int, comple
 		taskID = workerName
 	}
 
+	changed := false
 	if prNumber > 0 && p.taskPRs != nil {
-		p.taskPRs[taskID] = prNumber
+		if p.taskPRs[taskID] != prNumber {
+			p.taskPRs[taskID] = prNumber
+			changed = true
+		}
 	}
 
 	// Update the matching task status.
 	for i, t := range p.tasks {
 		if t.ID == taskID || t.AssignedTo == workerName {
+			newStatus := p.tasks[i].Status
 			if completed {
-				p.tasks[i].Status = TaskStatusCompleted
+				newStatus = TaskStatusCompleted
 			} else if prNumber > 0 {
 				// PR submitted but not merged yet
-				p.tasks[i].Status = TaskStatusInProgress
+				newStatus = TaskStatusInProgress
 			}
-			p.tasks[i].AssignedTo = workerName
+			if p.tasks[i].Status != newStatus {
+				p.tasks[i].Status = newStatus
+				changed = true
+			}
+			if p.tasks[i].AssignedTo != workerName {
+				p.tasks[i].AssignedTo = workerName
+				changed = true
+			}
 			break
 		}
+	}
+	if changed {
+		p.persistPlan()
 	}
 
 	// Check if the current wave is complete and note it in conversation.
 	p.checkWaveCompletion()
+}
+
+func (p *PlannerView) TrackWorkerAssignment(workerName, taskText string) {
+	if workerName == "" || taskText == "" {
+		return
+	}
+	taskID := taskIDFromPlannerMarker(taskText)
+	if taskID == "" {
+		return
+	}
+	p.applyWorkerAssignments(map[string]string{taskID: workerName})
+}
+
+func (p *PlannerView) applyWorkerAssignments(assignments map[string]string) {
+	if len(assignments) == 0 {
+		return
+	}
+	if p.taskWorkers == nil {
+		p.taskWorkers = make(map[string]string)
+	}
+	changed := false
+	for taskID, workerName := range assignments {
+		if taskID == "" || workerName == "" {
+			continue
+		}
+		if p.taskWorkers[taskID] != workerName {
+			p.taskWorkers[taskID] = workerName
+			changed = true
+		}
+		for i := range p.tasks {
+			if p.tasks[i].ID == taskID {
+				if p.tasks[i].AssignedTo != workerName {
+					p.tasks[i].AssignedTo = workerName
+					changed = true
+				}
+				if p.tasks[i].Status == TaskStatusPending {
+					p.tasks[i].Status = TaskStatusInProgress
+					changed = true
+				}
+				break
+			}
+		}
+	}
+	if changed {
+		p.persistPlan()
+	}
+}
+
+func taskIDFromPlannerMarker(text string) string {
+	const prefix = "[planner-task:"
+	start := strings.Index(text, prefix)
+	if start < 0 {
+		return ""
+	}
+	start += len(prefix)
+	end := strings.Index(text[start:], "]")
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[start : start+end])
 }
 
 // checkWaveCompletion checks if all tasks in the current execution wave are
@@ -1948,4 +2255,3 @@ func IsPlannerMsg(msg tea.Msg) bool {
 	}
 	return false
 }
-

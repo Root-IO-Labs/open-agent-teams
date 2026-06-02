@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
-	
+
 	"sync"
 )
 
@@ -18,16 +19,16 @@ type PlanStorage struct {
 
 // PlanDocument represents a complete planning session
 type PlanDocument struct {
-	ID              string                 `json:"id"`
-	Version         int                    `json:"version"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
-	Status          string                 `json:"status"` // draft, approved, executing, completed
-	Requirement     RequirementDoc         `json:"requirement"`
-	TestStrategy    TestStrategyDoc        `json:"test_strategy"`
-	Tasks           []TaskDoc              `json:"tasks"`
-	Metadata        map[string]interface{} `json:"metadata"`
-	History         []PlanRevision         `json:"history"`
+	ID           string                 `json:"id"`
+	Version      int                    `json:"version"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
+	Status       string                 `json:"status"` // draft, approved, executing, completed
+	Requirement  RequirementDoc         `json:"requirement"`
+	TestStrategy TestStrategyDoc        `json:"test_strategy"`
+	Tasks        []TaskDoc              `json:"tasks"`
+	Metadata     map[string]interface{} `json:"metadata"`
+	History      []PlanRevision         `json:"history"`
 }
 
 // RequirementDoc stores requirement details
@@ -49,17 +50,18 @@ type TestStrategyDoc struct {
 
 // TaskDoc represents a task in the plan
 type TaskDoc struct {
-	ID                 string   `json:"id"`
-	Title              string   `json:"title"`
-	Description        string   `json:"description"`
-	Type               string   `json:"type"`
-	Wave               int      `json:"wave"`
-	Dependencies       []string `json:"dependencies"`
-	SpecReference      string   `json:"spec_reference"`
-	TestFirst          bool     `json:"test_first"`
-	AcceptanceCriteria []string `json:"acceptance_criteria"`
-	Status             string   `json:"status"` // pending, assigned, in_progress, completed, failed
-	AssignedTo         string   `json:"assigned_to,omitempty"`
+	ID                 string     `json:"id"`
+	Title              string     `json:"title"`
+	Description        string     `json:"description"`
+	Type               string     `json:"type"`
+	Wave               int        `json:"wave"`
+	Dependencies       []string   `json:"dependencies"`
+	SpecReference      string     `json:"spec_reference"`
+	TestFirst          bool       `json:"test_first"`
+	AcceptanceCriteria []string   `json:"acceptance_criteria"`
+	Status             string     `json:"status"` // pending, assigned, in_progress, completed, failed
+	AssignedTo         string     `json:"assigned_to,omitempty"`
+	PRNumber           int        `json:"pr_number,omitempty"`
 	CompletedAt        *time.Time `json:"completed_at,omitempty"`
 }
 
@@ -106,6 +108,10 @@ func (ps *PlanStorage) SavePlan(plan *PlanDocument) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
+	return ps.savePlanNoLock(plan)
+}
+
+func (ps *PlanStorage) savePlanNoLock(plan *PlanDocument) error {
 	// Generate ID if new plan
 	if plan.ID == "" {
 		plan.ID = fmt.Sprintf("plan-%d", time.Now().Unix())
@@ -117,7 +123,7 @@ func (ps *PlanStorage) SavePlan(plan *PlanDocument) error {
 		if existing != nil {
 			plan.Version = existing.Version + 1
 			plan.CreatedAt = existing.CreatedAt
-			
+
 			// Add to history
 			revision := PlanRevision{
 				Version:     plan.Version,
@@ -127,6 +133,13 @@ func (ps *PlanStorage) SavePlan(plan *PlanDocument) error {
 				Changes:     ps.detectChanges(existing, plan),
 			}
 			plan.History = append(existing.History, revision)
+		} else {
+			if plan.Version == 0 {
+				plan.Version = 1
+			}
+			if plan.CreatedAt.IsZero() {
+				plan.CreatedAt = time.Now()
+			}
 		}
 	}
 
@@ -145,13 +158,13 @@ func (ps *PlanStorage) SavePlan(plan *PlanDocument) error {
 		return fmt.Errorf("failed to marshal plan: %w", err)
 	}
 
-	if err := os.WriteFile(planPath, data, 0644); err != nil {
+	if err := atomicWriteFile(planPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write plan file: %w", err)
 	}
 
 	// Save versioned backup
 	versionPath := filepath.Join(planDir, fmt.Sprintf("v%d.json", plan.Version))
-	if err := os.WriteFile(versionPath, data, 0644); err != nil {
+	if err := atomicWriteFile(versionPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write version file: %w", err)
 	}
 
@@ -178,7 +191,7 @@ func (ps *PlanStorage) LoadPlan(planID string) (*PlanDocument, error) {
 
 func (ps *PlanStorage) loadPlanNoLock(planID string) (*PlanDocument, error) {
 	planPath := filepath.Join(ps.basePath, planID, "plan.json")
-	
+
 	data, err := os.ReadFile(planPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -228,7 +241,7 @@ func (ps *PlanStorage) UpdatePlan(planID string, updates map[string]interface{})
 	}
 
 	// Save updated plan
-	return ps.SavePlan(plan)
+	return ps.savePlanNoLock(plan)
 }
 
 // ListPlans returns all available plans
@@ -260,7 +273,7 @@ func (ps *PlanStorage) ListPlans() ([]PlanDocument, error) {
 // saveMarkdown generates a human-readable markdown document
 func (ps *PlanStorage) saveMarkdown(plan *PlanDocument) error {
 	mdPath := filepath.Join(ps.basePath, plan.ID, "plan.md")
-	
+
 	md := fmt.Sprintf(`# %s
 
 ## Overview
@@ -308,12 +321,8 @@ func (ps *PlanStorage) saveMarkdown(plan *PlanDocument) error {
 	}
 
 	// Write tasks by wave
-	for wave := 0; wave <= len(waveMap); wave++ {
-		tasks, exists := waveMap[wave]
-		if !exists {
-			continue
-		}
-
+	for _, wave := range sortedWaveKeys(waveMap) {
+		tasks := waveMap[wave]
 		md += fmt.Sprintf("### Wave %d\n\n", wave)
 		for _, task := range tasks {
 			md += fmt.Sprintf("#### %s (%s)\n", task.Title, task.ID)
@@ -328,6 +337,9 @@ func (ps *PlanStorage) saveMarkdown(plan *PlanDocument) error {
 			md += fmt.Sprintf("- **Status**: %s\n", task.Status)
 			if task.AssignedTo != "" {
 				md += fmt.Sprintf("- **Assigned To**: %s\n", task.AssignedTo)
+			}
+			if task.PRNumber > 0 {
+				md += fmt.Sprintf("- **PR**: #%d\n", task.PRNumber)
 			}
 			md += "\n**Acceptance Criteria:**\n"
 			for _, criteria := range task.AcceptanceCriteria {
@@ -354,14 +366,13 @@ func (ps *PlanStorage) saveMarkdown(plan *PlanDocument) error {
 		}
 	}
 
-	return os.WriteFile(mdPath, []byte(md), 0644)
+	return atomicWriteFile(mdPath, []byte(md), 0644)
 }
 
 // saveWorkGraph generates a YAML work graph for task dispatch
 func (ps *PlanStorage) saveWorkGraph(plan *PlanDocument) error {
 	graphPath := filepath.Join(ps.basePath, plan.ID, "workgraph.yml")
-	
-	// Simple YAML generation (you might want to use a proper YAML library)
+
 	yaml := fmt.Sprintf(`# Work Graph for %s
 # Generated: %s
 
@@ -370,7 +381,7 @@ version: %d
 status: %s
 
 waves:
-`, plan.Requirement.Title, time.Now().Format(time.RFC3339), plan.ID, plan.Version, plan.Status)
+`, yamlScalar(plan.Requirement.Title), time.Now().Format(time.RFC3339), yamlScalar(plan.ID), plan.Version, yamlScalar(plan.Status))
 
 	// Group tasks by wave
 	waveMap := make(map[int][]TaskDoc)
@@ -378,28 +389,74 @@ waves:
 		waveMap[task.Wave] = append(waveMap[task.Wave], task)
 	}
 
-	for wave := 0; wave <= len(waveMap); wave++ {
-		tasks, exists := waveMap[wave]
-		if !exists {
-			continue
-		}
-
+	for _, wave := range sortedWaveKeys(waveMap) {
+		tasks := waveMap[wave]
 		yaml += fmt.Sprintf("  - wave: %d\n    tasks:\n", wave)
 		for _, task := range tasks {
-			yaml += fmt.Sprintf("      - id: %s\n", task.ID)
-			yaml += fmt.Sprintf("        title: %s\n", task.Title)
-			yaml += fmt.Sprintf("        type: %s\n", task.Type)
-			yaml += fmt.Sprintf("        status: %s\n", task.Status)
+			yaml += fmt.Sprintf("      - id: %s\n", yamlScalar(task.ID))
+			yaml += fmt.Sprintf("        title: %s\n", yamlScalar(task.Title))
+			yaml += fmt.Sprintf("        type: %s\n", yamlScalar(task.Type))
+			yaml += fmt.Sprintf("        status: %s\n", yamlScalar(task.Status))
+			if task.AssignedTo != "" {
+				yaml += fmt.Sprintf("        assigned_to: %s\n", yamlScalar(task.AssignedTo))
+			}
+			if task.PRNumber > 0 {
+				yaml += fmt.Sprintf("        pr_number: %d\n", task.PRNumber)
+			}
 			if len(task.Dependencies) > 0 {
 				yaml += "        dependencies:\n"
 				for _, dep := range task.Dependencies {
-					yaml += fmt.Sprintf("          - %s\n", dep)
+					yaml += fmt.Sprintf("          - %s\n", yamlScalar(dep))
 				}
 			}
 		}
 	}
 
-	return os.WriteFile(graphPath, []byte(yaml), 0644)
+	return atomicWriteFile(graphPath, []byte(yaml), 0644)
+}
+
+func sortedWaveKeys(waveMap map[int][]TaskDoc) []int {
+	keys := make([]int, 0, len(waveMap))
+	for wave := range waveMap {
+		keys = append(keys, wave)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func yamlScalar(value string) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return `""`
+	}
+	return string(encoded)
+}
+
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 // detectChanges compares two plans and returns the differences

@@ -1806,6 +1806,7 @@ func TestAgentTypeIsPersistent(t *testing.T) {
 		{AgentTypeSupervisor, true},
 		{AgentTypeMergeQueue, true},
 		{AgentTypeWorkspace, true},
+		{AgentTypePlanner, true},
 		{AgentTypeGenericPersistent, true},
 		// Transient agents should return false
 		{AgentTypeWorker, false},
