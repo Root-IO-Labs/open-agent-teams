@@ -34,6 +34,119 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
+// TestRestoreVirtualRepoSurvivesDaemonRestart_2026_06_02 pins the
+// inverse property of TestAssistantRemoveStaysRemovedAcrossReload_R2:
+// an ACTIVE virtual repo + assistant agent record must survive a
+// daemon restart (i.e., a restoreRepoAgents call against a freshly-
+// loaded state).
+//
+// Pre-fix bug (reported 2026-06-02: "when I reinstall and reload the
+// extension and restart the daemon, test1 disappears for some reason"):
+// the standard restoreRepoAgents path assumed every repo had a git
+// directory on disk + a supervisor + worktrees. A virtual repo
+// (state.Repository.IsVirtual=true, from `oat assistant start`) has
+// none of those. The os.Stat(repoPath) check returned ENOENT, the
+// function returned an error, the health-check loop retried until
+// fetchFailureThreshold, then it called RemoveAgent on every agent in
+// the repo. The user's assistant was silently deleted on every
+// daemon restart with no visible failure narrative beyond the
+// daemon log's "failed to restore" warnings.
+//
+// Post-fix: restoreRepoAgents branches on repo.IsVirtual and calls
+// restoreVirtualRepoAgents instead. That path only creates the
+// backend session and re-spawns assistant agents (skipping user-
+// stopped ones); it does NOT touch git, supervisor, or worktrees,
+// and it does NOT remove "stale" agents.
+func TestRestoreVirtualRepoSurvivesDaemonRestart_2026_06_02(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	// Force OAT_TEST_MODE so startRegisteredAgent's spawn branch
+	// is skipped (no real oat-agent binary in the test sandbox).
+	t.Setenv("OAT_TEST_MODE", "1")
+
+	const (
+		assistantName = "post-restart-survivor"
+		virtualRepo   = "_assistant-post-restart-survivor"
+	)
+
+	// Build the world an in-progress assistant would have:
+	// virtual repo + AgentTypeAssistant record with no live PID
+	// (simulating the post-daemon-restart state where the in-
+	// process backend has lost its sessions).
+	repo := &state.Repository{
+		SessionName: "oat-" + virtualRepo,
+		IsVirtual:   true,
+		Agents:      map[string]state.Agent{},
+	}
+	if err := d.state.AddRepo(virtualRepo, repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	// Worktree path must exist for startRegisteredAgent's
+	// downstream prompt-file write etc. The virtual-repo create
+	// path in CLI assistantStart mkdirs this; mirror that here.
+	wtPath := d.paths.AgentWorktree(virtualRepo, assistantName)
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	if err := d.state.AddAgent(virtualRepo, assistantName, state.Agent{
+		Type:         state.AgentTypeAssistant,
+		WorktreePath: wtPath,
+		WindowName:   assistantName,
+		// PID=0 (no live process) — matches the post-restart
+		// reality of the in-process DirectBackend.
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	// Re-read repo from state with the agent we just added.
+	gotRepo, ok := d.state.GetRepo(virtualRepo)
+	if !ok {
+		t.Fatalf("repo %q missing from state immediately after AddRepo+AddAgent", virtualRepo)
+	}
+
+	// THE PIN: restoreRepoAgents on a virtual repo must NOT return
+	// an error and must NOT remove the agent. (Pre-fix this
+	// returned "repository path does not exist" → after enough
+	// retries the agent was deleted via the appendToSliceMap →
+	// deadAgents → RemoveAgent path in checkAgentHealth.)
+	if err := d.restoreRepoAgents(virtualRepo, gotRepo); err != nil {
+		t.Fatalf("restoreRepoAgents on virtual repo returned error: %v", err)
+	}
+
+	// Repo + agent must still exist after restore.
+	postRepo, ok := d.state.GetRepo(virtualRepo)
+	if !ok {
+		t.Fatalf("virtual repo %q was removed during restoreRepoAgents", virtualRepo)
+	}
+	if _, exists := postRepo.Agents[assistantName]; !exists {
+		t.Fatalf("agent %q was removed during restoreRepoAgents (this is the 2026-06-02 disappearing-assistant bug)", assistantName)
+	}
+
+	// User-stopped agents must NOT be respawned. Mirror the
+	// stop_agent verb's LastError marker; restoreVirtualRepoAgents
+	// should leave the PID at 0.
+	stoppedAgent := postRepo.Agents[assistantName]
+	stoppedAgent.LastError = "stopped by user"
+	stoppedAgent.PID = 0
+	if err := d.state.UpdateAgent(virtualRepo, assistantName, stoppedAgent); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+	stoppedRepo, _ := d.state.GetRepo(virtualRepo)
+	if err := d.restoreRepoAgents(virtualRepo, stoppedRepo); err != nil {
+		t.Fatalf("restoreRepoAgents on virtual repo (user-stopped agent) returned error: %v", err)
+	}
+	finalRepo, _ := d.state.GetRepo(virtualRepo)
+	finalAgent, exists := finalRepo.Agents[assistantName]
+	if !exists {
+		t.Fatalf("user-stopped agent %q was removed during restoreRepoAgents", assistantName)
+	}
+	if finalAgent.PID != 0 {
+		t.Errorf("user-stopped agent was respawned by restoreVirtualRepoAgents (PID=%d); should have been left STOPPED", finalAgent.PID)
+	}
+}
+
+
 func TestAssistantRemoveStaysRemovedAcrossReload_R2(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "oat-r2-*")
 	if err != nil {

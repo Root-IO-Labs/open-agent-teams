@@ -7024,8 +7024,77 @@ func (d *Daemon) discoverMissingWorkspaces(repoName string, repo *state.Reposito
 	}
 }
 
+// restoreVirtualRepoAgents is the virtual-repo branch of
+// restoreRepoAgents. See the IsVirtual gate at the top of
+// restoreRepoAgents for the design rationale (the standard restore
+// path's git/supervisor/worktree assumptions would silently delete
+// assistant records on every daemon restart).
+//
+// Idempotent: skips agents that already have a live PID (e.g. a
+// future backend whose processes survive a daemon restart). Per-
+// agent spawn failures log + continue rather than returning early
+// so one broken assistant doesn't block restore of the rest.
+func (d *Daemon) restoreVirtualRepoAgents(repoName string, repo *state.Repository) error {
+	d.logger.Info("Restoring virtual repo %s (%d agent(s))", repoName, len(repo.Agents))
+	if err := d.backend.CreateSession(d.ctx, repo.SessionName); err != nil {
+		return fmt.Errorf("failed to create session for virtual repo %s: %w", repoName, err)
+	}
+	for agentName, agent := range repo.Agents {
+		// Live process already there (re-adopted, or backend
+		// survived the daemon restart) — leave it alone.
+		if agent.PID > 0 && isProcessAlive(agent.PID) {
+			d.logger.Debug("Virtual repo %s: agent %s already alive (PID=%d), skipping respawn", repoName, agentName, agent.PID)
+			continue
+		}
+		// User-initiated stop: the LastError marker tells us NOT
+		// to auto-restore (matches the Part 7 Commit 7.2 gate in
+		// checkAgentHealth). The operator clicked Stop; surfacing
+		// the assistant as STOPPED in the side panel is the
+		// correct post-restart state.
+		if agent.LastError == "stopped by user" {
+			d.logger.Info("Virtual repo %s: agent %s is user-stopped, leaving in STOPPED state", repoName, agentName)
+			continue
+		}
+		pid, err := d.startRegisteredAgent(repoName, repo, agentName, agent, nil)
+		if err != nil {
+			d.logger.Error("Virtual repo %s: failed to respawn agent %s: %v", repoName, agentName, err)
+			continue
+		}
+		d.logger.Info("Virtual repo %s: respawned agent %s (PID=%d)", repoName, agentName, pid)
+	}
+	return nil
+}
+
 // restoreRepoAgents restores the backend session and agents for a tracked repo
 func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) error {
+	// Virtual repos (today: _assistant-<name> from Part 5c) have NO
+	// git repo on disk, NO supervisor / merge-queue / pr-shepherd,
+	// and NO worktrees. The standard restore path below assumes ALL
+	// of those, so for virtual repos we'd fail the os.Stat(repoPath)
+	// check, return an error, get retried until fetchFailureThreshold,
+	// and then "mark all agents for cleanup" — silently deleting the
+	// user's assistant from state on every daemon restart. Reported
+	// 2026-06-02: "when I reinstall and reload the extension and
+	// restart the daemon, test1 disappears for some reason."
+	//
+	// For a virtual repo we only need to:
+	//   1. Re-create the backend session (DirectBackend is in-process
+	//      so a daemon restart always loses sessions; the on-disk
+	//      assistant.go log/JSONL state is the source of truth).
+	//   2. Re-spawn any registered assistant agents that don't have
+	//      a live PID (the user stopped them → leave them STOPPED;
+	//      a live PID is impossible after a daemon restart of an
+	//      in-process backend, but the check keeps the path correct
+	//      if a future backend gains process-survives-daemon
+	//      semantics).
+	// No supervisor, no merge-queue, no git worktrees. Idempotent
+	// against the rest of the daemon's restore loop because we
+	// return success (no failure-counter increment, no cleanup
+	// marking).
+	if repo.IsVirtual {
+		return d.restoreVirtualRepoAgents(repoName, repo)
+	}
+
 	repoPath := d.paths.RepoDir(repoName)
 
 	// Verify the repo still exists on disk
