@@ -29,6 +29,37 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
+func TestAgentContextOccupancy(t *testing.T) {
+	cases := []struct {
+		name  string
+		agent state.Agent
+		want  int64
+	}{
+		{
+			name:  "window known wins over cumulative",
+			agent: state.Agent{ContextWindowTokens: 42_000, TotalTokens: 900_000},
+			want:  42_000,
+		},
+		{
+			name:  "window unknown falls back to cumulative",
+			agent: state.Agent{ContextWindowTokens: 0, TotalTokens: 51_200},
+			want:  51_200,
+		},
+		{
+			name:  "both zero is zero",
+			agent: state.Agent{},
+			want:  0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := agentContextOccupancy(tc.agent); got != tc.want {
+				t.Errorf("agentContextOccupancy = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestComputeCapacityPct_Part5e(t *testing.T) {
 	cases := []struct {
 		name  string

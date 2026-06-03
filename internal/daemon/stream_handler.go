@@ -724,8 +724,9 @@ func (sh *streamHandler) handleStreamContextCapacity(req socket.Request, conn ne
 	// agent state (the broadcaster's lastTier dedupe is irrelevant
 	// here -- this is an unconditional reply to the new subscriber).
 	limit, _ := sh.d.effectiveContextLimit(agent.Model, repoName, agentName)
-	pct := computeCapacityPct(agent.TotalTokens, limit)
-	snapshot := capacitySnapshotFrame(pct, agent.TotalTokens, limit)
+	used := agentContextOccupancy(agent)
+	pct := computeCapacityPct(used, limit)
+	snapshot := capacitySnapshotFrame(pct, used, limit)
 	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
 	if err := enc.Encode(snapshot); err != nil {
 		return

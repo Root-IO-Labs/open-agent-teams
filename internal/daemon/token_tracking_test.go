@@ -44,6 +44,63 @@ func TestHandleTokenUsageEvent(t *testing.T) {
 		}
 	})
 
+	t.Run("context window tokens populated when present", func(t *testing.T) {
+		d, cleanup := setupTestDaemon(t)
+		defer cleanup()
+
+		repo := "test-repo"
+		agent := "test-agent"
+		d.state.AddRepo(repo, &state.Repository{GithubURL: "https://github.com/test/test"})
+		d.state.AddAgent(repo, agent, state.Agent{Type: state.AgentTypeAssistant})
+
+		payload, _ := json.Marshal(map[string]int64{
+			"delta_input":       800,
+			"delta_output":      200,
+			"cumulative_input":  800,
+			"cumulative_output": 200,
+			"context_input":     42_000,
+			"context_output":    900,
+		})
+		d.handleTokenUsageEvent(repo, agent, string(payload))
+
+		a, _ := d.state.GetAgent(repo, agent)
+		if a.ContextWindowTokens != 42_900 {
+			t.Errorf("ContextWindowTokens = %d, want 42900", a.ContextWindowTokens)
+		}
+		// Cumulative spend is tracked independently of window occupancy.
+		if a.TotalTokens != 1000 {
+			t.Errorf("TotalTokens = %d, want 1000", a.TotalTokens)
+		}
+	})
+
+	t.Run("omitted context window does not clobber stored value", func(t *testing.T) {
+		d, cleanup := setupTestDaemon(t)
+		defer cleanup()
+
+		repo := "test-repo"
+		agent := "test-agent"
+		d.state.AddRepo(repo, &state.Repository{GithubURL: "https://github.com/test/test"})
+		d.state.AddAgent(repo, agent, state.Agent{
+			Type:                state.AgentTypeAssistant,
+			ContextWindowTokens: 42_900,
+		})
+
+		// A second emission (e.g. the sidecar mirror) carries no
+		// context fields. It must not zero the stored window value.
+		payload, _ := json.Marshal(map[string]int64{
+			"delta_input":       0,
+			"delta_output":      0,
+			"cumulative_input":  800,
+			"cumulative_output": 200,
+		})
+		d.handleTokenUsageEvent(repo, agent, string(payload))
+
+		a, _ := d.state.GetAgent(repo, agent)
+		if a.ContextWindowTokens != 42_900 {
+			t.Errorf("ContextWindowTokens = %d, want 42900 (must not be clobbered)", a.ContextWindowTokens)
+		}
+	})
+
 	t.Run("monotonicity guard rejects stale event", func(t *testing.T) {
 		d, cleanup := setupTestDaemon(t)
 		defer cleanup()

@@ -196,7 +196,7 @@ class TestCommitTokenTracking:
 
 
 class TestEmitOatTokens:
-    def _capture_emit(self, adapter, delta_in, delta_out):
+    def _capture_emit(self, adapter, delta_in, delta_out, context_in=0, context_out=0):
         """Call _emit_oat_tokens and capture its output.
 
         _emit_oat_tokens writes to sys.__stdout__ to bypass Textual's
@@ -210,7 +210,7 @@ class TestEmitOatTokens:
         old = getattr(sys, "__stdout__", sys.stdout)
         sys.__stdout__ = buf
         try:
-            _emit_oat_tokens(adapter, delta_in, delta_out)
+            _emit_oat_tokens(adapter, delta_in, delta_out, context_in, context_out)
         finally:
             sys.__stdout__ = old
         return buf.getvalue().strip()
@@ -320,6 +320,28 @@ class TestEmitOatTokens:
         payload = json.loads(line[len("[OAT_TOKENS] "):])
         assert "cache_read" not in payload
         assert "cache_creation" not in payload
+
+    def test_context_window_fields_emitted_when_nonzero(self):
+        """Current context-window size is surfaced for the live capacity %."""
+        adapter = MagicMock()
+        adapter._spend_tracker = TokenSpendAccumulator()
+        adapter._spend_tracker.record_turn(1000, 200)
+
+        line = self._capture_emit(adapter, 1000, 200, context_in=42000, context_out=900)
+        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        assert payload["context_input"] == 42000
+        assert payload["context_output"] == 900
+
+    def test_context_window_fields_omitted_when_zero(self):
+        """Omitting the window size lets the sidecar mirror avoid clobbering it."""
+        adapter = MagicMock()
+        adapter._spend_tracker = TokenSpendAccumulator()
+        adapter._spend_tracker.record_turn(1000, 200)
+
+        line = self._capture_emit(adapter, 1000, 200)
+        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        assert "context_input" not in payload
+        assert "context_output" not in payload
 
 
 # ---------------------------------------------------------------------------

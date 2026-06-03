@@ -318,6 +318,27 @@ func (d *Daemon) warnf(format string, args ...any) {
 	d.logger.Warn(format, args...)
 }
 
+// agentContextOccupancy returns the token count the capacity % is
+// computed against: the current context-WINDOW occupancy (latest
+// main-turn prompt + response) reported by the runtime. This is the
+// honest "how full is the window right now" number — distinct from
+// agent.TotalTokens, which is the cumulative lifetime spend and
+// over-counts wildly because every turn re-sends the whole growing
+// context.
+//
+// Falls back to TotalTokens when the window value is not yet known
+// (== 0): an assistant that hasn't emitted a token event this process
+// has no window reading, and TotalTokens (0 on a fresh agent, or the
+// last persisted spend) is the best available proxy until the first
+// per-turn emission lands. The fallback also keeps a runtime that
+// somehow omits the field from reporting 0% forever.
+func agentContextOccupancy(agent state.Agent) int64 {
+	if agent.ContextWindowTokens > 0 {
+		return agent.ContextWindowTokens
+	}
+	return agent.TotalTokens
+}
+
 // computeCapacityPct returns total / limit as a float in [0, 1].
 // Returns 0 for non-positive limits (treats them as "unknown" →
 // no tier ever triggers, which is the right safe default).
@@ -380,19 +401,17 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 		return
 	}
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
-	pct := computeCapacityPct(agent.TotalTokens, limit)
+	used := agentContextOccupancy(agent)
+	pct := computeCapacityPct(used, limit)
 
-	// Part 5e Slice B: emit a tier-crossing frame on the
-	// stream_context_capacity wire BEFORE the early-return below.
-	// Crossings BELOW 75% (e.g. "hint" → "ok" after a successful
-	// compact_conversation) are an important signal too -- they tell
-	// the side panel to hide the amber pill / banner -- so we must
-	// not gate this on pct >= contextTierHint the way the PTY hint
-	// path does. The broadcaster's per-agent dedupe (lastTier)
-	// ensures the wire only fires when the tier actually changes,
-	// regardless of how often this function is called.
+	// Emit a capacity frame on EVERY token event (i.e. every turn) so
+	// the side-panel ring meter is genuinely live, not a step function
+	// that only moves on tier boundaries. The frame still carries the
+	// tier name so the extension can drive the amber/red colour shift +
+	// nudge copy; the per-turn cadence is low (one per assistant reply)
+	// so the broadcaster's small buffer is never stressed.
 	if repo, ok := d.state.GetRepo(repoName); ok {
-		d.publishCapacityFrameIfTierChanged(repoName, agentName, repo.SessionName, pct, agent.TotalTokens, limit)
+		d.publishCapacityFrame(repoName, agentName, repo.SessionName, pct, used, limit)
 	}
 
 	if pct < contextTierHint {
@@ -416,7 +435,7 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	}
 	directive := fmt.Sprintf(
 		"[OAT-system] You are at %.0f%% of your effective context window (%d / %d tokens). Call compact_conversation now to free working memory before your next reply.",
-		pct*100, agent.TotalTokens, limit,
+		pct*100, used, limit,
 	)
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, directive); err != nil {
 		d.logger.Warn(
@@ -427,7 +446,7 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	}
 	d.logger.Info(
 		"context capacity hint sent to %s/%s: %.0f%% (%d / %d tokens)",
-		repoName, agentName, pct*100, agent.TotalTokens, limit,
+		repoName, agentName, pct*100, used, limit,
 	)
 }
 
@@ -446,7 +465,8 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 		return "", false
 	}
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
-	pct := computeCapacityPct(agent.TotalTokens, limit)
+	used := agentContextOccupancy(agent)
+	pct := computeCapacityPct(used, limit)
 	if pct < contextTierSafetyNet {
 		return "", false
 	}
@@ -456,6 +476,6 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 	// can ignore-as-duplicate.
 	return fmt.Sprintf(
 		"[OAT-system] You are at %.0f%% of effective context capacity (%d / %d). Call compact_conversation now before responding to anything else.",
-		pct*100, agent.TotalTokens, limit,
+		pct*100, used, limit,
 	), true
 }

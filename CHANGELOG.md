@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Context capacity % is now computed from current window occupancy, not cumulative lifetime spend, and capacity frames stream on every turn (2026-06-03).**
+
+  The daemon previously derived an assistant's "% of context capacity"
+  from `agent.TotalTokens` — the *cumulative lifetime* input+output
+  spend. That over-counts wildly: every turn re-sends the whole growing
+  context, so the lifetime sum races past the window limit long before
+  the window is actually full, firing the 75/85/90/95 % tiers (PTY hint,
+  amber pill, banner, synthetic compact inject) far too early. The
+  runtime now emits the size of the *current* context window
+  (`context_input` / `context_output` in the `[OAT_TOKENS]` payload —
+  the latest main-turn prompt + response, which already includes cached
+  tokens) and the daemon stores it as `Agent.ContextWindowTokens`. All
+  four capacity computations (PTY hint, safety-net inject, the
+  `stream_context_capacity` snapshot, and the live frame) now use this
+  window value, falling back to `TotalTokens` only when the window is
+  not yet known. The `stream_context_capacity` wire also publishes a
+  frame on **every** token event rather than only on tier crossings, so
+  the side-panel meter is genuinely live instead of a step function.
+  Window occupancy is only updated when the payload carries it (>0) so
+  the sidecar mirror's equal-cumulative no-op can't zero it out.
+
 - **Effective context limit bumped from 32 K → 128 K when no `ModelProfile` exists for an agent's model (2026-05-29).**
 
   Context-overflow protection layer in the daemon. The same smoke

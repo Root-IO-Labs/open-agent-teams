@@ -8093,6 +8093,12 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 		CumulativeOutput int64 `json:"cumulative_output"`
 		CacheRead        int64 `json:"cache_read,omitempty"`
 		CacheCreation    int64 `json:"cache_creation,omitempty"`
+		// ContextInput/ContextOutput are the size of the CURRENT context
+		// window (latest main-turn prompt + response), NOT cumulative
+		// lifetime totals. The runtime omits them when unknown so the
+		// sidecar mirror's equal-cumulative no-op can't zero them out.
+		ContextInput  int64 `json:"context_input,omitempty"`
+		ContextOutput int64 `json:"context_output,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(jsonPayload), &payload); err != nil {
 		d.logger.Warn("Failed to parse token usage from %s/%s: %v", repoName, agentName, err)
@@ -8145,6 +8151,13 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 	agent.TotalTokens = agent.InputTokens + agent.OutputTokens
 	agent.CacheReadTokens = newCacheRead
 	agent.CacheCreationTokens = newCacheCreation
+	// Current context-window occupancy. Update only when the payload
+	// carries it (>0) so the sidecar mirror — which omits these fields —
+	// can't clobber the stored value back to zero on its equal-cumulative
+	// no-op emission. This is the value the capacity % is computed from.
+	if payload.ContextInput > 0 || payload.ContextOutput > 0 {
+		agent.ContextWindowTokens = payload.ContextInput + payload.ContextOutput
+	}
 	agent.LastTokenUpdate = time.Now()
 
 	if err := d.state.UpdateAgent(repoName, agentName, agent); err != nil {

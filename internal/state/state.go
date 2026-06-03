@@ -249,6 +249,7 @@ type Agent struct {
 	TotalTokens                 int64     `json:"total_tokens,omitempty"`                   // InputTokens + OutputTokens
 	CacheReadTokens             int64     `json:"cache_read_tokens,omitempty"`              // Tokens served from prompt cache (cheaper)
 	CacheCreationTokens         int64     `json:"cache_creation_tokens,omitempty"`          // Tokens written to prompt cache (first call)
+	ContextWindowTokens         int64     `json:"context_window_tokens,omitempty"`          // Current context-WINDOW occupancy (latest main-turn prompt+response); distinct from cumulative TotalTokens. Drives the live capacity %.
 	LastTokenUpdate             time.Time `json:"last_token_update,omitempty"`              // When token counts were last updated
 	MaxTokens                   int64     `json:"max_tokens,omitempty"`                     // Token budget (0 = unlimited); worker killed if TotalTokens exceeds this
 	WaitingForPR                bool      `json:"waiting_for_pr,omitempty"`                 // Worker is dormant waiting for PR resolution

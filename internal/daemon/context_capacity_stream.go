@@ -255,6 +255,37 @@ func (d *Daemon) lookupCapacityBroadcaster(sessionName, agentName string) *capac
 	return d.capacityBroadcasters[key]
 }
 
+// publishCapacityFrame builds a contextCapacityFrame and broadcasts
+// it UNCONDITIONALLY (no tier-crossing dedupe). This is the live-meter
+// path: the side panel wants a fresh pct on every turn so the ring
+// animates smoothly instead of snapping only at 75/85/90/95 % tier
+// boundaries. It still records the current tier in lastTier so any
+// future tier-change consumer stays consistent, and the frame carries
+// the tier name so colour/nudge logic remains tier-driven on the
+// extension side. Returns the tier it published.
+func (d *Daemon) publishCapacityFrame(repoName, agentName, sessionName string, pct float64, used, limit int64) string {
+	if d.contextCap == nil {
+		return ""
+	}
+	tier := tierForPct(pct)
+	key := agentKey(repoName, agentName)
+
+	d.contextCap.mu.Lock()
+	d.contextCap.lastTier[key] = tier
+	d.contextCap.mu.Unlock()
+
+	frame := contextCapacityFrame{
+		Pct:   roundPct(pct),
+		Tier:  tier,
+		Used:  used,
+		Limit: limit,
+		TS:    time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	b := d.lookupOrCreateCapacityBroadcaster(sessionName, agentName)
+	b.Publish(frame)
+	return tier
+}
+
 // publishCapacityFrameIfTierChanged builds a contextCapacityFrame
 // from the supplied state and broadcasts it ONLY if the tier
 // differs from the previously-observed tier for this agent. Returns
