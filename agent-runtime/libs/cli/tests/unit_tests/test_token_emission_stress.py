@@ -28,7 +28,7 @@ def _read_token_payloads(log_file: Path) -> list[dict]:
     if not log_file.exists():
         return []
     return [
-        json.loads(line[len("[OAT_TOKENS] "):])
+        json.loads(line[len("[OAT_TOKENS] ") :])
         for line in log_file.read_text(encoding="utf-8").splitlines()
         if line.startswith("[OAT_TOKENS] ")
     ]
@@ -90,7 +90,9 @@ class TestSequentialAccuracy:
         restore = _suppress_stdout()
         try:
             for delta_in, delta_out in turns:
-                _commit_token_tracking(adapter, delta_in, delta_out, delta_in, delta_out)
+                _commit_token_tracking(
+                    adapter, delta_in, delta_out, delta_in, delta_out
+                )
         finally:
             restore()
 
@@ -104,8 +106,12 @@ class TestSequentialAccuracy:
 
         # Monotonic: cumulative never decreases between turns.
         for i in range(1, len(payloads)):
-            assert payloads[i]["cumulative_input"] >= payloads[i - 1]["cumulative_input"]
-            assert payloads[i]["cumulative_output"] >= payloads[i - 1]["cumulative_output"]
+            assert (
+                payloads[i]["cumulative_input"] >= payloads[i - 1]["cumulative_input"]
+            )
+            assert (
+                payloads[i]["cumulative_output"] >= payloads[i - 1]["cumulative_output"]
+            )
 
         # Each line's cumulative_input equals sum of deltas up to and including that turn.
         running_in = 0
@@ -128,8 +134,8 @@ class TestCacheFlow:
 
         # (delta_in, delta_out, cache_read, cache_creation)
         turns = [
-            (1000, 50, 0, 800),    # turn 1: creates cache
-            (1200, 100, 700, 0),   # turn 2: cache hit
+            (1000, 50, 0, 800),  # turn 1: creates cache
+            (1200, 100, 700, 0),  # turn 2: cache hit
             (1500, 120, 1000, 0),  # turn 3: bigger cache hit
             (2000, 200, 1500, 400),  # turn 4: partial refresh
             (1800, 150, 1700, 0),  # turn 5: full hit
@@ -141,8 +147,13 @@ class TestCacheFlow:
         try:
             for delta_in, delta_out, cache_read, cache_creation in turns:
                 _commit_token_tracking(
-                    adapter, delta_in, delta_out, delta_in, delta_out,
-                    cache_read, cache_creation,
+                    adapter,
+                    delta_in,
+                    delta_out,
+                    delta_in,
+                    delta_out,
+                    cache_read,
+                    cache_creation,
                 )
         finally:
             restore()
@@ -193,7 +204,9 @@ class TestCacheFlow:
 
 
 class TestStress:
-    def test_1000_sequential_emissions_all_valid_and_ordered(self, tmp_path, monkeypatch):
+    def test_1000_sequential_emissions_all_valid_and_ordered(
+        self, tmp_path, monkeypatch
+    ):
         """Rapid-fire: every line is valid JSON and cumulative is strictly monotonic."""
         log_file = tmp_path / "agent.log"
         monkeypatch.setenv("OAT_TOOL_LOG", str(log_file))
@@ -243,7 +256,9 @@ class TestStress:
 
         restore = _suppress_stdout()
         try:
-            threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+            threads = [
+                threading.Thread(target=worker, args=(i,)) for i in range(n_threads)
+            ]
             for t in threads:
                 t.start()
             for t in threads:
@@ -258,7 +273,7 @@ class TestStress:
         seen_markers = set()
         for line in raw_lines:
             assert line.startswith("[OAT_TOKENS] "), f"corrupted prefix: {line!r}"
-            payload = json.loads(line[len("[OAT_TOKENS] "):])
+            payload = json.loads(line[len("[OAT_TOKENS] ") :])
             seen_markers.add(payload["delta_input"])
 
         # Every expected marker appears exactly once: no drops, no duplicates.
@@ -295,7 +310,12 @@ class TestDaemonContract:
         # Daemon struct at internal/daemon/daemon.go:4450 unmarshals
         # delta_input, delta_output, cumulative_input, cumulative_output,
         # plus optional cache_read and cache_creation.
-        required = {"delta_input", "delta_output", "cumulative_input", "cumulative_output"}
+        required = {
+            "delta_input",
+            "delta_output",
+            "cumulative_input",
+            "cumulative_output",
+        }
         assert required.issubset(p.keys())
 
         # Cache fields are surfaced when non-zero.
@@ -304,15 +324,25 @@ class TestDaemonContract:
 
         # All numeric fields are ints (not floats or strings).
         numeric_keys = (
-            "delta_input", "delta_output",
-            "cumulative_input", "cumulative_output",
-            "cache_read", "cache_creation",
+            "delta_input",
+            "delta_output",
+            "cumulative_input",
+            "cumulative_output",
+            "cache_read",
+            "cache_creation",
         )
         for key in numeric_keys:
             assert isinstance(p[key], int), f"{key} not int: {type(p[key])}"
 
     def test_non_caching_provider_payload_compact(self, tmp_path, monkeypatch):
-        """When cache is never reported, payload stays 4 fields — no noise."""
+        """When cache is never reported, no cache fields leak into the payload.
+
+        The 500/25 context args ride along as ``context_input`` /
+        ``context_output`` (this turn's window occupancy, emitted when
+        non-zero), but the cache fields stay absent — that's the
+        compactness this test guards: a non-caching provider never pays
+        for ``cache_read`` / ``cache_creation`` noise.
+        """
         log_file = tmp_path / "agent.log"
         monkeypatch.setenv("OAT_TOOL_LOG", str(log_file))
 
@@ -329,5 +359,12 @@ class TestDaemonContract:
         payloads = _read_token_payloads(log_file)
         assert len(payloads) == 1
         assert set(payloads[0].keys()) == {
-            "delta_input", "delta_output", "cumulative_input", "cumulative_output",
+            "delta_input",
+            "delta_output",
+            "cumulative_input",
+            "cumulative_output",
+            "context_input",
+            "context_output",
         }
+        assert "cache_read" not in payloads[0]
+        assert "cache_creation" not in payloads[0]

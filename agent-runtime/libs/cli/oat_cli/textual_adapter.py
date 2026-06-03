@@ -619,7 +619,9 @@ async def execute_task_textual(
 
                         if conv_log:
                             conv_log.log_tool_result(
-                                tool_name, tool_content_str, tool_status,
+                                tool_name,
+                                tool_content_str,
+                                tool_status,
                             )
                         sidecar_emitter.emit_tool_result(
                             call_id=sidecar_call_id,
@@ -796,8 +798,12 @@ async def execute_task_textual(
                                     conv_log.log_tool_call(buffer_name, parsed_args)
                                 sidecar_emitter.emit_tool_call(
                                     name=buffer_name,
-                                    args=parsed_args if isinstance(parsed_args, dict) else {"value": parsed_args},
-                                    call_id=str(buffer_id) if buffer_id is not None else "",
+                                    args=parsed_args
+                                    if isinstance(parsed_args, dict)
+                                    else {"value": parsed_args},
+                                    call_id=str(buffer_id)
+                                    if buffer_id is not None
+                                    else "",
                                 )
 
                                 # Hide spinner before showing tool call
@@ -1032,7 +1038,15 @@ async def execute_task_textual(
         adapter._current_tool_messages.clear()
 
         # Report tokens even on interrupt — failed work still counts as spend
-        _commit_token_tracking(adapter, latest_main_context_input, latest_main_context_output, spend_input_delta, spend_output_delta, spend_cache_read_delta, spend_cache_creation_delta)
+        _commit_token_tracking(
+            adapter,
+            latest_main_context_input,
+            latest_main_context_output,
+            spend_input_delta,
+            spend_output_delta,
+            spend_cache_read_delta,
+            spend_cache_creation_delta,
+        )
         sidecar_emitter.emit_turn_end()
         if conv_log:
             conv_log.close()
@@ -1076,14 +1090,30 @@ async def execute_task_textual(
         adapter._current_tool_messages.clear()
 
         # Report tokens even on interrupt — failed work still counts as spend
-        _commit_token_tracking(adapter, latest_main_context_input, latest_main_context_output, spend_input_delta, spend_output_delta, spend_cache_read_delta, spend_cache_creation_delta)
+        _commit_token_tracking(
+            adapter,
+            latest_main_context_input,
+            latest_main_context_output,
+            spend_input_delta,
+            spend_output_delta,
+            spend_cache_read_delta,
+            spend_cache_creation_delta,
+        )
         sidecar_emitter.emit_turn_end()
         if conv_log:
             conv_log.close()
         return
 
     # Normal completion: commit token tracking
-    _commit_token_tracking(adapter, latest_main_context_input, latest_main_context_output, spend_input_delta, spend_output_delta, spend_cache_read_delta, spend_cache_creation_delta)
+    _commit_token_tracking(
+        adapter,
+        latest_main_context_input,
+        latest_main_context_output,
+        spend_input_delta,
+        spend_output_delta,
+        spend_cache_read_delta,
+        spend_cache_creation_delta,
+    )
     sidecar_emitter.emit_turn_end()
     if conv_log:
         conv_log.close()
@@ -1127,7 +1157,13 @@ def _commit_token_tracking(
                 spend_cache_read_delta,
                 spend_cache_creation_delta,
             )
-        _emit_oat_tokens(adapter, spend_input_delta, spend_output_delta)
+        _emit_oat_tokens(
+            adapter,
+            spend_input_delta,
+            spend_output_delta,
+            latest_main_context_input,
+            latest_main_context_output,
+        )
 
 
 def _emit_oat_model() -> None:
@@ -1159,6 +1195,8 @@ def _emit_oat_tokens(
     adapter: "TextualUIAdapter",
     delta_input: int,
     delta_output: int,
+    context_input: int = 0,
+    context_output: int = 0,
 ) -> None:
     """Emit a structured [OAT_TOKENS] line to stdout for daemon parsing.
 
@@ -1169,6 +1207,12 @@ def _emit_oat_tokens(
     Field semantics (honest names — no aliases):
       - ``delta_input`` / ``delta_output``: tokens spent this request
       - ``cumulative_input`` / ``cumulative_output``: monotonic lifetime totals
+      - ``context_input`` / ``context_output``: CURRENT main-agent context
+        window occupancy (this turn's input/output token counts, including
+        cached tokens). Emitted only when non-zero so the daemon can drive
+        a live "% full" capacity meter from real window occupancy rather
+        than cumulative lifetime spend. Omitted on zero so a sidecar/idle
+        emission can't clobber a previously-reported window size.
 
     Mixed-version operation is unsupported for v1.  Python runtime and Go
     daemon/TUI ship atomically in the same release.
@@ -1183,9 +1227,7 @@ def _emit_oat_tokens(
     if adapter._spend_tracker:
         cumulative_input = adapter._spend_tracker.total_input
         cumulative_output = adapter._spend_tracker.total_output
-        cumulative_cache_read = getattr(
-            adapter._spend_tracker, "total_cache_read", 0
-        )
+        cumulative_cache_read = getattr(adapter._spend_tracker, "total_cache_read", 0)
         cumulative_cache_creation = getattr(
             adapter._spend_tracker, "total_cache_creation", 0
         )
@@ -1202,6 +1244,12 @@ def _emit_oat_tokens(
     if cumulative_cache_read > 0 or cumulative_cache_creation > 0:
         payload["cache_read"] = cumulative_cache_read
         payload["cache_creation"] = cumulative_cache_creation
+    # Include current context-window occupancy only when non-zero so the
+    # daemon can render a live capacity % from real window size; omitting
+    # on zero prevents an idle/sidecar emission from zeroing a prior value.
+    if context_input > 0 or context_output > 0:
+        payload["context_input"] = context_input
+        payload["context_output"] = context_output
     line = f"[OAT_TOKENS] {json.dumps(payload)}"
 
     # Use __stdout__ to bypass Textual's stdout redirection.
