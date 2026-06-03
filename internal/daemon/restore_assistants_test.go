@@ -147,24 +147,30 @@ func TestRestoreVirtualRepoSurvivesDaemonRestart_2026_06_02(t *testing.T) {
 }
 
 // TestStartRegisteredAgentPreservesExistingSessionID_2026_06_02 pins
-// the memory-continuity contract that startRegisteredAgent must NOT
+// the SessionID-stability contract that startRegisteredAgent must NOT
 // generate a fresh session ID when the agent record already carries
-// one. Reported 2026-06-02: "the agent can't see the old message" —
-// even though the conversation transcript still exists on disk under
-// ~/.claude/projects/.../<old-sessionID>.jsonl, a daemon restart
-// would silently rotate it onto a new SessionID and the agent CLI
-// would --resume nothing.
+// one. SessionID stability is the foundation of the assistant memory-
+// continuity fix shipped 2026-06-03: the daemon passes
+// `--thread-id <agent.SessionID>` on every assistant spawn, and
+// langgraph (oat-cli's checkpointer) keys conversation history by
+// thread_id. Regenerate the SessionID across restarts and you orphan
+// the prior langgraph thread → assistant has no memory of prior
+// turns. This test guards only the state half of that contract; the
+// arg-construction half (—> --thread-id ends up in the spawn args)
+// is gated behind OAT_TEST_MODE=1's spawn-skip, so it lives in the
+// manual smoke test step.
 //
-// Property under test: if agent.SessionID is non-empty when
-// startRegisteredAgent is entered, the post-call state record must
-// still carry the same SessionID. Empty SessionID is the fresh-
-// create path and gets a new one (asserted in the companion case).
-//
-// This is a state-level test (OAT_TEST_MODE=1 short-circuits the
-// real spawn) so it stays cheap and deterministic. The downstream
-// `--resume <sessionID>` arg-construction lives behind the spawn
-// branch; manual smoke test covers that the agent CLI actually
-// rehydrates the transcript.
+// Background (2026-06-02 follow-up): the first attempt at memory
+// continuity stat'd `~/.claude/projects/.../<SessionID>.jsonl` to
+// decide whether to pass `--resume`. That path is Claude CLI's
+// convention; oat-cli stores threads in `~/.oat/sessions.db` via
+// langgraph checkpoints. The stat always failed, --resume was
+// never passed, and the user-visible behavior remained "fresh
+// spawn re-injects the system prompt on every restart." The
+// 06-03 rework switched to --thread-id (which langgraph treats
+// idempotently — create on first call, resume on subsequent ones)
+// and suppressed the -m prompt re-injection when SessionID was
+// already populated.
 func TestStartRegisteredAgentPreservesExistingSessionID_2026_06_02(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
@@ -214,8 +220,8 @@ func TestStartRegisteredAgentPreservesExistingSessionID_2026_06_02(t *testing.T)
 	// Companion case: empty SessionID → new one assigned (fresh-
 	// create path). Pin so a future "preserve unconditionally"
 	// refactor doesn't leave fresh-create agents with no
-	// SessionID at all (which breaks --resume on their FIRST
-	// daemon restart).
+	// SessionID at all (which breaks --thread-id on the very
+	// first spawn — langgraph wouldn't have anything to key on).
 	const freshName = "fresh-create"
 	if err := d.state.AddAgent(virtualRepo, freshName, state.Agent{
 		Type:         state.AgentTypeAssistant,

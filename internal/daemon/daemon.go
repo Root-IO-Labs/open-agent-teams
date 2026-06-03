@@ -5237,31 +5237,46 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
 		args = append(args, denyToolArgs(agent.Type)...)
 
-		// Memory continuity (2026-06-02 follow-up to SessionID
-		// preservation above). When we're reusing a prior
-		// SessionID AND a transcript exists on disk for it, pass
-		// `--resume <sessionID>` so the agent CLI rehydrates the
-		// conversation. Mirrors the warm-restart path in
-		// restartAgent (which already does this stat+resume dance
-		// for click-Restart and adopt-on-startup). The home-dir
-		// + .claude/projects path derivation is the same as
-		// restartAgent's. Best-effort: if the stat fails (file
-		// missing, permissions), fall through to the no-resume
-		// path so a missing transcript doesn't break the spawn —
-		// the agent will just start without prior context, which
-		// is strictly better than failing to start at all.
-		resumeFromSession := false
-		if preservedSession && agent.Type == state.AgentTypeAssistant {
-			if home, hErr := os.UserHomeDir(); hErr == nil {
-				encodedPath := strings.ReplaceAll(agent.WorktreePath, "/", "-")
-				sessionFile := filepath.Join(home, ".claude", "projects", encodedPath, sessionID+".jsonl")
-				if info, statErr := os.Stat(sessionFile); statErr == nil && info.Size() > 0 {
-					args = append(args, "--resume", sessionID)
-					resumeFromSession = true
-					d.logger.Info("Restore %s/%s: resuming session %s (transcript %d bytes)", repoName, agentName, sessionID, info.Size())
-				} else {
-					d.logger.Debug("Restore %s/%s: SessionID %s present but no transcript at %s — starting without --resume", repoName, agentName, sessionID, sessionFile)
-				}
+		// Assistant memory continuity (2026-06-03 rework of the
+		// 2026-06-02 attempt that targeted the wrong on-disk
+		// path). The oat-agent CLI is langchain's `oat-cli` — its
+		// conversation history lives in
+		// `~/.oat/sessions.db` (SQLite, langgraph-checkpointed)
+		// keyed by thread_id, NOT in `~/.claude/projects/.../<id>.jsonl`
+		// (which is Claude CLI's convention). The original 06-02
+		// fix stat'd the Claude path, always found nothing for
+		// assistants, and silently fell through to a fresh start
+		// — so the user's reported "the prompt dominates the
+		// context after restart" was the actual fresh-spawn
+		// behavior reasserting itself.
+		//
+		// Correct integration: pass `--thread-id <agent.SessionID>`
+		// on EVERY spawn for assistants. langgraph's checkpointer
+		// will auto-create the thread on first call and resume
+		// from prior checkpoints on subsequent calls — no caller-
+		// side existence check needed. `--resume` is the wrong
+		// flag for this: it errors out with `sys.exit(1)` when
+		// the thread doesn't exist yet (see oat_cli/main.py
+		// resume_thread branch), so the first-ever spawn would
+		// crash the agent immediately. `--thread-id` is the
+		// idempotent verb.
+		//
+		// Skipping the -m prompt injection on resume is the
+		// pair-wise other half of this fix: the prompt is
+		// already in the thread's first turn (it was sent as
+		// `-m` during the first spawn). Re-sending it would
+		// append the entire prompt as a second user turn on
+		// every restart, which is exactly the "prompt dominates"
+		// behavior the user reported. preservedSession is the
+		// existing flag set above when agent.SessionID is non-
+		// empty at function entry (i.e., this is NOT a brand-new
+		// agent record).
+		resumingAssistantThread := false
+		if agent.Type == state.AgentTypeAssistant {
+			args = append(args, "--thread-id", sessionID)
+			resumingAssistantThread = preservedSession
+			if resumingAssistantThread {
+				d.logger.Info("Restore %s/%s: rehydrating langgraph thread %s (suppressing -m prompt re-injection)", repoName, agentName, sessionID)
 			}
 		}
 
@@ -5276,13 +5291,15 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 				promptContent = string(data)
 			}
 		}
-		// Don't replay the system prompt when --resume rehydrates
-		// the prior conversation; the agent already has it from
-		// the rehydrated transcript, and re-sending would land as
-		// a second user-visible system message in the new turn.
-		// Mirrors restartAgent's hasHistory branch which skips
-		// the `-m <prompt>` arg in the same situation.
-		if resumeFromSession {
+		// When --thread-id reattaches an assistant to a prior
+		// langgraph thread, the prompt is ALREADY in the thread's
+		// first turn (it was sent as -m on the first spawn) and
+		// re-sending it would land as a fresh user message on
+		// top of the rehydrated history — that's the "prompt
+		// dominates the context after restart" behavior reported
+		// 2026-06-03. Suppressing the InitialPrompt on the
+		// resume path keeps the conversation continuous.
+		if resumingAssistantThread {
 			promptContent = ""
 		}
 
@@ -8460,6 +8477,44 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
 	args = append(args, denyToolArgs(agent.Type)...)
 
+	// Assistant memory continuity for the warm-restart path
+	// (mirror of the startRegisteredAgent change shipped
+	// 2026-06-03). oat-cli's `--thread-id` is idempotent —
+	// langgraph creates the thread on first call and resumes
+	// from prior checkpoints on subsequent ones — so the
+	// `hasHistory` branch above (which targets the wrong
+	// Claude-CLI .jsonl path and ALWAYS evaluates false for
+	// assistants) is sidestepped. The `-m promptContent` line
+	// that hasHistory=false took above ALSO needs suppressing
+	// when we know the langgraph thread already has content:
+	// for an assistant restart, the thread invariably has
+	// content (the agent was running before), so we strip the
+	// -m arg here too. Pre-fix symptom: every Restart click
+	// re-injected the entire system prompt as a fresh user
+	// message, drowning the prior conversation.
+	if agent.Type == state.AgentTypeAssistant {
+		args = append(args, "--thread-id", agent.SessionID)
+		// Strip any `-m <prompt>` pair from the hasHistory=false
+		// branch above. Restarting an assistant is always a
+		// resume, never a fresh start, because state.Agent
+		// records survive the restart (and the langgraph thread
+		// keyed by agent.SessionID does too).
+		filtered := args[:0]
+		skipNext := false
+		for _, a := range args {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if a == "-m" {
+				skipNext = true
+				continue
+			}
+			filtered = append(filtered, a)
+		}
+		args = filtered
+	}
+
 	envPrefix := buildAgentEnvPrefix(d.paths, repoName)
 	isWorker := agent.Type == state.AgentTypeWorker || agent.Type == state.AgentTypeReview || agent.Type == state.AgentTypeVerification
 	logFile := d.paths.AgentLogFile(repoName, agentName, isWorker)
@@ -8470,6 +8525,16 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	var promptContent string
 	if data, readErr := os.ReadFile(promptFile); readErr == nil {
 		promptContent = string(data)
+	}
+	// Suppress InitialPrompt on assistant restart for the same
+	// reason we strip the -m arg above: the prompt already
+	// exists as the first turn of the langgraph thread we're
+	// rehydrating, so resending it would double-inject it on
+	// every Restart click (the user-reported "prompt dominates
+	// the context" symptom). Non-assistant types still get the
+	// prompt — they're not langgraph-thread-resumed.
+	if agent.Type == state.AgentTypeAssistant {
+		promptContent = ""
 	}
 
 	// Restart via backend

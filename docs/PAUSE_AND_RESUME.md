@@ -23,15 +23,26 @@ delete semantics that differ from worker semantics:
   evict oldest-first. The rotation policy is local-storage
   only — there is no external backup.
 
-  **Memory continuity across daemon restarts** (as of 2026-06-02):
-  the daemon preserves `agent.SessionID` when re-spawning a
-  registered assistant during restore. The agent CLI then
-  rehydrates its conversation via `--resume <sessionID>` from
-  `~/.claude/projects/.../<sessionID>.jsonl`, so a user who
-  restarts the daemon (or their whole machine) sees the
-  assistant remember their prior exchange. To explicitly wipe
-  memory, the operator still has to opt in with
-  `oat assistant restart <name> --fresh`.
+  **Memory continuity across daemon restarts** (as of 2026-06-03):
+  the daemon passes `--thread-id <agent.SessionID>` on every
+  assistant spawn. oat-cli's langgraph checkpointer keys
+  conversation history by thread_id (stored in
+  `~/.oat/sessions.db`), so reusing the same thread_id on a
+  subsequent spawn picks up where the prior turn left off — the
+  assistant remembers the prior conversation across daemon
+  restarts (including machine reboots) and Pause→Resume cycles.
+  The daemon also suppresses the `-m <prompt>` injection on the
+  resume path so the system prompt isn't re-appended as a fresh
+  user turn on each restart (which would otherwise dominate the
+  context window — reported 2026-06-03). To explicitly wipe
+  memory, the operator opts in with
+  `oat assistant restart <name> --fresh`, which rotates the
+  on-disk session log; the langgraph thread itself is identified
+  by SessionID so a future cleanup pass should also clear the
+  matching `~/.oat/sessions.db` checkpoints when --fresh is
+  selected (currently the langgraph thread persists across
+  --fresh until explicitly deleted via `oat-agent threads delete
+  <id>` — tracked as a follow-up).
 - **`oat assistant remove <name>`** (alias **`rm`**) — destroy
   the assistant. State record wiped, virtual repo at
   `_assistant-<name>` removed. This is the destructive flow;
