@@ -245,7 +245,6 @@ func TestStartRegisteredAgentPreservesExistingSessionID_2026_06_02(t *testing.T)
 	}
 }
 
-
 func TestAssistantRemoveStaysRemovedAcrossReload_R2(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "oat-r2-*")
 	if err != nil {

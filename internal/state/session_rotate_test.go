@@ -1,19 +1,19 @@
 // Tests for RotateSessionIfTooLarge (Part 7 Commit 7.0.5).
 //
 // Coverage:
-//   1. Head under cap → no rotation, no archives.
-//   2. Head over cap, no existing archives → .1 created, head empty.
-//   3. Head over cap, .1 + .2 exist → shift to .2 + .3, head → .1.
-//   4. Head over cap, .1 + .2 + .3 exist → oldest .3 deleted,
-//      remaining shift up.
-//   5. Head doesn't exist at all → no-op (no error).
-//   6. Head exactly equal to cap → ROTATES (cap is inclusive).
-//   7. Permission-denied during rotation → returns error, head
-//      untouched if the failure was in step 1/2.
-//   8. flock guard: a second call while the first holds the lock
-//      yields EWOULDBLOCK (this is best-effort because shared
-//      filesystem semantics vary; we test in-process via two fds).
-//   9. keepArchives = 0 is clamped to 1.
+//  1. Head under cap → no rotation, no archives.
+//  2. Head over cap, no existing archives → .1 created, head empty.
+//  3. Head over cap, .1 + .2 exist → shift to .2 + .3, head → .1.
+//  4. Head over cap, .1 + .2 + .3 exist → oldest .3 deleted,
+//     remaining shift up.
+//  5. Head doesn't exist at all → no-op (no error).
+//  6. Head exactly equal to cap → ROTATES (cap is inclusive).
+//  7. Permission-denied during rotation → returns error, head
+//     untouched if the failure was in step 1/2.
+//  8. flock guard: a second call while the first holds the lock
+//     yields EWOULDBLOCK (this is best-effort because shared
+//     filesystem semantics vary; we test in-process via two fds).
+//  9. keepArchives = 0 is clamped to 1.
 //
 // Tests use a small `maxBytes` (e.g. 32 bytes) so each fixture
 // file can be a one-line synthetic JSONL row and we can assert

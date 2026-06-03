@@ -66,7 +66,7 @@ func TestAssistantSpawnEnvVars_RepoNameAlongForRide_Part5f(t *testing.T) {
 	// refactor accidentally hardcodes the repo to "personal" or
 	// strips the prefix, this fails.
 	cases := []struct {
-		repoName string
+		repoName  string
 		wantInOAT string
 	}{
 		{"_assistant-personal", "OAT_REPO=_assistant-personal"},

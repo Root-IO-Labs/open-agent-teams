@@ -4,6 +4,7 @@ Scope: behavior of ``SidecarClient`` in isolation — queue bounds, drop
 policy, connect retry, disconnect resilience. End-to-end wire interop with
 the Go server is tested by ``pkg/sidecar/integration_test.go``.
 """
+
 from __future__ import annotations
 
 import os
@@ -239,7 +240,7 @@ class TestSendPath:
 
             def producer(base: int):
                 for i in range(per_thread):
-                    c.emit(assistant_delta(base + i, "t", f"x{base+i}"))
+                    c.emit(assistant_delta(base + i, "t", f"x{base + i}"))
 
             threads = [
                 threading.Thread(target=producer, args=(t * per_thread,))

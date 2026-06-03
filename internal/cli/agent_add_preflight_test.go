@@ -16,11 +16,11 @@ import (
 // the same shape on the Python side).
 func TestNormalizeModelIDForEnv(t *testing.T) {
 	cases := map[string]string{
-		"google_genai:gemini-2.5-flash":   "google_genai_gemini-2.5-flash",
-		"anthropic:claude-sonnet-4":       "anthropic_claude-sonnet-4",
-		"openrouter:meta-llama/llama-3":   "openrouter_meta-llama_llama-3",
-		"OPENAI:GPT-4O":                   "openai_gpt-4o",
-		"ollama:llama3:8b":                "ollama_llama3_8b",
+		"google_genai:gemini-2.5-flash": "google_genai_gemini-2.5-flash",
+		"anthropic:claude-sonnet-4":     "anthropic_claude-sonnet-4",
+		"openrouter:meta-llama/llama-3": "openrouter_meta-llama_llama-3",
+		"OPENAI:GPT-4O":                 "openai_gpt-4o",
+		"ollama:llama3:8b":              "ollama_llama3_8b",
 	}
 	for raw, want := range cases {
 		t.Run(raw, func(t *testing.T) {

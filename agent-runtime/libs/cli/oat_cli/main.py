@@ -70,9 +70,7 @@ def check_cli_dependencies() -> None:
 _RIPGREP_URL = "https://github.com/BurntSushi/ripgrep#installation"
 
 _RIPGREP_SUPPRESS_HINT = (
-    "To suppress, add to ~/.oat/config.toml:\n"
-    "\\[warnings]\n"
-    'suppress = \\["ripgrep"]'
+    'To suppress, add to ~/.oat/config.toml:\n\\[warnings]\nsuppress = \\["ripgrep"]'
 )
 
 
@@ -628,7 +626,12 @@ async def run_textual_cli_async(
                         setup_script_path=sandbox_setup,
                     )
                     sandbox_backend = sandbox_cm.__enter__()  # noqa: PLC2801  # Context manager used without `with` for long-lived sandbox lifecycle
-                except (ImportError, ValueError, RuntimeError, NotImplementedError) as e:
+                except (
+                    ImportError,
+                    ValueError,
+                    RuntimeError,
+                    NotImplementedError,
+                ) as e:
                     console.print()
                     console.print("[red]Sandbox creation failed[/red]")
                     console.print(Text(str(e), style="dim"))
@@ -1100,8 +1103,7 @@ def cli_main() -> None:
                         "available threads.[/dim]"
                     )
                     console.print(
-                        "[dim]Use 'oat_sdk -r' to resume the most "
-                        "recent thread.[/dim]"
+                        "[dim]Use 'oat_sdk -r' to resume the most recent thread.[/dim]"
                     )
                     sys.exit(1)
 

@@ -8,6 +8,7 @@ Covers:
 - Metrics: get_metrics() reflects state accurately.
 - Idempotent shutdown: multiple _shutdown / _reset cycles are safe.
 """
+
 from __future__ import annotations
 
 import os
@@ -91,8 +92,7 @@ class _ListeningServer:
         while time.time() < deadline:
             with self._lock:
                 if len(self.received) >= n:
-                    return [Event.from_json(b.decode("utf-8"))
-                            for b in self.received]
+                    return [Event.from_json(b.decode("utf-8")) for b in self.received]
             time.sleep(0.02)
         with self._lock:
             return [Event.from_json(b.decode("utf-8")) for b in self.received]
@@ -164,8 +164,10 @@ class TestEnabledPath:
         try:
             monkeypatch.setenv("OAT_SIDECAR_SOCKET", srv.path)
             sidecar_emitter.emit_token_usage(
-                delta_input=10, delta_output=5,
-                cumulative_input=100, cumulative_output=50,
+                delta_input=10,
+                delta_output=5,
+                cumulative_input=100,
+                cumulative_output=50,
                 cache_read=20,
             )
             # Give the writer a moment to drain.
@@ -200,8 +202,11 @@ class TestEnabledPath:
             assert turn_ids == {tid}
             kinds = [e.kind for e in events]
             assert kinds == [
-                "turn_start", "assistant_delta", "assistant_message",
-                "token_usage", "turn_end",
+                "turn_start",
+                "assistant_delta",
+                "assistant_message",
+                "token_usage",
+                "turn_end",
             ]
         finally:
             srv.stop()

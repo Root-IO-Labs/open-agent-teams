@@ -404,31 +404,31 @@ func (c *CLI) assistantStop(args []string) error {
 // preserves the state.Agent record + session JSONL), this verb
 // removes EVERYTHING associated with the named assistant:
 //
-//   1. Confirmation prompt unless --yes (interactive only;
-//      non-interactive callers MUST pass --yes).
-//   2. stop_agent best-effort (so the process tree is down
-//      BEFORE we wipe the session file). "Not found" is a soft
-//      success: it just means no live process is in the way.
-//   3. wipeAssistantSession to delete the head session.jsonl.
-//   4. Wipe the rotation archives (.1, .2, .3) introduced in
-//      Commit 7.0.5 so they don't outlive their owner.
-//   5. remove_agent with reason="user_cleanup_after_pause"
-//      so the daemon's recovery-suppression gates (Commit 7.2
-//      audit: workspace-replacement, health-check restore) all
-//      short-circuit. Otherwise the next 2-min health-check
-//      cycle would notice the missing agent and try to bring
-//      it back, defeating the user's cleanup intent.
-//   6. Delete the virtual repo dir
-//      `~/.oat/repos/_assistant-<name>` AFTER canonicalising
-//      the path and verifying it is under c.paths.ReposDir.
-//      The canonicalisation matters because <name> is user-
-//      controlled; a future caller that accepts assistant
-//      names from a remote source (e.g. a future NM RPC verb)
-//      could otherwise be tricked into `os.RemoveAll` against
-//      anywhere on disk. validateVirtualRepoName already
-//      restricts <name> to [a-zA-Z0-9_-]{1,32}, but the
-//      defense-in-depth check belongs here too because the
-//      blast radius of a regression is unbounded.
+//  1. Confirmation prompt unless --yes (interactive only;
+//     non-interactive callers MUST pass --yes).
+//  2. stop_agent best-effort (so the process tree is down
+//     BEFORE we wipe the session file). "Not found" is a soft
+//     success: it just means no live process is in the way.
+//  3. wipeAssistantSession to delete the head session.jsonl.
+//  4. Wipe the rotation archives (.1, .2, .3) introduced in
+//     Commit 7.0.5 so they don't outlive their owner.
+//  5. remove_agent with reason="user_cleanup_after_pause"
+//     so the daemon's recovery-suppression gates (Commit 7.2
+//     audit: workspace-replacement, health-check restore) all
+//     short-circuit. Otherwise the next 2-min health-check
+//     cycle would notice the missing agent and try to bring
+//     it back, defeating the user's cleanup intent.
+//  6. Delete the virtual repo dir
+//     `~/.oat/repos/_assistant-<name>` AFTER canonicalising
+//     the path and verifying it is under c.paths.ReposDir.
+//     The canonicalisation matters because <name> is user-
+//     controlled; a future caller that accepts assistant
+//     names from a remote source (e.g. a future NM RPC verb)
+//     could otherwise be tricked into `os.RemoveAll` against
+//     anywhere on disk. validateVirtualRepoName already
+//     restricts <name> to [a-zA-Z0-9_-]{1,32}, but the
+//     defense-in-depth check belongs here too because the
+//     blast radius of a regression is unbounded.
 //
 // On any error after step 1 we keep going (each step logs
 // independently) so a partial cleanup leaves the user as close

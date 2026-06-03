@@ -177,4 +177,3 @@ func (c *CLI) listVirtualRepos() (map[string]map[string]interface{}, error) {
 	}
 	return out, nil
 }
-

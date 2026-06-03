@@ -23,6 +23,7 @@ Failure-mode policy: the agent is the producer of truth. If the sidecar is
 unreachable the agent MUST continue running (ConversationLogger still writes
 to disk); only the live TUI view is degraded.
 """
+
 from __future__ import annotations
 
 import errno
@@ -86,7 +87,9 @@ class SidecarClient:
             raise ValueError("queue_size must be >= 1")
         self.socket_path = socket_path
         self._queue: queue.Queue[Event] = queue.Queue(maxsize=queue_size)
-        self._backoff = connect_backoff if connect_backoff is not None else _CONNECT_BACKOFF_S
+        self._backoff = (
+            connect_backoff if connect_backoff is not None else _CONNECT_BACKOFF_S
+        )
         self._stop = threading.Event()
         self._sock: Optional[socket.socket] = None
         self._writer: Optional[threading.Thread] = None
@@ -107,7 +110,9 @@ class SidecarClient:
         if self._writer is not None:
             return
         self._writer = threading.Thread(
-            target=self._writer_loop, name="sidecar-writer", daemon=True,
+            target=self._writer_loop,
+            name="sidecar-writer",
+            daemon=True,
         )
         self._writer.start()
 
@@ -345,22 +350,35 @@ def _cli_main(argv: list[str]) -> int:
                 ev = assistant_delta(seq=i, turn_id=turn_id, content=f"d{i}")
             elif kind_idx == 2:
                 ev = assistant_message(
-                    seq=i, turn_id=turn_id, content=f"msg{i}",
+                    seq=i,
+                    turn_id=turn_id,
+                    content=f"msg{i}",
                     usage=Usage(input_tokens=10 + i, output_tokens=5),
                 )
             elif kind_idx == 3:
                 ev = tool_call(
-                    seq=i, turn_id=turn_id, name="x", args={"i": i}, call_id=f"c{i}",
+                    seq=i,
+                    turn_id=turn_id,
+                    name="x",
+                    args={"i": i},
+                    call_id=f"c{i}",
                 )
             elif kind_idx == 4:
-                ev = tool_result(seq=i, turn_id=turn_id, call_id=f"c{i-1}", content="ok")
+                ev = tool_result(
+                    seq=i, turn_id=turn_id, call_id=f"c{i - 1}", content="ok"
+                )
             elif kind_idx == 5:
-                ev = interrupt(seq=i, turn_id=turn_id, interrupt_kind="approval", prompt="?")
+                ev = interrupt(
+                    seq=i, turn_id=turn_id, interrupt_kind="approval", prompt="?"
+                )
             elif kind_idx == 6:
                 ev = token_usage(
-                    seq=i, turn_id=turn_id,
-                    delta_input=10 + i, delta_output=5,
-                    cumulative_input=100 + i * 10, cumulative_output=50 + i * 5,
+                    seq=i,
+                    turn_id=turn_id,
+                    delta_input=10 + i,
+                    delta_output=5,
+                    cumulative_input=100 + i * 10,
+                    cumulative_output=50 + i * 5,
                     cache_read=i if i % 2 == 0 else 0,
                 )
             else:

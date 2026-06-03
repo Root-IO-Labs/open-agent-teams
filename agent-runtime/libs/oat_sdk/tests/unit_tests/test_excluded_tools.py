@@ -18,6 +18,7 @@ These tests intercept the call to ``langchain.agents.create_agent``
 we can inspect the assembled tool list and middleware stack without
 needing a live LLM.
 """
+
 from __future__ import annotations
 
 from typing import Any

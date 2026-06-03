@@ -162,9 +162,7 @@ class TestCommitTokenTracking:
     def test_no_spend_skips_emit(self):
         """When no spend captured, no emission to daemon."""
         adapter = self._make_adapter()
-        with patch(
-            "oat_cli.textual_adapter._emit_oat_tokens"
-        ) as mock_emit:
+        with patch("oat_cli.textual_adapter._emit_oat_tokens") as mock_emit:
             _commit_token_tracking(adapter, 0, 0, 0, 0)
             mock_emit.assert_not_called()
 
@@ -222,7 +220,7 @@ class TestEmitOatTokens:
 
         line = self._capture_emit(adapter, 400, 100)
         assert line.startswith("[OAT_TOKENS] ")
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
 
         assert payload["delta_input"] == 400
         assert payload["delta_output"] == 100
@@ -234,7 +232,7 @@ class TestEmitOatTokens:
         adapter._spend_tracker = None
 
         line = self._capture_emit(adapter, 100, 50)
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
         assert payload["cumulative_input"] == 0
         assert payload["cumulative_output"] == 0
 
@@ -244,7 +242,7 @@ class TestEmitOatTokens:
         adapter._spend_tracker = TokenSpendAccumulator()
 
         line = self._capture_emit(adapter, 100, 50)
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
         # Only new honest field names
         assert set(payload.keys()) == {
             "delta_input",
@@ -274,7 +272,7 @@ class TestEmitOatTokens:
         contents = log_file.read_text().splitlines()
         assert len(contents) == 1
         assert contents[0].startswith("[OAT_TOKENS] ")
-        payload = json.loads(contents[0][len("[OAT_TOKENS] "):])
+        payload = json.loads(contents[0][len("[OAT_TOKENS] ") :])
         assert payload["cumulative_input"] == 500
 
     def test_oat_tool_log_missing_is_noop(self, tmp_path, monkeypatch):
@@ -303,10 +301,12 @@ class TestEmitOatTokens:
         """Anthropic-style cache metrics are surfaced in the payload."""
         adapter = MagicMock()
         adapter._spend_tracker = TokenSpendAccumulator()
-        adapter._spend_tracker.record_turn(1000, 200, cache_read=700, cache_creation=100)
+        adapter._spend_tracker.record_turn(
+            1000, 200, cache_read=700, cache_creation=100
+        )
 
         line = self._capture_emit(adapter, 1000, 200)
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
         assert payload["cache_read"] == 700
         assert payload["cache_creation"] == 100
 
@@ -317,7 +317,7 @@ class TestEmitOatTokens:
         adapter._spend_tracker.record_turn(1000, 200)
 
         line = self._capture_emit(adapter, 1000, 200)
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
         assert "cache_read" not in payload
         assert "cache_creation" not in payload
 
@@ -328,7 +328,7 @@ class TestEmitOatTokens:
         adapter._spend_tracker.record_turn(1000, 200)
 
         line = self._capture_emit(adapter, 1000, 200, context_in=42000, context_out=900)
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
         assert payload["context_input"] == 42000
         assert payload["context_output"] == 900
 
@@ -339,7 +339,7 @@ class TestEmitOatTokens:
         adapter._spend_tracker.record_turn(1000, 200)
 
         line = self._capture_emit(adapter, 1000, 200)
-        payload = json.loads(line[len("[OAT_TOKENS] "):])
+        payload = json.loads(line[len("[OAT_TOKENS] ") :])
         assert "context_input" not in payload
         assert "context_output" not in payload
 

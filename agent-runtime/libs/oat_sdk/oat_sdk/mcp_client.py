@@ -119,8 +119,7 @@ def _resolve_stderr_log_path(spec: McpServerSpec) -> Path | None:
         base.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         logger.warning(
-            "Could not create MCP stderr log dir %s for server %r (%s); "
-            "subprocess stderr will be inherited (PTY-dropped under OAT_TOOL_LOG)",
+            "Could not create MCP stderr log dir %s for server %r (%s); subprocess stderr will be inherited (PTY-dropped under OAT_TOOL_LOG)",
             base,
             spec.name,
             e,
@@ -129,9 +128,7 @@ def _resolve_stderr_log_path(spec: McpServerSpec) -> Path | None:
     return base / f"mcp-{spec.name}.stderr.log"
 
 
-def _open_stderr_log_for_spec(
-    spec: McpServerSpec, stack: AsyncExitStack
-) -> TextIO | None:
+def _open_stderr_log_for_spec(spec: McpServerSpec, stack: AsyncExitStack) -> TextIO | None:
     """Open the per-server stderr log file and register its close on ``stack``.
 
     Returns the open file (suitable for passing as ``errlog`` to
@@ -158,8 +155,7 @@ def _open_stderr_log_for_spec(
         errlog_file = log_path.open("a", encoding="utf-8", buffering=1)
     except OSError as e:
         logger.warning(
-            "Could not open MCP stderr log %s for server %r (%s); "
-            "subprocess stderr will be inherited",
+            "Could not open MCP stderr log %s for server %r (%s); subprocess stderr will be inherited",
             log_path,
             spec.name,
             e,
@@ -511,9 +507,7 @@ async def load_mcp_tools(
             # Enter the stdio_client context (spawns the subprocess +
             # opens stdin/stdout streams) on the exit stack so the
             # subprocess is reaped when the stack closes.
-            read_stream, write_stream = await stack.enter_async_context(
-                stdio_client(params, **stdio_kwargs)
-            )
+            read_stream, write_stream = await stack.enter_async_context(stdio_client(params, **stdio_kwargs))
             session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
             await asyncio.wait_for(session.initialize(), timeout=_INIT_TIMEOUT_SECONDS)
 

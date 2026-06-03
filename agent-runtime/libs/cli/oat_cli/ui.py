@@ -67,9 +67,7 @@ def show_help() -> None:
     console.print(
         "  oat-agent reset --agent AGENT [--target SRC]  Reset an agent's prompt"
     )
-    console.print(
-        "  oat-agent skills <list|create|info|delete>    Manage agent skills"
-    )
+    console.print("  oat-agent skills <list|create|info|delete>    Manage agent skills")
     console.print(
         "  oat-agent threads <list|delete>               Manage conversation threads"
     )

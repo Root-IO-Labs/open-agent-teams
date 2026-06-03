@@ -138,7 +138,8 @@ class WelcomeBanner(Static):
                 banner.append(f"Thread: {self._cli_thread_id}\n", style="dim")
 
         banner.append(
-            "OAT - Open Agent Teams ready! What would you like to build?\n", style=COLORS["primary"]
+            "OAT - Open Agent Teams ready! What would you like to build?\n",
+            style=COLORS["primary"],
         )
         bullet = get_glyphs().bullet
         banner.append(

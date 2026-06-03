@@ -239,9 +239,7 @@ class TestImageUtilsExceptionHandling:
     def test_image_utils_exception_types(self):
         """Test that image_utils uses proper exception types."""
         # Read the source file and check exception handling
-        source_path = (
-            Path(__file__).parent.parent.parent / "oat_cli" / "image_utils.py"
-        )
+        source_path = Path(__file__).parent.parent.parent / "oat_cli" / "image_utils.py"
         source = source_path.read_text()
         tree = ast.parse(source)
 
@@ -260,9 +258,7 @@ class TestImageUtilsExceptionHandling:
         with (
             patch("oat_cli.image_utils._get_executable") as mock_exec,
             patch("subprocess.run") as mock_run,
-            patch(
-                "oat_cli.image_utils._get_clipboard_via_osascript"
-            ) as mock_osascript,
+            patch("oat_cli.image_utils._get_clipboard_via_osascript") as mock_osascript,
         ):
             mock_exec.return_value = "/usr/local/bin/pngpaste"
             mock_run.side_effect = subprocess.TimeoutExpired(cmd="pngpaste", timeout=2)
@@ -279,9 +275,7 @@ class TestImageUtilsExceptionHandling:
         with (
             patch("oat_cli.image_utils._get_executable") as mock_exec,
             patch("subprocess.run") as mock_run,
-            patch(
-                "oat_cli.image_utils._get_clipboard_via_osascript"
-            ) as mock_osascript,
+            patch("oat_cli.image_utils._get_clipboard_via_osascript") as mock_osascript,
         ):
             mock_exec.return_value = "/usr/local/bin/pngpaste"
             mock_run.side_effect = FileNotFoundError("pngpaste")

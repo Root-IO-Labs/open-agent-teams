@@ -71,14 +71,14 @@ const DefaultSessionRotateKeepArchives = 3
 // Rotation, when triggered, does the following atomically with
 // respect to a flock on the head file:
 //
-//   1. Delete `<headPath>.<keepArchives>` if it exists (oldest
-//      slot is overwritten).
-//   2. Shift `<headPath>.<i>` → `<headPath>.<i+1>` for
-//      `i = keepArchives-1` down to `1`.
-//   3. Rename `<headPath>` → `<headPath>.1`.
-//   4. Create a fresh empty `<headPath>` so the runtime sees
-//      a writable file on startup (avoids a "file not found"
-//      branch in any consumer that doesn't lazy-create).
+//  1. Delete `<headPath>.<keepArchives>` if it exists (oldest
+//     slot is overwritten).
+//  2. Shift `<headPath>.<i>` → `<headPath>.<i+1>` for
+//     `i = keepArchives-1` down to `1`.
+//  3. Rename `<headPath>` → `<headPath>.1`.
+//  4. Create a fresh empty `<headPath>` so the runtime sees
+//     a writable file on startup (avoids a "file not found"
+//     branch in any consumer that doesn't lazy-create).
 //
 // On any rename/delete failure, return the underlying error so
 // the caller can decide whether to surface it. The function

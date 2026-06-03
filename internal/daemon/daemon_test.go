@@ -1259,7 +1259,7 @@ func TestHandleRemoveAgentUserCleanupReason_Part7Commit2(t *testing.T) {
 // recovery loop (which is far harder to test end-to-end).
 func TestAgentLastErrorSaysUserStopped_Part7Commit2(t *testing.T) {
 	cases := []struct {
-		name string
+		name  string
 		agent state.Agent
 		want  bool
 	}{
@@ -1648,10 +1648,10 @@ func TestHandleRouteUserMessage_Part7Commit3(t *testing.T) {
 		resp := d.handleRouteUserMessage(socket.Request{
 			Command: "route_user_message",
 			Args: map[string]interface{}{
-				"repo":           "test-repo",
-				"agent":          "tab-target",
-				"text":           "what tab am I on",
-				"active_tab_id":  float64(42),
+				"repo":          "test-repo",
+				"agent":         "tab-target",
+				"text":          "what tab am I on",
+				"active_tab_id": float64(42),
 			},
 		})
 		if !resp.Success {

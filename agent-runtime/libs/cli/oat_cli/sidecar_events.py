@@ -8,14 +8,20 @@ under chrome-redraw flood.
 
 Wire format: newline-delimited JSON. Each line is a complete envelope::
 
-    {"v":1,"seq":42,"ts":1714000000000,"turn_id":"abc123",
-     "kind":"assistant_message",
-     "data":{"content":"hello","usage":{...}}}
+    {
+        "v": 1,
+        "seq": 42,
+        "ts": 1714000000000,
+        "turn_id": "abc123",
+        "kind": "assistant_message",
+        "data": {"content": "hello", "usage": {...}},
+    }
 
 Forward-compat contract: any consumer that doesn't recognize ``kind``
 MUST log and skip, never raise. The Go side follows the same rule — see
 ``pkg/sidecar/events.go``. Both sides must evolve in lockstep.
 """
+
 from __future__ import annotations
 
 import json
@@ -107,7 +113,9 @@ class Event:
 
 def turn_start(seq: int, turn_id: str, user_input: str) -> Event:
     return Event(
-        seq=seq, turn_id=turn_id, kind=KIND_TURN_START,
+        seq=seq,
+        turn_id=turn_id,
+        kind=KIND_TURN_START,
         data={"user_input": user_input},
     )
 
@@ -118,45 +126,68 @@ def turn_end(seq: int, turn_id: str) -> Event:
 
 def assistant_delta(seq: int, turn_id: str, content: str) -> Event:
     return Event(
-        seq=seq, turn_id=turn_id, kind=KIND_ASSISTANT_DELTA,
+        seq=seq,
+        turn_id=turn_id,
+        kind=KIND_ASSISTANT_DELTA,
         data={"content": content},
     )
 
 
 def assistant_message(
-    seq: int, turn_id: str, content: str, usage: Optional[Usage] = None,
+    seq: int,
+    turn_id: str,
+    content: str,
+    usage: Optional[Usage] = None,
 ) -> Event:
     data: dict[str, Any] = {"content": content}
     if usage is not None:
         data["usage"] = asdict(usage)
     return Event(
-        seq=seq, turn_id=turn_id, kind=KIND_ASSISTANT_MESSAGE, data=data,
+        seq=seq,
+        turn_id=turn_id,
+        kind=KIND_ASSISTANT_MESSAGE,
+        data=data,
     )
 
 
 def tool_call(
-    seq: int, turn_id: str, name: str, args: dict[str, Any], call_id: str,
+    seq: int,
+    turn_id: str,
+    name: str,
+    args: dict[str, Any],
+    call_id: str,
 ) -> Event:
     return Event(
-        seq=seq, turn_id=turn_id, kind=KIND_TOOL_CALL,
+        seq=seq,
+        turn_id=turn_id,
+        kind=KIND_TOOL_CALL,
         data={"name": name, "args": args, "call_id": call_id},
     )
 
 
 def tool_result(
-    seq: int, turn_id: str, call_id: str, content: str,
+    seq: int,
+    turn_id: str,
+    call_id: str,
+    content: str,
     error: Optional[str] = None,
 ) -> Event:
     data: dict[str, Any] = {"call_id": call_id, "content": content}
     if error is not None:
         data["error"] = error
     return Event(
-        seq=seq, turn_id=turn_id, kind=KIND_TOOL_RESULT, data=data,
+        seq=seq,
+        turn_id=turn_id,
+        kind=KIND_TOOL_RESULT,
+        data=data,
     )
 
 
 def interrupt(
-    seq: int, turn_id: str, interrupt_kind: str, prompt: str,
+    seq: int,
+    turn_id: str,
+    interrupt_kind: str,
+    prompt: str,
 ) -> Event:
     """Human-in-the-loop interrupt event.
 
@@ -165,7 +196,9 @@ def interrupt(
     field of the same name.
     """
     return Event(
-        seq=seq, turn_id=turn_id, kind=KIND_INTERRUPT,
+        seq=seq,
+        turn_id=turn_id,
+        kind=KIND_INTERRUPT,
         data={"kind": interrupt_kind, "prompt": prompt},
     )
 

@@ -956,9 +956,7 @@ class TestThreadSelectorMessageCountErrors:
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("unexpected type mismatch"),
             ),
-            patch(
-                "oat_cli.widgets.thread_selector.logger.warning"
-            ) as mock_warning,
+            patch("oat_cli.widgets.thread_selector.logger.warning") as mock_warning,
         ):
             await screen._load_message_counts()
 

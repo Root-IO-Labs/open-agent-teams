@@ -1837,7 +1837,9 @@ class OatSdksApp(App):
             # when streaming aborts before tool results arrive.
             safe_error = escape_markup(str(e))
             if self._ui_adapter:
-                self._ui_adapter.finalize_pending_tools_with_error(f"Agent error: {safe_error}")
+                self._ui_adapter.finalize_pending_tools_with_error(
+                    f"Agent error: {safe_error}"
+                )
             await self._mount_message(ErrorMessage(f"Agent error: {safe_error}"))
         finally:
             # Clean up loading widget and agent state
@@ -2750,8 +2752,7 @@ class OatSdksApp(App):
             else:
                 await self._mount_message(
                     ErrorMessage(
-                        "Could not save model preference. "
-                        "Check permissions for ~/.oat/"
+                        "Could not save model preference. Check permissions for ~/.oat/"
                     )
                 )
             return
@@ -2875,8 +2876,7 @@ class OatSdksApp(App):
         else:
             await self._mount_message(
                 ErrorMessage(
-                    "Could not clear default model. "
-                    "Check permissions for ~/.oat/"
+                    "Could not clear default model. Check permissions for ~/.oat/"
                 )
             )
 

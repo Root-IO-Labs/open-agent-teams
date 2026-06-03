@@ -5,6 +5,7 @@ Usage:
     uv run --no-sync run.py
     uv run --no-sync run.py --thread-id <id>   # resume a session
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,25 +23,27 @@ if _env_file.exists():
     load_dotenv(_env_file)
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-CYAN   = "\033[36m"
-GREEN  = "\033[32m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
 YELLOW = "\033[33m"
-RED    = "\033[31m"
-BLUE   = "\033[34m"
+RED = "\033[31m"
+BLUE = "\033[34m"
+
 
 def _c(code: str, text: str) -> str:
     return f"{code}{text}{RESET}"
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-_HERE      = Path(__file__).parent
+_HERE = Path(__file__).parent
 _MAIN_YAML = _HERE / "agent-builder" / "main.yaml"
 
 
 # ── Streaming helpers ─────────────────────────────────────────────────────────
+
 
 def _text_from_chunk(msg_chunk: object) -> str:
     """Extract plain text from an AIMessageChunk, ignoring tool-call parts."""
@@ -98,9 +101,9 @@ async def _stream_turn(runtime, messages: list[dict], thread_id: str) -> str:
 # ── REPL ──────────────────────────────────────────────────────────────────────
 
 _BANNER = f"""
-{_c(BOLD + CYAN, '╔══════════════════════════════════════╗')}
-{_c(BOLD + CYAN, '║')}  {_c(BOLD, 'OAT Agent Builder')}  {_c(BOLD + CYAN, '║')}
-{_c(BOLD + CYAN, '╚══════════════════════════════════════╝')}
+{_c(BOLD + CYAN, "╔══════════════════════════════════════╗")}
+{_c(BOLD + CYAN, "║")}  {_c(BOLD, "OAT Agent Builder")}  {_c(BOLD + CYAN, "║")}
+{_c(BOLD + CYAN, "╚══════════════════════════════════════╝")}
 {_c(DIM, "Describe the agent service you want to build.")}
 {_c(DIM, "Type 'exit' or press Ctrl-C to quit.")}
 """
@@ -147,6 +150,7 @@ async def run_repl(thread_id: str) -> None:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

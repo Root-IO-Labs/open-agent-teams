@@ -35,6 +35,7 @@ Safety invariants:
    the client reconnects, the server resets its own tracker on disconnect
    (see pkg/sidecar/server.go trackSeq).
 """
+
 from __future__ import annotations
 
 import atexit
@@ -206,9 +207,13 @@ def emit_turn_start(user_input: str, turn_id: Optional[str] = None) -> Optional[
     if c is None:
         return turn_id
     try:
-        c.emit(turn_start(
-            seq=_next_seq(), turn_id=turn_id, user_input=user_input,
-        ))
+        c.emit(
+            turn_start(
+                seq=_next_seq(),
+                turn_id=turn_id,
+                user_input=user_input,
+            )
+        )
     except Exception as e:  # noqa: BLE001
         _log.warning("sidecar_emitter: emit_turn_start failed: %s", e)
     return turn_id
@@ -231,54 +236,77 @@ def emit_assistant_delta(content: str) -> None:
     if c is None:
         return
     try:
-        c.emit(assistant_delta(
-            seq=_next_seq(), turn_id=_turn_id() or "", content=content,
-        ))
+        c.emit(
+            assistant_delta(
+                seq=_next_seq(),
+                turn_id=_turn_id() or "",
+                content=content,
+            )
+        )
     except Exception as e:  # noqa: BLE001
         _log.warning("sidecar_emitter: emit_assistant_delta failed: %s", e)
 
 
 def emit_assistant_message(
-    content: str, usage: Optional[Usage] = None,
+    content: str,
+    usage: Optional[Usage] = None,
 ) -> None:
     c = _get_client()
     if c is None:
         return
     try:
-        c.emit(assistant_message(
-            seq=_next_seq(), turn_id=_turn_id() or "",
-            content=content, usage=usage,
-        ))
+        c.emit(
+            assistant_message(
+                seq=_next_seq(),
+                turn_id=_turn_id() or "",
+                content=content,
+                usage=usage,
+            )
+        )
     except Exception as e:  # noqa: BLE001
         _log.warning("sidecar_emitter: emit_assistant_message failed: %s", e)
 
 
 def emit_tool_call(
-    name: str, args: dict[str, Any], call_id: str,
+    name: str,
+    args: dict[str, Any],
+    call_id: str,
 ) -> None:
     c = _get_client()
     if c is None:
         return
     try:
-        c.emit(tool_call(
-            seq=_next_seq(), turn_id=_turn_id() or "",
-            name=name, args=args, call_id=call_id,
-        ))
+        c.emit(
+            tool_call(
+                seq=_next_seq(),
+                turn_id=_turn_id() or "",
+                name=name,
+                args=args,
+                call_id=call_id,
+            )
+        )
     except Exception as e:  # noqa: BLE001
         _log.warning("sidecar_emitter: emit_tool_call failed: %s", e)
 
 
 def emit_tool_result(
-    call_id: str, content: str, error: Optional[str] = None,
+    call_id: str,
+    content: str,
+    error: Optional[str] = None,
 ) -> None:
     c = _get_client()
     if c is None:
         return
     try:
-        c.emit(tool_result(
-            seq=_next_seq(), turn_id=_turn_id() or "",
-            call_id=call_id, content=content, error=error,
-        ))
+        c.emit(
+            tool_result(
+                seq=_next_seq(),
+                turn_id=_turn_id() or "",
+                call_id=call_id,
+                content=content,
+                error=error,
+            )
+        )
     except Exception as e:  # noqa: BLE001
         _log.warning("sidecar_emitter: emit_tool_result failed: %s", e)
 
@@ -288,10 +316,14 @@ def emit_interrupt(interrupt_kind: str, prompt: str) -> None:
     if c is None:
         return
     try:
-        c.emit(make_interrupt(
-            seq=_next_seq(), turn_id=_turn_id() or "",
-            interrupt_kind=interrupt_kind, prompt=prompt,
-        ))
+        c.emit(
+            make_interrupt(
+                seq=_next_seq(),
+                turn_id=_turn_id() or "",
+                interrupt_kind=interrupt_kind,
+                prompt=prompt,
+            )
+        )
     except Exception as e:  # noqa: BLE001
         _log.warning("sidecar_emitter: emit_interrupt failed: %s", e)
 

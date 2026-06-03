@@ -55,12 +55,12 @@ import (
 // Frame kind constants. Stable strings on the wire — the bridge
 // and the extension match against them by string compare.
 const (
-	lifecycleKindSnapshot       = "snapshot"
-	lifecycleKindAgentAdded     = "agent_added"
-	lifecycleKindAgentStarted   = "agent_started"
-	lifecycleKindAgentStopped   = "agent_stopped"
-	lifecycleKindAgentRemoved   = "agent_removed"
-	lifecycleKindEmergencyStop  = "emergency_stop"
+	lifecycleKindSnapshot        = "snapshot"
+	lifecycleKindAgentAdded      = "agent_added"
+	lifecycleKindAgentStarted    = "agent_started"
+	lifecycleKindAgentStopped    = "agent_stopped"
+	lifecycleKindAgentRemoved    = "agent_removed"
+	lifecycleKindEmergencyStop   = "emergency_stop"
 	lifecycleKindEmergencyResume = "emergency_resume"
 )
 

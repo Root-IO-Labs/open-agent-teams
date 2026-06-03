@@ -5,6 +5,7 @@ same wire format and must stay in sync. Fixtures crafted here to look
 exactly like what the Go side emits, so a field-rename on either side
 surfaces immediately.
 """
+
 from __future__ import annotations
 
 import json
@@ -123,7 +124,9 @@ class TestShape:
         # fields should not appear on the wire — this saves bytes on every
         # event and matches the Go omitempty contract.
         ev = assistant_message(
-            seq=1, turn_id="t", content="hi",
+            seq=1,
+            turn_id="t",
+            content="hi",
             usage=Usage(input_tokens=10, output_tokens=5),
         )
         payload = json.loads(ev.to_json())
@@ -189,10 +192,14 @@ class TestFactories:
         # existing handleTokenUsageEvent can consume sidecar events with
         # no adaptation.
         ev = token_usage(
-            seq=1, turn_id="t",
-            delta_input=10, delta_output=5,
-            cumulative_input=100, cumulative_output=50,
-            cache_read=20, cache_creation=30,
+            seq=1,
+            turn_id="t",
+            delta_input=10,
+            delta_output=5,
+            cumulative_input=100,
+            cumulative_output=50,
+            cache_read=20,
+            cache_creation=30,
         )
         assert ev.kind == KIND_TOKEN_USAGE
         assert ev.data == {
@@ -209,9 +216,12 @@ class TestFactories:
         # cache_creation only appear when non-zero. Reduces wire bytes and
         # keeps parity with the existing [OAT_TOKENS] path.
         ev = token_usage(
-            seq=1, turn_id="t",
-            delta_input=10, delta_output=5,
-            cumulative_input=100, cumulative_output=50,
+            seq=1,
+            turn_id="t",
+            delta_input=10,
+            delta_output=5,
+            cumulative_input=100,
+            cumulative_output=50,
         )
         assert "cache_read" not in ev.data
         assert "cache_creation" not in ev.data
@@ -220,8 +230,11 @@ class TestFactories:
         # The existing emitter sometimes runs pre-turn (model banner) or
         # aggregated across turns — turn_id may legitimately be None.
         ev = token_usage(
-            seq=1, turn_id=None,
-            delta_input=0, delta_output=0,
-            cumulative_input=10, cumulative_output=5,
+            seq=1,
+            turn_id=None,
+            delta_input=0,
+            delta_output=0,
+            cumulative_input=10,
+            cumulative_output=5,
         )
         assert ev.turn_id is None

@@ -297,9 +297,7 @@ def create_oat_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly 
     # adds the *automatic* summarizer (no tool surface) and stays
     # enabled regardless of `excluded_tools` so context limits still
     # get managed in long sessions.
-    excluded: frozenset[str] = (
-        frozenset(excluded_tools) if excluded_tools else frozenset()
-    )
+    excluded: frozenset[str] = frozenset(excluded_tools) if excluded_tools else frozenset()
     task_excluded: bool = "task" in excluded
 
     # Filter user-provided tools by name. We retain anything whose
@@ -384,9 +382,7 @@ def create_oat_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly 
 
     # Combine GP (if present) with processed user-provided subagents.
     all_subagents: list[SubAgent | CompiledSubAgent] = (
-        [general_purpose_spec, *processed_subagents]
-        if general_purpose_spec is not None
-        else list(processed_subagents)
+        [general_purpose_spec, *processed_subagents] if general_purpose_spec is not None else list(processed_subagents)
     )
 
     # Build main agent middleware stack. `SubAgentMiddleware` is the

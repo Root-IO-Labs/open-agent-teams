@@ -206,9 +206,7 @@ class TestCLIStartupTime:
     def test_version_under_threshold(self) -> None:
         """`oat_sdk --version` should complete well under 10 s."""
         elapsed = self._time_cli_command("--version")
-        assert elapsed < 10, (
-            f"`oat_sdk --version` took {elapsed:.2f}s — expected < 10s"
-        )
+        assert elapsed < 10, f"`oat_sdk --version` took {elapsed:.2f}s — expected < 10s"
 
 
 # ---------------------------------------------------------------------------

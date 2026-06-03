@@ -41,9 +41,7 @@ def test_load_mcp_config_missing_file_returns_empty(tmp_path: Path) -> None:
     assert load_mcp_config(tmp_path / "nonexistent.json") == []
 
 
-def test_load_mcp_config_malformed_json_logs_warning_returns_empty(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_load_mcp_config_malformed_json_logs_warning_returns_empty(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Graceful degradation: bad JSON -> empty list + warning.
 
     The agent proceeds with built-in tools only.
@@ -61,9 +59,7 @@ def test_load_mcp_config_missing_servers_key_returns_empty(tmp_path: Path) -> No
     assert load_mcp_config(p) == []
 
 
-def test_load_mcp_config_filters_unsupported_transport(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_load_mcp_config_filters_unsupported_transport(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Servers declaring ``transport != "stdio"`` are skipped with a warning.
 
     Valid neighbours still load. Future SSE/WS support won't regress
@@ -87,9 +83,7 @@ def test_load_mcp_config_filters_unsupported_transport(
     assert any("only 'stdio' is supported" in r.message for r in caplog.records)
 
 
-def test_load_mcp_config_expands_home_and_envvars(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_load_mcp_config_expands_home_and_envvars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``~`` and ``$VAR`` resolve at load time so callers downstream see canonical paths.
 
     The daemon writes portable paths like ``~/.oat/...``; this is the contract.
@@ -119,9 +113,7 @@ def test_load_mcp_config_expands_home_and_envvars(
     assert specs[0].env == {"OAT_TARGET": str(tmp_path / "output")}
 
 
-def test_load_mcp_config_invalid_entry_skipped(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_load_mcp_config_invalid_entry_skipped(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """One bad entry doesn't take down the others. We log + continue."""
     p = tmp_path / "mcp.json"
     p.write_text(
@@ -168,9 +160,7 @@ def test_resolve_stderr_log_path_uses_audit_dir_env(tmp_path: Path) -> None:
     assert audit_dir.is_dir()
 
 
-def test_resolve_stderr_log_path_falls_back_to_cwd_dot_oat(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resolve_stderr_log_path_falls_back_to_cwd_dot_oat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """No env override -> <cwd>/.oat/.
 
     That's the agent worktree's hidden config dir, which already
@@ -191,9 +181,7 @@ def test_resolve_stderr_log_path_falls_back_to_cwd_dot_oat(
     assert (tmp_path / ".oat").is_dir()
 
 
-def test_resolve_stderr_log_path_expands_tilde_and_envvars(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resolve_stderr_log_path_expands_tilde_and_envvars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The audit dir env value goes through ~/$VAR expansion.
 
     Matches every other path in mcp_client.py. Without this, the
@@ -360,9 +348,7 @@ async def test_tool_name_collision_with_builtin_namespaces(stub_spec: McpServerS
 
 
 @pytest.mark.asyncio
-async def test_bad_command_skipped_remaining_specs_still_load(
-    stub_spec: McpServerSpec, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_bad_command_skipped_remaining_specs_still_load(stub_spec: McpServerSpec, caplog: pytest.LogCaptureFixture) -> None:
     """A spec whose command doesn't exist is skipped with a warning.
 
     Valid specs after it still load. Mirrors how a real deployment
@@ -475,6 +461,5 @@ async def test_load_mcp_tools_captures_subprocess_stderr_to_file(
     assert stderr_log.exists(), f"expected stderr log at {stderr_log}"
     captured = stderr_log.read_text(encoding="utf-8")
     assert "[STUB MCP] boot banner" in captured, (
-        f"stub server's startup banner did not reach the per-server stderr "
-        f"log; subprocess stderr capture is broken. captured={captured!r}"
+        f"stub server's startup banner did not reach the per-server stderr log; subprocess stderr capture is broken. captured={captured!r}"
     )
