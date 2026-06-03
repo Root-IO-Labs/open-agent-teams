@@ -605,11 +605,24 @@ func (c *CLI) assistantRestart(args []string) error {
 	repoKey := virtualRepoNameFor(name)
 	agent := agentSlug(name)
 
-	if flags["fresh"] == "true" {
+	fresh := flags["fresh"] == "true"
+	if fresh {
+		// Wipe the on-disk OAT session log + archives. NOTE: this
+		// is NOT where conversation memory lives — oat-cli keeps
+		// that in ~/.oat/sessions.db (langgraph checkpoints keyed
+		// by thread_id == agent.SessionID). Deleting the .jsonl
+		// alone left the assistant remembering everything after a
+		// --fresh restart (reported 2026-06-03: "it still
+		// remembers my favorite color even when i restarted with
+		// --fresh"). The actual memory wipe is the `fresh:true`
+		// flag below, which makes the daemon rotate the agent's
+		// SessionID to a brand-new (empty) langgraph thread. We
+		// still wipe the .jsonl here to keep the on-disk log
+		// directory tidy.
 		if err := c.wipeAssistantSession(repoKey, agent); err != nil {
 			return err
 		}
-		fmt.Printf("✓ Session JSONL wiped for assistant '%s'.\n", name)
+		fmt.Printf("✓ Session wiped for assistant '%s'.\n", name)
 	}
 
 	// force:true is load-bearing, not belt-and-suspenders. "Restart"
@@ -632,6 +645,11 @@ func (c *CLI) assistantRestart(args []string) error {
 		"repo":  repoKey,
 		"agent": agent,
 		"force": true,
+		// fresh tells the daemon to rotate the langgraph thread
+		// (mint a new SessionID) so the restarted assistant has
+		// no memory of prior turns. Without it the daemon resumes
+		// the existing thread by SessionID.
+		"fresh": fresh,
 	})
 	if err != nil {
 		if !isAgentNotFoundError(err) {
