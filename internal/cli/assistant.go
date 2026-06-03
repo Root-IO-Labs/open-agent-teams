@@ -612,9 +612,26 @@ func (c *CLI) assistantRestart(args []string) error {
 		fmt.Printf("✓ Session JSONL wiped for assistant '%s'.\n", name)
 	}
 
+	// force:true is load-bearing, not belt-and-suspenders. "Restart"
+	// semantically means "bounce it" (stop the live process, start a
+	// fresh one), and the side-panel Manage-tab Restart button is
+	// only clickable while the assistant is RUNNING. Without force,
+	// handleRestartAgent hits its "already running with PID N — use
+	// --force to restart anyway" short-circuit and returns an error
+	// the side panel silently swallows, so the button appears dead.
+	// Reported 2026-06-03: "the restart button does nothing when i
+	// click it." There is no `--force` flag on `oat assistant
+	// restart` (only `--fresh`), so a terminal user likewise had no
+	// way to bounce a running assistant before this. The Resume
+	// button worked only because it fires on a STOPPED assistant
+	// (no live PID → no short-circuit). force routes through
+	// handleRestartAgent's prior-process-kill path, which tears down
+	// the old oat-agent + python + bridge child tree before the new
+	// spawn, so it's the correct bounce primitive here.
 	resp, err := c.sendDaemonRequest("restart_agent", map[string]interface{}{
 		"repo":  repoKey,
 		"agent": agent,
+		"force": true,
 	})
 	if err != nil {
 		if !isAgentNotFoundError(err) {
