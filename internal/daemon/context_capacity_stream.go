@@ -15,18 +15,20 @@
 //
 // Tier semantics:
 //
+//	"unknown"     → no live window reading yet (renders neutral/hidden)
 //	"ok"          → pct <  75 %   (clears any UI indicator)
 //	"hint"        → pct >= 75 %   (silent PTY hint already sent in Slice A)
 //	"amber"       → pct >= 85 %   (Status-tab amber pill)
 //	"banner"      → pct >= 90 %   (user-visible banner w/ Compact/Reset)
 //	"safety_net"  → pct >= 95 %   (synthetic inject auto-fires)
 //
-// Tier-crossing rule: a frame is only published when the agent's tier
-// actually CHANGES. Going from "ok" → "hint" emits one frame; staying
-// in "hint" emits nothing more. Going from "hint" → "ok" (after a
-// successful compact_conversation) emits a clear-the-UI frame. This
-// keeps the wire quiet during normal operation and ensures the side
-// panel never sees stale UI state — every transition is reported.
+// Cadence: publishCapacityFrame emits one frame per token event (i.e.
+// per turn) so the side-panel ring meter is genuinely live, not a step
+// function that only moves at the 75/85/90/95 % boundaries. The frame
+// still carries the tier name so the extension drives colour/nudge
+// copy by tier. (The older tier-crossing-only path,
+// publishCapacityFrameIfTierChanged, is retained for any future
+// transition-only consumer but is not on the live-meter path.)
 //
 // Why a separate stream from stream_assistant_turns / stream_agent_output:
 //   - The frame cadence is dramatically different (one per tier
@@ -36,9 +38,12 @@
 //     budgets) extend this stream's tier enum without touching the
 //     turn-feed schema.
 //
-// Restricted to AgentTypeAssistant by the socket handler — the
-// workflow-helper AgentTypeBrowser doesn't surface side-panel chat
-// UI, so a capacity pill would be meaningless there.
+// Accepts any chat-capable agent (usesBrowserBridge: assistant +
+// browser) by the socket handler so the side-panel meter can follow
+// whichever agent the chat picker has selected. The 75 % silent hint
+// and 95 % synthetic-inject safety net in context_capacity.go remain
+// assistant-only (browser agents have compact_conversation denied);
+// only the display frame is published for browser agents.
 
 package daemon
 
@@ -79,6 +84,16 @@ const (
 	capacityTierAmber     = "amber"
 	capacityTierBanner    = "banner"
 	capacityTierSafetyNet = "safety_net"
+	// capacityTierUnknown is emitted when the agent has no live
+	// context-window reading yet (ContextWindowTokens == 0): right
+	// after a (re)start before the first per-turn token event, or for
+	// a runtime that never reports window occupancy. The extension
+	// renders this as a hidden/neutral meter rather than guessing a
+	// percentage from stale or cumulative numbers (a long-lived
+	// browser agent's cumulative spend would otherwise peg the ring
+	// at a false 100%). DO NOT rename without a coordinated cross-repo
+	// bump (matching enum in oat-browser-agent).
+	capacityTierUnknown = "unknown"
 )
 
 // Tier-crossing fractional thresholds. Mirrors the constants in
@@ -255,6 +270,29 @@ func (d *Daemon) lookupCapacityBroadcaster(sessionName, agentName string) *capac
 	return d.capacityBroadcasters[key]
 }
 
+// buildCapacityFrame constructs the wire frame, honoring the unknown
+// state. When the live window occupancy is not yet known the meter
+// must render neutral/hidden rather than guess from stale or
+// cumulative numbers, so we emit tier "unknown" with zeroed pct/used
+// (Limit is still carried because the bridge's tool-result cap can
+// use it). When known, the frame is the normal pct/tier/used triple.
+func buildCapacityFrame(pct float64, used, limit int64, known bool) contextCapacityFrame {
+	if !known {
+		return contextCapacityFrame{
+			Tier:  capacityTierUnknown,
+			Limit: limit,
+			TS:    time.Now().UTC().Format(time.RFC3339Nano),
+		}
+	}
+	return contextCapacityFrame{
+		Pct:   roundPct(pct),
+		Tier:  tierForPct(pct),
+		Used:  used,
+		Limit: limit,
+		TS:    time.Now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
 // publishCapacityFrame builds a contextCapacityFrame and broadcasts
 // it UNCONDITIONALLY (no tier-crossing dedupe). This is the live-meter
 // path: the side panel wants a fresh pct on every turn so the ring
@@ -262,28 +300,23 @@ func (d *Daemon) lookupCapacityBroadcaster(sessionName, agentName string) *capac
 // boundaries. It still records the current tier in lastTier so any
 // future tier-change consumer stays consistent, and the frame carries
 // the tier name so colour/nudge logic remains tier-driven on the
-// extension side. Returns the tier it published.
-func (d *Daemon) publishCapacityFrame(repoName, agentName, sessionName string, pct float64, used, limit int64) string {
+// extension side. When known is false the frame carries tier
+// "unknown" and the meter renders neutral/hidden. Returns the tier it
+// published.
+func (d *Daemon) publishCapacityFrame(repoName, agentName, sessionName string, pct float64, used, limit int64, known bool) string {
 	if d.contextCap == nil {
 		return ""
 	}
-	tier := tierForPct(pct)
+	frame := buildCapacityFrame(pct, used, limit, known)
 	key := agentKey(repoName, agentName)
 
 	d.contextCap.mu.Lock()
-	d.contextCap.lastTier[key] = tier
+	d.contextCap.lastTier[key] = frame.Tier
 	d.contextCap.mu.Unlock()
 
-	frame := contextCapacityFrame{
-		Pct:   roundPct(pct),
-		Tier:  tier,
-		Used:  used,
-		Limit: limit,
-		TS:    time.Now().UTC().Format(time.RFC3339Nano),
-	}
 	b := d.lookupOrCreateCapacityBroadcaster(sessionName, agentName)
 	b.Publish(frame)
-	return tier
+	return frame.Tier
 }
 
 // publishCapacityFrameIfTierChanged builds a contextCapacityFrame
@@ -341,14 +374,8 @@ func (d *Daemon) publishCapacityFrameIfTierChanged(repoName, agentName, sessionN
 // Returns the constructed frame so the handler can write it directly
 // on its own connection (avoids a producer→subscriber→handler hop
 // for what's just a synchronous reply).
-func capacitySnapshotFrame(pct float64, used, limit int64) contextCapacityFrame {
-	return contextCapacityFrame{
-		Pct:   roundPct(pct),
-		Tier:  tierForPct(pct),
-		Used:  used,
-		Limit: limit,
-		TS:    time.Now().UTC().Format(time.RFC3339Nano),
-	}
+func capacitySnapshotFrame(pct float64, used, limit int64, known bool) contextCapacityFrame {
+	return buildCapacityFrame(pct, used, limit, known)
 }
 
 // roundPct rounds to 4 decimals so the wire shape is stable. Side-

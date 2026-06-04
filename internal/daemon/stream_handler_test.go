@@ -701,3 +701,147 @@ func TestStreamHandlerClientDisconnect(t *testing.T) {
 	// Clean up agent
 	db.StopAgent(d.ctx, sessionName, agentWindow)
 }
+
+// handleStreamContextCapacity gate widened from assistant-only to any
+// chat-capable agent (usesBrowserBridge: assistant + browser) so the
+// side-panel ring meter can follow whichever agent the chat picker has
+// selected. A browser-agent subscription must now handshake OK (it was
+// rejected with "restricted to assistant agent type" before).
+func TestStreamHandlerContextCapacity_BrowserPassesGate(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "my-repo"
+	sessionName := "oat-my-repo"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"browser-agent": {
+				Type:       state.AgentTypeBrowser,
+				WindowName: "browser-agent",
+				PID:        12345,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamContextCapacity(socket.Request{
+		Command: "stream_context_capacity",
+		Args: map[string]interface{}{
+			"repo":  repoName,
+			"agent": "browser-agent",
+		},
+	}, server)
+
+	dec := json.NewDecoder(client)
+	var resp socket.Response
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode handshake: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("browser agent should pass the widened gate; got error: %s", resp.Error)
+	}
+	// Drain the snapshot frame so the handler doesn't block writing it
+	// on the synchronous pipe.
+	var snap contextCapacityFrame
+	if err := dec.Decode(&snap); err != nil {
+		t.Fatalf("Failed to decode snapshot frame: %v", err)
+	}
+}
+
+// Mirror of the turns verb: handleStreamContextCapacity resolves a
+// `repo` arg directly (the CapacityMultiplexer addresses subscriptions
+// by repo, not the tmux session name).
+func TestStreamHandlerContextCapacity_AcceptsRepoArg(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "_assistant-personal"
+	sessionName := "oat-_assistant-personal"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"personal": {
+				Type:                state.AgentTypeAssistant,
+				WindowName:          "personal",
+				PID:                 12345,
+				ContextWindowTokens: 64_000,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamContextCapacity(socket.Request{
+		Command: "stream_context_capacity",
+		Args: map[string]interface{}{
+			"repo":  repoName,
+			"agent": "personal",
+		},
+	}, server)
+
+	dec := json.NewDecoder(client)
+	var resp socket.Response
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode handshake: %v", err)
+	}
+	if !resp.Success {
+		if strings.Contains(resp.Error, "not found") || strings.Contains(resp.Error, "no repository is bound") {
+			t.Fatalf("repo arg should resolve directly; got: %s", resp.Error)
+		}
+		t.Fatalf("assistant via repo arg should handshake OK; got: %s", resp.Error)
+	}
+	var snap contextCapacityFrame
+	if err := dec.Decode(&snap); err != nil {
+		t.Fatalf("Failed to decode snapshot frame: %v", err)
+	}
+}
+
+// Non-chat-capable agents (supervisor/worker/etc.) are still rejected
+// by the capacity verb, with the same chat-capable wording the turns
+// verb uses.
+func TestStreamHandlerContextCapacity_SupervisorRejected(t *testing.T) {
+	d, _, cleanup := setupStreamTestDaemon(t)
+	defer cleanup()
+
+	repoName := "test-repo"
+	sessionName := "oat-test-session"
+	d.state.AddRepo(repoName, &state.Repository{
+		SessionName: sessionName,
+		Agents: map[string]state.Agent{
+			"supervisor": {
+				Type:       state.AgentTypeSupervisor,
+				WindowName: "supervisor",
+				PID:        12345,
+			},
+		},
+	})
+
+	sh := &streamHandler{d: d}
+	server, client := net.Pipe()
+	defer client.Close()
+
+	go sh.handleStreamContextCapacity(socket.Request{
+		Command: "stream_context_capacity",
+		Args: map[string]interface{}{
+			"session": sessionName,
+			"agent":   "supervisor",
+		},
+	}, server)
+
+	var resp socket.Response
+	if err := json.NewDecoder(client).Decode(&resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp.Success {
+		t.Fatal("supervisor capacity subscription must be rejected")
+	}
+	if !strings.Contains(resp.Error, "chat-capable agents (assistant + browser)") {
+		t.Errorf("expected chat-capable rejection wording; got: %s", resp.Error)
+	}
+}

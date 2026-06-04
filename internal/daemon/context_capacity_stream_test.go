@@ -83,7 +83,7 @@ func TestRoundPct_Part5eSliceB(t *testing.T) {
 // Pins: tier derivation matches tierForPct, pct gets rounded, used
 // + limit are plumbed verbatim, TS is non-empty (RFC3339Nano).
 func TestCapacitySnapshotFrame_Part5eSliceB(t *testing.T) {
-	frame := capacitySnapshotFrame(0.876, 56_321, 64_000)
+	frame := capacitySnapshotFrame(0.876, 56_321, 64_000, true)
 	if frame.Tier != capacityTierAmber {
 		t.Errorf("Tier = %q, want %q (87.6%% → amber)", frame.Tier, capacityTierAmber)
 	}
@@ -107,6 +107,29 @@ func TestCapacitySnapshotFrame_Part5eSliceB(t *testing.T) {
 	}
 	if frame.Err != "" {
 		t.Errorf("Err = %q -- snapshot frames must never be error frames", frame.Err)
+	}
+}
+
+// When occupancy is unknown (known=false) the snapshot/display frame
+// carries tier "unknown" with zeroed pct/used so the side panel renders
+// a neutral/hidden meter instead of guessing a percentage. Limit is
+// still carried (the bridge's tool-result cap can use it).
+func TestCapacitySnapshotFrame_Unknown(t *testing.T) {
+	frame := capacitySnapshotFrame(0, 0, 64_000, false)
+	if frame.Tier != capacityTierUnknown {
+		t.Errorf("Tier = %q, want %q (unknown occupancy)", frame.Tier, capacityTierUnknown)
+	}
+	if frame.Pct != 0 {
+		t.Errorf("Pct = %v, want 0 on unknown frame", frame.Pct)
+	}
+	if frame.Used != 0 {
+		t.Errorf("Used = %d, want 0 on unknown frame", frame.Used)
+	}
+	if frame.Limit != 64_000 {
+		t.Errorf("Limit = %d, want 64000 (carried even on unknown)", frame.Limit)
+	}
+	if frame.Done {
+		t.Error("Done = true -- unknown frames are not terminal")
 	}
 }
 
@@ -387,11 +410,13 @@ func TestMaybeNudgeContextCapacity_EmitsClearFrame_Part5eSliceB(t *testing.T) {
 	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
 	defer subCancel()
 
-	// Climb to hint (80% of 128K fallback = 102_400).
+	// Climb to hint (80% of 128K fallback = 102_400). Drive the live
+	// window reading (ContextWindowTokens), not cumulative TotalTokens
+	// — the meter is computed from window occupancy now.
 	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
-		Type:        state.AgentTypeAssistant,
-		TotalTokens: 102_400,
-		Model:       "", // forces 128K fallback → 80%
+		Type:                state.AgentTypeAssistant,
+		ContextWindowTokens: 102_400,
+		Model:               "", // forces 128K fallback → 80%
 	})
 	expectFrameWithin(t, sub, "climb to hint", 100*time.Millisecond, capacityTierHint, 0, 102_400, 128_000)
 
@@ -400,11 +425,86 @@ func TestMaybeNudgeContextCapacity_EmitsClearFrame_Part5eSliceB(t *testing.T) {
 	// below the contextTierHint threshold the PTY-hint path uses
 	// for its own gating.
 	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
-		Type:        state.AgentTypeAssistant,
-		TotalTokens: 25_600,
-		Model:       "",
+		Type:                state.AgentTypeAssistant,
+		ContextWindowTokens: 25_600,
+		Model:               "",
 	})
 	expectFrameWithin(t, sub, "drop to ok", 100*time.Millisecond, capacityTierOK, 0, 25_600, 128_000)
+}
+
+// A browser agent gets the live display frame (so the side-panel ring
+// meter can follow it) but NEVER a compact hint — compact_conversation
+// is denied for browser agents, so the hint would be wasted.
+func TestMaybeNudgeContextCapacity_BrowserPublishesFrameNoHint(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	const repo = "my-repo"
+	const session = "my-session"
+	const agent = "browser-agent"
+	if err := d.state.AddRepo(repo, &state.Repository{SessionName: session, Agents: map[string]state.Agent{}}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent(repo, agent, state.Agent{Type: state.AgentTypeBrowser, PID: 99}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	_, sub, subCancel := subscribeForTest(t, d, session, agent)
+	defer subCancel()
+
+	// 80% of the 128K fallback = 102_400 → would be a "hint" tier.
+	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
+		Type:                state.AgentTypeBrowser,
+		ContextWindowTokens: 102_400,
+		Model:               "",
+	})
+	// The display frame still flows (tier reflects pct) so the meter renders.
+	expectFrameWithin(t, sub, "browser meter frame", 100*time.Millisecond, capacityTierHint, 0, 102_400, 128_000)
+
+	// But NO compact hint is recorded for a browser agent.
+	d.contextCap.mu.Lock()
+	_, hinted := d.contextCap.lastHintAt[agentKey(repo, agent)]
+	d.contextCap.mu.Unlock()
+	if hinted {
+		t.Error("browser agent recorded a compact hint; the hint must be assistant-only")
+	}
+}
+
+// When occupancy is unknown (ContextWindowTokens == 0) the per-turn
+// publish emits a tier:"unknown" frame (meter hidden/neutral) instead
+// of guessing a percentage, and no hint is recorded.
+func TestMaybeNudgeContextCapacity_UnknownPublishesUnknownFrame(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	const repo = "_assistant-personal"
+	const agent = "personal"
+	if err := d.state.AddRepo(repo, &state.Repository{SessionName: repo, Agents: map[string]state.Agent{}}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent(repo, agent, state.Agent{Type: state.AgentTypeAssistant, PID: 7}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
+	defer subCancel()
+
+	// No live window reading yet; cumulative TotalTokens must NOT be
+	// used to fabricate a percentage.
+	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
+		Type:        state.AgentTypeAssistant,
+		TotalTokens: 9_999_999,
+		Model:       "",
+	})
+	// limit is the 128K fallback; pct/used are 0 on an unknown frame.
+	expectFrameWithin(t, sub, "unknown meter frame", 100*time.Millisecond, capacityTierUnknown, 0, 0, 128_000)
+
+	d.contextCap.mu.Lock()
+	_, hinted := d.contextCap.lastHintAt[agentKey(repo, agent)]
+	d.contextCap.mu.Unlock()
+	if hinted {
+		t.Error("unknown occupancy recorded a compact hint; must skip the hint when occupancy is unknown")
+	}
 }
 
 // subscribeForTest wires a fresh subscriber to the (session, agent)

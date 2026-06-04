@@ -326,17 +326,21 @@ func (d *Daemon) warnf(format string, args ...any) {
 // over-counts wildly because every turn re-sends the whole growing
 // context.
 //
-// Falls back to TotalTokens when the window value is not yet known
-// (== 0): an assistant that hasn't emitted a token event this process
-// has no window reading, and TotalTokens (0 on a fresh agent, or the
-// last persisted spend) is the best available proxy until the first
-// per-turn emission lands. The fallback also keeps a runtime that
-// somehow omits the field from reporting 0% forever.
-func agentContextOccupancy(agent state.Agent) int64 {
+// Returns known=false when the window value is not yet known (== 0):
+// an agent that hasn't emitted a token event this process has no
+// window reading. We deliberately do NOT fall back to cumulative
+// TotalTokens — that over-counts wildly (every turn re-sends the
+// growing context), so a long-lived browser agent would peg the meter
+// at a false 100% and could trip the assistant safety net off a
+// number that has nothing to do with live window occupancy. Callers
+// render a neutral/hidden meter and skip the hint/safety-net while
+// occupancy is unknown; once the runtime emits context_input on turn 1
+// the value becomes known and normal behavior resumes.
+func agentContextOccupancy(agent state.Agent) (used int64, known bool) {
 	if agent.ContextWindowTokens > 0 {
-		return agent.ContextWindowTokens
+		return agent.ContextWindowTokens, true
 	}
-	return agent.TotalTokens
+	return 0, false
 }
 
 // computeCapacityPct returns total / limit as a float in [0, 1].
@@ -377,11 +381,16 @@ func safetyNetEnabled() bool {
 }
 
 // maybeNudgeContextCapacity is called from handleTokenUsageEvent
-// after the token counters have been persisted. Only acts on
-// AgentTypeAssistant (the workflow-helper AgentTypeBrowser has
-// compact_conversation denied in its tool list, so the hint would
-// be useless; and the other agent types don't have side-panel
-// chat).
+// after the token counters have been persisted. It does two things
+// with different agent-type scopes:
+//
+//   - Display frame: published for any chat-capable agent
+//     (usesBrowserBridge: assistant + browser) so the side-panel ring
+//     meter can follow whichever agent the chat picker has selected.
+//   - Compact hint (below) + the 95 % safety net: assistant-only. The
+//     workflow-helper AgentTypeBrowser has compact_conversation denied
+//     in its tool list, so the hint would be useless; other agent
+//     types don't have side-panel chat at all.
 //
 // Action: at >= 75 % capacity AND not-recently-hinted, emit a
 // silent PTY directive instructing the assistant to call
@@ -394,24 +403,39 @@ func safetyNetEnabled() bool {
 // event) and keeps the safety-net atomically aligned with the
 // user message it's protecting.
 func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent state.Agent) {
-	if agent.Type != state.AgentTypeAssistant {
+	// The display frame is published for any chat-capable agent
+	// (assistant + browser) so the side-panel meter can follow the
+	// selected agent. The compact hint + safety net below stay
+	// assistant-only (browser agents have compact_conversation denied).
+	if !usesBrowserBridge(agent.Type) {
 		return
 	}
 	if d.contextCap == nil {
 		return
 	}
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
-	used := agentContextOccupancy(agent)
+	used, known := agentContextOccupancy(agent)
 	pct := computeCapacityPct(used, limit)
 
 	// Emit a capacity frame on EVERY token event (i.e. every turn) so
 	// the side-panel ring meter is genuinely live, not a step function
 	// that only moves on tier boundaries. The frame still carries the
 	// tier name so the extension can drive the amber/red colour shift +
-	// nudge copy; the per-turn cadence is low (one per assistant reply)
-	// so the broadcaster's small buffer is never stressed.
+	// nudge copy; the per-turn cadence is low (one per reply) so the
+	// broadcaster's small buffer is never stressed. When occupancy is
+	// unknown the frame carries tier "unknown" (neutral/hidden meter).
 	if repo, ok := d.state.GetRepo(repoName); ok {
-		d.publishCapacityFrame(repoName, agentName, repo.SessionName, pct, used, limit)
+		d.publishCapacityFrame(repoName, agentName, repo.SessionName, pct, used, limit, known)
+	}
+
+	// Hint + safety net are assistant-only and require a real window
+	// reading; never nudge a browser agent or fire off an unknown
+	// (would otherwise compact based on a number we don't have).
+	if agent.Type != state.AgentTypeAssistant {
+		return
+	}
+	if !known {
+		return
 	}
 
 	if pct < contextTierHint {
@@ -465,7 +489,13 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 		return "", false
 	}
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
-	used := agentContextOccupancy(agent)
+	used, known := agentContextOccupancy(agent)
+	if !known {
+		// No live window reading yet — don't compact off a number we
+		// don't have (previously this fell back to inflated cumulative
+		// spend and could mis-fire right after a restart/wake).
+		return "", false
+	}
 	pct := computeCapacityPct(used, limit)
 	if pct < contextTierSafetyNet {
 		return "", false

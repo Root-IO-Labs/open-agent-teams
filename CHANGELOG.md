@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`stream_context_capacity` now follows the selected agent (assistant + browser), and unknown occupancy renders neutral instead of guessing (2026-06-04).**
+
+  The capacity verb (`stream_context_capacity`) previously rejected any
+  agent that wasn't `AgentTypeAssistant`, so when the browser-agent
+  bridge was bonded the side-panel ring meter never received frames for
+  the assistant the user was actually chatting with. The verb now
+  accepts any chat-capable agent (`usesBrowserBridge`: assistant +
+  browser) and accepts a `repo` argument in addition to `session`
+  (mirroring `stream_assistant_turns`), so the bridge's new
+  `CapacityMultiplexer` can open one subscription per chat-capable agent
+  and tag each frame with its `(repo, agent)` origin. The daemon now
+  publishes the per-turn display frame for browser agents too; the 75%
+  compact hint + 95% safety-net inject stay assistant-only (browser
+  agents have `compact_conversation` denied). Occupancy now reports a
+  new `tier:"unknown"` frame when the live context-window reading is not
+  yet known (right after a (re)start, before the first per-turn token
+  event) — the meter renders hidden/neutral and the hint/safety net do
+  NOT fire, instead of falling back to the inflated cumulative
+  `TotalTokens` (which could peg a long-lived browser agent's ring at a
+  false 100% and trip a spurious compaction on wake).
+
 - **Context capacity % is now computed from current window occupancy, not cumulative lifetime spend, and capacity frames stream on every turn (2026-06-03).**
 
   The daemon previously derived an assistant's "% of context capacity"

@@ -661,11 +661,16 @@ func (sh *streamHandler) handleStreamAssistantTurns(req socket.Request, conn net
 // publishCapacityFrameIfTierChanged) becomes a JSON frame on this
 // stream.
 //
-// Restricted to AgentTypeAssistant — the workflow-helper
-// AgentTypeBrowser doesn't surface side-panel chat UI, so capacity
-// indicators would be meaningless there. Same identity model as
-// stream_assistant_turns: addressed by (session, agent_name) so the
-// bridge doesn't have to reverse-resolve the repo name.
+// Accepts any chat-capable agent (usesBrowserBridge: assistant +
+// browser) so the side-panel ring meter can follow whichever agent
+// the chat picker has selected, not just the bonded one. The
+// bridge's CapacityMultiplexer opens one subscription per
+// chat-capable agent in its lifecycle inventory, mirroring the
+// AssistantTurnMultiplexer. Same addressing model as
+// stream_assistant_turns: agent_name plus either `session` (the
+// bonded bridge's env-derived tmux session) or `repo` (the
+// multiplexer's cross-agent path); when `repo` is supplied the
+// repo-derived session wins.
 //
 // Protocol mirrors stream_assistant_turns:
 //  1. Server sends handshake: {"success":true,"stream":true}
@@ -686,24 +691,43 @@ func (sh *streamHandler) handleStreamContextCapacity(req socket.Request, conn ne
 	enc := json.NewEncoder(conn)
 
 	sessionName, _ := req.Args["session"].(string)
+	repoArg, _ := req.Args["repo"].(string)
 	agentName, _ := req.Args["agent"].(string)
-	if sessionName == "" || agentName == "" {
-		enc.Encode(socket.Response{Success: false, Error: "session and agent are required"}) //nolint:errcheck
+	if agentName == "" || (sessionName == "" && repoArg == "") {
+		enc.Encode(socket.Response{Success: false, Error: "agent and (session or repo) are required"}) //nolint:errcheck
 		return
 	}
 
-	repoName, _, found := sh.d.findRepoBySession(sessionName)
-	if !found {
-		enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
-		return
+	// Resolve to (repoName, sessionName). The broadcaster lookup is
+	// keyed on sessionName so we always derive it from the repo
+	// record when the caller supplied `repo` — this also defends
+	// against a buggy client that sends both `repo` and a stale /
+	// env-derived `session` that names a different agent (the
+	// repo-supplied identity wins).
+	var repoName string
+	if repoArg != "" {
+		repo, exists := sh.d.state.GetRepo(repoArg)
+		if !exists {
+			enc.Encode(socket.Response{Success: false, Error: "repository '" + repoArg + "' not found"}) //nolint:errcheck
+			return
+		}
+		repoName = repoArg
+		sessionName = repo.SessionName
+	} else {
+		var found bool
+		repoName, _, found = sh.d.findRepoBySession(sessionName)
+		if !found {
+			enc.Encode(socket.Response{Success: false, Error: "no repository is bound to session " + sessionName}) //nolint:errcheck
+			return
+		}
 	}
 	agent, exists := sh.d.state.GetAgent(repoName, agentName)
 	if !exists {
 		enc.Encode(socket.Response{Success: false, Error: "agent '" + agentName + "' not found in session " + sessionName}) //nolint:errcheck
 		return
 	}
-	if agent.Type != state.AgentTypeAssistant {
-		enc.Encode(socket.Response{Success: false, Error: "stream_context_capacity is restricted to assistant agent type; " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
+	if !usesBrowserBridge(agent.Type) {
+		enc.Encode(socket.Response{Success: false, Error: "stream_context_capacity is restricted to chat-capable agents (assistant + browser); " + repoName + "/" + agentName + " is " + string(agent.Type)}) //nolint:errcheck
 		return
 	}
 
@@ -724,9 +748,9 @@ func (sh *streamHandler) handleStreamContextCapacity(req socket.Request, conn ne
 	// agent state (the broadcaster's lastTier dedupe is irrelevant
 	// here -- this is an unconditional reply to the new subscriber).
 	limit, _ := sh.d.effectiveContextLimit(agent.Model, repoName, agentName)
-	used := agentContextOccupancy(agent)
+	used, known := agentContextOccupancy(agent)
 	pct := computeCapacityPct(used, limit)
-	snapshot := capacitySnapshotFrame(pct, used, limit)
+	snapshot := capacitySnapshotFrame(pct, used, limit, known)
 	conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
 	if err := enc.Encode(snapshot); err != nil {
 		return

@@ -272,6 +272,8 @@ The Personal Assistant is a separate agent type from the workflow-helper Browser
 - At ≥ 75 %: silent PTY hint instructing the assistant to call `compact_conversation`. Suppressed 5 min after fire.
 - At ≥ 95 %: synthetic compact-conversation directive injected as a separate PTY message before forwarding any pending user message. Gated by `OAT_CONTEXT_SAFETY_NET` (default ON).
 
+The hint + safety net are **assistant-only** (browser agents have `compact_conversation` denied). Separately, the daemon publishes a per-turn `stream_context_capacity` **display frame** for ALL chat-capable agents (assistant + browser) so the side-panel ring meter can follow whichever agent the chat picker has selected. Occupancy is measured from the live context-window reading (`ContextWindowTokens`); when that is not yet known (right after a (re)start, before the first per-turn token event) the daemon emits a `tier:"unknown"` frame (meter renders hidden/neutral) and the hint/safety net do NOT fire — they no longer fall back to cumulative `TotalTokens`, which over-counts and could otherwise trigger a spurious compaction on wake.
+
 **Model onboarding workflow.** Before spawning any agent against a model, run the one-time capability probe:
 
 ```bash

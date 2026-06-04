@@ -31,30 +31,38 @@ import (
 
 func TestAgentContextOccupancy(t *testing.T) {
 	cases := []struct {
-		name  string
-		agent state.Agent
-		want  int64
+		name      string
+		agent     state.Agent
+		want      int64
+		wantKnown bool
 	}{
 		{
-			name:  "window known wins over cumulative",
-			agent: state.Agent{ContextWindowTokens: 42_000, TotalTokens: 900_000},
-			want:  42_000,
+			name:      "window known is used and reported known",
+			agent:     state.Agent{ContextWindowTokens: 42_000, TotalTokens: 900_000},
+			want:      42_000,
+			wantKnown: true,
 		},
 		{
-			name:  "window unknown falls back to cumulative",
-			agent: state.Agent{ContextWindowTokens: 0, TotalTokens: 51_200},
-			want:  51_200,
+			name: "window unknown does NOT fall back to cumulative",
+			// Cumulative TotalTokens over-counts wildly; the meter +
+			// hint/safety-net must treat occupancy as unknown rather
+			// than guess from it.
+			agent:     state.Agent{ContextWindowTokens: 0, TotalTokens: 51_200},
+			want:      0,
+			wantKnown: false,
 		},
 		{
-			name:  "both zero is zero",
-			agent: state.Agent{},
-			want:  0,
+			name:      "both zero is unknown",
+			agent:     state.Agent{},
+			want:      0,
+			wantKnown: false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := agentContextOccupancy(tc.agent); got != tc.want {
-				t.Errorf("agentContextOccupancy = %d, want %d", got, tc.want)
+			got, known := agentContextOccupancy(tc.agent)
+			if got != tc.want || known != tc.wantKnown {
+				t.Errorf("agentContextOccupancy = (%d, %v), want (%d, %v)", got, known, tc.want, tc.wantKnown)
 			}
 		})
 	}
@@ -222,10 +230,10 @@ func TestMaybeNudgeContextCapacity_Suppression_Part5e(t *testing.T) {
 	}
 
 	assistant := state.Agent{
-		Type:        state.AgentTypeAssistant,
-		WindowName:  "personal",
-		TotalTokens: 96_000, // 75 % of the 128 K fallback exactly
-		Model:       "",     // forces fallback → 128 K limit → 75 %
+		Type:                state.AgentTypeAssistant,
+		WindowName:          "personal",
+		ContextWindowTokens: 96_000, // 75 % of the 128 K fallback exactly
+		Model:               "",     // forces fallback → 128 K limit → 75 %
 	}
 
 	// First call: should record a lastHintAt entry.
@@ -275,10 +283,10 @@ func TestMaybeNudgeContextCapacity_BelowTier_Part5e(t *testing.T) {
 	// 74 % of the 128 K fallback ≈ 94 720 tokens. Below tier → no
 	// hint, no dedupe entry recorded.
 	d.maybeNudgeContextCapacity("repo", "personal", state.Agent{
-		Type:        state.AgentTypeAssistant,
-		WindowName:  "personal",
-		TotalTokens: int64(0.74 * float64(contextFallbackTokens)),
-		Model:       "",
+		Type:                state.AgentTypeAssistant,
+		WindowName:          "personal",
+		ContextWindowTokens: int64(0.74 * float64(contextFallbackTokens)),
+		Model:               "",
 	})
 	d.contextCap.mu.Lock()
 	_, ok := d.contextCap.lastHintAt[agentKey("repo", "personal")]
@@ -294,17 +302,17 @@ func TestShouldInjectContextSafetyNet_Part5e(t *testing.T) {
 
 	// 95 % of 128 K fallback = 121 600. Use 122 000 to clearly cross.
 	hot := state.Agent{
-		Type:        state.AgentTypeAssistant,
-		TotalTokens: 122_000,
+		Type:                state.AgentTypeAssistant,
+		ContextWindowTokens: 122_000,
 	}
 	// 90 % of 128 K fallback = 115 200. Below tier → no inject.
 	warm := state.Agent{
-		Type:        state.AgentTypeAssistant,
-		TotalTokens: 115_000,
+		Type:                state.AgentTypeAssistant,
+		ContextWindowTokens: 115_000,
 	}
 	browser := state.Agent{
-		Type:        state.AgentTypeBrowser,
-		TotalTokens: 122_000,
+		Type:                state.AgentTypeBrowser,
+		ContextWindowTokens: 122_000,
 	}
 
 	t.Run("assistant at 95% with safety net ON → inject", func(t *testing.T) {
@@ -351,6 +359,27 @@ func TestShouldInjectContextSafetyNet_Part5e(t *testing.T) {
 			t.Error("browser agent triggered safety-net inject (should be assistant-only)")
 		}
 	})
+}
+
+// TestShouldInjectContextSafetyNet_UnknownOccupancy pins the
+// 2026-06-04 behavior change: when an assistant has no live
+// context-window reading yet (ContextWindowTokens == 0), the safety
+// net must NOT fire even if cumulative TotalTokens is enormous. The
+// old code fell back to TotalTokens here, which could force a spurious
+// compaction on the first message after a restart/wake.
+func TestShouldInjectContextSafetyNet_UnknownOccupancy(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	t.Setenv(safetyNetEnvVar, "1")
+
+	unknown := state.Agent{
+		Type:                state.AgentTypeAssistant,
+		ContextWindowTokens: 0,         // no live reading yet
+		TotalTokens:         9_999_999, // inflated cumulative — must be ignored
+	}
+	if _, inject := d.shouldInjectContextSafetyNet(unknown, "repo", "agent"); inject {
+		t.Error("safety net fired on unknown occupancy (should suppress, not fall back to cumulative)")
+	}
 }
 
 // (Substring `contains` helper is shared from daemon_test.go.)

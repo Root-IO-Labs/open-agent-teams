@@ -8171,10 +8171,11 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 		go d.stopAgentOverBudget(repoName, agentName, agent)
 	}
 
-	// Part 5e: piggyback the assistant context-capacity hint on the
-	// same token-usage event so we don't add a separate poll loop.
-	// No-ops for non-assistant types; in-memory dedupe gates repeat
-	// hints. See context_capacity.go.
+	// Part 5e: piggyback the context-capacity work on the same
+	// token-usage event so we don't add a separate poll loop. Publishes
+	// the per-turn display frame for chat-capable agents (assistant +
+	// browser); the compact hint is assistant-only with in-memory
+	// dedupe; no-op for other agent types. See context_capacity.go.
 	d.maybeNudgeContextCapacity(repoName, agentName, agent)
 }
 
