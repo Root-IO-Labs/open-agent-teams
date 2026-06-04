@@ -2,8 +2,6 @@ package factory
 
 import (
 	"time"
-
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/state"
 )
 
 type AgentTemplate struct {

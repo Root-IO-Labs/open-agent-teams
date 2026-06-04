@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/daemon"
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/daemon"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
 type AgentFactory interface {

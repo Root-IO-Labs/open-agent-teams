@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/factory"
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/factory"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
 // EnhancedPlanner uses the agent factory to create specialized agents

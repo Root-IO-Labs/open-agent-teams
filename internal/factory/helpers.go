@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"text/template"
 
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
 func generateAgentID() string {

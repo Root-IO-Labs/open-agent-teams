@@ -116,12 +116,13 @@ type Command struct {
 // the CLI outside of a signal-aware entry point (tests), ctx defaults to
 // context.Background().
 type CLI struct {
-	rootCmd       *Command
-	paths         *config.Paths
-	backend       backend_pkg.ProcessBackend
-	documentation string                     // Full CLI reference (`oat docs`, tests)
-	docsByAgent   map[state.AgentType]string // Per-agent-type filtered reference, populated on demand
-	ctx           context.Context
+	rootCmd            *Command
+	paths              *config.Paths
+	backend            backend_pkg.ProcessBackend
+	documentation      string                     // Full CLI reference (`oat docs`, tests)
+	docsByAgent        map[state.AgentType]string // Per-agent-type filtered reference, populated on demand
+	ctx                context.Context
+	factoryIntegration *FactoryIntegration // Agent factory integration
 }
 
 // New creates a new CLI
@@ -3063,6 +3064,25 @@ func (c *CLI) configWorkerModels(repoName string, args []string) error {
 	}
 }
 
+// tryFactoryWorkerCreation attempts to create a worker using the agent factory
+func (c *CLI) tryFactoryWorkerCreation(args []string) error {
+	// Initialize factory integration if needed
+	if c.factoryIntegration == nil {
+		c.factoryIntegration = NewFactoryIntegration(c)
+	}
+	
+	_, posArgs := ParseFlags(args)
+	task := strings.Join(posArgs, " ")
+	
+	// Check if we should use a specialized agent
+	if !c.factoryIntegration.selector.CanUseSpecializedAgent(task) {
+		return fmt.Errorf("no specialized agent matches")
+	}
+	
+	// Create worker with factory
+	return c.createWorkerWithFactory(args)
+}
+
 func (c *CLI) createWorker(args []string) error {
 	flags, posArgs := ParseFlags(args)
 
@@ -3070,6 +3090,18 @@ func (c *CLI) createWorker(args []string) error {
 	task := strings.Join(posArgs, " ")
 	if task == "" {
 		return errors.InvalidUsage("usage: oat worker create <task description>")
+	}
+
+	// Check if factory is enabled and can handle this task
+	if os.Getenv("OAT_FACTORY_ENABLED") == "true" {
+		// Try to use factory for specialized agent selection
+		if err := c.tryFactoryWorkerCreation(args); err == nil {
+			return nil // Factory handled it successfully
+		}
+		// Fall through to standard worker creation if factory fails
+		if os.Getenv("OAT_DEBUG") == "true" {
+			fmt.Printf("Factory creation failed, falling back to standard worker\n")
+		}
 	}
 
 	// Determine repository

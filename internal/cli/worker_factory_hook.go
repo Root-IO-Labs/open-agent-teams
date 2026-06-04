@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/factory"
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/factory"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/names"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/format"
 )
 
 // enhanceWorkerCreation wraps the existing worker creation to add factory intelligence

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/factory"
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/planner"
-	"github.com/Root-IO-Labs/open-agent-teams-8/internal/state"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/factory"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/planner"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
 // FactoryIntegration handles the integration between CLI and agent factory

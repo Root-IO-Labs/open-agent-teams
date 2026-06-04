@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +19,7 @@ type TemplateRegistry interface {
 	SearchTemplates(query string) ([]*TemplateInfo, error)
 	DownloadTemplate(name string, source string) error
 	VerifyTemplate(template *AgentTemplate) (bool, error)
+	GetTemplate(name string) (*AgentTemplate, error)
 	GetTemplateSignature(name string) (*Signature, error)
 }
 
@@ -288,6 +288,14 @@ func (r *templateRegistry) VerifyTemplate(template *AgentTemplate) (bool, error)
 	}
 
 	return true, nil
+}
+
+// GetTemplate returns a specific template by name
+func (r *templateRegistry) GetTemplate(name string) (*AgentTemplate, error) {
+	if template, ok := r.templates[name]; ok {
+		return template, nil
+	}
+	return nil, fmt.Errorf("template %s not found", name)
 }
 
 func (r *templateRegistry) GetTemplateSignature(name string) (*Signature, error) {
