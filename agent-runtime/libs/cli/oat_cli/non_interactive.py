@@ -342,8 +342,8 @@ def _process_message_chunk(
     # --- Token usage extraction (BEFORE summarization skip) ---
     # Extract from ALL usage-bearing chunks so Path B (cumulative spend)
     # counts summarization, interrupted, and failed work.
-    if hasattr(message_obj, "usage_metadata") and message_obj.usage_metadata:
-        usage = message_obj.usage_metadata
+    usage = getattr(message_obj, "usage_metadata", None)
+    if isinstance(usage, dict):
         if "input_tokens" in usage:
             state.spend_input += int(usage["input_tokens"])
         if "output_tokens" in usage:
@@ -977,7 +977,7 @@ async def run_non_interactive(
                 if isinstance(name, str) and name:
                     return name
                 if isinstance(t, dict):
-                    n = t.get("name")
+                    n = cast("dict[str, Any]", t).get("name")
                     if isinstance(n, str) and n:
                         return n
                 fn_name = getattr(t, "__name__", None)
