@@ -1389,6 +1389,24 @@ func (c *CLI) daemonStatus(args []string) error {
 			}
 			fmt.Printf("  Active: %s\n", strings.Join(names, ", "))
 		}
+		if degraded, ok := statusMap["degraded_repos"].(map[string]interface{}); ok && len(degraded) > 0 {
+			repoNames := make([]string, 0, len(degraded))
+			for name := range degraded {
+				repoNames = append(repoNames, name)
+			}
+			sort.Strings(repoNames)
+			for _, name := range repoNames {
+				reasons := make([]string, 0)
+				if raw, ok := degraded[name].([]interface{}); ok {
+					for _, r := range raw {
+						if s, _ := r.(string); s != "" {
+							reasons = append(reasons, s)
+						}
+					}
+				}
+				fmt.Printf("  Degraded: %s (%s)\n", name, strings.Join(reasons, "; "))
+			}
+		}
 	} else {
 		// Fallback: print as JSON
 		jsonData, _ := json.MarshalIndent(resp.Data, "  ", "  ")
@@ -2333,10 +2351,6 @@ func (c *CLI) initRepo(args []string) error {
 		fmt.Printf("Warning: failed to checkout main in planner worktree: %v\n", err)
 	}
 
-	// Select the best available model for the planner (prefers Anthropic for
-	// reasoning quality). Falls back silently so init never fails on this.
-	plannerModel, _ := routing.GetModelForTask("planner")
-
 	// Add planner agent
 	addPlannerArgs := map[string]interface{}{
 		"repo":          repoName,
@@ -2344,9 +2358,6 @@ func (c *CLI) initRepo(args []string) error {
 		"type":          "planner",
 		"worktree_path": plannerWtPath,
 		"window_name":   "planner",
-	}
-	if plannerModel != "" {
-		addPlannerArgs["model"] = plannerModel
 	}
 	resp, err = client.Send(socket.Request{
 		Command: "add_agent",

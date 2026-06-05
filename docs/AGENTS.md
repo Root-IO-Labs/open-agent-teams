@@ -132,7 +132,22 @@ The workspace is unique - it's the only agent that:
 - Can spawn workers on behalf of the user
 - Persists conversation history across sessions
 
-### 5. Review (`internal/templates/agent-templates/reviewer.md`)
+### 5. Planner (`internal/prompts/planner.md`)
+
+**Role**: Requirement clarification and execution planning
+**Worktree**: Isolated `planner` worktree
+**Lifecycle**: Persistent (started by `oat init`, restored by daemon health checks)
+
+The planner is a planning-only agent. It:
+- Runs as a first-class persistent agent named `planner`
+- Is opened from `oat ui` with `ctrl+l`
+- Produces structured JSON that the planner TUI parses into requirements, test strategy, and task waves
+- Saves approved plans to `~/.oat/plans/<repo>/<plan-id>/`
+- Sends `[PLANNER-APPROVED]` handoffs to workspace, including `[planner-task:<id>]` markers so worker progress maps back to task IDs
+
+Like workspace, planner is user-facing and is not part of the periodic wake/nudge cycle, but it is restarted if its persistent process dies.
+
+### 6. Review (`internal/templates/agent-templates/reviewer.md`)
 
 **Role**: Code review and quality gate
 **Worktree**: PR branch (ephemeral)
@@ -143,7 +158,7 @@ Review agents are spawned by merge-queue to evaluate PRs before merge. They:
 - Report summary to merge-queue for merge decision
 - Default to non-blocking suggestions unless security/correctness issues
 
-### 6. Verification Agent (`internal/templates/agent-templates/verification.md`)
+### 7. Verification Agent (`internal/templates/agent-templates/verification.md`)
 
 **Role**: Reviews a worker's changes before merge
 **Worktree**: Detached at worker's commit SHA (ephemeral)
@@ -160,7 +175,7 @@ Verification agents:
 
 **Rejection cap**: Workers are auto-completed after repeated rejections (default: 3, configurable via `OAT_MAX_REJECTIONS`). When the cap is hit, the daemon escalates to the supervisor with context for task reassignment. This prevents unbounded token burn from workers stuck in rejection loops.
 
-### 7. PR Shepherd (`internal/templates/agent-templates/pr-shepherd.md`)
+### 8. PR Shepherd (`internal/templates/agent-templates/pr-shepherd.md`)
 
 **Role**: Monitors and manages PRs in fork mode
 **Worktree**: Main repository
@@ -227,7 +242,7 @@ The escalation to the supervisor at nudge 5 is important: the supervisor is an A
 
 **Supervisor nudge reset:** If the supervisor determines a worker is actively working (e.g., running a long test suite) and not actually stuck, it can run `oat worker reset-nudge <worker-name>` to reset the nudge count to zero. This gives the worker another full escalation cycle. The reset can only be used **once per worker** -- if the worker still hasn't completed after a second round of nudges, the daemon proceeds with its escalation. The `NudgeResetUsed` flag resets when a worker enters dormancy (starting a fresh active cycle).
 
-**Supervisor-initiated completion:** If a worker's work is done (PR exists) but the worker process can't complete itself, the supervisor can complete it on its behalf: `oat agent complete --worker <worker-name>`. Permanent agent types (supervisor, workspace, merge-queue) are guarded against self-completion — running `oat agent complete` without `--worker` from the supervisor window will return an error instead of completing the supervisor.
+**Supervisor-initiated completion:** If a worker's work is done (PR exists) but the worker process can't complete itself, the supervisor can complete it on its behalf: `oat agent complete --worker <worker-name>`. Permanent agent types (supervisor, workspace, planner, merge-queue, PR shepherd, agent-builder, and generic persistent agents) are guarded against self-completion — running `oat agent complete` without `--worker` from a permanent agent window will return an error instead of completing that agent.
 
 **Admin commands are not tasks:** The supervisor prompt explicitly instructs the supervisor to run `oat worker rm` (alias: `remove`) and `oat agent complete --worker` directly in its own session. Spawning a worker for these one-line commands wastes an agent slot and generates unnecessary daemon nudges.
 
@@ -254,7 +269,7 @@ The daemon checks PR status using `gh pr view` and `gh run list` -- it parses th
 A repo enters idle mode when it has no active workers or review agents (agents that are dormant/waiting-for-PR or ready-for-cleanup don't count as active). In idle mode:
 
 - Supervisor, merge-queue, and PR shepherd are **not nudged** (saves tokens)
-- Workspace stuck detection is **skipped** (the workspace is expected to be idle)
+- Workspace and planner stuck detection are **skipped** (both are user-facing and expected to be idle)
 - On transition to idle, one final nudge is sent so agents can do a last check
 - A **delayed follow-up nudge** is sent to the merge-queue ~3 minutes after entering idle, catching PRs whose CI was still in-progress during the final nudge
 
@@ -454,7 +469,7 @@ Repositories can customize agent behavior by creating markdown files in `.oat/ag
 2. `~/.oat/repos/<repo>/agents/<agent>.md` (local overrides)
 3. Built-in templates (fallback)
 
-Note: Supervisor and workspace agents use embedded prompts only and cannot be customized via this system.
+Note: Supervisor, workspace, and planner agents use embedded prompts only and cannot be customized via this system.
 
 **Deprecated:** The old system using `SUPERVISOR.md`, `WORKER.md`, `REVIEWER.md`, etc. directly in `.oat/` is deprecated. Migrate your custom prompts to the new `.oat/agents/` directory structure.
 
@@ -562,7 +577,7 @@ The daemon runs health checks every 2 minutes with **self-healing behavior**:
 1. Check if backend session exists for each repo
 2. If session is missing, **attempt restoration** before cleanup:
    - Recreate the backend session
-   - Restart supervisor, merge-queue/pr-shepherd, and workspace agents
+   - Restart supervisor, merge-queue/pr-shepherd, planner, and workspace agents
    - Only mark agents for cleanup if restoration fails
 3. For each agent, verify the agent process is alive via the backend
 4. Clean up any agents with `ReadyForCleanup=true`
@@ -615,6 +630,7 @@ The daemon periodically "nudges" agents to keep them active:
 | worker | "Status check: Update on your progress?" |
 | review | "Status check: Update on your review progress?" |
 | workspace | **Not nudged** (user-driven only) |
+| planner | **Not nudged** (user-driven planning only) |
 
 Nudges are sent every 60 seconds, but agents are skipped if nudged within the last cycle.
 
@@ -628,6 +644,7 @@ Agent-related tests are in:
 - `internal/messages/messages_test.go` - Message system
 - `internal/state/state_test.go` - State management
 - `internal/prompts/prompts_test.go` - Prompt loading
+- `internal/planner/persistence_test.go` - Planner plan persistence
 
 ### Integration Tests
 
@@ -660,7 +677,7 @@ go test ./test/ -run TestDaemonCrashRecovery
    ```
 
 2. **Create the prompt template** at `internal/templates/agent-templates/my-agent.md`
-   - Note: Only supervisor and workspace prompts are embedded directly in `internal/prompts/`
+   - Note: Only supervisor, workspace, and planner prompts are embedded directly in `internal/prompts/`
    - Other agent types (worker, merge-queue, review) use templates that can be customized
 
 3. **Add the template** to `internal/templates/templates.go` for embedding

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Root-IO-Labs/open-agent-teams/internal/messages"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 	"github.com/Root-IO-Labs/open-agent-teams/pkg/config"
@@ -56,6 +57,74 @@ func setupTestDaemonWithState(t *testing.T, setupFn func(*state.State)) (*Daemon
 	}
 
 	return d, cleanup
+}
+
+// A legacy repo restored without a planner agent (e.g. planner failed to
+// start, or the repo predates the planner feature and restore didn't add it)
+// must be reported as degraded so the operator can see the capability is down.
+func TestRepoDegradedReasons_FlagsMissingPlanner(t *testing.T) {
+	withPlanner := &state.Repository{
+		Agents: map[string]state.Agent{
+			"supervisor": {Type: state.AgentTypeSupervisor},
+			"planner":    {Type: state.AgentTypePlanner},
+		},
+	}
+	if reasons := repoDegradedReasons(withPlanner); len(reasons) != 0 {
+		t.Fatalf("repo with planner reported degraded: %v", reasons)
+	}
+
+	missingPlanner := &state.Repository{
+		Agents: map[string]state.Agent{
+			"supervisor": {Type: state.AgentTypeSupervisor},
+		},
+	}
+	reasons := repoDegradedReasons(missingPlanner)
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "planner") {
+		t.Fatalf("repoDegradedReasons = %v, want a single planner reason", reasons)
+	}
+
+	if reasons := repoDegradedReasons(nil); reasons != nil {
+		t.Fatalf("repoDegradedReasons(nil) = %v, want nil", reasons)
+	}
+}
+
+func TestPlannerAgentRoleAndCompletionGuard(t *testing.T) {
+	if got := roleForAgentType(state.AgentTypePlanner); got != routing.RoleOrchestrator {
+		t.Fatalf("roleForAgentType(planner) = %s, want %s", got, routing.RoleOrchestrator)
+	}
+
+	d, cleanup := setupTestDaemonWithState(t, func(s *state.State) {
+		if err := s.AddRepo("test-repo", &state.Repository{
+			GithubURL:   "https://github.com/test/repo",
+			SessionName: "test-session",
+			Agents:      make(map[string]state.Agent),
+		}); err != nil {
+			t.Fatalf("AddRepo: %v", err)
+		}
+		if err := s.AddAgent("test-repo", "planner", state.Agent{
+			Type:         state.AgentTypePlanner,
+			WorktreePath: "/tmp/planner",
+			WindowName:   "planner",
+			CreatedAt:    time.Now(),
+		}); err != nil {
+			t.Fatalf("AddAgent: %v", err)
+		}
+	})
+	defer cleanup()
+
+	resp := d.handleCompleteAgent(socket.Request{
+		Command: "complete_agent",
+		Args: map[string]interface{}{
+			"repo":  "test-repo",
+			"agent": "planner",
+		},
+	})
+	if resp.Success {
+		t.Fatal("planner should not be completable")
+	}
+	if !strings.Contains(resp.Error, "planner") || !strings.Contains(resp.Error, "cannot be completed") {
+		t.Fatalf("unexpected completion error: %s", resp.Error)
+	}
 }
 
 // TestHandleAddAgentTableDriven tests handleAddAgent with various argument combinations

@@ -362,21 +362,21 @@ Run `oat --help` for the full command tree. See [Commands Reference](docs/COMMAN
 | **Reviewer** | Reviews PRs before merge. Posts blocking or non-blocking feedback. | Ephemeral |
 | **Verification** | Independent quality gate. Reviews diff, runs tests, delivers approve/reject. | Ephemeral |
 
-Agent definitions: [supervisor](internal/prompts/supervisor.md) | [merge-queue](internal/templates/agent-templates/merge-queue.md) | [pr-shepherd](internal/templates/agent-templates/pr-shepherd.md) | [workspace](internal/prompts/workspace.md) | [worker](internal/templates/agent-templates/worker.md) | [reviewer](internal/templates/agent-templates/reviewer.md) | [verification](internal/templates/agent-templates/verification.md) | [overlord](internal/templates/agent-templates/overlord.md)
+Agent definitions: [supervisor](internal/prompts/supervisor.md) | [planner](internal/prompts/planner.md) | [merge-queue](internal/templates/agent-templates/merge-queue.md) | [pr-shepherd](internal/templates/agent-templates/pr-shepherd.md) | [workspace](internal/prompts/workspace.md) | [worker](internal/templates/agent-templates/worker.md) | [reviewer](internal/templates/agent-templates/reviewer.md) | [verification](internal/templates/agent-templates/verification.md)
 
-## Planner/Overlord Agent
+## Planner Agent
 
-The **Planner/Overlord** agent is OAT's intelligent requirement decomposition and task planning system. It transforms vague requirements into detailed, executable plans with wave-based task batching and ensures complete requirement fulfillment.
+The **planner** agent is OAT's requirement decomposition and task planning system. It transforms vague requirements into executable, wave-based plans that the workspace can dispatch to workers.
 
 ### Purpose
 
-**Intelligent requirement decomposition** — The overlord analyzes complex requirements and breaks them down into atomic, parallelizable tasks organized in dependency-safe waves.
+**Intelligent requirement decomposition** — The planner analyzes complex requirements and breaks them down into atomic, parallelizable tasks organized in dependency-safe waves.
 
 **Wave-based task batching** — Groups related tasks into sequential waves that minimize merge conflicts while maximizing parallel execution within each wave.
 
-**GitHub issue integration** — Automatically creates tracked GitHub issues for each task with proper labels, acceptance criteria, and technical hints for workers.
+**Workspace handoff** — Approved plans are sent to the workspace with stable task IDs, wave ordering, acceptance criteria, and `[planner-task:<id>]` markers for progress tracking.
 
-**Convergence tracking** — Monitors progress and ensures 100% requirement completion by spawning fix tasks for gaps or failures.
+**Execution tracking** — The TUI maps worker status back to planner tasks when workers preserve the planner task marker.
 
 ### Features
 
@@ -388,46 +388,46 @@ The **Planner/Overlord** agent is OAT's intelligent requirement decomposition an
 
 ### Usage Examples
 
-**Spawn an overlord agent:**
+**Initialize a repo with a planner:**
 ```bash
-oat agent create overlord --repo my-project --class persistent
+oat init https://github.com/org/repo
 ```
 
-**Send a requirement for planning:**
+**Open the interactive planner:**
 ```bash
-oat message send overlord "Add OAuth2 authentication with JWT and RBAC"
+oat ui
+# Press ctrl+l to open the planner view
+```
+
+**Send a requirement manually:**
+```bash
+oat message send planner "Add OAuth2 authentication with JWT and RBAC"
 ```
 
 **View generated plans:**
 ```bash
-ls .oat/specs/                        # List all plans
-cat .oat/specs/add-oauth2/tasks.md    # Review task breakdown
-```
-
-**Approve and execute a plan:**
-```bash
-oat-plan-approve add-oauth2-auth       # Approve plan and create GitHub issues
+ls ~/.oat/plans/<repo>/                # List all saved plans for a repo
+cat ~/.oat/plans/<repo>/<plan-id>/plan.md
 ```
 
 **Monitor plan progress:**
 ```bash
 oat status                             # View overall progress
-oat agent attach overlord             # Interactive plan monitoring
+oat ui                                 # Planner summary appears in the sidebar
 ```
 
 ### Workflow
 
-1. **Requirement** → User sends high-level requirement to overlord
-2. **Plan** → Overlord analyzes repo, decomposes into waves of atomic tasks  
-3. **Issues** → Plan approval creates GitHub issues with proper labeling
-4. **Workers** → Workspace spawns workers for approved tasks in wave order
-5. **Completion** → Overlord tracks progress and ensures convergence
+1. **Requirement** → User describes the goal in `oat ui` planner view or by messaging `planner`
+2. **Plan** → Planner clarifies requirements, proposes architecture, and decomposes work into waves
+3. **Approval** → User approves the plan in the planner UI
+4. **Workers** → Workspace receives `[PLANNER-APPROVED]` and spawns workers in wave order
+5. **Progress** → Worker markers such as `[planner-task:T1]` map execution status back to planner tasks
 
-**Plan artifacts** are saved to `.oat/specs/<plan-slug>/` containing:
-- `requirements.md` - Structured EARS requirements
-- `design.md` - Architecture and implementation strategy  
-- `tasks.md` - Wave-organized task breakdown
-- `plan.yaml` - Machine-readable plan metadata
+**Plan artifacts** are saved to `~/.oat/plans/<repo>/<plan-id>/` containing:
+- `plan.json` - Machine-readable plan and execution metadata
+- `plan.md` - Human-readable plan summary
+- `workgraph.yml` - Wave-organized task graph for dispatch
 
 ### Integration
 

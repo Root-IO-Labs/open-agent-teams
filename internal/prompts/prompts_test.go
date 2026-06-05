@@ -17,6 +17,7 @@ func TestGetDefaultPrompt(t *testing.T) {
 	}{
 		{"supervisor", state.AgentTypeSupervisor, false},
 		{"workspace", state.AgentTypeWorkspace, false},
+		{"planner", state.AgentTypePlanner, false},
 		// Worker, merge-queue, and review should return empty - they use configurable agent definitions
 		{"worker", state.AgentTypeWorker, true},
 		{"merge-queue", state.AgentTypeMergeQueue, true},
@@ -57,6 +58,14 @@ func TestGetDefaultPromptContent(t *testing.T) {
 	}
 	if !strings.Contains(workspacePrompt, "Spawning Workers") {
 		t.Error("workspace prompt should document worker spawning capabilities")
+	}
+
+	plannerPrompt := GetDefaultPrompt(state.AgentTypePlanner)
+	if !strings.Contains(plannerPrompt, "planning-only agent") {
+		t.Error("planner prompt should mention its planning-only role")
+	}
+	if !strings.Contains(plannerPrompt, "Every response must be a structured JSON object") {
+		t.Error("planner prompt should document the JSON response contract")
 	}
 
 	// Note: Worker, merge-queue, and review prompts are now configurable
@@ -171,6 +180,22 @@ func TestLoadCustomPrompt(t *testing.T) {
 		}
 
 		prompt, err := LoadCustomPrompt(tmpDir, state.AgentTypeReview)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if prompt != customContent {
+			t.Errorf("expected %q, got %q", customContent, prompt)
+		}
+	})
+
+	t.Run("with custom planner prompt", func(t *testing.T) {
+		customContent := "Custom planner instructions"
+		promptPath := filepath.Join(oatDir, "PLANNER.md")
+		if err := os.WriteFile(promptPath, []byte(customContent), 0644); err != nil {
+			t.Fatalf("failed to write custom prompt: %v", err)
+		}
+
+		prompt, err := LoadCustomPrompt(tmpDir, state.AgentTypePlanner)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -383,10 +408,11 @@ func TestGetPromptIncludesSlashCommandsForHardcodedAgentTypes(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Only test hardcoded agent types (supervisor, workspace)
+	// Only test hardcoded agent types (supervisor, workspace, planner)
 	agentTypes := []state.AgentType{
 		state.AgentTypeSupervisor,
 		state.AgentTypeWorkspace,
+		state.AgentTypePlanner,
 	}
 
 	for _, agentType := range agentTypes {

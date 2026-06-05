@@ -23,6 +23,7 @@ import (
 	"github.com/Root-IO-Labs/open-agent-teams/internal/hooks"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/logging"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/messages"
+	"github.com/Root-IO-Labs/open-agent-teams/internal/planner"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/prompts"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
@@ -1369,7 +1370,7 @@ func (d *Daemon) scheduleDelayedMergeQueueNudge(repoName string, repo *state.Rep
 // before entering idle mode. Unlike shouldNudgeAgent, this deliberately skips
 // the 2-minute time-based cooldown because the final nudge is critical.
 func (d *Daemon) shouldSendFinalNudge(agent state.Agent) bool {
-	if agent.Type == state.AgentTypeWorkspace {
+	if agent.Type == state.AgentTypeWorkspace || agent.Type == state.AgentTypePlanner {
 		return false
 	}
 	if agent.ReadyForCleanup {
@@ -1416,9 +1417,10 @@ func (d *Daemon) nudgeIntervalFor(repo *state.Repository, agent state.Agent) tim
 	return def
 }
 
-// shouldNudgeAgent returns false if the agent should be skipped (workspace, dormant, recently nudged, or process not alive).
+// shouldNudgeAgent returns false if the agent should be skipped (user-facing,
+// dormant, recently nudged, or process not alive).
 func (d *Daemon) shouldNudgeAgent(repo *state.Repository, agentName string, agent state.Agent, now time.Time) bool {
-	if agent.Type == state.AgentTypeWorkspace {
+	if agent.Type == state.AgentTypeWorkspace || agent.Type == state.AgentTypePlanner {
 		return false
 	}
 	if agent.IsDormant() {
@@ -1893,6 +1895,7 @@ func (d *Daemon) handleStatus(req socket.Request) socket.Response {
 	agentCount := 0
 	idleRepos := make([]string, 0)
 	activeRepos := make([]string, 0)
+	degradedRepos := make(map[string]interface{})
 	for name, repo := range repos {
 		agentCount += len(repo.Agents)
 		if repo.IdleMode {
@@ -1900,17 +1903,45 @@ func (d *Daemon) handleStatus(req socket.Request) socket.Response {
 		} else {
 			activeRepos = append(activeRepos, name)
 		}
+		if reasons := repoDegradedReasons(repo); len(reasons) > 0 {
+			degradedRepos[name] = reasons
+		}
 	}
 
 	return socket.SuccessResponse(map[string]interface{}{
-		"running":      true,
-		"pid":          os.Getpid(),
-		"repos":        len(repos),
-		"agents":       agentCount,
-		"socket_path":  d.paths.DaemonSock,
-		"idle_repos":   idleRepos,
-		"active_repos": activeRepos,
+		"running":        true,
+		"pid":            os.Getpid(),
+		"repos":          len(repos),
+		"agents":         agentCount,
+		"socket_path":    d.paths.DaemonSock,
+		"idle_repos":     idleRepos,
+		"active_repos":   activeRepos,
+		"degraded_repos": degradedRepos,
 	})
+}
+
+// repoDegradedReasons reports why a repo is operating in a degraded state.
+// A missing persistent agent does not stop worker execution, but it means a
+// first-class capability is unavailable and should be visible to the operator.
+// The planner is restored on every daemon startup (restoreRepoAgents), so its
+// absence indicates a restore failure worth surfacing rather than silently
+// logging.
+func repoDegradedReasons(repo *state.Repository) []string {
+	if repo == nil {
+		return nil
+	}
+	hasPlanner := false
+	for _, agent := range repo.Agents {
+		if agent.Type == state.AgentTypePlanner {
+			hasPlanner = true
+			break
+		}
+	}
+	var reasons []string
+	if !hasPlanner {
+		reasons = append(reasons, "planner agent not running")
+	}
+	return reasons
 }
 
 // handleListRepos lists all repositories with detailed status
@@ -2207,6 +2238,13 @@ func (d *Daemon) handleStartWorker(req socket.Request) socket.Response {
 	agent.Task = task
 	agent.IssueNumber = issueNumber
 	agent.IssueURL = issueURL
+	// Persist the planner linkage structurally so the planner TUI can map this
+	// worker back to its plan task without re-parsing the task text, and so the
+	// link survives in state.json for inspection/recovery.
+	if planID, taskID := planner.ParseTaskMarker(task); taskID != "" {
+		agent.PlannerPlanID = planID
+		agent.PlannerTaskID = taskID
+	}
 	if model != "" {
 		agent.Model = model
 	}
@@ -2424,14 +2462,16 @@ func (d *Daemon) handleListAgents(req socket.Request) socket.Response {
 		}
 
 		detail := map[string]interface{}{
-			"name":          agentName,
-			"type":          agent.Type,
-			"worktree_path": agent.WorktreePath,
-			"window_name":   agent.WindowName,
-			"task":          agent.Task,
-			"summary":       agent.Summary,
-			"model":         agent.Model,
-			"created_at":    agent.CreatedAt,
+			"name":            agentName,
+			"type":            agent.Type,
+			"worktree_path":   agent.WorktreePath,
+			"window_name":     agent.WindowName,
+			"task":            agent.Task,
+			"summary":         agent.Summary,
+			"model":           agent.Model,
+			"created_at":      agent.CreatedAt,
+			"planner_plan_id": agent.PlannerPlanID,
+			"planner_task_id": agent.PlannerTaskID,
 		}
 
 		// Add rich status information if requested
@@ -2526,14 +2566,16 @@ func (d *Daemon) handleCompleteAgent(req socket.Request) socket.Response {
 		return socket.ErrorResponse("agent '%s' not found in repository '%s' - check available agents with: oat worker list --repo %s", agentName, repoName, repoName)
 	}
 
-	// Guard: permanent agents (supervisor, workspace, merge-queue) cannot be completed.
+	// Guard: permanent agents cannot be completed.
 	// This prevents accidents like a supervisor running "oat agent complete" without --worker.
 	permanentTypes := map[state.AgentType]bool{
 		state.AgentTypeSupervisor:        true,
 		state.AgentTypeWorkspace:         true,
+		state.AgentTypePlanner:           true,
 		state.AgentTypeMergeQueue:        true,
 		state.AgentTypePRShepherd:        true,
 		state.AgentTypeGenericPersistent: true,
+		state.AgentTypeAgentBuilder:      true,
 	}
 	if permanentTypes[agent.Type] {
 		d.logger.Warn("Rejected oat agent complete for %s agent %s/%s", agent.Type, repoName, agentName)
@@ -4308,6 +4350,8 @@ func (d *Daemon) handleSpawnAgent(req socket.Request) socket.Response {
 			agentType = state.AgentTypeMergeQueue
 		case "pr-shepherd":
 			agentType = state.AgentTypePRShepherd
+		case "planner":
+			agentType = state.AgentTypePlanner
 		default:
 			agentType = state.AgentTypeGenericPersistent
 		}
@@ -4722,6 +4766,26 @@ func (d *Daemon) discoverMissingWorkspaces(repoName string, repo *state.Reposito
 	}
 }
 
+func (d *Daemon) ensureDetachedAgentWorktree(repoName, repoPath, agentName string) string {
+	wtPath := d.paths.AgentWorktree(repoName, agentName)
+	if _, err := os.Stat(wtPath); os.IsNotExist(err) {
+		d.logger.Info("Creating %s worktree for %s", agentName, repoName)
+		wt := worktree.NewManagerWithContext(d.ctx, repoPath)
+		if err := wt.CreateDetached(wtPath, "HEAD"); err != nil {
+			d.logger.Error("Failed to create %s worktree for %s: %v", agentName, repoName, err)
+			return ""
+		}
+		if err := wt.CheckoutBranch(wtPath, "main"); err != nil {
+			d.logger.Warn("Failed to checkout main in %s worktree for %s: %v", agentName, repoName, err)
+		}
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		d.logger.Warn("%s worktree unavailable for %s: %v", agentName, repoName, err)
+		return ""
+	}
+	return wtPath
+}
+
 // restoreRepoAgents restores the backend session and agents for a tracked repo
 func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) error {
 	repoPath := d.paths.RepoDir(repoName)
@@ -4831,6 +4895,15 @@ func (d *Daemon) restoreRepoAgents(repoName string, repo *state.Repository) erro
 			if err := d.startAgent(repoName, repo, psName, state.AgentTypePRShepherd, psWtPath); err != nil {
 				d.logger.Error("Failed to start pr-shepherd for %s: %v", repoName, err)
 			}
+		}
+	}
+
+	// Planner is a persistent, user-facing planning agent. Restore it for
+	// existing repos even if they were initialized before planner existed.
+	plannerWtPath := d.ensureDetachedAgentWorktree(repoName, repoPath, "planner")
+	if plannerWtPath != "" {
+		if err := d.startAgent(repoName, repo, "planner", state.AgentTypePlanner, plannerWtPath); err != nil {
+			d.logger.Error("Failed to start planner for %s: %v", repoName, err)
 		}
 	}
 
@@ -5831,10 +5904,7 @@ func (d *Daemon) validateModelForAgentType(model string, agentType state.AgentTy
 		return nil // no profiles — can't validate, pass through
 	}
 
-	role := routing.RoleWorker
-	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace || agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd {
-		role = routing.RoleOrchestrator
-	}
+	role := roleForAgentType(agentType)
 
 	if err := d.modelProfiles.Validate(model, role); err != nil {
 		return err
@@ -5893,12 +5963,7 @@ func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoMod
 		return repoModel, RoutingSourcePassthrough, nil
 	}
 
-	role := routing.RoleWorker
-	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace ||
-		agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd ||
-		agentType == state.AgentTypePlanner {
-		role = routing.RoleOrchestrator
-	}
+	role := roleForAgentType(agentType)
 
 	// Build allowed set for workers (only enforced for worker role)
 	isWorker := role == routing.RoleWorker
@@ -5962,6 +6027,15 @@ func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoMod
 	}
 	d.logger.Info("Model routing: auto-selected %s for %s (preferred=%s)", best, role, repoModel)
 	return best, RoutingSourceRouterAuto, nil
+}
+
+func roleForAgentType(agentType state.AgentType) routing.AgentRole {
+	switch agentType {
+	case state.AgentTypeSupervisor, state.AgentTypeWorkspace, state.AgentTypeMergeQueue, state.AgentTypePRShepherd, state.AgentTypePlanner:
+		return routing.RoleOrchestrator
+	default:
+		return routing.RoleWorker
+	}
 }
 
 // handleReloadModelProfiles reloads model profiles from disk.

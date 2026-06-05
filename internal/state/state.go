@@ -166,6 +166,8 @@ type Agent struct {
 	ReadyForCleanupAt           time.Time `json:"ready_for_cleanup_at,omitempty"`           // When marked ready (for delayed cleanup)
 	IssueNumber                 string    `json:"issue_number,omitempty"`                   // GitHub issue number for this task (workers only)
 	IssueURL                    string    `json:"issue_url,omitempty"`                      // Optional issue URL (workers only)
+	PlannerPlanID               string    `json:"planner_plan_id,omitempty"`                // Plan this worker's task belongs to (parsed from [planner-task:<plan-id>:<task-id>] marker; workers only)
+	PlannerTaskID               string    `json:"planner_task_id,omitempty"`                // Plan task this worker fulfills (workers only); lets the planner map worker→task structurally instead of re-parsing task text
 	NudgeCount                  int       `json:"nudge_count,omitempty"`                    // Number of nudges sent since last git activity
 	NudgeResetUsed              bool      `json:"nudge_reset_used,omitempty"`               // Whether supervisor has used their one-time nudge reset
 	LastBranchSHA               string    `json:"last_branch_sha,omitempty"`                // Last known commit SHA on the worker's branch

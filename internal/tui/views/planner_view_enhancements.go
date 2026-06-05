@@ -1,9 +1,9 @@
 package views
 
 import (
+	"fmt"
 	"strings"
 	"time"
-	"fmt"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -22,10 +22,10 @@ const (
 
 // PlannerContext provides contextual awareness for user intent
 type PlannerContext struct {
-	ApprovalPatterns   []string
-	RejectionPatterns  []string
-	QuestionPatterns   []string
-	CompletionSignals  []string
+	ApprovalPatterns  []string
+	RejectionPatterns []string
+	QuestionPatterns  []string
+	CompletionSignals []string
 }
 
 // PhaseGate represents a checkpoint requiring explicit approval
@@ -148,7 +148,7 @@ func initBrainstormThemes() []BrainstormTheme {
 // detectContextualIntent analyzes user input to determine intent
 func (p *PlannerView) detectContextualIntent(input string) ContextIntent {
 	normalized := strings.ToLower(strings.TrimSpace(input))
-	
+
 	// Check for completion signals first (more specific)
 	for _, pattern := range p.context.CompletionSignals {
 		if strings.Contains(normalized, pattern) {
@@ -162,7 +162,7 @@ func (p *PlannerView) detectContextualIntent(input string) ContextIntent {
 			}
 		}
 	}
-	
+
 	// Check for rejection patterns before approval
 	for _, pattern := range p.context.RejectionPatterns {
 		if strings.Contains(normalized, pattern) &&
@@ -172,7 +172,7 @@ func (p *PlannerView) detectContextualIntent(input string) ContextIntent {
 			return IntentRejection
 		}
 	}
-	
+
 	// Check for approval signals - but exclude false positives
 	for _, pattern := range p.context.ApprovalPatterns {
 		if strings.Contains(normalized, pattern) {
@@ -187,7 +187,7 @@ func (p *PlannerView) detectContextualIntent(input string) ContextIntent {
 			return IntentApproval
 		}
 	}
-	
+
 	// Check for questions
 	if strings.Contains(normalized, "?") ||
 		strings.HasPrefix(normalized, "what") ||
@@ -197,14 +197,14 @@ func (p *PlannerView) detectContextualIntent(input string) ContextIntent {
 		strings.HasPrefix(normalized, "should") {
 		return IntentClarification
 	}
-	
+
 	return IntentFeedback
 }
 
 // handleContextualInput processes input based on detected intent
 func (p *PlannerView) handleContextualInput(text string) tea.Cmd {
 	intent := p.detectContextualIntent(text)
-	
+
 	switch intent {
 	case IntentApproval:
 		// Check if we have a pending gate
@@ -224,7 +224,7 @@ func (p *PlannerView) handleContextualInput(text string) tea.Cmd {
 		if p.state == StateRefiningRequirement {
 			return p.advanceToNextPhase()
 		}
-		
+
 	case IntentCompletion:
 		// User signaled they're done with current phase
 		if p.state == StateDefiningRequirement || p.state == StateRefiningRequirement {
@@ -235,7 +235,7 @@ func (p *PlannerView) handleContextualInput(text string) tea.Cmd {
 			})
 			return p.completeCurrentPhase()
 		}
-		
+
 	case IntentRejection:
 		if p.state == StateReviewingPlan {
 			return p.rejectPlan()
@@ -246,12 +246,12 @@ func (p *PlannerView) handleContextualInput(text string) tea.Cmd {
 			Content:   "Understood. Please describe what needs to be changed.",
 			Timestamp: time.Now(),
 		})
-		
+
 	case IntentClarification:
 		// User is asking a question - let it go through to planner
 		break
 	}
-	
+
 	// Default: send to planner as normal feedback
 	return p.sendToPlanner(text)
 }
@@ -408,7 +408,7 @@ func (p *PlannerView) passGate() tea.Cmd {
 // advanceToNextPhase moves to the next planning phase
 func (p *PlannerView) advanceToNextPhase() tea.Cmd {
 	oldPhase := p.state
-	
+
 	switch p.state {
 	case StateDefiningRequirement:
 		p.state = StateRefiningRequirement
@@ -417,19 +417,19 @@ func (p *PlannerView) advanceToNextPhase() tea.Cmd {
 	case StateDecomposingTasks:
 		p.state = StateReviewingPlan
 	}
-	
+
 	if oldPhase != p.state {
 		p.feedback = append(p.feedback, FeedbackEntry{
 			Type:      "system",
 			Content:   fmt.Sprintf("📋 Advanced to: %s", p.getStateDescription()),
 			Timestamp: time.Now(),
 		})
-		
+
 		// Notify planner of phase change
 		message := fmt.Sprintf("[planner-tui phase=%s]\nUser signaled completion. Moving to next phase.", p.getPhaseString())
 		return p.sendToPlanner(message)
 	}
-	
+
 	return nil
 }
 
@@ -440,13 +440,13 @@ func (p *PlannerView) completeCurrentPhase() tea.Cmd {
 		// Request planner to finalize requirements
 		msg := "[planner-tui phase=architecture]\nUser indicated requirements are complete. Please proceed to architecture phase and create the operational specification."
 		return p.sendToPlanner(msg)
-		
+
 	case StateDecomposingTasks:
 		// Request planner to finalize plan
 		msg := "[planner-tui phase=ready_for_review]\nUser indicated planning is complete. Please finalize the plan and output as JSON."
 		return p.sendToPlanner(msg)
 	}
-	
+
 	return nil
 }
 
@@ -491,13 +491,13 @@ func (p *PlannerView) surfacePendingQuestions() {
 	if len(p.pendingQuestions) == 0 {
 		return
 	}
-	
+
 	p.feedback = append(p.feedback, FeedbackEntry{
 		Type:      "system",
 		Content:   "📌 Pending questions need your attention:",
 		Timestamp: time.Now(),
 	})
-	
+
 	for i, q := range p.pendingQuestions {
 		p.feedback = append(p.feedback, FeedbackEntry{
 			Type:      "system",
@@ -505,18 +505,18 @@ func (p *PlannerView) surfacePendingQuestions() {
 			Timestamp: time.Now(),
 		})
 	}
-	
+
 	p.pendingQuestions = []string{} // Clear after showing
 }
 
 // Enhanced status display
 func (p *PlannerView) getDetailedStatus() string {
 	status := p.getStateDescription()
-	
+
 	if p.requirement != nil {
 		status += fmt.Sprintf(" (v%d)", p.requirement.Iteration)
 	}
-	
+
 	if len(p.tasks) > 0 {
 		completed := 0
 		inProgress := 0
@@ -533,11 +533,11 @@ func (p *PlannerView) getDetailedStatus() string {
 			status += fmt.Sprintf(" (%d in progress)", inProgress)
 		}
 	}
-	
+
 	if p.currentGate != nil {
 		status += fmt.Sprintf(" | ⚠️ Gate: %s", p.currentGate.Name)
 	}
-	
+
 	return status
 }
 
@@ -546,43 +546,47 @@ func (p *PlannerView) conductSocraticDialogue() tea.Cmd {
 	if len(p.brainstormThemes) == 0 {
 		return nil
 	}
-	
+
 	// Get next theme
 	theme := p.brainstormThemes[0]
-	
+	p.conversation = append(p.conversation, ConversationEntry{
+		Role: "system",
+		Text: fmt.Sprintf("Brainstorming: %s", theme.Name),
+	})
+
 	// Ask questions for this theme
 	questions := strings.Join(theme.Questions, "\n")
 	msg := fmt.Sprintf("[planner-tui brainstorm=%s]\nLet's discuss %s:\n%s", theme.Name, theme.Name, questions)
-	
+
 	// Remove this theme from queue
 	if len(p.brainstormThemes) > 1 {
 		p.brainstormThemes = p.brainstormThemes[1:]
 	} else {
 		p.brainstormThemes = []BrainstormTheme{}
 	}
-	
+
 	return p.sendToPlanner(msg)
 }
 
 // Smart suggestion system
 func (p *PlannerView) getContextualSuggestions() []string {
 	suggestions := []string{}
-	
+
 	switch p.state {
 	case StateDefiningRequirement:
-		suggestions = append(suggestions, 
+		suggestions = append(suggestions,
 			"Try describing: what problem you're solving",
 			"Include: target users and use cases",
 			"Consider: technical constraints",
 		)
-		
+
 	case StateRefiningRequirement:
 		suggestions = append(suggestions,
 			"Say 'done' when requirements are complete",
 			"Ask questions if anything is unclear",
 			"Type 'approve' to move forward",
 		)
-		
+
 	case StateReviewingPlan:
 		suggestions = append(suggestions,
 			"Review tasks and waves carefully",
@@ -591,7 +595,7 @@ func (p *PlannerView) getContextualSuggestions() []string {
 			"Press ^p to pull plan as JSON",
 		)
 	}
-	
+
 	return suggestions
 }
 

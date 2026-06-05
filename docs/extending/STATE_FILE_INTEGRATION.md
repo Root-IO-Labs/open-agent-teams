@@ -2,7 +2,7 @@
 
 <!-- state-struct: State repos current_repo -->
 <!-- state-struct: Repository github_url session_name agents task_history merge_queue_config pr_shepherd_config fork_config target_branch idle_mode model allowed_worker_models workspace_stuck_detection -->
-<!-- state-struct: Agent type worktree_path window_name session_id pid task summary failure_reason created_at last_nudge last_nudge_hash nudge_skip_count ready_for_cleanup ready_for_cleanup_at issue_number issue_url nudge_count nudge_reset_used last_branch_sha model routing_source routing_decision_reason routing_candidates routing_allowlist prompt_system_hash prompt_system_tokens prompt_user_hash prompt_user_tokens base_sha input_tokens output_tokens total_tokens cache_read_tokens cache_creation_tokens last_token_update max_tokens waiting_for_pr waiting_for_pr_since waiting_for_verification waiting_for_verification_since pr_number verification_agent verification_status verified_commit_sha verification_at verification_reason rejection_count last_pr_comment_id last_wake_reason woken_for_merged_pr_at last_nudge_tier suppressed_nudge_count -->
+<!-- state-struct: Agent type worktree_path window_name session_id pid task summary failure_reason created_at last_nudge last_nudge_hash nudge_skip_count ready_for_cleanup ready_for_cleanup_at issue_number issue_url planner_plan_id planner_task_id nudge_count nudge_reset_used last_branch_sha model routing_source routing_decision_reason routing_candidates routing_allowlist prompt_system_hash prompt_system_tokens prompt_user_hash prompt_user_tokens base_sha input_tokens output_tokens total_tokens cache_read_tokens cache_creation_tokens last_token_update max_tokens waiting_for_pr waiting_for_pr_since waiting_for_verification waiting_for_verification_since pr_number verification_agent verification_status verified_commit_sha verification_at verification_reason rejection_count last_pr_comment_id last_wake_reason woken_for_merged_pr_at last_nudge_tier suppressed_nudge_count -->
 <!-- state-struct: TaskHistoryEntry name task branch pr_url pr_number status summary failure_reason model created_at completed_at input_tokens output_tokens total_tokens -->
 <!-- state-struct: MergeQueueConfig enabled track_mode -->
 <!-- state-struct: PRShepherdConfig enabled track_mode -->
@@ -57,6 +57,8 @@ The daemon persists state to `~/.oat/state.json` and writes it atomically. This 
   "ready_for_cleanup_at": "...",       // When marked for cleanup (grace period)
   "issue_number": "42",               // GitHub issue number (workers only)
   "issue_url": "...",                  // Optional issue URL (workers only)
+  "planner_plan_id": "plan-1717160000", // Plan this worker's task belongs to (workers only)
+  "planner_task_id": "T1",            // Plan task this worker fulfills (workers only)
   "nudge_count": 0,                   // Nudges since last git activity
   "nudge_reset_used": false,          // One-time supervisor reset flag
   "last_branch_sha": "abc123",        // Last known commit SHA on agent branch
