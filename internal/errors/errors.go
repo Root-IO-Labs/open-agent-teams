@@ -378,3 +378,21 @@ func WorkspaceNotFound(name, repo string) *CLIError {
 		Suggestion: fmt.Sprintf("oat workspace list --repo %s", repo),
 	}
 }
+
+// RepoAlreadyInitialized creates an error for when a repository is already tracked
+func RepoAlreadyInitialized(repoName string) *CLIError {
+	return &CLIError{
+		Category:   CategoryConfig,
+		Message:    fmt.Sprintf("repository '%s' is already initialized", repoName),
+		Suggestion: fmt.Sprintf("oat repo rm %s  (to remove and re-init), or provide a different name", repoName),
+	}
+}
+
+// ModelProfileNotFound creates an error for when a model profile does not exist
+func ModelProfileNotFound(modelStr string) *CLIError {
+	return &CLIError{
+		Category:   CategoryNotFound,
+		Message:    fmt.Sprintf("no model profile found for %q", modelStr),
+		Suggestion: fmt.Sprintf("oat model onboard %s", modelStr),
+	}
+}

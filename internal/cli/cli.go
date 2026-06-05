@@ -2010,7 +2010,8 @@ func (c *CLI) initRepo(args []string) error {
 		case "assigned":
 			mqTrackMode = state.TrackModeAssigned
 		default:
-			return fmt.Errorf("invalid --mq-track value: %s (must be 'all', 'author', or 'assigned')", trackMode)
+			return errors.New(errors.CategoryUsage, fmt.Sprintf("invalid --mq-track value: %q", trackMode)).
+				WithSuggestion("--mq-track must be one of: all, author, assigned")
 		}
 	}
 
@@ -2047,7 +2048,7 @@ func (c *CLI) initRepo(args []string) error {
 		return fmt.Errorf("failed to load state: %w", err)
 	}
 	if _, exists := st.GetRepo(repoName); exists {
-		return fmt.Errorf("repository '%s' is already initialized\nUse 'oat repo rm %s' to remove it first, or choose a different name", repoName, repoName)
+		return errors.RepoAlreadyInitialized(repoName)
 	}
 
 	// Check if session already exists (stale session from previous incomplete init)
@@ -2068,7 +2069,8 @@ func (c *CLI) initRepo(args []string) error {
 	// Check if repository directory already exists
 	repoPath := c.paths.RepoDir(repoName)
 	if _, err := os.Stat(repoPath); err == nil {
-		return fmt.Errorf("directory already exists: %s\nRemove it manually or choose a different name", repoPath)
+		return errors.New(errors.CategoryConfig, fmt.Sprintf("directory already exists: %s", repoPath)).
+			WithSuggestion(fmt.Sprintf("rm -rf %s  (to remove it manually), or choose a different repo name", repoPath))
 	}
 
 	// Clone repository
@@ -3934,7 +3936,8 @@ func (c *CLI) removeWorker(args []string) error {
 
 	// --all requires --force for safety
 	if removeAll && !force {
-		return fmt.Errorf("--all requires --force (removing all workers is destructive)\nUsage: oat worker rm --all --force [--repo <repo>]")
+		return errors.New(errors.CategoryUsage, "--all requires --force (removing all workers is destructive)").
+			WithSuggestion("oat worker rm --all --force [--repo <repo>]")
 	}
 
 	// Determine repository
@@ -4580,20 +4583,23 @@ func (c *CLI) writeVerificationPromptFile(repoPath, verifierName, workerName, wo
 // Used by verification agents to approve or reject worker output.
 func (c *CLI) setVerificationVerdict(args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: oat worker set-verdict <worker-name> approved|rejected --sha <sha> --reason \"...\"")
+		return errors.InvalidUsage("oat worker set-verdict: requires <worker-name> and <verdict>").
+			WithSuggestion("oat worker set-verdict <worker-name> approved|rejected --sha <sha> --reason \"...\"")
 	}
 
 	workerName := args[0]
 	verdict := args[1]
 
 	if verdict != "approved" && verdict != "rejected" {
-		return fmt.Errorf("verdict must be 'approved' or 'rejected', got %q", verdict)
+		return errors.New(errors.CategoryUsage, fmt.Sprintf("verdict must be 'approved' or 'rejected', got %q", verdict)).
+			WithSuggestion("oat worker set-verdict <worker-name> approved|rejected --sha <sha> --reason \"...\"")
 	}
 
 	flags, _ := ParseFlags(args[2:])
 	sha := flags["sha"]
 	if sha == "" {
-		return fmt.Errorf("--sha is required")
+		return errors.New(errors.CategoryUsage, "--sha is required").
+			WithSuggestion("oat worker set-verdict <worker-name> approved|rejected --sha <sha> --reason \"...\"")
 	}
 	reason := flags["reason"]
 
@@ -9002,7 +9008,7 @@ func (c *CLI) modelShow(args []string) error {
 		}
 	}
 
-	return fmt.Errorf("profile not found for %s\n  Run: oat model onboard %s", modelStr, modelStr)
+	return errors.ModelProfileNotFound(modelStr)
 }
 
 func (c *CLI) modelRestore(args []string) error {
@@ -9030,7 +9036,8 @@ func (c *CLI) modelRestore(args []string) error {
 	}
 
 	if !restored {
-		return fmt.Errorf("no backup found for %s\n  Backups are created automatically when oat model onboard overwrites a profile", modelStr)
+		return errors.New(errors.CategoryNotFound, fmt.Sprintf("no backup found for %q", modelStr)).
+			WithSuggestion("backups are created automatically when oat model onboard overwrites a profile")
 	}
 
 	// Reload daemon profiles
@@ -9059,21 +9066,24 @@ func (c *CLI) modelSet(args []string) error {
 	maxTokensStr, hasMaxTokens := flags["max-tokens"]
 	nudgeStr, hasNudge := flags["nudge-interval"]
 	if !hasMaxTokens && !hasNudge {
-		return fmt.Errorf("oat model set: at least one of --max-tokens or --nudge-interval is required")
+		return errors.New(errors.CategoryUsage, "oat model set: at least one of --max-tokens or --nudge-interval is required").
+			WithSuggestion("oat model set <provider:model> --max-tokens N\noat model set <provider:model> --nudge-interval SECONDS")
 	}
 
 	var maxTokens, nudgeSecs int
 	if hasMaxTokens {
 		n, err := strconv.Atoi(maxTokensStr)
 		if err != nil || n <= 0 {
-			return fmt.Errorf("--max-tokens must be a positive integer (got %q)", maxTokensStr)
+			return errors.New(errors.CategoryUsage, fmt.Sprintf("--max-tokens must be a positive integer, got %q", maxTokensStr)).
+				WithSuggestion("example: oat model set anthropic:claude-3-5-sonnet --max-tokens 8192")
 		}
 		maxTokens = n
 	}
 	if hasNudge {
 		n, err := strconv.Atoi(nudgeStr)
 		if err != nil || n <= 0 {
-			return fmt.Errorf("--nudge-interval must be a positive integer seconds value (got %q)", nudgeStr)
+			return errors.New(errors.CategoryUsage, fmt.Sprintf("--nudge-interval must be a positive integer (seconds), got %q", nudgeStr)).
+				WithSuggestion("example: oat model set anthropic:claude-3-5-sonnet --nudge-interval 300")
 		}
 		nudgeSecs = n
 	}
@@ -9093,7 +9103,7 @@ func (c *CLI) modelSet(args []string) error {
 		}
 	}
 	if profilePath == "" {
-		return fmt.Errorf("profile not found for %s\n  Run: oat model onboard %s", modelStr, modelStr)
+		return errors.ModelProfileNotFound(modelStr)
 	}
 
 	data, err := os.ReadFile(profilePath)
