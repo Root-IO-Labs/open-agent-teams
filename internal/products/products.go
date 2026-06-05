@@ -46,7 +46,7 @@ type Store struct {
 	products map[string]*Product
 }
 
-// NewStore returns an initialised product store.
+// NewStore returns an initialized product store.
 func NewStore() *Store {
 	return &Store{
 		products: make(map[string]*Product),
@@ -270,7 +270,7 @@ func parsePagination(r *http.Request) (limit, offset int) {
 	return limit, offset
 }
 
-// writeJSON serialises v as JSON and writes it with the given status code.
+// writeJSON serializes v as JSON and writes it with the given status code.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
