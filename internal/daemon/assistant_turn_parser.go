@@ -51,6 +51,23 @@ var turnHeaderRE = regexp.MustCompile(`^\[\d{1,2}:\d{2}:\d{2}\] ASSISTANT:\s*$`)
 // subsequent ASSISTANT turns auto-emit (see Part 2g post-smoke fix).
 var userHeaderRE = regexp.MustCompile(`^\[\d{1,2}:\d{2}:\d{2}\] USER:\s*$`)
 
+// toolHeaderRE matches a TOOL block header and captures the tool name.
+// The runtime writes `[HH:MM:SS] TOOL: <name>` (textual_adapter.py
+// log_tool_call), so unlike USER/ASSISTANT the name sits ON the header
+// line. Used to surface per-tool activity rows for the side panel when
+// chatting with an ASSISTANT (whose tool calls are NOT mediated by the
+// bridge's MCP server, so they have no onToolStart hook — the log is
+// the only signal). The trailing `.*` is non-greedy-safe because the
+// name is a single token followed by EOL.
+var toolHeaderRE = regexp.MustCompile(`^\[\d{1,2}:\d{2}:\d{2}\] TOOL:\s*(\S.*?)\s*$`)
+
+// resultHeaderRE matches a RESULT block header and captures the name +
+// optional status. The runtime writes `[HH:MM:SS] RESULT: <name>` on
+// success and `[HH:MM:SS] RESULT: <name> (<status>)` otherwise
+// (log_tool_result). We treat any parenthesised suffix as a non-success
+// status so the side panel can flag the row red.
+var resultHeaderRE = regexp.MustCompile(`^\[\d{1,2}:\d{2}:\d{2}\] RESULT:\s*(\S.*?)\s*$`)
+
 // nextMarkerRE matches the start of any other structured log marker:
 // USER:, TOOL:, RESULT:, ERROR:, etc.; or any [OAT_*] envelope; or
 // any other timestamped block header. Used to detect the end of an
@@ -89,14 +106,49 @@ const (
 	// only needs to know "the user just spoke to me" to flip its
 	// gating flag.
 	EventSidePanelUser
+	// EventToolStart carries a parsed TOOL block: the tool's name
+	// (Event.Tool) plus a short, human-readable arg preview
+	// (Event.Arg) built from the block body. Surfaced as a
+	// `tool_start` activity row in the side panel.
+	EventToolStart
+	// EventToolEnd carries a parsed RESULT block: the tool's name
+	// (Event.Tool) plus a status (Event.ToolStatus: "ok" for a
+	// successful result, "error" otherwise). Surfaced as the
+	// matching `tool_end` activity-row update.
+	EventToolEnd
 )
 
 // Event is one item produced by the streaming parser. Exactly one of
-// the kind-specific payload fields is meaningful per the Kind value.
+// the kind-specific payload fields is meaningful per the Kind value:
+//   - EventAssistantTurn → Turn
+//   - EventSidePanelUser → (no payload)
+//   - EventToolStart     → Tool, Arg
+//   - EventToolEnd       → Tool, ToolStatus
 type Event struct {
 	Kind EventKind
 	Turn AssistantTurn
+	// Tool is the tool name for EventToolStart / EventToolEnd.
+	Tool string
+	// Arg is a short, sanitized arg preview for EventToolStart
+	// (e.g. `query: how to fold a shirt`). Empty when the tool had
+	// no body lines.
+	Arg string
+	// ToolStatus is "ok" or "error" for EventToolEnd.
+	ToolStatus string
 }
+
+// toolArgPreviewMaxBytes caps the per-tool arg preview the parser
+// surfaces on EventToolStart. The bridge redacts + re-caps before it
+// reaches the side panel; this is a first-line defense so an enormous
+// tool arg (e.g. a pasted document) can't bloat the daemon→bridge
+// frame.
+const toolArgPreviewMaxBytes = 200
+
+// toolArgPreviewMaxLines is how many leading `key: value` body lines
+// the parser folds into the arg preview. One is usually the salient
+// argument (path / query / url / command); a small allowance covers
+// tools whose primary arg isn't first.
+const toolArgPreviewMaxLines = 2
 
 // parseEvents extracts ordered Events (USER side-panel sentinels +
 // ASSISTANT turns) from a slice of log lines. The tailer drives its
@@ -120,8 +172,13 @@ func parseEvents(lines []string) []Event {
 		none blockKind = iota
 		assistantBlock
 		userBlock
+		toolBlock
+		resultBlock
 	)
 	current := none
+	// Name + status captured from the current TOOL/RESULT header line
+	// (the name sits ON the header, unlike USER/ASSISTANT).
+	var curTool, curStatus string
 
 	flushAssistant := func() {
 		raw := strings.Trim(bodyBuf.String(), "\n")
@@ -179,14 +236,53 @@ func parseEvents(lines []string) []Event {
 		}
 	}
 
+	flushTool := func() {
+		raw := strings.Trim(bodyBuf.String(), "\n")
+		bodyBuf.Reset()
+		if curTool == "" {
+			return
+		}
+		out = append(out, Event{
+			Kind: EventToolStart,
+			Tool: curTool,
+			Arg:  buildToolArgPreview(raw),
+		})
+	}
+
+	flushResult := func() {
+		// The result BODY is intentionally discarded: it can be large
+		// and carries page/tool-derived content (potential secrets).
+		// Only the name + success/error status surface, which is all
+		// the side panel needs to flip the row's terminal state.
+		bodyBuf.Reset()
+		if curTool == "" {
+			return
+		}
+		status := curStatus
+		if status == "" {
+			status = "ok"
+		}
+		out = append(out, Event{
+			Kind:       EventToolEnd,
+			Tool:       curTool,
+			ToolStatus: status,
+		})
+	}
+
 	flush := func() {
 		switch current {
 		case assistantBlock:
 			flushAssistant()
 		case userBlock:
 			flushUser()
+		case toolBlock:
+			flushTool()
+		case resultBlock:
+			flushResult()
 		}
 		current = none
+		curTool = ""
+		curStatus = ""
 	}
 
 	for _, line := range lines {
@@ -198,6 +294,18 @@ func parseEvents(lines []string) []Event {
 		if userHeaderRE.MatchString(line) {
 			flush()
 			current = userBlock
+			continue
+		}
+		if m := toolHeaderRE.FindStringSubmatch(line); m != nil {
+			flush()
+			current = toolBlock
+			curTool = strings.TrimSpace(m[1])
+			continue
+		}
+		if m := resultHeaderRE.FindStringSubmatch(line); m != nil {
+			flush()
+			current = resultBlock
+			curTool, curStatus = parseResultHeader(m[1])
 			continue
 		}
 		if current == none {
@@ -245,6 +353,73 @@ func parseAssistantTurns(lines []string) []AssistantTurn {
 		}
 	}
 	return out
+}
+
+// parseResultHeader splits a RESULT header tail like `web_search` or
+// `web_search (error)` into the tool name and a coarse status. Any
+// parenthesised suffix other than `success` is treated as an error so
+// the side panel flags the row; a bare name (or a `(success)` suffix)
+// is "ok".
+func parseResultHeader(tail string) (name, status string) {
+	tail = strings.TrimSpace(tail)
+	if i := strings.LastIndex(tail, " ("); i >= 0 && strings.HasSuffix(tail, ")") {
+		inner := strings.TrimSpace(tail[i+2 : len(tail)-1])
+		name = strings.TrimSpace(tail[:i])
+		if inner == "" || strings.EqualFold(inner, "success") {
+			return name, "ok"
+		}
+		return name, "error"
+	}
+	return tail, "ok"
+}
+
+// buildToolArgPreview folds the leading `key: value` body lines of a
+// TOOL block into a single short, sanitized preview string. The
+// runtime indents each arg with two spaces (stripped by the line loop
+// before it reaches bodyBuf), so the body arrives as `key: value`
+// lines. We keep only the first toolArgPreviewMaxLines non-blank
+// lines, join them, sanitize control bytes, and clamp to
+// toolArgPreviewMaxBytes. The bridge applies redaction on top.
+func buildToolArgPreview(body string) string {
+	if body == "" {
+		return ""
+	}
+	picked := make([]string, 0, toolArgPreviewMaxLines)
+	for _, ln := range strings.Split(body, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" {
+			continue
+		}
+		picked = append(picked, t)
+		if len(picked) >= toolArgPreviewMaxLines {
+			break
+		}
+	}
+	if len(picked) == 0 {
+		return ""
+	}
+	joined := sanitizeEmitText(strings.Join(picked, ", "))
+	return clampToolPreview(joined, toolArgPreviewMaxBytes)
+}
+
+// clampToolPreview clips s to at most maxBytes bytes without splitting
+// a UTF-8 code point, appending an ellipsis when truncation happens.
+// Distinct from truncateUTF8 (which adds a multi-line "[…truncated]"
+// suffix suited to chat bodies) — a one-line arg preview wants a bare
+// "…".
+func clampToolPreview(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	const ellipsis = "…"
+	keep := maxBytes - len(ellipsis)
+	if keep < 0 {
+		keep = 0
+	}
+	for keep > 0 && !utf8.RuneStart(s[keep]) {
+		keep--
+	}
+	return s[:keep] + ellipsis
 }
 
 // sanitizeEmitText strips C0 controls (except \n and \t), C1 controls,

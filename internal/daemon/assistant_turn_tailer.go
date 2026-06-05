@@ -7,20 +7,34 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // assistantTurnFrame is the wire shape sent over `stream_assistant_turns`.
-// One frame per ASSISTANT block extracted from the agent's OAT_TOOL_LOG.
+// One frame per ASSISTANT block extracted from the agent's OAT_TOOL_LOG,
+// OR one frame per TOOL/RESULT block (tool-activity frames, assistant
+// agents only — see assistantTurnTailer.emitToolEvents).
 //
-// Either the turn fields are set (the normal case) or Done/Err is set
-// (terminal frame). Never both.
+// Frame shapes (exactly one applies):
+//   - chat turn:  Text + Kind ("final" | "question")
+//   - tool start: Kind "tool_start" + Tool + Arg
+//   - tool end:   Kind "tool_end"   + Tool + Status ("ok" | "error")
+//   - terminal:   Done OR Err
 type assistantTurnFrame struct {
 	Text string `json:"text,omitempty"`
+	// Kind is "final" | "question" for chat turns, or
+	// "tool_start" | "tool_end" for tool-activity frames.
 	Kind string `json:"kind,omitempty"`
-	TS   string `json:"ts,omitempty"`
-	Done bool   `json:"done,omitempty"`
-	Err  string `json:"error,omitempty"`
+	// Tool is the tool name on tool_start / tool_end frames.
+	Tool string `json:"tool,omitempty"`
+	// Arg is a short, sanitized arg preview on tool_start frames.
+	Arg string `json:"arg,omitempty"`
+	// Status is "ok" | "error" on tool_end frames.
+	Status string `json:"status,omitempty"`
+	TS     string `json:"ts,omitempty"`
+	Done   bool   `json:"done,omitempty"`
+	Err    string `json:"error,omitempty"`
 }
 
 // turnBroadcaster fans out parsed AssistantTurn values from one
@@ -84,15 +98,38 @@ func (b *turnBroadcaster) Subscribe() (<-chan assistantTurnFrame, func()) {
 // subscriber whose buffer is full has the frame dropped; the producer
 // never blocks on a subscriber.
 func (b *turnBroadcaster) Publish(turn AssistantTurn) {
+	preview := turn.SanitizedText
+	if len(preview) > 80 {
+		preview = preview[:80] + "…"
+	}
+	b.publishFrame(assistantTurnFrame{
+		Text: turn.SanitizedText,
+		Kind: turn.Kind,
+		TS:   time.Now().UTC().Format(time.RFC3339Nano),
+	}, "ASSISTANT turn", preview)
+}
+
+// PublishTool broadcasts a tool-activity frame (tool_start / tool_end).
+// kind must be "tool_start" or "tool_end"; arg applies to tool_start
+// and status to tool_end. Same fire-and-forget fan-out semantics as
+// Publish.
+func (b *turnBroadcaster) PublishTool(kind, tool, arg, status string) {
+	b.publishFrame(assistantTurnFrame{
+		Kind:   kind,
+		Tool:   tool,
+		Arg:    arg,
+		Status: status,
+		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+	}, kind, tool)
+}
+
+// publishFrame is the shared fan-out path for Publish / PublishTool.
+// `what` + `preview` only feed the 0-subscriber diagnostic log.
+func (b *turnBroadcaster) publishFrame(frame assistantTurnFrame, what, preview string) {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
 		return
-	}
-	frame := assistantTurnFrame{
-		Text: turn.SanitizedText,
-		Kind: turn.Kind,
-		TS:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	subs := make([]chan assistantTurnFrame, 0, len(b.subscribers))
 	for _, ch := range b.subscribers {
@@ -101,18 +138,14 @@ func (b *turnBroadcaster) Publish(turn AssistantTurn) {
 	subCount := len(subs)
 	b.mu.Unlock()
 	if subCount == 0 && b.logf != nil {
-		// Critical diagnostic for the smoke-test regression: an
-		// ASSISTANT turn was produced but nobody is listening to
-		// hear it. Either the bridge subscribe hasn't landed yet
-		// (race window) or the bridge has died and not reconnected.
-		// Surfaced at Info level on purpose — Debug gets lost in
-		// the noise and this is exactly the "where did my chat
-		// reply go?" signal we want operators to find.
-		preview := turn.SanitizedText
-		if len(preview) > 80 {
-			preview = preview[:80] + "…"
-		}
-		b.logf("turnBroadcaster: PUBLISHED ASSISTANT turn with 0 subscribers (lost): %s", preview)
+		// Critical diagnostic for the smoke-test regression: a frame
+		// was produced but nobody is listening to hear it. Either the
+		// bridge subscribe hasn't landed yet (race window) or the
+		// bridge has died and not reconnected. Surfaced at Info level
+		// on purpose — Debug gets lost in the noise and this is
+		// exactly the "where did my chat reply go?" signal we want
+		// operators to find.
+		b.logf("turnBroadcaster: PUBLISHED %s with 0 subscribers (lost): %s", what, preview)
 	}
 	for _, ch := range subs {
 		select {
@@ -166,15 +199,44 @@ type assistantTurnTailer struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 
-	// sidePanelActive flips to true once the parser sees a USER
-	// block whose body begins with the `[SIDE-PANEL CHAT]` sentinel.
-	// Until that happens, ASSISTANT turns are NOT published — this
-	// suppresses post-restart noise like the agent's habitual
-	// `/messages` ritual or the literal word "Cleared." emitted in
-	// response to a screen-clear ANSI on PTY restart.
+	// sidePanelActive flips to true once side-panel chat is known to be
+	// underway for this agent. Until that happens, ASSISTANT turns are
+	// NOT published — this suppresses post-restart noise like the
+	// agent's habitual `/messages` ritual or the literal word
+	// "Cleared." emitted in response to a screen-clear ANSI on PTY
+	// restart.
 	//
-	// Owned exclusively by the tailer goroutine; no mutex needed.
-	sidePanelActive bool
+	// Two independent triggers set it (whichever fires first wins):
+	//   1. Delivery-time arming via markSidePanelActive(), called by the
+	//      daemon the instant it hands a side-panel message to the agent
+	//      (handleAgentInput / handleRouteUserMessage). This is the
+	//      authoritative signal — the daemon KNOWS it just delivered a
+	//      side-panel turn, so it never has to re-discover that fact by
+	//      parsing the sentinel back out of the agent's log.
+	//   2. The legacy log-parse path: the tailer sees a USER block whose
+	//      body begins with the `[SIDE-PANEL CHAT]` sentinel. Kept as a
+	//      belt-and-suspenders fallback.
+	//
+	// Trigger 1 fixes the blackout where a working agent's replies were
+	// all suppressed because the sentinel-bearing USER block was written
+	// to the log AFTER the agent's response turns (the agent was busy /
+	// blocked, so the conversation log writes landed out of order). The
+	// daemon-side arming lands well before any reply is emitted.
+	//
+	// atomic.Bool because markSidePanelActive() is called from the
+	// daemon's socket-handler goroutine while run() reads/writes it from
+	// the tailer goroutine.
+	sidePanelActive atomic.Bool
+
+	// emitToolEvents gates publishing of TOOL/RESULT blocks as
+	// tool_start/tool_end activity frames. Enabled ONLY for
+	// AgentTypeAssistant: the browser agent's tool calls are already
+	// surfaced as activity rows via the bridge's MCP onToolStart /
+	// onToolEnd hooks, so parsing them from its log too would
+	// double-render every row in the side panel. The assistant has
+	// no such hook (its tools aren't bridge-mediated), so the log is
+	// the only signal — hence this flag.
+	emitToolEvents bool
 }
 
 // tailerPollInterval is how often the tailer wakes to check for new
@@ -194,11 +256,12 @@ const tailerPollInterval = 100 * time.Millisecond
 // from buffering forever.
 const pendingLineWindow = 2048
 
-func newAssistantTurnTailer(logPath string, broadcaster *turnBroadcaster, logf func(format string, args ...any)) *assistantTurnTailer {
+func newAssistantTurnTailer(logPath string, broadcaster *turnBroadcaster, emitToolEvents bool, logf func(format string, args ...any)) *assistantTurnTailer {
 	return &assistantTurnTailer{
-		logPath:     logPath,
-		broadcaster: broadcaster,
-		logf:        logf,
+		logPath:        logPath,
+		broadcaster:    broadcaster,
+		emitToolEvents: emitToolEvents,
+		logf:           logf,
 	}
 }
 
@@ -232,6 +295,22 @@ func (t *assistantTurnTailer) Stop() {
 		}
 	}
 	t.broadcaster.Close()
+}
+
+// markSidePanelActive arms auto-emit from OUTSIDE the tailer goroutine
+// — the daemon calls this the instant it delivers a side-panel message
+// to the agent (handleAgentInput / handleRouteUserMessage). This is the
+// authoritative "side-panel chat is underway" signal and is immune to
+// the log-write-ordering race that previously suppressed a busy agent's
+// replies (the sentinel could land in the log after the reply turns).
+// Safe to call concurrently with run(); idempotent.
+func (t *assistantTurnTailer) markSidePanelActive() {
+	if t.sidePanelActive.Swap(true) {
+		return
+	}
+	if t.logf != nil {
+		t.logf("assistantTurnTailer: side-panel auto-emit ON via delivery (%s)", t.logPath)
+	}
 }
 
 func (t *assistantTurnTailer) run(ctx context.Context) {
@@ -302,7 +381,17 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 		// inconsistent).
 		lastHeader := -1
 		for i := len(pending) - 1; i >= 0; i-- {
-			if turnHeaderRE.MatchString(pending[i]) || userHeaderRE.MatchString(pending[i]) {
+			if turnHeaderRE.MatchString(pending[i]) || userHeaderRE.MatchString(pending[i]) ||
+				toolHeaderRE.MatchString(pending[i]) || resultHeaderRE.MatchString(pending[i]) {
+				// TOOL/RESULT headers count alongside USER/ASSISTANT so
+				// a trailing (still-growing) TOOL/RESULT block is held
+				// back like an open ASSISTANT block instead of being
+				// parsed with an incomplete body. Their arg/status only
+				// becomes complete once the NEXT header lands. This does
+				// NOT change ASSISTANT-prelude publish timing: the
+				// prelude sits before this header in `pending`, so the
+				// non-terminator branch below still parses + flushes it
+				// up to (but not including) the open tool/result block.
 				lastHeader = i
 				break
 			}
@@ -386,13 +475,12 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				// Once set, it stays set — a single chat session
 				// often contains many round trips and we don't want
 				// to gate every one.
-				wasActive := t.sidePanelActive
-				t.sidePanelActive = true
+				wasActive := t.sidePanelActive.Swap(true)
 				if !wasActive && t.logf != nil {
 					t.logf("assistantTurnTailer: side-panel sentinel detected, auto-emit ON (%s)", t.logPath)
 				}
 			case EventAssistantTurn:
-				if !t.sidePanelActive {
+				if !t.sidePanelActive.Load() {
 					// Pre-side-panel chatter (startup banner,
 					// /messages ritual, "Cleared." on restart, etc.)
 					// is suppressed. Log at debug-ish volume so we
@@ -408,6 +496,20 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					continue
 				}
 				t.broadcaster.Publish(ev.Turn)
+			case EventToolStart:
+				if !t.emitToolEvents || !t.sidePanelActive.Load() {
+					// Tool activity is assistant-only (browser tools
+					// already flow via MCP hooks) and gated on the same
+					// side-panel sentinel as ASSISTANT turns so terminal
+					// / pre-chat tool calls don't spam the panel.
+					continue
+				}
+				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "")
+			case EventToolEnd:
+				if !t.emitToolEvents || !t.sidePanelActive.Load() {
+					continue
+				}
+				t.broadcaster.PublishTool("tool_end", ev.Tool, "", ev.ToolStatus)
 			}
 		}
 	}

@@ -569,7 +569,7 @@ func TestTailerEnvelopeTerminatesIdleTurn(t *testing.T) {
 	}
 
 	b := newTurnBroadcaster(nil)
-	tailer := newAssistantTurnTailer(logPath, b, nil)
+	tailer := newAssistantTurnTailer(logPath, b, false, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tailer.Start(ctx)
@@ -640,6 +640,118 @@ func TestTailerEnvelopeTerminatesIdleTurn(t *testing.T) {
 	}
 }
 
+// TestTailerDeliveryArmingPublishesWithoutSentinel asserts that arming
+// auto-emit at message-delivery time (markSidePanelActive()) publishes an
+// assistant turn even when no `[SIDE-PANEL CHAT]` sentinel precedes it in
+// the log. This guards against the blackout where a busy agent's turns
+// were suppressed because the sentinel landed in the log out of order.
+func TestTailerDeliveryArmingPublishesWithoutSentinel(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, false, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Simulate the daemon delivering a side-panel message: arm
+	// auto-emit at delivery time. NOTE: no `[SIDE-PANEL CHAT]` sentinel
+	// is ever written to the log below — this is the out-of-order case
+	// where the sentinel-bearing USER block hasn't landed yet.
+	tailer.markSidePanelActive()
+
+	// The agent emits a status update (exactly the kind that was being
+	// black-holed) with no sentinel preceding it.
+	body := strings.Join([]string{
+		"[07:57:08] ASSISTANT:",
+		"  Browser is unresponsive, so I'm using direct web fetches for the research.",
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	deadline := time.After(2 * time.Second)
+	select {
+	case fr := <-ch:
+		if !strings.Contains(fr.Text, "direct web fetches") {
+			t.Errorf("unexpected published frame: %+v", fr)
+		}
+	case <-deadline:
+		t.Fatal("tailer suppressed an ASSISTANT turn despite delivery-time arming — side-panel blackout regression")
+	}
+}
+
+// TestTailerSuppressesWithoutAnyTrigger is the negative companion to
+// TestTailerDeliveryArmingPublishesWithoutSentinel: with NEITHER a
+// delivery-time arm NOR a log sentinel, pre-side-panel chatter (startup
+// banners, the `/messages` ritual, "Cleared." on restart) is still
+// correctly suppressed. This guards against the fix over-emitting.
+func TestTailerSuppressesWithoutAnyTrigger(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, false, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// No markSidePanelActive(), no sentinel — a habitual startup turn.
+	body := strings.Join([]string{
+		"[07:50:00] ASSISTANT:",
+		"  Cleared.",
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	select {
+	case fr := <-ch:
+		if !fr.Done {
+			t.Errorf("expected NO published turn (suppressed), got: %+v", fr)
+		}
+	case <-time.After(500 * time.Millisecond):
+		// Pass: nothing published, correctly suppressed.
+	}
+}
+
 // TestTailerToolMarkerTerminatesMidTurnAssistant locks in the
 // 2026-05-19 fix for the "last message hangs until next user input"
 // regression seen during the flight-times retest.
@@ -671,7 +783,7 @@ func TestTailerToolMarkerTerminatesMidTurnAssistant(t *testing.T) {
 	}
 
 	b := newTurnBroadcaster(nil)
-	tailer := newAssistantTurnTailer(logPath, b, nil)
+	tailer := newAssistantTurnTailer(logPath, b, false, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tailer.Start(ctx)
@@ -719,5 +831,238 @@ func TestTailerToolMarkerTerminatesMidTurnAssistant(t *testing.T) {
 		}
 	case <-deadline:
 		t.Fatal("tailer did not publish the mid-turn ASSISTANT prelude within 2s — TOOL-marker terminator regression")
+	}
+}
+
+// TestParseEventsToolBlocks verifies the parser surfaces TOOL/RESULT
+// blocks as EventToolStart / EventToolEnd with the tool name, a short
+// arg preview, and a coarse status — the signal the side panel needs
+// to render granular per-tool activity rows for an ASSISTANT (whose
+// tools aren't bridge-mediated, so the log is the only source).
+func TestParseEventsToolBlocks(t *testing.T) {
+	lines := strings.Split(strings.Join([]string{
+		"[09:00:00] ASSISTANT:",
+		"  Let me look that up.",
+		"",
+		"[09:00:01] TOOL: web_search",
+		"  query: how to fold a fitted sheet",
+		"",
+		"[09:00:03] RESULT: web_search",
+		"  3 results",
+		"",
+		"[09:00:04] TOOL: read_file",
+		"  file_path: /home/me/notes.txt",
+		"",
+		"[09:00:05] RESULT: read_file (error)",
+		"  file not found",
+		"",
+		"[09:00:06] ASSISTANT:",
+		"  Done.",
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+	}, "\n"), "\n")
+
+	events := parseEvents(lines)
+
+	var got []Event
+	for _, ev := range events {
+		if ev.Kind == EventToolStart || ev.Kind == EventToolEnd {
+			got = append(got, ev)
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("expected 4 tool events, got %d: %+v", len(got), got)
+	}
+	if got[0].Kind != EventToolStart || got[0].Tool != "web_search" {
+		t.Errorf("event[0] = %+v; want tool_start web_search", got[0])
+	}
+	if !strings.Contains(got[0].Arg, "how to fold a fitted sheet") {
+		t.Errorf("event[0].Arg = %q; want it to contain the query", got[0].Arg)
+	}
+	if got[1].Kind != EventToolEnd || got[1].Tool != "web_search" || got[1].ToolStatus != "ok" {
+		t.Errorf("event[1] = %+v; want tool_end web_search ok", got[1])
+	}
+	if got[2].Kind != EventToolStart || got[2].Tool != "read_file" {
+		t.Errorf("event[2] = %+v; want tool_start read_file", got[2])
+	}
+	if !strings.Contains(got[2].Arg, "notes.txt") {
+		t.Errorf("event[2].Arg = %q; want it to contain the file path", got[2].Arg)
+	}
+	if got[3].Kind != EventToolEnd || got[3].Tool != "read_file" || got[3].ToolStatus != "error" {
+		t.Errorf("event[3] = %+v; want tool_end read_file error", got[3])
+	}
+
+	// The chat turns must still parse normally alongside the tool events.
+	turns := parseAssistantTurns(lines)
+	if len(turns) != 2 {
+		t.Fatalf("expected 2 ASSISTANT turns, got %d: %+v", len(turns), turns)
+	}
+}
+
+// TestParseResultHeader covers the success / error / explicit-success
+// status heuristics for RESULT headers.
+func TestParseResultHeader(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantName   string
+		wantStatus string
+	}{
+		{"web_search", "web_search", "ok"},
+		{"web_search (error)", "web_search", "error"},
+		{"gmail_send (timeout)", "gmail_send", "error"},
+		{"read_file (success)", "read_file", "ok"},
+	}
+	for _, c := range cases {
+		name, status := parseResultHeader(c.in)
+		if name != c.wantName || status != c.wantStatus {
+			t.Errorf("parseResultHeader(%q) = (%q, %q); want (%q, %q)", c.in, name, status, c.wantName, c.wantStatus)
+		}
+	}
+}
+
+// TestTailerEmitsToolActivityFrames is the integration counterpart:
+// with emitToolEvents=true and the side-panel gate unlocked, the
+// tailer must publish tool_start/tool_end frames for the assistant's
+// TOOL/RESULT blocks (with name + arg + status), interleaved with the
+// ASSISTANT chat turn.
+func TestTailerEmitsToolActivityFrames(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, true, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	body := strings.Join([]string{
+		"[08:18:00] USER:",
+		"  [SIDE-PANEL CHAT] what's the weather?",
+		"",
+		"[OAT_MODEL] anthropic:claude-sonnet-4-6",
+		"[08:19:17] ASSISTANT:",
+		"  Checking now.",
+		"",
+		"[08:19:18] TOOL: web_search",
+		"  query: weather today",
+		"",
+		"[08:19:19] RESULT: web_search",
+		"  sunny",
+		"",
+		"[08:19:20] ASSISTANT:",
+		"  It's sunny.",
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	var sawToolStart, sawToolEnd, sawChatTurn bool
+	deadline := time.After(3 * time.Second)
+	for !(sawToolStart && sawToolEnd && sawChatTurn) {
+		select {
+		case fr := <-ch:
+			switch fr.Kind {
+			case "tool_start":
+				if fr.Tool == "web_search" && strings.Contains(fr.Arg, "weather today") {
+					sawToolStart = true
+				}
+			case "tool_end":
+				if fr.Tool == "web_search" && fr.Status == "ok" {
+					sawToolEnd = true
+				}
+			case "final", "question":
+				if strings.Contains(fr.Text, "sunny") {
+					sawChatTurn = true
+				}
+			}
+		case <-deadline:
+			t.Fatalf("did not observe all frames within 3s: tool_start=%v tool_end=%v chat=%v", sawToolStart, sawToolEnd, sawChatTurn)
+		}
+	}
+}
+
+// TestTailerToolEventsGatedOffForBrowserAgents verifies the
+// emitToolEvents=false path (the browser-agent / default case)
+// publishes NO tool frames — the browser agent's rows come from the
+// bridge's MCP hooks instead, and double-emitting would duplicate
+// every activity row in the side panel.
+func TestTailerToolEventsGatedOffForBrowserAgents(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, false, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	body := strings.Join([]string{
+		"[08:18:00] USER:",
+		"  [SIDE-PANEL CHAT] go",
+		"",
+		"[08:19:17] ASSISTANT:",
+		"  Working.",
+		"",
+		"[08:19:18] TOOL: browser_navigate",
+		"  url: https://example.com",
+		"",
+		"[08:19:19] RESULT: browser_navigate",
+		"  ok",
+		"",
+		"[08:19:20] ASSISTANT:",
+		"  Done.",
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case fr := <-ch:
+			if fr.Kind == "tool_start" || fr.Kind == "tool_end" {
+				t.Fatalf("unexpected tool frame with emitToolEvents=false: %+v", fr)
+			}
+			if fr.Done {
+				return
+			}
+		case <-deadline:
+			// No tool frames observed within the window → pass.
+			return
+		}
 	}
 }

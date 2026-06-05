@@ -75,7 +75,12 @@ func turnKey(sessionName, agentName string) string {
 // spot that builds the MCP config). The tailer must outlive the agent
 // briefly so any in-flight ASSISTANT block can be flushed; Stop() is
 // called when the agent process exits or when the daemon shuts down.
-func (d *Daemon) startAssistantTurnTailer(sessionName, agentName, logPath string) {
+//
+// emitToolEvents should be true ONLY for AgentTypeAssistant: it makes
+// the tailer publish TOOL/RESULT blocks as tool_start/tool_end
+// activity frames. Browser agents already surface tool rows via the
+// bridge's MCP hooks, so enabling it for them would double-render.
+func (d *Daemon) startAssistantTurnTailer(sessionName, agentName, logPath string, emitToolEvents bool) {
 	key := turnKey(sessionName, agentName)
 	d.assistantTurnTailersMu.Lock()
 	hadExisting := false
@@ -94,7 +99,7 @@ func (d *Daemon) startAssistantTurnTailer(sessionName, agentName, logPath string
 	// directly answer the operator question "did the daemon see the
 	// reply / hand it to the bridge?".
 	broadcaster := newTurnBroadcaster(d.logger.Info)
-	tailer := newAssistantTurnTailer(logPath, broadcaster, d.logger.Info)
+	tailer := newAssistantTurnTailer(logPath, broadcaster, emitToolEvents, d.logger.Info)
 	d.assistantTurnTailers[key] = tailer
 	d.assistantTurnTailersMu.Unlock()
 	tailer.Start(d.ctx)
@@ -131,6 +136,24 @@ func (d *Daemon) lookupAssistantTurnBroadcaster(sessionName, agentName string) *
 		return t.broadcaster
 	}
 	return nil
+}
+
+// armSidePanelAutoEmit flips the (session, agent) tailer's side-panel
+// auto-emit flag on at message-delivery time. Called from the daemon's
+// side-panel input paths (handleAgentInput + handleRouteUserMessage) the
+// instant a user message is handed to the agent, so the agent's replies
+// render even if the `[SIDE-PANEL CHAT]` sentinel lands in the agent's
+// log out of order (relying on the sentinel alone can suppress a busy
+// agent's turns). No-op if no tailer is registered yet — the
+// sentinel-parse path still covers that case.
+func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string) {
+	key := turnKey(sessionName, agentName)
+	d.assistantTurnTailersMu.Lock()
+	t := d.assistantTurnTailers[key]
+	d.assistantTurnTailersMu.Unlock()
+	if t != nil {
+		t.markSidePanelActive()
+	}
 }
 
 // stopAllAssistantTurnTailers tears down every active tailer.

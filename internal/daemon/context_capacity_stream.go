@@ -50,6 +50,8 @@ package daemon
 import (
 	"sync"
 	"time"
+
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
 // contextCapacityFrame is the wire shape sent over
@@ -317,6 +319,30 @@ func (d *Daemon) publishCapacityFrame(repoName, agentName, sessionName string, p
 	b := d.lookupOrCreateCapacityBroadcaster(sessionName, agentName)
 	b.Publish(frame)
 	return frame.Tier
+}
+
+// publishUnknownCapacityFrame broadcasts a neutral "unknown" capacity
+// frame for an agent whose live context-window reading was just reset
+// by a memory-wiping restart (SessionID rotation). Without this the
+// side-panel ring keeps showing the PRE-restart percentage until the
+// fresh langgraph thread emits its first per-turn token event — the
+// daemon's stored ContextWindowTokens is otherwise re-sent verbatim on
+// the next snapshot/reconnect. Two halves cover both timing cases:
+//   - already-connected subscribers get this Publish immediately;
+//   - a reconnecting subscriber's snapshot reads the persisted
+//     ContextWindowTokens==0 (the caller zeroes it in the same
+//     memory-wipe ModifyAgent) and renders unknown too.
+//
+// agent supplies the Model used to resolve the window limit. Only call
+// this from the memory-WIPE paths; a memory-preserving restart/resume
+// must keep its occupancy so the ring stays accurate.
+func (d *Daemon) publishUnknownCapacityFrame(repoName, agentName string, agent state.Agent) {
+	repo, ok := d.state.GetRepo(repoName)
+	if !ok {
+		return
+	}
+	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
+	d.publishCapacityFrame(repoName, agentName, repo.SessionName, 0, 0, limit, false)
 }
 
 // publishCapacityFrameIfTierChanged builds a contextCapacityFrame

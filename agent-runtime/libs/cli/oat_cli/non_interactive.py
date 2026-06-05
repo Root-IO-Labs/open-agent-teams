@@ -28,9 +28,9 @@ import signal
 import sys
 import threading
 import time
-from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from langchain.agents.middleware.human_in_the_loop import ActionRequest, HITLRequest
@@ -55,6 +55,8 @@ from oat_cli.sessions import generate_thread_id, get_checkpointer
 from oat_cli.tools import fetch_url, http_request, web_search
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from langchain_core.runnables import RunnableConfig
     from langgraph.pregel import Pregel
 
@@ -166,6 +168,18 @@ class StreamState:
     # cache_creation = tokens written to cache (25% surcharge on first call).
     spend_cache_read: int = 0
     spend_cache_creation: int = 0
+    # Token tracking (Path A: current context-window occupancy).
+    # OVERWRITTEN (not accumulated) with the latest main-agent,
+    # non-summarization turn's input/output token counts — that pair IS
+    # the current window size, which the daemon turns into a live "%
+    # full" capacity meter. Mirrors textual_adapter.py's Path A capture.
+    # The personal assistant runs the Textual runtime (which already
+    # emits this); the browser agent (and other headless agents) run THIS
+    # non-interactive runtime, so without this capture the daemon never
+    # learns the browser agent's occupancy and its capacity ring stays
+    # hidden.
+    context_input: int = 0
+    context_output: int = 0
 
 
 @dataclass
@@ -341,6 +355,22 @@ def _process_message_chunk(
             state.spend_cache_read += int(details.get("cache_read", 0) or 0)
             state.spend_cache_creation += int(details.get("cache_creation", 0) or 0)
 
+        # Path A (context-window occupancy): overwrite with the LATEST
+        # main-agent, non-summarization turn's counts. Summarization
+        # chunks are internal compression bookkeeping, not the
+        # user-visible window, so they must not move the meter. Emitted
+        # only when non-zero (downstream guard), so a usage-less chunk
+        # can't zero a previously-captured window.
+        is_summarization = bool(
+            metadata and metadata.get("lc_source") == "summarization"
+        )
+        if not is_summarization:
+            ctx_in = int(usage.get("input_tokens", 0) or 0)
+            ctx_out = int(usage.get("output_tokens", 0) or 0)
+            if ctx_in or ctx_out:
+                state.context_input = ctx_in
+                state.context_output = ctx_out
+
     # The summarization middleware injects synthetic messages to compress
     # conversation history for the LLM. These are internal bookkeeping and
     # should not be rendered to the user.
@@ -507,7 +537,7 @@ async def _stream_agent(
         console: Rich console for formatted output.
         file_op_tracker: Tracker for file-operation diffs.
     """
-    aiter = agent.astream(
+    astream_iter = agent.astream(
         stream_input,
         stream_mode=["messages", "updates"],
         subgraphs=True,
@@ -523,7 +553,7 @@ async def _stream_agent(
     spend_before_input = state.spend_input
     spend_before_output = state.spend_output
 
-    async for chunk in _idle_timeout_wrapper(aiter, idle_timeout, console):
+    async for chunk in _idle_timeout_wrapper(astream_iter, idle_timeout, console):
         _process_stream_chunk(chunk, state, console, file_op_tracker)
 
         if thinking_timeout > 0:
@@ -556,28 +586,37 @@ async def _stream_agent(
             state.spend_output,
             cache_read=state.spend_cache_read,
             cache_creation=state.spend_cache_creation,
+            context_input=state.context_input,
+            context_output=state.context_output,
         )
 
 
-async def _idle_timeout_wrapper(aiter, timeout_seconds: int, console: Console):
+async def _idle_timeout_wrapper(
+    astream_iter: AsyncIterator[object],
+    timeout_seconds: int,
+    console: Console,
+) -> AsyncIterator[object]:
     """Wrap an async iterator with an idle timeout.
 
-    Yields items from *aiter*. If no item arrives within *timeout_seconds*,
-    logs a warning and stops iteration. A timeout of 0 disables the check.
+    If no item arrives within *timeout_seconds*, logs a warning and stops
+    iteration. A timeout of 0 disables the check.
+
+    Yields:
+        Items from *astream_iter* as they arrive.
     """
     if timeout_seconds <= 0:
-        async for item in aiter:
+        async for item in astream_iter:
             yield item
         return
 
-    ait = aiter.__aiter__()
+    ait = aiter(astream_iter)
     while True:
         try:
-            item = await asyncio.wait_for(ait.__anext__(), timeout=timeout_seconds)
+            item = await asyncio.wait_for(anext(ait), timeout=timeout_seconds)
             yield item
         except StopAsyncIteration:
             break
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "Stream idle timeout: no data received for %ds, aborting API call",
                 timeout_seconds,
@@ -685,7 +724,7 @@ def _emit_oat_model() -> None:
     tool_log = os.environ.get("OAT_TOOL_LOG")
     if tool_log:
         try:
-            with open(tool_log, "a") as f:
+            with Path(tool_log).open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
                 f.flush()
         except OSError:
@@ -699,6 +738,8 @@ def _emit_oat_tokens(
     cumulative_output: int,
     cache_read: int = 0,
     cache_creation: int = 0,
+    context_input: int = 0,
+    context_output: int = 0,
 ) -> None:
     """Emit a structured [OAT_TOKENS] line for daemon parsing.
 
@@ -709,6 +750,13 @@ def _emit_oat_tokens(
       - ``delta_input`` / ``delta_output``: tokens spent this stream pass
       - ``cumulative_input`` / ``cumulative_output``: monotonic lifetime totals
       - ``cache_read`` / ``cache_creation``: Anthropic/DeepSeek cache metrics
+      - ``context_input`` / ``context_output``: CURRENT context-window
+        occupancy (latest main-agent, non-summarization turn). Emitted
+        only when non-zero so the daemon can drive a live "% full"
+        capacity meter from real window size; omitting on zero prevents
+        an idle/usage-less emission from zeroing a prior reading. This
+        is the non-interactive twin of textual_adapter._emit_oat_tokens
+        — keep the two field contracts in lockstep.
     """
     import json as _json
     from pathlib import Path
@@ -724,6 +772,11 @@ def _emit_oat_tokens(
     if cache_read > 0 or cache_creation > 0:
         payload["cache_read"] = cache_read
         payload["cache_creation"] = cache_creation
+    # Current context-window occupancy: emit only when non-zero so a
+    # usage-less stream pass can't clobber the daemon's stored window.
+    if context_input > 0 or context_output > 0:
+        payload["context_input"] = context_input
+        payload["context_output"] = context_output
     line = f"[OAT_TOKENS] {_json.dumps(payload)}"
     out = getattr(sys, "__stdout__", None) or sys.stdout
     print(line, file=out, flush=True)
@@ -831,6 +884,8 @@ async def run_non_interactive(
 
             When `False`, the full response is buffered and written to stdout in
             one shot after the agent finishes.
+        excluded_tools: Tool names to deny for this agent (e.g. the
+            browser-agent tool-catalog filter). `None` denies nothing.
 
     Returns:
         Exit code: 0 for success, 1 for error, 130 for keyboard interrupt.
@@ -917,7 +972,7 @@ async def run_non_interactive(
                     sorted(denied),
                 )
 
-            def _name_of(t: Any) -> str | None:
+            def _name_of(t: object) -> str | None:
                 name = getattr(t, "name", None)
                 if isinstance(name, str) and name:
                     return name

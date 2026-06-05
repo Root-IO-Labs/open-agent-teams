@@ -9,18 +9,22 @@ Covers:
 - Edge cases: no usage_metadata, zero values, interrupted requests
 """
 
+import io
 import json
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
+from rich.console import Console
 
+from oat_cli import non_interactive as ni
 from oat_cli.app import TextualTokenTracker, TokenSpendAccumulator
 from oat_cli.textual_adapter import (
     _commit_token_tracking,
     _emit_oat_tokens,
     _is_summarization_chunk,
 )
-
 
 # ---------------------------------------------------------------------------
 # Path A: TextualTokenTracker (context window)
@@ -133,7 +137,7 @@ class TestPathSeparation:
 
 
 class TestCommitTokenTracking:
-    def _make_adapter(self):
+    def _make_adapter(self) -> MagicMock:
         adapter = MagicMock()
         adapter._token_tracker = TextualTokenTracker(lambda _: None)
         adapter._spend_tracker = TokenSpendAccumulator()
@@ -194,7 +198,9 @@ class TestCommitTokenTracking:
 
 
 class TestEmitOatTokens:
-    def _capture_emit(self, adapter, delta_in, delta_out, context_in=0, context_out=0):
+    def _capture_emit(
+        self, adapter, delta_in, delta_out, context_in=0, context_out=0
+    ) -> str:
         """Call _emit_oat_tokens and capture its output.
 
         _emit_oat_tokens writes to sys.__stdout__ to bypass Textual's
@@ -237,7 +243,7 @@ class TestEmitOatTokens:
         assert payload["cumulative_output"] == 0
 
     def test_no_old_field_names(self):
-        """Old field names (input, output, total, cumulative_input as alias) are gone."""
+        """Old field-name aliases (input, output, total) are gone."""
         adapter = MagicMock()
         adapter._spend_tracker = TokenSpendAccumulator()
 
@@ -275,7 +281,7 @@ class TestEmitOatTokens:
         payload = json.loads(contents[0][len("[OAT_TOKENS] ") :])
         assert payload["cumulative_input"] == 500
 
-    def test_oat_tool_log_missing_is_noop(self, tmp_path, monkeypatch):
+    def test_oat_tool_log_missing_is_noop(self, monkeypatch):
         """Unset OAT_TOOL_LOG must not crash; stdout emission still works."""
         monkeypatch.delenv("OAT_TOOL_LOG", raising=False)
 
@@ -375,11 +381,11 @@ class TestProviderEdgeCases:
         tracker = TextualTokenTracker(lambda _: None)
 
         # Simulate: no usage captured at all (provider didn't report)
-        _adapter = MagicMock()
-        _adapter._token_tracker = tracker
-        _adapter._spend_tracker = acc
+        adapter = MagicMock()
+        adapter._token_tracker = tracker
+        adapter._spend_tracker = acc
 
-        _commit_token_tracking(_adapter, 0, 0, 0, 0)
+        _commit_token_tracking(adapter, 0, 0, 0, 0)
 
         assert acc.total == 0
         assert tracker.current_context == 0
@@ -410,3 +416,109 @@ class TestProviderEdgeCases:
         assert acc.total_input == 1300
         assert acc.total_output == 300
         assert acc.total == 1600
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive path (daemon-spawned assistants)
+# ---------------------------------------------------------------------------
+
+
+class TestNonInteractiveContextOccupancy:
+    """Path A capture + emission for the *non-interactive* runtime.
+
+    The personal assistant runs the Textual UI (which already emits Path A);
+    the browser agent and other headless agents run ``non_interactive``,
+    whose ``_emit_oat_tokens`` historically omitted
+    ``context_input``/``context_output``. The daemon therefore never
+    learned the browser agent's live window occupancy and its side-panel
+    capacity ring stayed perpetually hidden ("unknown"). These tests pin
+    the field contract and the overwrite/skip semantics. NB: this lives in
+    test_token_tracking.py (not test_non_interactive.py) because the CI
+    Python job only runs the token-tracking trio — putting the guard here
+    keeps it gated.
+    """
+
+    @staticmethod
+    def _capture_emit(**kwargs: int) -> dict:
+        old = sys.__stdout__
+        buf = io.StringIO()
+        sys.__stdout__ = buf  # type: ignore[misc]
+        try:
+            ni._emit_oat_tokens(**kwargs)
+        finally:
+            sys.__stdout__ = old  # type: ignore[misc]
+        line = buf.getvalue().strip()
+        return json.loads(line[len("[OAT_TOKENS] ") :])
+
+    def test_emit_includes_context_when_nonzero(self):
+        payload = self._capture_emit(
+            delta_input=1000,
+            delta_output=200,
+            cumulative_input=1000,
+            cumulative_output=200,
+            context_input=42000,
+            context_output=900,
+        )
+        assert payload["context_input"] == 42000
+        assert payload["context_output"] == 900
+
+    def test_emit_omits_context_when_zero(self):
+        payload = self._capture_emit(
+            delta_input=1000,
+            delta_output=200,
+            cumulative_input=1000,
+            cumulative_output=200,
+        )
+        assert "context_input" not in payload
+        assert "context_output" not in payload
+
+    @staticmethod
+    def _chunk(input_tokens, output_tokens, lc_source=None) -> tuple:
+        msg = AIMessage(content="hi")
+        msg.usage_metadata = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        metadata = {"lc_source": lc_source} if lc_source else {}
+        return (msg, metadata)
+
+    def test_main_turn_captures_window(self):
+        state = ni.StreamState()
+        with patch("oat_cli.non_interactive._process_ai_message"):
+            ni._process_message_chunk(
+                self._chunk(23133, 9), state, Console(quiet=True), MagicMock()
+            )
+        assert state.context_input == 23133
+        assert state.context_output == 9
+
+    def test_latest_main_turn_overwrites_window(self):
+        state = ni.StreamState()
+        with patch("oat_cli.non_interactive._process_ai_message"):
+            ni._process_message_chunk(
+                self._chunk(5000, 100), state, Console(quiet=True), MagicMock()
+            )
+            ni._process_message_chunk(
+                self._chunk(7000, 250), state, Console(quiet=True), MagicMock()
+            )
+        # Overwrite (not accumulate): the window is the LATEST turn's size.
+        assert state.context_input == 7000
+        assert state.context_output == 250
+
+    def test_summarization_chunk_does_not_move_window(self):
+        state = ni.StreamState()
+        with patch("oat_cli.non_interactive._process_ai_message"):
+            ni._process_message_chunk(
+                self._chunk(5000, 100), state, Console(quiet=True), MagicMock()
+            )
+            # Summarization still counts toward cumulative spend (Path B)
+            # but must NOT touch the user-visible window (Path A).
+            ni._process_message_chunk(
+                self._chunk(80000, 400, lc_source="summarization"),
+                state,
+                Console(quiet=True),
+                MagicMock(),
+            )
+        assert state.context_input == 5000
+        assert state.context_output == 100
+        assert state.spend_input == 85000
+        assert state.spend_output == 500

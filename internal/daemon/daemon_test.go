@@ -1783,6 +1783,94 @@ func TestHandleRouteUserMessage_Part7Commit3(t *testing.T) {
 	})
 }
 
+// TestHandleRouteUserMessage_Interrupt verifies the side-panel Interrupt
+// button's routed path: when the `interrupt` arg is set, the lone \x03
+// must survive sanitization (no sentinel prefix), and a malformed
+// interrupt (anything other than exactly \x03) must be rejected.
+func TestHandleRouteUserMessage_Interrupt(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	fake := &routeTestBackend{}
+	d.backend = fake
+
+	if err := d.state.AddRepo("test-repo", &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("test-repo", "assistant1", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "win-assistant1",
+		PID:        4242,
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	t.Run("valid interrupt delivers a lone Ctrl-C with no sentinel prefix", func(t *testing.T) {
+		before := len(fake.calls())
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":      "test-repo",
+				"agent":     "assistant1",
+				"text":      "\x03",
+				"interrupt": true,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("interrupt route should succeed; got: %s", resp.Error)
+		}
+		calls := fake.calls()
+		if len(calls) != before+1 {
+			t.Fatalf("expected 1 new SendMessage, got %d", len(calls)-before)
+		}
+		last := calls[len(calls)-1]
+		if last.Message != "\x03" {
+			t.Errorf("interrupt must deliver exactly the single byte \\x03, got %q", last.Message)
+		}
+		if strings.Contains(last.Message, sidePanelInputSentinel) {
+			t.Errorf("interrupt must NOT carry the side-panel sentinel: %q", last.Message)
+		}
+	})
+
+	t.Run("malformed interrupt (extra bytes) is rejected", func(t *testing.T) {
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":      "test-repo",
+				"agent":     "assistant1",
+				"text":      "\x03 rm -rf /",
+				"interrupt": true,
+			},
+		})
+		if resp.Success {
+			t.Fatal("an interrupt with extra bytes must be rejected")
+		}
+	})
+
+	t.Run("interrupt bypasses the per-target rate limit", func(t *testing.T) {
+		// Two interrupts back-to-back must BOTH succeed — a user must
+		// always be able to stop a runaway agent.
+		for i := 0; i < 2; i++ {
+			resp := d.handleRouteUserMessage(socket.Request{
+				Command: "route_user_message",
+				Args: map[string]interface{}{
+					"repo":      "test-repo",
+					"agent":     "assistant1",
+					"text":      "\x03",
+					"interrupt": true,
+				},
+			})
+			if !resp.Success {
+				t.Fatalf("interrupt #%d should not be rate-limited; got: %s", i+1, resp.Error)
+			}
+		}
+	})
+}
+
 // TestHandleRouteUserMessage_RateLimit_Part7Commit3 pins the
 // per-target throttle: two routes to the same agent within
 // the window must reject the second one with RPC_RATE_LIMITED,

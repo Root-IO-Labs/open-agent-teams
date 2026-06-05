@@ -388,6 +388,191 @@ func TestHandleRestartBrowserAgent_Validation(t *testing.T) {
 	})
 }
 
+// TestHandleRestartBrowserAgent_WipesAssistantMemory pins the contract
+// that the side-panel chat "Restart agent" button actually resets the
+// assistant's conversation memory, honouring its confirm-dialog promise
+// ("This wipes the agent's memory of this conversation"). The real
+// memory lives in ~/.oat/sessions.db keyed by thread_id (== SessionID),
+// so the wipe is implemented by rotating the langgraph thread: the
+// handler blanks SessionID before restartAgent, which mints a brand-new
+// one. A regression here (e.g. resuming the old --thread-id) silently
+// breaks the promise — exactly the bug reported 2026-06-04 ("it
+// remembers the old messages ... which is supposed to wipe the agent
+// memory"). This is deliberately the ONLY restart path that wipes; the
+// Manage-tab cards route through oat_assistant_* / oat_agent_* and
+// preserve memory (covered by their own tests).
+func TestHandleRestartBrowserAgent_WipesAssistantMemory(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	t.Setenv("OAT_TEST_MODE", "1")
+	// Disable the per-agent structured-event sidecar so the restart
+	// path doesn't leave an accept-loop goroutine behind (goleak in
+	// leak_test.go would otherwise fail the whole package). The
+	// SessionID-rotation logic under test is independent of it.
+	t.Setenv("OAT_USE_SIDECAR", "0")
+
+	const (
+		assistantName = "test1"
+		virtualRepo   = "_assistant-test1"
+		priorSession  = "00000000-0000-0000-0000-bbbbbbbbbbbb"
+	)
+	repo := &state.Repository{
+		SessionName: "oat-" + virtualRepo,
+		IsVirtual:   true,
+		Agents:      map[string]state.Agent{},
+	}
+	if err := d.state.AddRepo(virtualRepo, repo); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	wtPath := d.paths.AgentWorktree(virtualRepo, assistantName)
+	if err := os.MkdirAll(wtPath, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	if err := d.state.AddAgent(virtualRepo, assistantName, state.Agent{
+		Type:                state.AgentTypeAssistant,
+		WorktreePath:        wtPath,
+		WindowName:          assistantName,
+		SessionID:           priorSession,
+		ContextWindowTokens: 53300,
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	resp := d.handleRestartBrowserAgent(socket.Request{
+		Command: "restart_browser_agent",
+		Args: map[string]interface{}{
+			"session": repo.SessionName,
+			"agent":   assistantName,
+		},
+	})
+	if !resp.Success {
+		t.Fatalf("restart_browser_agent failed: %v", resp.Error)
+	}
+
+	postAgent, _ := d.state.GetAgent(virtualRepo, assistantName)
+	if postAgent.SessionID == priorSession {
+		t.Fatalf("SessionID was NOT rotated: still %q — the restart resumed the old thread, so memory was not wiped", postAgent.SessionID)
+	}
+	if postAgent.SessionID == "" {
+		t.Fatalf("SessionID is empty after restart — restartAgent should have minted a fresh thread id")
+	}
+	// Memory wipe must also reset the live context-window reading so the
+	// ring goes neutral instead of re-showing the pre-restart 53.3K.
+	if postAgent.ContextWindowTokens != 0 {
+		t.Fatalf("ContextWindowTokens = %d, want 0 — a memory-wiping restart must reset live occupancy so the ring doesn't show the old percentage", postAgent.ContextWindowTokens)
+	}
+}
+
+// TestHandleRestartAgent_FreshFlagControlsMemory is the companion to
+// TestHandleRestartBrowserAgent_WipesAssistantMemory: it pins the
+// Manage-tab card contract so the side-panel chat "Restart agent"
+// memory-wipe (which goes through restart_browser_agent) does NOT bleed
+// into the Manage-tab Pause/Resume/Restart buttons. Those route through
+// the SEPARATE restart_agent verb (oat_assistant_restart), where memory
+// reset is opt-in via the --fresh checkbox:
+//
+//   - fresh=false (Resume, and Restart with the box UNchecked) → the
+//     SessionID is preserved, so the langgraph thread resumes and the
+//     assistant keeps its memory.
+//   - fresh=true (Restart with --fresh checked) → the SessionID is
+//     rotated to a fresh thread, wiping memory.
+//
+// Reported 2026-06-04: "did you ensure those pause/resume/restart
+// buttons in the manage tab preserve memory and weren't affected by the
+// restart agent button in the burger menu fix?"
+func TestHandleRestartAgent_FreshFlagControlsMemory(t *testing.T) {
+	t.Setenv("OAT_TEST_MODE", "1")
+	t.Setenv("OAT_USE_SIDECAR", "0")
+
+	const (
+		assistantName = "test1"
+		virtualRepo   = "_assistant-test1"
+		priorSession  = "00000000-0000-0000-0000-cccccccccccc"
+	)
+
+	setup := func(t *testing.T) (*Daemon, func()) {
+		t.Helper()
+		d, cleanup := setupTestDaemon(t)
+		repo := &state.Repository{
+			SessionName: "oat-" + virtualRepo,
+			IsVirtual:   true,
+			Agents:      map[string]state.Agent{},
+		}
+		if err := d.state.AddRepo(virtualRepo, repo); err != nil {
+			t.Fatalf("AddRepo: %v", err)
+		}
+		wtPath := d.paths.AgentWorktree(virtualRepo, assistantName)
+		if err := os.MkdirAll(wtPath, 0o755); err != nil {
+			t.Fatalf("mkdir worktree: %v", err)
+		}
+		if err := d.state.AddAgent(virtualRepo, assistantName, state.Agent{
+			Type:                state.AgentTypeAssistant,
+			WorktreePath:        wtPath,
+			WindowName:          assistantName,
+			SessionID:           priorSession,
+			ContextWindowTokens: 53300,
+		}); err != nil {
+			t.Fatalf("AddAgent: %v", err)
+		}
+		return d, cleanup
+	}
+
+	t.Run("fresh=false preserves memory (Resume / Restart unchecked)", func(t *testing.T) {
+		d, cleanup := setup(t)
+		defer cleanup()
+		resp := d.handleRestartAgent(socket.Request{
+			Command: "restart_agent",
+			Args: map[string]interface{}{
+				"repo":  virtualRepo,
+				"agent": assistantName,
+				"force": true,
+				"fresh": false,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("restart_agent (fresh=false) failed: %v", resp.Error)
+		}
+		postAgent, _ := d.state.GetAgent(virtualRepo, assistantName)
+		if postAgent.SessionID != priorSession {
+			t.Fatalf("SessionID changed to %q — fresh=false must preserve the thread (memory)", postAgent.SessionID)
+		}
+		// Memory preserved → occupancy must be preserved too so the ring
+		// keeps showing the (accurate) resumed-thread percentage.
+		if postAgent.ContextWindowTokens != 53300 {
+			t.Fatalf("ContextWindowTokens = %d, want 53300 — fresh=false preserves memory, so live occupancy must be left intact", postAgent.ContextWindowTokens)
+		}
+	})
+
+	t.Run("fresh=true rotates the thread (Restart with --fresh)", func(t *testing.T) {
+		d, cleanup := setup(t)
+		defer cleanup()
+		resp := d.handleRestartAgent(socket.Request{
+			Command: "restart_agent",
+			Args: map[string]interface{}{
+				"repo":  virtualRepo,
+				"agent": assistantName,
+				"force": true,
+				"fresh": true,
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("restart_agent (fresh=true) failed: %v", resp.Error)
+		}
+		postAgent, _ := d.state.GetAgent(virtualRepo, assistantName)
+		if postAgent.SessionID == priorSession {
+			t.Fatalf("SessionID still %q — fresh=true must rotate the thread (wipe memory)", postAgent.SessionID)
+		}
+		if postAgent.SessionID == "" {
+			t.Fatalf("SessionID is empty — restartAgent should have minted a fresh thread id")
+		}
+		// Memory wiped → live occupancy must reset so the ring goes
+		// neutral instead of re-showing the old thread's percentage.
+		if postAgent.ContextWindowTokens != 0 {
+			t.Fatalf("ContextWindowTokens = %d, want 0 — fresh=true wipes memory, so live occupancy must reset", postAgent.ContextWindowTokens)
+		}
+	})
+}
+
 // TestHandleResetAssistantSession_Part5eSliceB4 pins the contract for
 // the Reset session button's daemon-side verb. What we verify:
 //

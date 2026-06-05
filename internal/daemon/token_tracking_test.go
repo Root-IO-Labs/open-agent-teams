@@ -134,6 +134,50 @@ func TestHandleTokenUsageEvent(t *testing.T) {
 		}
 	})
 
+	t.Run("stale cumulative still updates occupancy after restart", func(t *testing.T) {
+		// Regression: after an agent restart the cumulative counter resets to a
+		// fresh per-session value that is legitimately lower than the stored
+		// lifetime total. The monotonicity guard must drop the cumulative spend
+		// but must NOT discard the live context-window occupancy riding on the
+		// same event — otherwise the capacity ring freezes at the pre-restart
+		// value forever.
+		d, cleanup := setupTestDaemon(t)
+		defer cleanup()
+
+		repo := "test-repo"
+		agent := "test-agent"
+		d.state.AddRepo(repo, &state.Repository{GithubURL: "https://github.com/test/test"})
+		d.state.AddAgent(repo, agent, state.Agent{
+			Type:                state.AgentTypeAssistant,
+			InputTokens:         1_500_000,
+			OutputTokens:        64_019,
+			TotalTokens:         1_564_019,
+			ContextWindowTokens: 53_268,
+		})
+
+		// Post-restart event: cumulative resets far below stored total, but the
+		// occupancy reading is current and higher.
+		payload, _ := json.Marshal(map[string]int64{
+			"delta_input":       58_000,
+			"delta_output":      490,
+			"cumulative_input":  58_000,
+			"cumulative_output": 490,
+			"context_input":     58_000,
+			"context_output":    490,
+		})
+		d.handleTokenUsageEvent(repo, agent, string(payload))
+
+		a, _ := d.state.GetAgent(repo, agent)
+		// Cumulative spend is preserved (not rolled backward).
+		if a.TotalTokens != 1_564_019 {
+			t.Errorf("TotalTokens = %d, want 1564019 (cumulative must not roll back)", a.TotalTokens)
+		}
+		// Occupancy tracks the restarted agent's live context window.
+		if a.ContextWindowTokens != 58_490 {
+			t.Errorf("ContextWindowTokens = %d, want 58490 (occupancy must survive restart guard)", a.ContextWindowTokens)
+		}
+	})
+
 	t.Run("replayed same payload is idempotent", func(t *testing.T) {
 		d, cleanup := setupTestDaemon(t)
 		defer cleanup()

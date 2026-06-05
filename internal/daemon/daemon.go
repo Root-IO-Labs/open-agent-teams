@@ -3041,6 +3041,13 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 		}
 		return socket.ErrorResponse("failed to send input to agent '%s': %v", agentName, err)
 	}
+	// Arm side-panel auto-emit at DELIVERY time so the agent's replies
+	// render even if the `[SIDE-PANEL CHAT]` sentinel lands in its log
+	// out of order. Skip interrupts — a bare Ctrl-C carries no chat
+	// turn, and arming on it would be meaningless.
+	if !interrupt {
+		d.armSidePanelAutoEmit(repo.SessionName, agentName)
+	}
 	d.logger.Debug("agent_input delivered to %s/%s (interrupt=%v, len=%d)", repoName, agentName, interrupt, len(sanitized))
 	return socket.SuccessResponse(nil)
 }
@@ -3939,6 +3946,14 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	bridgeBondedRepo := getOptionalStringArg(req.Args, "bridge_bonded_repo", "")
 	bridgeBondedAgent := getOptionalStringArg(req.Args, "bridge_bonded_agent", "")
 
+	// When set, this routes a single Ctrl-C (0x03) to the selected chat
+	// target rather than ordinary chat text: the side-panel Interrupt
+	// button. The text MUST be exactly "\x03"; we enable the sanitizer's
+	// AllowInterrupt carve-out (a bare control char would otherwise be
+	// rejected as a possible injection) and skip the side-panel
+	// sentinel/active-tab prefix, since an interrupt carries no payload.
+	interrupt := getOptionalBoolArg(req.Args, "interrupt", false)
+
 	// Size cap (gate #5) FIRST — cheapest check, doesn't touch
 	// state, so a 50 MB junk payload doesn't even cost a map
 	// lookup. The byte length is in UTF-8 octets (Go strings are
@@ -3992,24 +4007,29 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// every other target's throttle check.
 	key := repoName + "/" + agentName
 	now := time.Now()
-	d.routeRateLimitMu.Lock()
-	if last, found := d.routeRateLimit[key]; found {
-		if now.Sub(last) < routeRateLimitWindow {
-			d.routeRateLimitMu.Unlock()
-			return socket.ErrorResponse(
-				"route to %s/%s rate-limited (RPC_RATE_LIMITED); minimum interval is %s",
-				repoName, agentName, routeRateLimitWindow,
-			)
+	// Interrupts bypass the rate limiter: stopping a runaway agent must
+	// never be throttled, and a user who just sent a message and
+	// immediately hits Interrupt would otherwise be told "rate-limited".
+	if !interrupt {
+		d.routeRateLimitMu.Lock()
+		if last, found := d.routeRateLimit[key]; found {
+			if now.Sub(last) < routeRateLimitWindow {
+				d.routeRateLimitMu.Unlock()
+				return socket.ErrorResponse(
+					"route to %s/%s rate-limited (RPC_RATE_LIMITED); minimum interval is %s",
+					repoName, agentName, routeRateLimitWindow,
+				)
+			}
 		}
+		d.routeRateLimitMu.Unlock()
 	}
-	d.routeRateLimitMu.Unlock()
 
 	// Sanitisation (gate #3). The same function gates the bonded
 	// user_message path (Part 2b), so a routed message is no
-	// more dangerous than a direct one. AllowInterrupt=false
-	// because the side-panel Interrupt button takes a separate
-	// code path; routed messages are always plain text.
-	sanitized, err := socket.SanitizePTYInput(text, socket.SanitizeOpts{})
+	// more dangerous than a direct one. AllowInterrupt mirrors the
+	// `interrupt` arg so the side-panel Interrupt button's single
+	// Ctrl-C survives the C0 filter (it must be exactly "\x03").
+	sanitized, err := socket.SanitizePTYInput(text, socket.SanitizeOpts{AllowInterrupt: interrupt})
 	if err != nil {
 		// Sanitiser oversize collapses into the same
 		// RPC_PAYLOAD_TOO_LARGE bucket as the 64 KiB pre-check
@@ -4024,6 +4044,26 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 			)
 		}
 		return socket.ErrorResponse("text failed sanitisation: %v", err)
+	}
+
+	if interrupt {
+		// An interrupt carries no chat payload — deliver the raw \x03
+		// straight to the PTY. No sentinel/active-tab prefix (those are
+		// for chat turns), no auto-emit arming (the agent was already
+		// armed by the message being interrupted).
+		windowName := agent.WindowName
+		if windowName == "" {
+			windowName = agentName
+		}
+		if sendErr := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); sendErr != nil {
+			return socket.ErrorResponse("backend.SendMessage failed for %s/%s: %v", repoName, agentName, sendErr)
+		}
+		d.logger.Info("route_user_message: interrupt (Ctrl-C) delivered to %s/%s", repoName, agentName)
+		return socket.SuccessResponse(map[string]interface{}{
+			"repo":      repoName,
+			"agent":     agentName,
+			"interrupt": true,
+		})
 	}
 
 	// Prepend the side-panel sentinel + optional active-tab-id
@@ -4051,6 +4091,14 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); err != nil {
 		return socket.ErrorResponse("backend.SendMessage failed for %s/%s: %v", repoName, agentName, err)
 	}
+
+	// Arm side-panel auto-emit at DELIVERY time (same rationale as
+	// handleAgentInput): the routed target's replies must render even
+	// if the `[SIDE-PANEL CHAT]` sentinel lands in its log after the
+	// reply turns. This is THE path the multi-agent chat picker uses
+	// (e.g. talking to a non-bonded assistant), and it's where the
+	// blackout was observed.
+	d.armSidePanelAutoEmit(repo.SessionName, agentName)
 
 	// Update rate-limit timestamp ONLY on success. See the
 	// routeRateLimit field doc for why failed routes don't
@@ -5348,7 +5396,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// Polling inside tailer.run() handles the "log file does not
 		// exist yet" case until the agent's first write.
 		if usesBrowserBridge(agent.Type) {
-			d.startAssistantTurnTailer(repo.SessionName, agentName, logFile)
+			d.startAssistantTurnTailer(repo.SessionName, agentName, logFile, agent.Type == state.AgentTypeAssistant)
 		}
 
 		handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
@@ -5779,19 +5827,23 @@ func (d *Daemon) handleAgentWaiting(req socket.Request) socket.Response {
 	return socket.SuccessResponse(nil)
 }
 
-// handleRestartBrowserAgent is the side-panel "Restart agent" path:
-// the bridge knows its own (session, agent) identity from
+// handleRestartBrowserAgent is the side-panel chat "Restart agent"
+// path: the bridge knows its own (session, agent) identity from
 // OAT_BROWSER_AGENT_SESSION / _NAME but does NOT know the repo name
 // — repo lives only on the daemon side. This handler accepts the
 // bridge's identity, resolves the repo via findRepoBySession, then
-// delegates to the same code path as `restart_agent --force`.
+// force-restarts the agent. For assistants it ALSO wipes the
+// langgraph thread first (see the SessionID-blank below) so the
+// restart honours the button's "wipes the agent's memory" promise —
+// this is the one restart path that resets memory; the Manage-tab
+// cards (oat_assistant_* / oat_agent_*) preserve it.
 //
 // Security model:
 //
-//   - Restricted to `state.AgentTypeBrowser` agents. Mirrors the
-//     defense-in-depth used by `agent_input` (line 2472): a
-//     misconfigured or malicious bridge MUST NOT be able to kick
-//     the supervisor or merge-queue.
+//   - Restricted to browser-bridge agent types (browser + assistant)
+//     via usesBrowserBridge. Mirrors the defense-in-depth used by
+//     `agent_input` (line 2472): a misconfigured or malicious bridge
+//     MUST NOT be able to kick the supervisor or merge-queue.
 //   - Always forces. A user clicking "Restart agent" in the side
 //     panel has unambiguously asked for a fresh start; gating on
 //     `force=false` here would just produce a confusing "already
@@ -5846,6 +5898,42 @@ func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
 		if err := d.backend.StopAgent(d.ctx, repo.SessionName, agent.WindowName); err != nil {
 			d.logger.Warn("Failed to stop prior agent %s/%s before side-panel restart: %v", repoName, agentName, err)
 		}
+	}
+
+	// Memory wipe (assistants only): the side-panel chat "Restart
+	// agent" button's confirm copy promises "This wipes the agent's
+	// memory of this conversation." Honour that — blank the SessionID
+	// so restartAgent mints a brand-new langgraph thread. The real
+	// memory lives in ~/.oat/sessions.db keyed by thread_id (==
+	// SessionID), NOT in the on-disk .session.jsonl, so blanking the
+	// id is what actually resets the context (mirrors the `fresh`
+	// path in handleRestartAgent). Without this the restart resumed
+	// the same thread via --resume and the assistant "remembered" the
+	// prior conversation despite the promise. This is deliberately
+	// distinct from the Manage-tab cards, which keep memory: Pause
+	// (oat_assistant_stop), Resume / Restart (oat_assistant_restart
+	// with fresh=false by default) and the browser-agent
+	// stop/restart (oat_agent_*) all route through OTHER verbs and
+	// are untouched here. Browser-bridge non-assistant agents have no
+	// langgraph thread, so the blank is a no-op for them (guarded).
+	if agent.Type == state.AgentTypeAssistant {
+		d.logger.Info("restart_browser_agent: %s/%s wiping memory; rotating langgraph thread (old=%s)", repoName, agentName, agent.SessionID)
+		agent.SessionID = ""
+		// Memory wipe also zeroes the live context-window reading: the
+		// fresh thread starts with no occupancy until its first turn,
+		// so the ring must go neutral immediately instead of re-showing
+		// the pre-restart percentage (a stale number from the old
+		// thread). publishUnknownCapacityFrame below pushes that to
+		// already-connected subscribers; the persisted 0 here seeds the
+		// snapshot a reconnecting subscriber gets.
+		agent.ContextWindowTokens = 0
+		if mErr := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+			a.SessionID = ""
+			a.ContextWindowTokens = 0
+		}); mErr != nil {
+			d.logger.Warn("failed to blank SessionID for side-panel restart of %s/%s: %v", repoName, agentName, mErr)
+		}
+		d.publishUnknownCapacityFrame(repoName, agentName, agent)
 	}
 
 	if err := d.restartAgent(repoName, agentName, agent, repo); err != nil {
@@ -6062,11 +6150,18 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 	if fresh && agent.Type == state.AgentTypeAssistant {
 		d.logger.Info("restart_agent: %s/%s --fresh requested; rotating langgraph thread (old=%s)", repoName, agentName, agent.SessionID)
 		agent.SessionID = ""
+		// Same reasoning as the side-panel restart: a --fresh wipe must
+		// also reset the live context-window reading so the ring goes
+		// neutral immediately rather than re-showing the old thread's
+		// percentage until the new thread's first turn.
+		agent.ContextWindowTokens = 0
 		if mErr := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
 			a.SessionID = ""
+			a.ContextWindowTokens = 0
 		}); mErr != nil {
 			d.logger.Warn("failed to blank SessionID for --fresh restart of %s/%s: %v", repoName, agentName, mErr)
 		}
+		d.publishUnknownCapacityFrame(repoName, agentName, agent)
 	}
 
 	// Restart the agent
@@ -8110,16 +8205,46 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 		return
 	}
 
+	// Current context-window occupancy is a POINT-IN-TIME gauge, independent
+	// of the cumulative-spend monotonicity guard below. After an agent restart
+	// the cumulative counter resets to a fresh per-session value that is
+	// legitimately LOWER than the stored lifetime total — the guard correctly
+	// refuses to roll cumulative spend backward, but it must NOT also discard
+	// the live occupancy reading riding on the same event, or the capacity ring
+	// freezes at the pre-restart value forever. Apply occupancy first, so it
+	// flows even when the cumulative totals are rejected as a restart replay.
+	// Update only when the payload carries it (>0) so the sidecar mirror — which
+	// omits these fields — can't clobber the stored value back to zero on its
+	// equal-cumulative no-op emission. This is the value the capacity % uses.
+	occupancyChanged := false
+	if payload.ContextInput > 0 || payload.ContextOutput > 0 {
+		newOccupancy := payload.ContextInput + payload.ContextOutput
+		if newOccupancy != agent.ContextWindowTokens {
+			agent.ContextWindowTokens = newOccupancy
+			occupancyChanged = true
+		}
+	}
+
 	// Monotonicity guard: cumulative must be >= existing combined total.
-	// Lower cumulative = stale/replayed event from restarted process → ignore.
-	// No delta fallback — delta replay is not safe.
+	// Lower cumulative = stale/replayed event from restarted process → ignore
+	// the cumulative-spend fields. No delta fallback — delta replay is not safe.
+	// Occupancy (above) is exempt: it is current, not cumulative.
 	newTotal := payload.CumulativeInput + payload.CumulativeOutput
 	oldTotal := agent.InputTokens + agent.OutputTokens
 	if newTotal < oldTotal {
 		d.logger.Warn(
-			"Dropped stale token usage for %s/%s: incoming total %d < stored %d (agent or daemon restart replay?)",
+			"Dropped stale cumulative token usage for %s/%s: incoming total %d < stored %d (agent or daemon restart replay?)",
 			repoName, agentName, newTotal, oldTotal,
 		)
+		// Still persist + publish the fresh occupancy reading so the capacity
+		// ring tracks the restarted agent's live context window.
+		if occupancyChanged {
+			agent.LastTokenUpdate = time.Now()
+			if err := d.state.UpdateAgent(repoName, agentName, agent); err != nil {
+				d.logger.Warn("Failed to persist occupancy for %s/%s: %v", repoName, agentName, err)
+			}
+			d.maybeNudgeContextCapacity(repoName, agentName, agent)
+		}
 		return
 	}
 
@@ -8151,13 +8276,8 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 	agent.TotalTokens = agent.InputTokens + agent.OutputTokens
 	agent.CacheReadTokens = newCacheRead
 	agent.CacheCreationTokens = newCacheCreation
-	// Current context-window occupancy. Update only when the payload
-	// carries it (>0) so the sidecar mirror — which omits these fields —
-	// can't clobber the stored value back to zero on its equal-cumulative
-	// no-op emission. This is the value the capacity % is computed from.
-	if payload.ContextInput > 0 || payload.ContextOutput > 0 {
-		agent.ContextWindowTokens = payload.ContextInput + payload.ContextOutput
-	}
+	// Context-window occupancy already applied above (it is exempt from the
+	// cumulative monotonicity guard so it survives an agent restart).
 	agent.LastTokenUpdate = time.Now()
 
 	if err := d.state.UpdateAgent(repoName, agentName, agent); err != nil {
@@ -8643,7 +8763,7 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// log file exists, so registering early when the file may not
 	// yet be created is safe.
 	if os.Getenv("OAT_TEST_MODE") != "1" && usesBrowserBridge(agent.Type) {
-		d.startAssistantTurnTailer(repo.SessionName, agentName, logFile)
+		d.startAssistantTurnTailer(repo.SessionName, agentName, logFile, agent.Type == state.AgentTypeAssistant)
 	}
 
 	handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
