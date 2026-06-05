@@ -237,7 +237,10 @@ func TestDeleteProduct(t *testing.T) {
 	}
 
 	// Confirm it is gone.
-	getResp, _ := http.Get(srv.URL + "/products/" + created.ID)
+	getResp, err := http.Get(srv.URL + "/products/" + created.ID)
+	if err != nil {
+		t.Fatalf("GET after delete: %v", err)
+	}
 	defer getResp.Body.Close()
 	if getResp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected 404 after delete, got %d", getResp.StatusCode)
