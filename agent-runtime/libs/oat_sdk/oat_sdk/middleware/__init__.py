@@ -5,10 +5,12 @@ from oat_sdk.middleware.memory import MemoryMiddleware
 from oat_sdk.middleware.skills import SkillsMiddleware
 from oat_sdk.middleware.subagents import CompiledSubAgent, SubAgent, SubAgentMiddleware
 from oat_sdk.middleware.summarization import SummarizationMiddleware, SummarizationToolMiddleware
+from oat_sdk.middleware.telemetry import LangfuseMiddleware
 
 __all__ = [
     "CompiledSubAgent",
     "FilesystemMiddleware",
+    "LangfuseMiddleware",
     "MemoryMiddleware",
     "SkillsMiddleware",
     "SubAgent",
