@@ -20,8 +20,13 @@ capabilities:
   multi_turn: 1.0
   large_output: 0.9
   effective_context_class: small
-  max_input_tokens: 65536
+  # Server vLLM --max-model-len was raised to 131072 (2026-06-11); set this to
+  # 96000 so the agent's usable window matches (daemon caps at 128K and reserves
+  # ~32K for output). Was 65536, which came from a langchain default, not the
+  # server. <100K so the class stays "small" per the daemon's thresholds.
+  max_input_tokens: 96000
   reasoning_controls: "none"
+  context_window_source: manual_override
 
 latency:
   ttft_ms: 357
