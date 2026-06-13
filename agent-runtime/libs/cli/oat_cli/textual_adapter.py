@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import UTC, datetime
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
 from langchain.agents.middleware.human_in_the_loop import (
     ApproveDecision,
@@ -96,6 +97,46 @@ def _is_summarization_chunk(metadata: dict | None) -> bool:
     if metadata is None:
         return False
     return metadata.get("lc_source") == "summarization"
+
+
+def _derive_tool_status(reported_status: str, tool_content_str: str) -> str:
+    """Promote a "success" tool result to "error" when its body is a
+    structured-error envelope.
+
+    Some MCP tools (notably the browser bridge) signal failure in-band by
+    returning a JSON envelope ``{"ok": false, "code": "...", ...}`` rather
+    than raising, so LangChain reports ``ToolMessage.status == "success"``.
+    We intentionally do NOT set ``isError`` on the tool message (it caused a
+    prior major bug — see CONTRIBUTING / CHANGELOG), so this is the seam that
+    keeps the conversation log and the side-panel label honest: inspect the
+    body and reclassify.
+
+    Detection is deliberately narrow — only an object whose ``ok`` is exactly
+    ``False`` counts — so a legitimate result that merely happens to contain a
+    ``code`` field is never mislabeled. Anything that does not parse as such an
+    envelope (plain text, truncated/"too large" results, multi-content blocks,
+    a successful ``{"ok": true}``) leaves the reported status untouched.
+
+    Args:
+        reported_status: The status LangChain attached to the ToolMessage.
+        tool_content_str: The stringified tool result content.
+
+    Returns:
+        ``"error"`` if a success result is actually a structured-error
+        envelope, otherwise ``reported_status`` unchanged.
+    """
+    if reported_status != "success":
+        return reported_status
+    text = tool_content_str.strip()
+    if not text.startswith("{"):
+        return reported_status
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return reported_status
+    if isinstance(parsed, dict) and parsed.get("ok") is False:
+        return "error"
+    return reported_status
 
 
 class TextualUIAdapter:
@@ -308,6 +349,138 @@ class ConversationLogger:
         self._file.close()
 
 
+# Optional graph-level stream idle watchdog (OPT-IN, default off).
+#
+# The primary defense against a network drop mid-generation now lives at
+# the MODEL layer: cloud chat models get a short per-chunk read timeout +
+# retries (see config.py `_network_resilience_kwargs`), which fails fast,
+# self-heals brief blips, and — crucially — does NOT span tool execution,
+# so a long-running tool (e.g. `npm install`) is never killed.
+#
+# This watchdog wraps the LangGraph `astream` instead, so its silence
+# window also covers tool execution; enabling it with a small value would
+# abort legitimately long tools. It is therefore disabled by default and
+# kept only as an opt-in last-resort backstop (e.g. for a wedged graph that
+# the model-level timeout can't see). Set OAT_STREAM_IDLE_TIMEOUT > 0 to
+# enable; pick a value comfortably larger than your longest tool call.
+_STREAM_IDLE_TIMEOUT_S = int(os.environ.get("OAT_STREAM_IDLE_TIMEOUT", "0"))
+
+# Time-to-first-chunk watchdog (ENABLED by default, unlike the idle one).
+#
+# This bounds ONLY the wait for the FIRST streamed item of each model
+# invocation. That first item always arrives before any tool runs, so a
+# short budget here fails fast on a message sent while offline WITHOUT
+# ever risking a long-running tool (the reason the idle watchdog above
+# must stay off).
+#
+# Why the model-level timeouts don't already cover this: the connect
+# timeout only applies to NEW connections. A send issued just after the
+# network dropped reuses a keep-alive connection that was pooled while
+# online, so the request blocks on the long per-chunk READ timeout (and
+# the SDK's internal retries) instead of the short connect timeout —
+# leaving the turn "thinking…" for minutes. A bounded first-chunk wait
+# caps that to a few tens of seconds.
+#
+# Set to 0 to disable. Raise it for reasoning models that buffer for a
+# long time before emitting their first streamed token.
+_STREAM_FIRST_CHUNK_TIMEOUT_S = int(
+    os.environ.get("OAT_STREAM_FIRST_CHUNK_TIMEOUT", "45")
+)
+
+
+class _StreamIdleTimeoutError(Exception):
+    """Raised when the model stream produces no data for too long.
+
+    Almost always a dropped network connection (either mid-generation, or
+    a send issued while already offline). Lets the turn fail fast (surface
+    an error, emit turn_end, drain the queue) instead of hanging
+    indefinitely.
+    """
+
+    def __init__(self, timeout_seconds: float) -> None:
+        super().__init__(f"model stream produced no data for {timeout_seconds}s")
+        self.timeout_seconds = timeout_seconds
+
+
+def _is_model_output_chunk(item: object) -> bool:
+    """Whether a LangGraph astream item is model output (network is alive).
+
+    The graph is streamed with ``stream_mode=["messages", "updates"]``. A
+    ``"messages"`` tuple is an actual LLM token / tool-call delta — proof
+    the model started responding, i.e. the connection is up. ``"updates"``
+    tuples come from local graph nodes (e.g. a fast pre-model node) and can
+    be emitted INSTANTLY even while offline, so they must NOT disarm the
+    first-output watchdog. Items that aren't the expected 3-tuple are
+    treated as non-output (defensive).
+    """
+    return isinstance(item, tuple) and len(item) == 3 and item[1] == "messages"  # noqa: PLR2004
+
+
+async def _astream_with_idle_timeout(
+    astream_iter: AsyncIterator[object],
+    timeout_seconds: float,
+    first_chunk_timeout_seconds: float = 0,
+    output_predicate: Callable[[object], bool] | None = None,
+) -> AsyncIterator[object]:
+    """Yield from *astream_iter* with first-output and per-item idle timeouts.
+
+    Until the model starts producing output, each wait uses
+    *first_chunk_timeout_seconds* — this is the window in which a send
+    issued while offline hangs (and it can span one or more instant local
+    ``updates`` chunks before the model is even called, which is why we
+    arm on *model output* rather than the literal first item). Once
+    *output_predicate* matches an item (or, when no predicate is given,
+    once the first item arrives) we disarm and fall back to
+    *timeout_seconds* (the idle budget, default off) so a long-running
+    tool is never killed. A value of 0 disables the watchdog for that
+    phase.
+
+    Wrapping each ``anext`` in ``asyncio.timeout`` also gives Stop /
+    Interrupt a real cancellation point: a bare blocking provider read may
+    never reach one, so cancelling the worker wouldn't abort a hung call.
+
+    Raises:
+        _StreamIdleTimeoutError: If an item does not arrive within the
+            budget that applies to it (our watchdog firing).
+        TimeoutError: Propagated unchanged when the provider SDK itself
+            raises a read/connection timeout, so the caller's
+            network-error handler can classify it.
+    """
+    if timeout_seconds <= 0 and first_chunk_timeout_seconds <= 0:
+        async for item in astream_iter:
+            yield item
+        return
+    ait = aiter(astream_iter)
+    # "armed" = still waiting for the model to start responding. While armed
+    # we use the (short) first-output budget; once disarmed we use the idle
+    # budget (default off) so tool execution isn't killed.
+    armed = first_chunk_timeout_seconds > 0
+    while True:
+        budget = first_chunk_timeout_seconds if armed else timeout_seconds
+        try:
+            if budget > 0:
+                try:
+                    async with asyncio.timeout(budget) as cm:
+                        item = await anext(ait)
+                except TimeoutError:
+                    # `cm.expired()` lets us tell OUR watchdog firing apart
+                    # from a real ``TimeoutError`` surfaced by the provider
+                    # SDK (e.g. an httpx read timeout). The latter must
+                    # propagate unchanged so the network-error handler can
+                    # write its final ASSISTANT block / "lost connection"
+                    # message — reclassifying it would swallow that.
+                    if cm.expired():
+                        raise _StreamIdleTimeoutError(budget) from None
+                    raise
+            else:
+                item = await anext(ait)
+        except StopAsyncIteration:
+            break
+        if armed and (output_predicate is None or output_predicate(item)):
+            armed = False
+        yield item
+
+
 async def execute_task_textual(
     user_input: str,
     agent: Any,  # noqa: ANN401  # Dynamic agent graph type
@@ -446,12 +619,17 @@ async def execute_task_textual(
             suppress_resumed_output = False
             pending_interrupts: dict[str, HITLRequest] = {}
 
-            async for chunk in agent.astream(
-                stream_input,
-                stream_mode=["messages", "updates"],
-                subgraphs=True,
-                config=config,
-                durability="exit",
+            async for chunk in _astream_with_idle_timeout(
+                agent.astream(
+                    stream_input,
+                    stream_mode=["messages", "updates"],
+                    subgraphs=True,
+                    config=config,
+                    durability="exit",
+                ),
+                _STREAM_IDLE_TIMEOUT_S,
+                _STREAM_FIRST_CHUNK_TIMEOUT_S,
+                _is_model_output_chunk,
             ):
                 if not isinstance(chunk, tuple) or len(chunk) != 3:  # noqa: PLR2004  # Retry count threshold
                     continue
@@ -616,6 +794,13 @@ async def execute_task_textual(
                         # is disabled.
                         tool_content_str = str(tool_content) if tool_content else ""
                         sidecar_call_id = getattr(message, "tool_call_id", "") or ""
+                        # Reclassify in-band structured-error envelopes
+                        # ({"ok": false, ...}) that LangChain still reports as
+                        # "success" because the tool returned instead of
+                        # raising. Keeps the conv log ("RESULT ... (error)"),
+                        # the sidecar emit, and the chat row label honest
+                        # without reintroducing the isError flag.
+                        tool_status = _derive_tool_status(tool_status, tool_content_str)
 
                         if conv_log:
                             conv_log.log_tool_result(
@@ -1000,6 +1185,55 @@ async def execute_task_textual(
             else:
                 break
 
+    except _StreamIdleTimeoutError as idle_exc:
+        # The model stream went silent for too long — almost always a
+        # dropped network connection (mid-generation, or a send issued
+        # while already offline so the first chunk never arrives). A
+        # half-open socket yields no bytes and no error. Fail the turn
+        # fast: surface an error so the user knows to retry, clear the
+        # spinner, emit turn_end so the side panel stops showing
+        # "thinking…", and return cleanly so _cleanup_agent_task runs and
+        # the turn queue drains instead of wedging behind a hung await.
+        idle_timeout_s = idle_exc.timeout_seconds
+        logger.warning(
+            "Model stream idle for %ds — aborting turn (likely lost network).",
+            idle_timeout_s,
+        )
+        if adapter._set_active_message:
+            adapter._set_active_message(None)
+        if adapter._set_spinner:
+            await adapter._set_spinner(None)
+
+        # Mark any in-flight tools as rejected so they don't linger as
+        # "running" in the UI / state after we bail out of the turn.
+        for tool_msg in list(adapter._current_tool_messages.values()):
+            tool_msg.set_rejected()
+        adapter._current_tool_messages.clear()
+
+        await adapter._mount_message(
+            AppMessage(
+                f"Connection to the model timed out after "
+                f"{idle_timeout_s}s with no response — this usually "
+                f"means the network dropped. Check your connection and send "
+                f"your message again."
+            )
+        )
+
+        # Failed work still counts as spend.
+        _commit_token_tracking(
+            adapter,
+            latest_main_context_input,
+            latest_main_context_output,
+            spend_input_delta,
+            spend_output_delta,
+            spend_cache_read_delta,
+            spend_cache_creation_delta,
+        )
+        sidecar_emitter.emit_turn_end()
+        if conv_log:
+            conv_log.close()
+        return
+
     except asyncio.CancelledError:
         # Clear active message immediately so it won't block pruning
         # If we don't do this, the store still thinks it's actice and protects
@@ -1090,6 +1324,55 @@ async def execute_task_textual(
         adapter._current_tool_messages.clear()
 
         # Report tokens even on interrupt — failed work still counts as spend
+        _commit_token_tracking(
+            adapter,
+            latest_main_context_input,
+            latest_main_context_output,
+            spend_input_delta,
+            spend_output_delta,
+            spend_cache_read_delta,
+            spend_cache_creation_delta,
+        )
+        sidecar_emitter.emit_turn_end()
+        if conv_log:
+            conv_log.close()
+        return
+
+    except Exception as exc:  # noqa: BLE001
+        from oat_cli.config import is_network_error
+
+        # Only handle network/timeout failures here; anything else propagates
+        # to the app-level handler which renders it as a generic "Agent error".
+        if not is_network_error(exc):
+            raise
+
+        # A dropped connection / model timeout, surfaced fast by the model's
+        # per-chunk read timeout + exhausted retries (see config.py). Fail the
+        # turn cleanly and — crucially — write a final ASSISTANT block to the
+        # conversation log so the daemon tailer emits a final chat_response and
+        # the side panel's "thinking…" indicator clears (turn_end alone does
+        # NOT clear it). Then return so the turn queue drains rather than
+        # wedging behind the error.
+        logger.warning("Model call failed (network/timeout): %s", exc)
+        if adapter._set_active_message:
+            adapter._set_active_message(None)
+        if adapter._set_spinner:
+            await adapter._set_spinner(None)
+
+        # In-flight tools shouldn't linger as "running" after we bail.
+        for tool_msg in list(adapter._current_tool_messages.values()):
+            tool_msg.set_rejected()
+        adapter._current_tool_messages.clear()
+
+        network_error_text = (
+            "Lost connection to the model (network error or timeout). "
+            "Check your internet and send your message again."
+        )
+        await adapter._mount_message(AppMessage(network_error_text))
+        if conv_log:
+            conv_log.log_assistant(network_error_text)
+
+        # Failed work still counts as spend.
         _commit_token_tracking(
             adapter,
             latest_main_context_input,

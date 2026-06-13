@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 
@@ -25,6 +26,7 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
+from oat_cli import sidecar_emitter
 from oat_cli.clipboard import copy_selection_to_clipboard
 from oat_cli.config import (
     DOCS_URL,
@@ -34,6 +36,7 @@ from oat_cli.config import (
     build_langsmith_thread_url,
     create_model,
     detect_provider,
+    is_network_error,
     is_shell_command_allowed,
     settings,
 )
@@ -63,15 +66,16 @@ from oat_cli.widgets.welcome import WelcomeBanner
 
 logger = logging.getLogger(__name__)
 
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from oat_sdk.backends import CompositeBackend
-    from oat_sdk.backends.sandbox import SandboxBackendProtocol
-    from oat_sdk.middleware.summarization import SummarizationMiddleware
     from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.pregel import Pregel
+    from oat_sdk.backends import CompositeBackend
+    from oat_sdk.backends.sandbox import SandboxBackendProtocol
+    from oat_sdk.middleware.summarization import SummarizationMiddleware
     from textual.app import ComposeResult
     from textual.events import Click, MouseUp, Paste, Resize
     from textual.scrollbar import ScrollUp
@@ -102,6 +106,21 @@ _IS_ITERM = (
 # Where OSC = ESC ] (0x1b 0x5d) and ST = ESC \ (0x1b 0x5c)
 _ITERM_CURSOR_GUIDE_OFF = "\x1b]1337;HighlightCursorLine=no\x1b\\"
 _ITERM_CURSOR_GUIDE_ON = "\x1b]1337;HighlightCursorLine=yes\x1b\\"
+
+# Marker for the side panel's "Compact conversation" directive. When the user
+# clicks Compact (extension overflow menu / capacity banner) or sends /compact
+# in the side panel, the bridge + daemon inject a one-line `[OAT-system]`
+# directive as PTY input. Historically that line was processed as an ordinary
+# user turn that merely *asked* the model to call `compact_conversation`, so
+# nothing happened until the model decided to (often only after a later user
+# message — the reported "button does nothing until I ask if it compacted"
+# bug). We instead detect the directive and run deterministic compaction, the
+# same code path as the TUI's /compact. Match on the stable marker substring
+# (plus the `[OAT-system]` system prefix) so minor wording drift in the bridge
+# directive can't silently regress to the model-nudge behavior. Keep the
+# canonical text in sync with bridge/src/oat-daemon-socket.ts and
+# internal/cli/assistant.go.
+_COMPACT_DIRECTIVE_MARKER = "User requested manual context compaction"
 
 
 def _format_token_count(count: int) -> str:
@@ -448,6 +467,31 @@ List what you captured and where you stored it:
 """  # noqa: E501
 
 
+def _consume_wakeup_marker_file(marker_file: str) -> str:
+    """Read and delete (consume-once) the wake-up marker payload file.
+
+    Synchronous on purpose — called via ``asyncio.to_thread`` so this tiny
+    one-shot startup file IO never blocks the event loop. Deletion is
+    best-effort so a later resume WITHOUT a fresh marker (env var unset)
+    can't re-inject a stale payload.
+
+    Returns:
+        The stripped marker text, or "" when the file is missing, empty,
+        or unreadable.
+    """
+    path = Path(marker_file)
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        logger.debug("Failed to read wake-up marker file", exc_info=True)
+        text = ""
+    with contextlib.suppress(OSError):
+        path.unlink()
+    return text
+
+
 class OatSdksApp(App):
     """Main Textual application for oat-cli."""
 
@@ -661,6 +705,13 @@ class OatSdksApp(App):
         # Size the spacer to fill remaining viewport below input
         self.call_after_refresh(self._size_initial_spacer)
 
+        # Inject the daemon's post-restart wake-up marker (if any) as silent
+        # thread context BEFORE any history display or initial-prompt turn.
+        # Awaited here so it lands before the user can submit, guaranteeing
+        # the model sees the stale-intent guard on its next turn without the
+        # marker fusing into the user's first message.
+        await self._inject_wakeup_marker()
+
         # Auto-submit initial prompt if provided via -m flag.
         # This check must come first because _lc_thread_id and _agent are
         # always set (even for brand-new sessions), so an elif after the
@@ -677,6 +728,43 @@ class OatSdksApp(App):
             self.call_after_refresh(
                 lambda: asyncio.create_task(self._load_thread_history())
             )
+
+    async def _inject_wakeup_marker(self) -> None:
+        """Inject the daemon's post-restart wake-up marker into the thread.
+
+        The daemon writes the marker text to a consume-once file pre-spawn
+        and points us at it via ``OAT_ASSISTANT_WAKEUP_MARKER_FILE``. We add
+        it to the thread via ``aupdate_state`` — NOT as a submitted turn — so
+        the model sees the "you just (re)started; do not act on rehydrated
+        history without a fresh trigger" guard on its next turn, without the
+        marker ever fusing into the user's first message (the PTY-race bug
+        this replaced) and without burning a model turn.
+
+        Best-effort: any failure degrades to "no marker injected" and never
+        blocks startup. The marker is defense-in-depth — the system-prompt
+        rule is the agent-side half.
+        """
+        marker_file = os.environ.get("OAT_ASSISTANT_WAKEUP_MARKER_FILE")
+        if not marker_file or not self._agent or not self._lc_thread_id:
+            return
+
+        # Read + delete off the event loop (blocking file IO).
+        text = await asyncio.to_thread(_consume_wakeup_marker_file, marker_file)
+        if not text:
+            return
+
+        from langchain_core.messages import HumanMessage
+
+        config: RunnableConfig = {
+            "configurable": {"thread_id": self._lc_thread_id}
+        }
+        try:
+            await self._agent.aupdate_state(
+                config, {"messages": [HumanMessage(content=text)]}
+            )
+            logger.info("Injected post-restart wake-up marker into thread")
+        except Exception:
+            logger.debug("Failed to inject wake-up marker into thread", exc_info=True)
 
     def on_resize(self, _event: Resize) -> None:
         """Handle terminal resize to recalculate layout."""
@@ -1045,6 +1133,19 @@ class OatSdksApp(App):
             value: The message text to process.
             mode: The input mode that determines message routing.
         """
+        # The side panel's "Compact conversation" button / capacity-banner
+        # "Compact now" / side-panel /compact all arrive here as an
+        # `[OAT-system]` PTY directive in normal mode. Run deterministic
+        # compaction directly (like the TUI /compact) instead of letting it
+        # ride through as a model turn that only *asks* the agent to compact.
+        if (
+            mode == "normal"
+            and value.lstrip().startswith("[OAT-system]")
+            and _COMPACT_DIRECTIVE_MARKER in value
+        ):
+            await self._handle_compact()
+            return
+
         if mode == "bash":
             await self._handle_bash_command(value.removeprefix("!"))
         elif mode == "command":
@@ -1661,22 +1762,39 @@ class OatSdksApp(App):
 
             await self._agent.aupdate_state(config, {"_summarization_event": new_event})
 
-            await self._mount_message(
-                AppMessage(
-                    "Conversation compacted. "
-                    f"Summarized {len(to_summarize)} messages into a concise summary.\n"
-                    f"Summarized context: {summarized_before} \u2192 "
-                    f"{summarized_after} tokens\n"
-                    f"Total context: {before} \u2192 {after} tokens "
-                    f"({pct}% decrease), {len(to_keep)} messages unchanged."
-                )
+            compact_message = (
+                "Conversation compacted. "
+                f"Summarized {len(to_summarize)} messages into a concise summary.\n"
+                f"Summarized context: {summarized_before} \u2192 "
+                f"{summarized_after} tokens\n"
+                f"Total context: {before} \u2192 {after} tokens "
+                f"({pct}% decrease), {len(to_keep)} messages unchanged."
             )
+            await self._mount_message(AppMessage(compact_message))
 
-            # Approximate token count via count_tokens_approximately (content
-            # tokens only; excludes system prompts and tool schemas). The next
-            # agent turn replaces this with the real count from usage_metadata.
+            # Estimate the post-compaction context-window occupancy so BOTH the
+            # TUI ring and the side-panel ring refresh immediately instead of
+            # waiting for the next turn's real usage_metadata. tokens_after is
+            # CONTENT-only (excludes system prompt + tool schemas), so feeding
+            # it raw would make the ring dip too low and then snap back up on
+            # the next turn. Subtract only the reclaimed content from the last
+            # known FULL occupancy, which preserves the (roughly constant)
+            # overhead; fall back to tokens_after when we have no prior reading.
+            old_occupancy = (
+                self._token_tracker.current_context if self._token_tracker else 0
+            )
+            reclaimed = max(0, tokens_before - tokens_after)
+            new_occupancy = (
+                old_occupancy - reclaimed if old_occupancy > reclaimed else tokens_after
+            )
             if self._token_tracker:
-                self._token_tracker.add(tokens_after)
+                self._token_tracker.add(new_occupancy)
+
+            # `_handle_compact` runs OUTSIDE execute_task_textual, so nothing
+            # has surfaced this result to the side panel — without this the
+            # user sees no "compacted" bubble and the side-panel ring stays
+            # stuck on the pre-compaction percentage until the next message.
+            self._emit_compact_result_to_clients(compact_message, new_occupancy)
 
         except Exception as exc:  # surface compaction errors to user
             logger.exception("Compaction failed")
@@ -1687,6 +1805,54 @@ class OatSdksApp(App):
                 await self._set_spinner(None)
             except Exception:  # best-effort spinner cleanup
                 logger.exception("Failed to dismiss spinner after compaction")
+
+    def _emit_compact_result_to_clients(
+        self, message: str, new_occupancy: int
+    ) -> None:
+        """Surface a deterministic-compaction result to the side panel.
+
+        ``_handle_compact`` runs OUTSIDE ``execute_task_textual``, so it has no
+        ``ConversationLogger`` and emits no turn events. Without this the side
+        panel shows nothing when the user hits Compact / runs ``/compact`` (the
+        agent never "spoke"), and the capacity ring keeps the stale
+        pre-compaction percentage until the next real turn. We bridge both:
+
+          1. Append an ``ASSISTANT`` block to ``OAT_TOOL_LOG`` so the daemon's
+             assistant-turn tailer renders a chat bubble — the same path the
+             agent's own ``compact_conversation`` narration travels, which is
+             why the user already sees self-initiated compactions in history.
+          2. Emit an ``[OAT_TOKENS]`` line carrying the post-compaction
+             context-window occupancy so the daemon recomputes the capacity
+             ring right away. That trailing marker also terminates the
+             ``ASSISTANT`` block so the bubble flushes immediately.
+
+        Best-effort: a logging/IO failure here must never abort compaction
+        (the state mutation already succeeded), and every emit is a no-op when
+        the relevant sink is absent (no ``OAT_TOOL_LOG`` / no UI adapter / no
+        sidecar socket), so the TUI ``/compact`` path is unaffected.
+        """
+        log_path = os.environ.get("OAT_TOOL_LOG")
+        if log_path:
+            from oat_cli.textual_adapter import ConversationLogger
+
+            try:
+                conv_log = ConversationLogger(log_path)
+                try:
+                    conv_log.log_assistant(message)
+                finally:
+                    conv_log.close()
+            except OSError:
+                logger.warning(
+                    "Failed to write compaction message to OAT_TOOL_LOG"
+                )
+
+        if new_occupancy > 0 and self._ui_adapter is not None:
+            from oat_cli.textual_adapter import _emit_oat_tokens
+
+            try:
+                _emit_oat_tokens(self._ui_adapter, 0, 0, new_occupancy, 0)
+            except Exception:  # ring refresh must not crash compaction
+                logger.exception("Failed to emit post-compaction token occupancy")
 
     async def _offload_messages_for_compact(
         self,
@@ -1835,13 +2001,25 @@ class OatSdksApp(App):
         except Exception as e:  # noqa: BLE001  # Resilient tool rendering
             # Ensure any in-flight tool calls don't remain stuck in "Running..."
             # when streaming aborts before tool results arrive.
-            safe_error = escape_markup(str(e))
-            if self._ui_adapter:
-                self._ui_adapter.finalize_pending_tools_with_error(
-                    f"Agent error: {safe_error}"
+            if is_network_error(e):
+                # Dropped connection / model timeout (after the SDK's retries).
+                # Give an actionable message rather than a raw error string.
+                error_text = (
+                    "Lost connection to the model (network error or timeout). "
+                    "Check your internet and send your message again."
                 )
-            await self._mount_message(ErrorMessage(f"Agent error: {safe_error}"))
+            else:
+                error_text = f"Agent error: {escape_markup(str(e))}"
+            if self._ui_adapter:
+                self._ui_adapter.finalize_pending_tools_with_error(error_text)
+            await self._mount_message(ErrorMessage(error_text))
         finally:
+            # Always close the side-panel turn so its "thinking…" indicator
+            # clears even when the turn ended via a propagating exception
+            # (execute_task_textual only emits turn_end on its own handled
+            # paths). emit_turn_end is idempotent — a no-op when the turn was
+            # already closed on the normal-completion path.
+            sidecar_emitter.emit_turn_end()
             # Clean up loading widget and agent state
             await self._cleanup_agent_task()
 

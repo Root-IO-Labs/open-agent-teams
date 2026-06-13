@@ -59,6 +59,91 @@ class TestInitialPromptOnMount:
         assert submitted == ["hello world"]
 
 
+class TestWakeUpMarkerInjection:
+    """Test the post-restart wake-up marker injection (_inject_wakeup_marker).
+
+    The daemon delivers the marker via a consume-once file pointed to by
+    OAT_ASSISTANT_WAKEUP_MARKER_FILE instead of a PTY write that raced the
+    not-yet-ready UI. The runtime injects it as silent thread context (no
+    submitted turn) and deletes the file.
+    """
+
+    async def test_injects_marker_as_thread_context(self, tmp_path) -> None:
+        """A present marker file is injected via aupdate_state, no model turn."""
+        from langchain_core.messages import HumanMessage
+
+        marker = "[OAT-system] you just (re)started; wait for the user."
+        marker_file = tmp_path / "wakeup-marker.pending"
+        marker_file.write_text(marker, encoding="utf-8")
+
+        mock_agent = MagicMock()
+        mock_agent.aupdate_state = AsyncMock()
+        app = OatSdksApp(agent=mock_agent, thread_id="thread-xyz")
+
+        with patch.dict(
+            os.environ,
+            {"OAT_ASSISTANT_WAKEUP_MARKER_FILE": str(marker_file)},
+            clear=False,
+        ):
+            await app._inject_wakeup_marker()
+
+        mock_agent.aupdate_state.assert_awaited_once()
+        config, update = mock_agent.aupdate_state.await_args.args
+        assert config == {"configurable": {"thread_id": "thread-xyz"}}
+        injected = update["messages"][0]
+        assert isinstance(injected, HumanMessage)
+        assert injected.content == marker
+        # Consume-once: file removed so a later resume can't re-inject.
+        assert not marker_file.exists()
+
+    async def test_noop_when_env_unset(self) -> None:
+        """No env var → nothing injected, no crash."""
+        mock_agent = MagicMock()
+        mock_agent.aupdate_state = AsyncMock()
+        app = OatSdksApp(agent=mock_agent, thread_id="thread-xyz")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OAT_ASSISTANT_WAKEUP_MARKER_FILE", None)
+            await app._inject_wakeup_marker()
+
+        mock_agent.aupdate_state.assert_not_awaited()
+
+    async def test_noop_when_file_missing(self, tmp_path) -> None:
+        """Env points at a non-existent file → nothing injected, no crash."""
+        missing = tmp_path / "does-not-exist.pending"
+        mock_agent = MagicMock()
+        mock_agent.aupdate_state = AsyncMock()
+        app = OatSdksApp(agent=mock_agent, thread_id="thread-xyz")
+
+        with patch.dict(
+            os.environ,
+            {"OAT_ASSISTANT_WAKEUP_MARKER_FILE": str(missing)},
+            clear=False,
+        ):
+            await app._inject_wakeup_marker()
+
+        mock_agent.aupdate_state.assert_not_awaited()
+
+    async def test_empty_file_consumed_without_injection(self, tmp_path) -> None:
+        """An empty/whitespace marker file is deleted but never injected."""
+        marker_file = tmp_path / "wakeup-marker.pending"
+        marker_file.write_text("   \n", encoding="utf-8")
+
+        mock_agent = MagicMock()
+        mock_agent.aupdate_state = AsyncMock()
+        app = OatSdksApp(agent=mock_agent, thread_id="thread-xyz")
+
+        with patch.dict(
+            os.environ,
+            {"OAT_ASSISTANT_WAKEUP_MARKER_FILE": str(marker_file)},
+            clear=False,
+        ):
+            await app._inject_wakeup_marker()
+
+        mock_agent.aupdate_state.assert_not_awaited()
+        assert not marker_file.exists()
+
+
 class TestAppCSSValidation:
     """Test that app CSS is valid and doesn't cause runtime errors."""
 

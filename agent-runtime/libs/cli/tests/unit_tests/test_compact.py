@@ -15,6 +15,7 @@ from oat_cli.widgets.messages import AppMessage, ErrorMessage
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from pathlib import Path
 
 # Patch target for count_tokens_approximately used inside _handle_compact
 _TOKEN_COUNT_PATH = "langchain_core.messages.utils.count_tokens_approximately"
@@ -331,6 +332,9 @@ class TestCompactSuccess:
             await pilot.pause()
             _setup_compact_app(app)
             app._token_tracker = MagicMock()
+            # current_context is an int in production (last full window
+            # occupancy); the post-compaction estimate reads it arithmetically.
+            app._token_tracker.current_context = 1000
 
             with (
                 _mock_middleware(cutoff=4, summary="Summary."),
@@ -346,6 +350,44 @@ class TestCompactSuccess:
                 await pilot.pause()
 
             app._token_tracker.add.assert_called_once()
+
+    async def test_compaction_emits_to_side_panel(self, tmp_path: Path) -> None:
+        """A button/slash compaction must surface to the side panel.
+
+        ``_handle_compact`` runs outside ``execute_task_textual``, so it has to
+        write the result itself: an ``ASSISTANT`` block to ``OAT_TOOL_LOG`` (the
+        daemon renders this as a chat bubble) plus an ``[OAT_TOKENS]`` line so
+        the capacity ring refreshes immediately instead of next turn.
+        """
+        log_file = tmp_path / "tool.log"
+        app = OatSdksApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            _setup_compact_app(app)
+            app._token_tracker = MagicMock()
+            app._token_tracker.current_context = 5000
+            # _emit_oat_tokens reads adapter._spend_tracker; None => cumulative 0.
+            app._ui_adapter = MagicMock()
+            app._ui_adapter._spend_tracker = None
+
+            with (
+                _mock_middleware(cutoff=4, summary="Summary."),
+                patch.object(
+                    app,
+                    "_offload_messages_for_compact",
+                    new_callable=AsyncMock,
+                    return_value=None,
+                ),
+                patch(_TOKEN_COUNT_PATH, return_value=500),
+                patch.dict("os.environ", {"OAT_TOOL_LOG": str(log_file)}),
+            ):
+                await app._handle_compact()
+                await pilot.pause()
+
+        content = log_file.read_text(encoding="utf-8")
+        assert "ASSISTANT:" in content
+        assert "Conversation compacted." in content
+        assert "[OAT_TOKENS]" in content
 
     async def test_no_ui_clear_reload(self) -> None:
         """Should NOT clear/reload UI since messages stay in state."""
@@ -896,6 +938,77 @@ class TestCompactRouting:
 
             msgs = app.query(AppMessage)
             assert any("Nothing to compact" in str(w._content) for w in msgs)
+
+
+_COMPACT_DIRECTIVE = (
+    "[OAT-system] User requested manual context compaction. "
+    "Call compact_conversation now before your next reply."
+)
+
+
+class TestSidePanelCompactDirectiveRouting:
+    """The side-panel Compact button arrives as an `[OAT-system]` PTY line.
+
+    It must run deterministic compaction (like /compact) rather than be sent
+    to the model as an ordinary turn — the regression where clicking Compact
+    did nothing until the user separately asked the agent to compact.
+    """
+
+    async def test_directive_runs_deterministic_compaction(self) -> None:
+        """The canonical directive routes to `_handle_compact`, not the model."""
+        app = OatSdksApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with (
+                patch.object(
+                    app, "_handle_compact", new_callable=AsyncMock
+                ) as mock_compact,
+                patch.object(
+                    app, "_handle_user_message", new_callable=AsyncMock
+                ) as mock_user,
+            ):
+                await app._process_message(_COMPACT_DIRECTIVE, "normal")
+                await pilot.pause()
+
+            mock_compact.assert_awaited_once()
+            mock_user.assert_not_awaited()
+
+    async def test_directive_tolerates_trailing_whitespace(self) -> None:
+        """A PTY-delivered directive with surrounding whitespace still routes."""
+        app = OatSdksApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with (
+                patch.object(
+                    app, "_handle_compact", new_callable=AsyncMock
+                ) as mock_compact,
+                patch.object(app, "_handle_user_message", new_callable=AsyncMock),
+            ):
+                await app._process_message(f"  {_COMPACT_DIRECTIVE}\n", "normal")
+                await pilot.pause()
+
+            mock_compact.assert_awaited_once()
+
+    async def test_ordinary_message_is_not_treated_as_compact(self) -> None:
+        """A normal user message must not be hijacked by the directive check."""
+        app = OatSdksApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            with (
+                patch.object(
+                    app, "_handle_compact", new_callable=AsyncMock
+                ) as mock_compact,
+                patch.object(
+                    app, "_handle_user_message", new_callable=AsyncMock
+                ) as mock_user,
+            ):
+                await app._process_message(
+                    "please compact the conversation when you can", "normal"
+                )
+                await pilot.pause()
+
+            mock_compact.assert_not_awaited()
+            mock_user.assert_awaited_once()
 
 
 class TestFormatTokenCount:

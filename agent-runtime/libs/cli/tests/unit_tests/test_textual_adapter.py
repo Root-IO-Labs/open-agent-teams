@@ -4,6 +4,7 @@ import asyncio
 from asyncio import Future
 from collections.abc import AsyncIterator, Generator
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -13,9 +14,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from oat_cli.textual_adapter import (
     TextualUIAdapter,
+    _astream_with_idle_timeout,
     _build_interrupted_ai_message,
     _build_stream_config,
+    _derive_tool_status,
     _is_summarization_chunk,
+    _StreamIdleTimeoutError,
     execute_task_textual,
 )
 from oat_cli.widgets.messages import SummarizationMessage
@@ -33,6 +37,162 @@ def _mock_approval() -> Future[object]:
 
 def _noop_status(_: str) -> None:
     """No-op status callback for tests."""
+
+
+async def _noop_spinner(_status: str | None) -> None:
+    """No-op async spinner callback for tests."""
+
+
+class TestAstreamIdleTimeout:
+    """Tests for the `_astream_with_idle_timeout` stream watchdog."""
+
+    async def test_passes_items_through_when_stream_is_active(self) -> None:
+        async def gen() -> AsyncIterator[int]:
+            for i in range(3):
+                await asyncio.sleep(0)
+                yield i
+
+        got = [item async for item in _astream_with_idle_timeout(gen(), 5)]
+        assert got == [0, 1, 2]
+
+    async def test_zero_timeout_disables_watchdog(self) -> None:
+        async def gen() -> AsyncIterator[str]:
+            await asyncio.sleep(0.05)
+            yield "ok"
+
+        got = [item async for item in _astream_with_idle_timeout(gen(), 0)]
+        assert got == ["ok"]
+
+    async def test_raises_on_idle_stream_instead_of_hanging(self) -> None:
+        # First item arrives, then the stream goes silent forever —
+        # simulating a half-open socket after a dropped network. The
+        # watchdog must raise rather than hang.
+        async def gen() -> AsyncIterator[int]:
+            yield 1
+            await asyncio.Event().wait()  # never resolves
+
+        async def drain() -> list[int]:
+            return [item async for item in _astream_with_idle_timeout(gen(), 1)]
+
+        with pytest.raises(_StreamIdleTimeoutError):
+            await drain()
+
+    async def test_first_chunk_timeout_raises_when_first_item_never_arrives(
+        self,
+    ) -> None:
+        # Simulates a message sent while already offline: the first chunk
+        # never arrives. With the idle watchdog OFF (0) but the first-chunk
+        # budget ON, the turn must still fail fast.
+        async def gen() -> AsyncIterator[int]:
+            await asyncio.Event().wait()  # never resolves
+            yield 1  # pragma: no cover - never reached
+
+        async def drain() -> list[int]:
+            return [
+                item
+                async for item in _astream_with_idle_timeout(
+                    gen(), 0, first_chunk_timeout_seconds=1
+                )
+            ]
+
+        with pytest.raises(_StreamIdleTimeoutError) as exc_info:
+            await drain()
+        assert exc_info.value.timeout_seconds == 1
+
+    async def test_stays_armed_past_instant_non_output_chunks(self) -> None:
+        # Reproduces the real LangGraph shape: an instant local "updates"
+        # chunk arrives first (even while offline), THEN the model gap hangs.
+        # The watchdog must stay armed past the instant chunk and still fire
+        # on the hanging wait for the first model-output chunk.
+        async def gen() -> AsyncIterator[tuple[str, str, dict[str, object]]]:
+            yield ("ns", "updates", {})  # instant local node event
+            await asyncio.Event().wait()  # model never responds (offline)
+            yield ("ns", "messages", {})  # never reached
+
+        def is_output(item: object) -> bool:
+            return isinstance(item, tuple) and len(item) == 3 and item[1] == "messages"
+
+        async def drain() -> list[object]:
+            return [
+                item
+                async for item in _astream_with_idle_timeout(
+                    gen(), 0, first_chunk_timeout_seconds=1, output_predicate=is_output
+                )
+            ]
+
+        with pytest.raises(_StreamIdleTimeoutError):
+            await drain()
+
+    async def test_output_predicate_disarms_after_model_output(self) -> None:
+        # Once a model-output chunk arrives, a later long gap (a tool call)
+        # must NOT fire — the idle budget is off, so tools aren't killed.
+        async def gen() -> AsyncIterator[tuple[str, str, dict[str, object]]]:
+            yield ("ns", "updates", {})
+            yield ("ns", "messages", {"tok": "a"})
+            await asyncio.sleep(0.1)  # tool-execution gap > first-output budget
+            yield ("ns", "messages", {"tok": "b"})
+
+        def is_output(item: object) -> bool:
+            return isinstance(item, tuple) and len(item) == 3 and item[1] == "messages"
+
+        got = [
+            item
+            async for item in _astream_with_idle_timeout(
+                gen(), 0, first_chunk_timeout_seconds=0.05, output_predicate=is_output
+            )
+        ]
+        assert len(got) == 3
+
+    async def test_first_chunk_timeout_does_not_apply_after_first_item(self) -> None:
+        # After the first item arrives, a long gap (e.g. a slow tool) must
+        # NOT trip the watchdog when the idle budget is disabled. This is
+        # why the first-chunk budget is safe to enable by default while the
+        # idle one stays off.
+        async def gen() -> AsyncIterator[int]:
+            yield 1
+            await asyncio.sleep(0.1)  # longer than the first-chunk budget
+            yield 2
+
+        got = [
+            item
+            async for item in _astream_with_idle_timeout(
+                gen(), 0, first_chunk_timeout_seconds=0.05
+            )
+        ]
+        assert got == [1, 2]
+
+
+class TestDeriveToolStatus:
+    """Tests for `_derive_tool_status` structured-error reclassification."""
+
+    def test_structured_error_envelope_becomes_error(self) -> None:
+        """A success result whose body is {"ok": false, ...} -> "error"."""
+        body = '{"ok": false, "code": "EXTENSION_NOT_CONNECTED", "message": "down"}'
+        assert _derive_tool_status("success", body) == "error"
+
+    def test_ok_true_envelope_stays_success(self) -> None:
+        """A genuine success envelope is left untouched."""
+        assert _derive_tool_status("success", '{"ok": true, "result": 1}') == "success"
+
+    def test_plain_text_result_stays_success(self) -> None:
+        """Non-JSON content is never reclassified."""
+        assert _derive_tool_status("success", "all good") == "success"
+
+    def test_result_without_ok_field_stays_success(self) -> None:
+        """An object that merely has a `code` field is not an error envelope."""
+        assert _derive_tool_status("success", '{"code": "X", "value": 2}') == "success"
+
+    def test_malformed_or_truncated_json_stays_success(self) -> None:
+        """Truncated / "too large" results that don't parse fail gracefully."""
+        assert _derive_tool_status("success", '{"ok": false, "message": "tru') == "success"
+
+    def test_already_error_is_preserved(self) -> None:
+        """A status that is already non-success is returned unchanged."""
+        assert _derive_tool_status("error", "anything") == "error"
+
+    def test_ok_false_with_surrounding_whitespace(self) -> None:
+        """Leading/trailing whitespace around the envelope still detected."""
+        assert _derive_tool_status("success", '  {"ok": false}\n') == "error"
 
 
 class TestTextualUIAdapterInit:
@@ -187,6 +347,81 @@ class _FakeAgent:
         """Yield preconfigured stream chunks."""
         for chunk in self._chunks:
             yield chunk
+
+
+class _RaisingAgent:
+    """Async stream agent that raises a preset exception on first item."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def astream(self, *_: Any, **__: Any) -> AsyncIterator[tuple[Any, ...]]:
+        """Raise the configured exception when iteration begins."""
+        raise self._exc
+        yield  # pragma: no cover - makes this an async generator
+
+
+class TestExecuteTaskTextualNetworkFailure:
+    """A model network/timeout failure should fail the turn cleanly."""
+
+    async def test_network_error_writes_final_assistant_block(
+        self, tmp_path: Path
+    ) -> None:
+        """Dropped connection: handled (not propagated) + final block logged.
+
+        A final ASSISTANT block in the conversation log is what lets the
+        daemon tailer emit a final chat_response so the side panel clears.
+        """
+        mounted: list[object] = []
+
+        async def mount_message(widget: object) -> None:
+            await asyncio.sleep(0)
+            mounted.append(widget)
+
+        log_path = tmp_path / "conversation.log"
+        adapter = TextualUIAdapter(
+            mount_message=mount_message,
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=_noop_spinner,
+        )
+
+        # Must not raise — the network failure is handled internally.
+        await execute_task_textual(
+            user_input="hello",
+            agent=_RaisingAgent(TimeoutError("read timeout")),
+            assistant_id="assistant",
+            session_state=SimpleNamespace(thread_id="t-net", auto_approve=False),
+            adapter=adapter,
+            conversation_log_path=str(log_path),
+        )
+
+        # A final ASSISTANT block (with the user-facing error) lands in the
+        # conversation log -> daemon tailer emits a final chat_response ->
+        # side panel "thinking…" clears.
+        log_text = log_path.read_text(encoding="utf-8")
+        assert "ASSISTANT:" in log_text
+        assert "Lost connection to the model" in log_text
+
+    async def test_non_network_error_propagates(self, tmp_path: Path) -> None:
+        """A non-network exception still bubbles to the app-level handler."""
+        log_path = tmp_path / "conversation.log"
+        adapter = TextualUIAdapter(
+            mount_message=_mock_mount,
+            update_status=_noop_status,
+            request_approval=_mock_approval,
+            set_spinner=_noop_spinner,
+        )
+
+        with pytest.raises(ValueError, match="boom"):
+            await execute_task_textual(
+                user_input="hello",
+                agent=_RaisingAgent(ValueError("boom")),
+                assistant_id="assistant",
+                session_state=SimpleNamespace(thread_id="t-x", auto_approve=False),
+                adapter=adapter,
+                conversation_log_path=str(log_path),
+            )
 
 
 class TestExecuteTaskTextualSummarizationFeedback:
