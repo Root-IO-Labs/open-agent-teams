@@ -5,7 +5,7 @@
 model_id: "spark:bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4"
 status: known
 source: onboarded
-onboarded_at: "2026-04-20"
+onboarded_at: "2026-06-10"
 
 provider:
   name: spark
@@ -13,7 +13,7 @@ provider:
 capabilities:
   tool_reliability: 1.0
   shell_roundtrip: 0.8
-  shell_recovery: 0.33
+  shell_recovery: 0.55
   file_write_reliability: 1.0
   token_reporting: 0.85
   streaming: 1.0
@@ -29,23 +29,23 @@ capabilities:
   context_window_source: manual_override
 
 latency:
-  ttft_ms: 357
-  basic_inference_ms: 493
-  tool_calling_ms: 463
-  token_reporting_ms: 310
-  streaming_ms: 528
-  streaming_tokens_ms: 503
-  shell_roundtrip_ms: 1505
-  shell_failure_recovery_ms: 4614
-  file_write_via_tool_ms: 646
-  multi_turn_ms: 7777
-  large_output_ms: 15714
+  ttft_ms: 341
+  basic_inference_ms: 429
+  tool_calling_ms: 550
+  token_reporting_ms: 281
+  streaming_ms: 449
+  streaming_tokens_ms: 390
+  shell_roundtrip_ms: 1521
+  shell_failure_recovery_ms: 7428
+  file_write_via_tool_ms: 605
+  multi_turn_ms: 6475
+  large_output_ms: 16423
   routing_decision_ms: 1528
-  avg_ms: 3098
+  avg_ms: 3279
 
 routing:
   autonomy_tier: standard
-  overall_score: 81
+  overall_score: 84
 
 contract:
   onboarding_passed: true
@@ -56,11 +56,11 @@ evidence:
   probe_version: 2
   probe_set: default
   probes_run: 13
-  probes_passed: 10
+  probes_passed: 11
   resolution_fallback: false
+  retries_needed: 0
   probe_errors:
     streaming_tokens: "Streaming works but no chunk carried usage_metadata"
 
 warnings:
   - "Streaming works but doesn't report usage_metadata per-chunk"
-  - "Model does not recover from shell failures — may get stuck on errors"
