@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agents recover from unstable networks instead of hanging on
+  "thinking…" for ~30 minutes.** A WiFi/network drop mid-generation left
+  the model call blocked on the SDK's default ~30-minute request timeout,
+  so the side panel sat on "thinking…" with no `turn_end` and the turn
+  queue wedged. The fix moves resilience to the model layer, where it
+  belongs:
+  - Cloud chat models now get a short **per-chunk read timeout** (default
+    90s, `OAT_API_TIMEOUT`) plus **retries** (default 3,
+    `OAT_API_MAX_RETRIES`). A dropped connection now fails in seconds, and
+    a brief blip self-heals via the SDK's exponential backoff — so a
+    momentary WiFi flap recovers without intervention. The 3rd retry widens
+    the backoff window to a few seconds, which also covers the gap right
+    after WiFi is re-enabled but before the OS finishes re-associating, so
+    the first message after a reconnect no longer has to be sent twice.
+    Because the model's HTTP request closes before any tool runs, this
+    *cannot* abort a long tool call (e.g. `npm install`), unlike a
+    graph-level watchdog.
+  - **Note on idle drops:** the timeout only fires while a request is
+    actually in flight. If the network dies while the agent is idle
+    (waiting for you), there is nothing to time out, so the loss is only
+    reported on the next message you send (which fails fast). This is
+    expected — connectivity can't be probed without a live request.
+  - **Local models are exempt:** known local providers (Ollama, LM Studio,
+    vLLM, llama.cpp, …) and any model with a custom `base_url` keep the
+    generous timeout and are not forced to retry, so a slow cold-loading
+    local model is never killed.
+  - **OpenAI** additionally gets `stream_chunk_timeout`
+    (`OAT_STREAM_CHUNK_TIMEOUT`, defaults to the request timeout), a
+    per-content-chunk timeout that — unlike the httpx read timeout — is not
+    reset by SSE keepalive comments, so it also catches a NAT/load-balancer
+    "silent drop". (langchain-anthropic has no equivalent field yet and
+    relies on the read timeout.)
+  - On a model/network failure the agent now shows a clear *"Lost
+    connection to the model… send your message again"* message and writes a
+    final `ASSISTANT` block to the conversation log, so the daemon tailer
+    emits a final `chat_response` and the side panel's "thinking…" indicator
+    clears (a bare `turn_end` does not clear it). The turn is handled in
+    place so the turn queue drains instead of wedging.
+  - The earlier graph-level idle watchdog (`OAT_STREAM_IDLE_TIMEOUT`) is
+    now **opt-in and disabled by default** (it spanned tool execution and
+    could kill legitimately long tools); it remains available as a
+    last-resort backstop.
+- **Structured tool errors are labeled correctly without `isError`
+  (browser-tool "disconnected" mislabel).** A tool that returned the
+  in-band structured-error envelope `{"ok":false,"code":...}` (notably
+  the browser bridge's `EXTENSION_NOT_CONNECTED`) was logged as a plain
+  `RESULT:` and shown as a green "OK" in the side panel, because
+  LangChain reports `ToolMessage.status == "success"` (no exception) and
+  the daemon parser only flagged errors from an explicit `(error)`
+  suffix. The agent-runtime (`textual_adapter.py`) now reclassifies a
+  `{ok:false}` body to `status=error`, and the daemon parser
+  (`assistant_turn_parser.go`) independently classifies such bodies as
+  errors as defense-in-depth — **without** reintroducing the `isError`
+  flag (whose removal fixed a prior major bug). The daemon also threads a
+  bounded, redacted failure reason through the `tool_end` frame so the
+  side panel shows `error: <reason>` instead of "(detail not attached)".
+
 ### Added
 
 - **Per-tool activity rows for the assistant chat (2026-06-04).** The
@@ -58,6 +117,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reasonably distrust the result.
 
 ### Fixed
+
+- **Side-panel Compact/Reset reach the *selected* assistant.** Two
+  daemon-side changes let the bridge route capacity actions to the chat
+  picker's selected `(repo, agent)` instead of only the bonded agent
+  (which sent the directive to the wrong agent in the normal multi-agent
+  case — the selected assistant reported "I don't see a compact
+  directive" and its usage never dropped):
+  - `agent_input` and `route_user_message` both gain an optional `system`
+    bool. When set, the daemon skips the `[SIDE-PANEL CHAT]` sentinel, the
+    active-tab prefix, the context safety-net inject, and the per-target
+    rate limiter, so the message reaches the agent verbatim — letting the
+    bridge deliver the `[OAT-system]` manual-compaction directive through
+    the session-addressed (`agent_input`) or target-addressed
+    (`route_user_message`) verb. Both are browser/assistant-restricted, so
+    no operator privilege is exposed.
+  - `reset_assistant_session` now accepts `repo` as an alternative to
+    `session`, so the picker can address a reset by the same `(repo,
+    agent)` it uses for chat. (The earlier `agent_input{system}`-only fix
+    still failed for the common case because it used the bonded identity;
+    routing by the selected target is what actually fixes it.)
 
 - **Side-panel agent progress/replies no longer suppressed when the agent is busy (2026-06-05).**
   The `assistantTurnTailer` gates UI output behind a `sidePanelActive`

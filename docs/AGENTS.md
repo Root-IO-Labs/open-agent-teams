@@ -238,7 +238,7 @@ It interacts with web pages through the OAT Browser Agent extension and MCP brid
 - Works within authenticated sessions (leverages the user's existing Chrome login state).
 - Operates under hard, programmatic safety constraints enforced in the bridge — not just by prompt instruction:
   - URL blocklist (Chrome internals blocked by default) and optional `domainAllowlist`.
-  - Sensitive-page detection on banking / login / payment pages.
+  - Action-level gating (`actionGating`, default on): a deterministic `allow | confirm | block` classifier runs before the executor. Consequential actions on payment / banking / email-send pages and file downloads pause for an explicit side-panel Approve/Deny (human-in-the-loop), bound to the exact call by a bridge-minted approval token the page and model never see; timeout / socket loss / panic all default to deny. Users can pre-approve a specific `(tool, origin)` via "Always allow" (payment/email-send never allowlistable).
   - Password-field interaction guard and `browser_evaluate` outbound-request guard.
   - Untrusted-content delimiters wrap page-derived text returned to the LLM.
   - Per-call defenses also run inside `browser_batch` (no batch-bypass).
