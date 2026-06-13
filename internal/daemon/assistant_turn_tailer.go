@@ -32,9 +32,14 @@ type assistantTurnFrame struct {
 	Arg string `json:"arg,omitempty"`
 	// Status is "ok" | "error" on tool_end frames.
 	Status string `json:"status,omitempty"`
-	TS     string `json:"ts,omitempty"`
-	Done   bool   `json:"done,omitempty"`
-	Err    string `json:"error,omitempty"`
+	// ErrorMessage is a short, sanitized failure reason on tool_end
+	// frames whose Status is "error" (e.g. the bridge's
+	// EXTENSION_NOT_CONNECTED message). Lets the side panel show the
+	// reason instead of "(detail not attached)" on a failed row.
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	TS           string `json:"ts,omitempty"`
+	Done         bool   `json:"done,omitempty"`
+	Err          string `json:"error,omitempty"`
 }
 
 // turnBroadcaster fans out parsed AssistantTurn values from one
@@ -110,16 +115,17 @@ func (b *turnBroadcaster) Publish(turn AssistantTurn) {
 }
 
 // PublishTool broadcasts a tool-activity frame (tool_start / tool_end).
-// kind must be "tool_start" or "tool_end"; arg applies to tool_start
-// and status to tool_end. Same fire-and-forget fan-out semantics as
-// Publish.
-func (b *turnBroadcaster) PublishTool(kind, tool, arg, status string) {
+// kind must be "tool_start" or "tool_end"; arg applies to tool_start,
+// status + errorMessage to tool_end. Same fire-and-forget fan-out
+// semantics as Publish.
+func (b *turnBroadcaster) PublishTool(kind, tool, arg, status, errorMessage string) {
 	b.publishFrame(assistantTurnFrame{
-		Kind:   kind,
-		Tool:   tool,
-		Arg:    arg,
-		Status: status,
-		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+		Kind:         kind,
+		Tool:         tool,
+		Arg:          arg,
+		Status:       status,
+		ErrorMessage: errorMessage,
+		TS:           time.Now().UTC().Format(time.RFC3339Nano),
 	}, kind, tool)
 }
 
@@ -256,6 +262,26 @@ const tailerPollInterval = 100 * time.Millisecond
 // from buffering forever.
 const pendingLineWindow = 2048
 
+// trailingFlushGrace is how long a buffered-but-unterminated block may
+// sit at EOF before the tailer force-flushes it. The normal flush path
+// waits for a terminator marker after the last header — the next
+// `[OAT_TOKENS]` envelope, USER/ASSISTANT header, or TOOL/RESULT block.
+// A turn that ends WITHOUT any of those (a network-error / interrupted
+// turn writes its ASSISTANT block but emits no token envelope, since a
+// failed turn that consumed zero tokens commits nothing) would
+// otherwise stay invisible in the side panel until the user sends the
+// NEXT message — making a 3-second fast-fail look like a multi-minute
+// hang.
+//
+// This is safe because the runtime writes each ASSISTANT block
+// atomically (ConversationLogger.log_assistant emits header + body +
+// trailing blank in one flush), so a block that has not grown for this
+// long is definitively complete. Successful turns self-terminate via
+// the `[OAT_TOKENS]` envelope the runtime emits in the same end-of-turn
+// finalization (sub-second), so they flush via the terminator path and
+// never wait on this grace.
+const trailingFlushGrace = 1 * time.Second
+
 func newAssistantTurnTailer(logPath string, broadcaster *turnBroadcaster, emitToolEvents bool, logf func(format string, args ...any)) *assistantTurnTailer {
 	return &assistantTurnTailer{
 		logPath:        logPath,
@@ -366,6 +392,12 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 	// stitch them onto the next read so we don't accidentally split
 	// the [HH:MM:SS] header.
 	var carry strings.Builder
+
+	// When the last line was appended to `pending`. Drives the
+	// trailingFlushGrace idle-flush so an unterminated trailing block
+	// (e.g. a network-error turn that emits no token envelope) still
+	// reaches the side panel instead of waiting for the next turn.
+	var lastAppend time.Time
 
 	flushBuffer := func(force bool) {
 		if len(pending) == 0 {
@@ -504,12 +536,12 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					// / pre-chat tool calls don't spam the panel.
 					continue
 				}
-				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "")
+				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "", "")
 			case EventToolEnd:
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
 					continue
 				}
-				t.broadcaster.PublishTool("tool_end", ev.Tool, "", ev.ToolStatus)
+				t.broadcaster.PublishTool("tool_end", ev.Tool, "", ev.ToolStatus, ev.ErrorMessage)
 			}
 		}
 	}
@@ -535,6 +567,7 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 			} else {
 				line := strings.TrimRight(full, "\r\n")
 				pending = append(pending, line)
+				lastAppend = time.Now()
 				if len(pending) >= pendingLineWindow {
 					// Defensive: prevent unbounded growth if the
 					// runtime stops emitting a terminator marker.
@@ -564,6 +597,17 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 						t.logf("assistantTurnTailer: detected truncation of %s, resetting", t.logPath)
 					}
 				}
+			}
+			// Idle-flush: a trailing block that the terminator path
+			// couldn't publish (no [OAT_TOKENS]/header after it — the
+			// network-error / interrupted-turn case) is force-flushed
+			// once it has been stable for trailingFlushGrace. Without
+			// this a fast model-side failure stays invisible until the
+			// user's next message. See trailingFlushGrace for why this
+			// is safe (atomic block writes; successful turns terminate
+			// via [OAT_TOKENS] well within the grace window).
+			if len(pending) > 0 && !lastAppend.IsZero() && time.Since(lastAppend) >= trailingFlushGrace {
+				flushBuffer(true)
 			}
 			select {
 			case <-ctx.Done():

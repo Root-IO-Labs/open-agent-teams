@@ -1871,6 +1871,68 @@ func TestHandleRouteUserMessage_Interrupt(t *testing.T) {
 	})
 }
 
+// TestHandleRouteUserMessage_System pins the system-directive carve-out
+// used by the routed "Compact now" path: the text must be delivered
+// verbatim (no `[SIDE-PANEL CHAT]` sentinel / active-tab prefix) and
+// the per-target rate limiter must be bypassed so a user clicking
+// Compact right after a chat send isn't throttled.
+func TestHandleRouteUserMessage_System(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	fake := &routeTestBackend{}
+	d.backend = fake
+
+	if err := d.state.AddRepo("test-repo", &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent("test-repo", "assistant1", state.Agent{
+		Type:       state.AgentTypeAssistant,
+		WindowName: "win-assistant1",
+		PID:        4242,
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	directive := "[OAT-system] User requested manual context compaction. Call compact_conversation now before your next reply."
+
+	// Two system directives back-to-back must BOTH succeed (no rate
+	// limit), and neither may carry the side-panel sentinel.
+	for i := 0; i < 2; i++ {
+		resp := d.handleRouteUserMessage(socket.Request{
+			Command: "route_user_message",
+			Args: map[string]interface{}{
+				"repo":          "test-repo",
+				"agent":         "assistant1",
+				"text":          directive,
+				"system":        true,
+				"active_tab_id": float64(99),
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("system directive #%d should succeed; got: %s", i+1, resp.Error)
+		}
+	}
+	calls := fake.calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 SendMessage calls, got %d", len(calls))
+	}
+	last := calls[len(calls)-1]
+	if last.Message != directive {
+		t.Errorf("system directive must be delivered verbatim; got %q", last.Message)
+	}
+	if strings.Contains(last.Message, sidePanelInputSentinel) {
+		t.Errorf("system directive must NOT carry the side-panel sentinel: %q", last.Message)
+	}
+	if strings.Contains(last.Message, "active-tab-id") {
+		t.Errorf("system directive must NOT carry the active-tab prefix: %q", last.Message)
+	}
+}
+
 // TestHandleRouteUserMessage_RateLimit_Part7Commit3 pins the
 // per-target throttle: two routes to the same agent within
 // the window must reject the second one with RPC_RATE_LIMITED,

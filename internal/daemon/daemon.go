@@ -2939,6 +2939,23 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 		}
 	}
 
+	// `system` (optional bool): an out-of-band system directive (e.g.
+	// the manual "Compact now" control) rather than side-panel user
+	// chat. When set we skip the `[SIDE-PANEL CHAT]` sentinel and the
+	// active-tab prefix so the agent sees the directive's leading
+	// `[OAT-system]` tag verbatim, matching how the CLI delivers
+	// `oat assistant compact`. The verb stays browser-restricted and
+	// session-addressed, so this is not an escalation path.
+	system := false
+	if raw, present := req.Args["system"]; present {
+		switch v := raw.(type) {
+		case bool:
+			system = v
+		case string:
+			system = strings.EqualFold(v, "true")
+		}
+	}
+
 	// Look up the repo whose SessionName matches. Linear scan because
 	// repos are typically O(1–3) per daemon and adding an index would
 	// add a sync invariant we don't need yet. If repo-count grows we
@@ -2989,7 +3006,7 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// "the user's last-focused tab id when they sent this message,"
 	// removing the chrome.tabs.query({}) ambiguity that caused the
 	// agent to act on the wrong tab when multiple windows are open.
-	if !interrupt {
+	if !interrupt && !system {
 		// Part 4.K diagnostic (added 2026-05-21): log the inbound
 		// active_tab_id value at INFO so we can correlate "side
 		// panel said X" with "daemon saw X" without tailing
@@ -3021,8 +3038,10 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// lines as out-of-band, not as side-panel user input.
 	// Non-interrupt path only; interrupts go directly to the
 	// runtime without buffering, where prepending an instruction
-	// would be wrong semantically.
-	if !interrupt {
+	// would be wrong semantically. Also skipped for explicit system
+	// directives (e.g. a manual compact) — the user is already
+	// compacting, so a second injected directive is redundant.
+	if !interrupt && !system {
 		if directive, inject := d.shouldInjectContextSafetyNet(agent, repoName, agentName); inject {
 			if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, directive); err != nil {
 				// Best-effort: log + continue. We still send the
@@ -3954,6 +3973,15 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// sentinel/active-tab prefix, since an interrupt carries no payload.
 	interrupt := getOptionalBoolArg(req.Args, "interrupt", false)
 
+	// When set, the text is an out-of-band system directive (e.g. the
+	// "Compact now" control routed to the picker-selected target) rather
+	// than side-panel user chat. Like the same flag on agent_input, we
+	// skip the `[SIDE-PANEL CHAT]` sentinel + active-tab prefix and the
+	// rate limiter so the agent sees the directive's leading
+	// `[OAT-system]` tag verbatim. Mutually exclusive with interrupt in
+	// practice (the side panel never sets both).
+	system := getOptionalBoolArg(req.Args, "system", false)
+
 	// Size cap (gate #5) FIRST — cheapest check, doesn't touch
 	// state, so a 50 MB junk payload doesn't even cost a map
 	// lookup. The byte length is in UTF-8 octets (Go strings are
@@ -4010,7 +4038,10 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// Interrupts bypass the rate limiter: stopping a runaway agent must
 	// never be throttled, and a user who just sent a message and
 	// immediately hits Interrupt would otherwise be told "rate-limited".
-	if !interrupt {
+	// System directives (e.g. a manual compact) bypass it too — a user
+	// who clicks Compact right after sending a message shouldn't be
+	// throttled, and the directive is user-initiated and rare.
+	if !interrupt && !system {
 		d.routeRateLimitMu.Lock()
 		if last, found := d.routeRateLimit[key]; found {
 			if now.Sub(last) < routeRateLimitWindow {
@@ -4075,8 +4106,14 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// the route_user_message verb must do the same or the
 	// multi-agent picker delivers user messages successfully but
 	// the agent's reply never reaches the side panel.
-	prefix := buildActiveTabPrefix(req.Args["active_tab_id"])
-	sanitized = sidePanelInputSentinel + prefix + sanitized
+	//
+	// System directives skip the sentinel + active-tab prefix so the
+	// agent sees the directive's `[OAT-system]` tag verbatim (the same
+	// carve-out agent_input makes for the bonded path).
+	if !system {
+		prefix := buildActiveTabPrefix(req.Args["active_tab_id"])
+		sanitized = sidePanelInputSentinel + prefix + sanitized
+	}
 
 	// Backend write. We do NOT hold any daemon mutex during the
 	// PTY write — backend.SendMessage uses its own per-window
@@ -4102,10 +4139,14 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 
 	// Update rate-limit timestamp ONLY on success. See the
 	// routeRateLimit field doc for why failed routes don't
-	// poison the throttle.
-	d.routeRateLimitMu.Lock()
-	d.routeRateLimit[key] = time.Now()
-	d.routeRateLimitMu.Unlock()
+	// poison the throttle. System directives don't record (they also
+	// don't check above) so a manual compact never throttles the
+	// user's next real message.
+	if !system {
+		d.routeRateLimitMu.Lock()
+		d.routeRateLimit[key] = time.Now()
+		d.routeRateLimitMu.Unlock()
+	}
 
 	// Audit log (gate #4). Best-effort; failure is logged but
 	// doesn't fail the verb. We log the SANITISED byte count
@@ -5364,6 +5405,15 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// Inject CLI-forwarded env vars (tokens, API keys) so agents inherit
 		// the caller's environment even when the daemon lacks those vars.
 		envVars = append(envVars, extraEnv...)
+		// Wake-up marker (assistants only): write the consume-once payload
+		// and point the runtime at it so it injects the marker as the first
+		// thread message, instead of a post-spawn PTY write that raced the
+		// not-yet-ready terminal UI and fused the marker into the user's
+		// first message. No-op (returns "") for non-assistants, disabled,
+		// or rate-limited — then no env var is set and nothing is injected.
+		if mf := d.prepareWakeUpMarkerFile(repoName, agentName, agent.Type); mf != "" {
+			envVars = append(envVars, fmt.Sprintf("%s=%s", wakeUpMarkerEnvFile, mf))
+		}
 
 		// Opt-in sidecar. When OAT_USE_SIDECAR=1 is set on the daemon,
 		// compute a per-agent socket path; the backend binds to it before
@@ -5453,14 +5503,11 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		)
 	}
 
-	// Inject the autonomous wake-up safeguard marker for assistant
-	// agents (no-op for any other agent type). Fired AFTER the state
-	// update so the marker function reads the fresh (repo, agent,
-	// pid) tuple. The injection is the agent's first PTY write in
-	// the new process lifetime, so it lands ahead of any rehydrated
-	// user message or queued inter-agent message. See wakeup_marker.go
-	// for the full design — best-effort, must not block agent startup.
-	d.injectWakeUpMarker(repoName, agentName, agent, WakeUpMarkerTriggerFresh)
+	// Wake-up safeguard marker for assistants is delivered via the
+	// runtime on this fresh-spawn path: prepareWakeUpMarkerFile above
+	// wrote the consume-once payload and set OAT_ASSISTANT_WAKEUP_MARKER_FILE
+	// in envVars before StartAgent, so the agent injects it as the first
+	// thread message (no PTY startup race). See wakeup_marker.go.
 
 	// Part 5g.5 Slice A (2026-05-22): operator-visible coexistence
 	// log for browser-agents. When a second (or third, ...)
@@ -5979,23 +6026,44 @@ func (d *Daemon) handleRestartBrowserAgent(req socket.Request) socket.Response {
 //
 // Returns { wiped: true, agent, repo, scratchpad_cleared: bool }.
 func (d *Daemon) handleResetAssistantSession(req socket.Request) socket.Response {
-	sessionName, errResp, ok := getRequiredStringArg(req.Args, "session", "session name is required")
-	if !ok {
-		return errResp
-	}
 	agentName, errResp, ok := getRequiredStringArg(req.Args, "agent", "agent name is required")
 	if !ok {
 		return errResp
 	}
 	full := getOptionalBoolArg(req.Args, "full", false)
 
-	repoName, _, found := d.findRepoBySession(sessionName)
-	if !found {
-		return socket.ErrorResponse("no repository is bound to session %q", sessionName)
+	// Identity: the bonded path supplies `session` (the bridge knows
+	// its OAT_BROWSER_AGENT_SESSION but not the repo name) and we resolve
+	// the repo via findRepoBySession. The picker-routed path supplies
+	// `repo` directly (the side panel selected a specific (repo, agent)
+	// target that may not be the bonded one); when present it wins, since
+	// it names a concrete repo without the session indirection.
+	repoArg := getOptionalStringArg(req.Args, "repo", "")
+	var repoName string
+	// notFoundScope keeps the agent-not-found message wording stable for
+	// each identity path (session-bonded vs picker-routed).
+	var notFoundScope string
+	if repoArg != "" {
+		if _, exists := d.state.GetRepo(repoArg); !exists {
+			return socket.ErrorResponse("repository '%s' not found", repoArg)
+		}
+		repoName = repoArg
+		notFoundScope = fmt.Sprintf("repository %q", repoName)
+	} else {
+		sessionName, errResp, ok := getRequiredStringArg(req.Args, "session", "session name (or repo) is required")
+		if !ok {
+			return errResp
+		}
+		var found bool
+		repoName, _, found = d.findRepoBySession(sessionName)
+		if !found {
+			return socket.ErrorResponse("no repository is bound to session %q", sessionName)
+		}
+		notFoundScope = fmt.Sprintf("session %q", sessionName)
 	}
 	agent, exists := d.state.GetAgent(repoName, agentName)
 	if !exists {
-		return socket.ErrorResponse("agent '%s' not found in session %q", agentName, sessionName)
+		return socket.ErrorResponse("agent '%s' not found in %s", agentName, notFoundScope)
 	}
 	if agent.Type != state.AgentTypeAssistant {
 		return socket.ErrorResponse("reset_assistant_session is restricted to assistant agent type; %s/%s is %s", repoName, agentName, agent.Type)
@@ -8731,6 +8799,13 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	envVars = append(envVars, fmt.Sprintf("OAT_TOOL_LOG=%s", logFile))
 	// Part 5f: assistant memory env-var prep (see assistant_env.go).
 	envVars = append(envVars, assistantSpawnEnvVars(agent.Type, repoName)...)
+	// Wake-up marker (assistants): deliver via the runtime on restart too.
+	// Writing the consume-once payload pre-spawn and letting the runtime
+	// inject it avoids the post-spawn PTY write that raced the not-yet-
+	// ready terminal UI and fused the marker into the user's first message.
+	if mf := d.prepareWakeUpMarkerFile(repoName, agentName, agent.Type); mf != "" {
+		envVars = append(envVars, fmt.Sprintf("%s=%s", wakeUpMarkerEnvFile, mf))
+	}
 	// Sidecar path also wired on restart so an agent that was started
 	// with sidecar on keeps sidecar on across a manual restart.
 	sidecarPath := sidecarSocketPath(repoName, agentName)
@@ -8821,18 +8896,14 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 
 	d.logger.Info("Restarted agent %s with PID %d (resumed=%v)", agentName, pid, hasHistory)
 
-	// Inject the wake-up marker for assistants after a restart. This
-	// path covers BOTH operator-driven restarts (handleRestartAgent /
-	// handleRestartBrowserAgent) AND health-check auto-restarts (the
-	// health-check loop calls into restartAgent directly). The marker
-	// doesn't distinguish the two at the call site — both indicate
-	// the agent's process restarted and any rehydrated history should
-	// not be acted on without a fresh trigger. Refresh the agent.PID
-	// from local 'pid' so the marker reads the new process identity
-	// (state was already updated above via UpdateAgentPID).
-	agentForMarker := agent
-	agentForMarker.PID = pid
-	d.injectWakeUpMarker(repoName, agentName, agentForMarker, WakeUpMarkerTriggerRestart)
+	// Wake-up marker for assistants after a restart is delivered via the
+	// runtime: prepareWakeUpMarkerFile above wrote the consume-once payload
+	// and set OAT_ASSISTANT_WAKEUP_MARKER_FILE in envVars before StartAgent.
+	// This covers BOTH operator-driven restarts (handleRestartAgent /
+	// handleRestartBrowserAgent) and health-check auto-restarts (which call
+	// restartAgent directly). The agent injects the marker as the first
+	// thread message before accepting input — no PTY startup race, and the
+	// marker never fuses into the user's first message. See wakeup_marker.go.
 
 	return nil
 }

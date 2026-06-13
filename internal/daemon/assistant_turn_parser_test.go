@@ -640,6 +640,69 @@ func TestTailerEnvelopeTerminatesIdleTurn(t *testing.T) {
 	}
 }
 
+// TestTailerIdleFlushesUnterminatedErrorTurn reproduces the wifi-drop
+// post-mortem: the model call fast-fails (network error / timeout), the
+// runtime writes the error ASSISTANT block, but — because a failed turn
+// consumes zero tokens — emits NO `[OAT_TOKENS]` envelope and no further
+// header. The terminator-driven flush path can't publish such a block,
+// so before the idle-flush it stayed invisible in the side panel until
+// the user's NEXT message, making a ~3 s fast-fail look like a multi-
+// minute hang. The tailer MUST publish it on its own via the
+// trailingFlushGrace idle-flush.
+func TestTailerIdleFlushesUnterminatedErrorTurn(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, false, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Exact shape from the post-mortem log: side-panel USER, model
+	// marker, then an error ASSISTANT block with NOTHING after it — no
+	// [OAT_TOKENS], no next header.
+	body := strings.Join([]string{
+		"[15:42:21] USER:",
+		"  [SIDE-PANEL CHAT] test message 3",
+		"",
+		"[OAT_MODEL] anthropic:claude-opus-4-7",
+		"[15:42:24] ASSISTANT:",
+		"  Lost connection to the model (network error or timeout). Check your internet and send your message again.",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	// Must arrive without any further log activity. Allow
+	// trailingFlushGrace + poll/scheduling slack.
+	deadline := time.After(trailingFlushGrace + 2*time.Second)
+	select {
+	case fr := <-ch:
+		if !strings.Contains(fr.Text, "Lost connection to the model") {
+			t.Errorf("unexpected published frame: %+v", fr)
+		}
+	case <-deadline:
+		t.Fatal("tailer never published the unterminated error turn — idle-flush regression (side panel would hang until next message)")
+	}
+}
+
 // TestTailerDeliveryArmingPublishesWithoutSentinel asserts that arming
 // auto-emit at message-delivery time (markSidePanelActive()) publishes an
 // assistant turn even when no `[SIDE-PANEL CHAT]` sentinel precedes it in
@@ -920,6 +983,94 @@ func TestParseResultHeader(t *testing.T) {
 	}
 }
 
+// TestParseEventsStructuredErrorBody verifies the defense-in-depth path:
+// a RESULT header tagged success whose BODY is a structured-error envelope
+// ({"ok": false, ...}) is reclassified to "error" and surfaces a bounded
+// failure reason — even though the header lacked an `(error)` suffix. This
+// covers logs that predate the runtime's status-derivation seam.
+func TestParseEventsStructuredErrorBody(t *testing.T) {
+	lines := strings.Split(strings.Join([]string{
+		"[09:00:00] TOOL: ping",
+		"  (no args)",
+		"",
+		"[09:00:01] RESULT: ping",
+		`  {"ok": false, "code": "EXTENSION_NOT_CONNECTED", "message": "The browser isn't connected to Chrome right now."}`,
+		"",
+	}, "\n"), "\n")
+
+	var end *Event
+	for _, ev := range parseEvents(lines) {
+		if ev.Kind == EventToolEnd {
+			e := ev
+			end = &e
+		}
+	}
+	if end == nil {
+		t.Fatal("expected an EventToolEnd")
+	}
+	if end.ToolStatus != "error" {
+		t.Errorf("ToolStatus = %q; want error (reclassified from ok:false body)", end.ToolStatus)
+	}
+	if !strings.Contains(end.ErrorMessage, "browser isn't connected") {
+		t.Errorf("ErrorMessage = %q; want it to carry the failure reason", end.ErrorMessage)
+	}
+}
+
+// TestParseEventsSuccessBodyNotMisclassified guards the narrow detection:
+// a RESULT whose body is a genuine success envelope ({"ok": true}) or
+// plain text must stay "ok" with no ErrorMessage.
+func TestParseEventsSuccessBodyNotMisclassified(t *testing.T) {
+	lines := strings.Split(strings.Join([]string{
+		"[09:00:01] RESULT: navigate",
+		`  {"ok": true, "url": "https://example.com"}`,
+		"",
+		"[09:00:02] RESULT: web_search",
+		"  3 results found",
+		"",
+	}, "\n"), "\n")
+
+	for _, ev := range parseEvents(lines) {
+		if ev.Kind != EventToolEnd {
+			continue
+		}
+		if ev.ToolStatus != "ok" {
+			t.Errorf("tool %q: ToolStatus = %q; want ok", ev.Tool, ev.ToolStatus)
+		}
+		if ev.ErrorMessage != "" {
+			t.Errorf("tool %q: ErrorMessage = %q; want empty on success", ev.Tool, ev.ErrorMessage)
+		}
+	}
+}
+
+// TestDetectStructuredResultError unit-tests the envelope detector across
+// the envelope, success, plain-text, and malformed cases.
+func TestDetectStructuredResultError(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantErr   bool
+		wantMsgIn string
+	}{
+		{"ok false with message", `{"ok": false, "code": "X", "message": "boom"}`, true, "boom"},
+		{"ok false error field", `{"ok": false, "error": "nope"}`, true, "nope"},
+		{"ok false no message", `{"ok": false, "code": "X"}`, true, ""},
+		{"ok true", `{"ok": true, "result": 1}`, false, ""},
+		{"no ok field", `{"code": "X", "value": 2}`, false, ""},
+		{"plain text", "all good", false, ""},
+		{"truncated json", `{"ok": false, "message": "tru`, false, ""},
+		{"leading whitespace", "  {\"ok\": false}\n", true, ""},
+	}
+	for _, c := range cases {
+		gotErr, gotMsg := detectStructuredResultError(c.body)
+		if gotErr != c.wantErr {
+			t.Errorf("%s: isError = %v; want %v", c.name, gotErr, c.wantErr)
+		}
+		if c.wantMsgIn != "" && !strings.Contains(gotMsg, c.wantMsgIn) {
+			t.Errorf("%s: message = %q; want it to contain %q", c.name, gotMsg, c.wantMsgIn)
+		}
+	}
+}
+
 // TestTailerEmitsToolActivityFrames is the integration counterpart:
 // with emitToolEvents=true and the side-panel gate unlocked, the
 // tailer must publish tool_start/tool_end frames for the assistant's
@@ -994,6 +1145,71 @@ func TestTailerEmitsToolActivityFrames(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatalf("did not observe all frames within 3s: tool_start=%v tool_end=%v chat=%v", sawToolStart, sawToolEnd, sawChatTurn)
+		}
+	}
+}
+
+// TestTailerThreadsStructuredErrorReason verifies the end-to-end
+// Section 3 path: a RESULT whose body is a {ok:false,...} envelope is
+// published as a tool_end frame with Status="error" AND a non-empty
+// ErrorMessage carrying the reason, so the side panel can show it
+// instead of "(detail not attached)".
+func TestTailerThreadsStructuredErrorReason(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, true, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	body := strings.Join([]string{
+		"[08:18:00] USER:",
+		"  [SIDE-PANEL CHAT] ping",
+		"",
+		"[08:19:18] TOOL: ping",
+		"  (no args)",
+		"",
+		"[08:19:19] RESULT: ping",
+		`  {"ok": false, "code": "EXTENSION_NOT_CONNECTED", "message": "The browser isn't connected to Chrome right now."}`,
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case fr := <-ch:
+			if fr.Kind == "tool_end" && fr.Tool == "ping" {
+				if fr.Status != "error" {
+					t.Fatalf("tool_end Status = %q; want error", fr.Status)
+				}
+				if !strings.Contains(fr.ErrorMessage, "browser isn't connected") {
+					t.Fatalf("tool_end ErrorMessage = %q; want the failure reason", fr.ErrorMessage)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("did not observe an error tool_end frame within 3s")
 		}
 	}
 }

@@ -745,6 +745,45 @@ func TestHandleResetAssistantSession_Part5eSliceB4(t *testing.T) {
 		}
 	})
 
+	t.Run("addressed by repo (picker-routed) instead of session", func(t *testing.T) {
+		// The multi-agent picker routes reset by (repo, agent) because
+		// the side panel knows the target's repo, not its session. The
+		// repo arg must be accepted as an alternative to session.
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"repo":  "_assistant-personal",
+				"agent": "personal",
+			},
+		})
+		if !resp.Success {
+			t.Fatalf("expected success addressed by repo, got error: %v", resp.Error)
+		}
+		data, ok := resp.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("Data is not map[string]interface{}: %T", resp.Data)
+		}
+		if data["repo"] != "_assistant-personal" {
+			t.Errorf("repo = %v, want \"_assistant-personal\"", data["repo"])
+		}
+	})
+
+	t.Run("rejects unknown repo", func(t *testing.T) {
+		resp := d.handleResetAssistantSession(socket.Request{
+			Command: "reset_assistant_session",
+			Args: map[string]interface{}{
+				"repo":  "no-such-repo",
+				"agent": "personal",
+			},
+		})
+		if resp.Success {
+			t.Fatal("expected rejection for unknown repo")
+		}
+		if !strings.Contains(resp.Error, "not found") {
+			t.Errorf("error %q should explain repo lookup failure", resp.Error)
+		}
+	})
+
 	t.Run("wipes an existing session JSONL on disk", func(t *testing.T) {
 		// Pre-create the session JSONL the runtime would have left
 		// behind. The verb must remove it AND report wiped: true.

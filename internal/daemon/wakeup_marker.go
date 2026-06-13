@@ -25,13 +25,23 @@ import (
 // the prompt rule is the safety net.
 //
 // Marker semantics:
-//   - Prepended via PTY input on every (re)spawn of AgentTypeAssistant
-//     agents (fresh spawn, auto-restart from health check, manual
-//     restart from side panel, daemon-restart-driven adoption of an
-//     alive process). Browser-agent (AgentTypeBrowser) is explicitly
-//     scoped out — workflow helpers are designed for single-task
-//     autonomous execution; suppressing post-restart action defeats
-//     their purpose.
+//   - Fires on every (re)spawn / adoption of AgentTypeAssistant agents
+//     (fresh spawn, auto-restart from health check, manual restart from
+//     side panel, daemon-restart-driven adoption of an alive process).
+//     Browser-agent (AgentTypeBrowser) is explicitly scoped out —
+//     workflow helpers are designed for single-task autonomous
+//     execution; suppressing post-restart action defeats their purpose.
+//   - Delivery differs by path. For an ACTUAL (re)spawn the daemon writes
+//     the marker text to a consume-once file pre-spawn and points the
+//     agent runtime at it via OAT_ASSISTANT_WAKEUP_MARKER_FILE
+//     (prepareWakeUpMarkerFile); the runtime injects it as the first
+//     thread message before accepting input. This replaced an earlier
+//     post-spawn PTY write that raced the not-yet-ready terminal UI and
+//     fused the marker into the user's first message (the `\r` wasn't
+//     honored as submit until the line editor was live). For the
+//     adoption of an ALREADY-RUNNING process (daemon restart re-adopting
+//     a live agent) the UI is ready, so injectWakeUpMarker still
+//     delivers via a PTY write — no race there.
 //   - Uses the [OAT-system] prefix the assistant is already conditioned
 //     to trust (capacity hints, panic notices). Text is hardcoded; no
 //     interpolation of user-supplied fields.
@@ -75,6 +85,20 @@ const wakeUpMarkerFileName = "wakeup-marker.ts"
 // p.Root. Created on demand (parent dir does not exist in the standard
 // EnsureDirectories set).
 const wakeUpMarkerDirName = "runtime"
+
+// wakeUpMarkerPendingFileName is the consume-once payload file the
+// daemon writes pre-spawn (for actual (re)spawns) carrying the marker
+// text. Distinct from the ".ts" rate-limit timestamp file: ".pending"
+// holds the marker body and is deleted by the agent runtime once it has
+// injected the marker into the thread.
+const wakeUpMarkerPendingFileName = "wakeup-marker.pending"
+
+// wakeUpMarkerEnvFile is the env var the daemon sets on an actual
+// (re)spawn to point the agent runtime at the pending marker file. It
+// carries a PATH only (the marker text lives in the file), so there is
+// no shell/exec escaping concern even though the marker body contains
+// spaces and backticks.
+const wakeUpMarkerEnvFile = "OAT_ASSISTANT_WAKEUP_MARKER_FILE"
 
 // wakeUpMarkerFiredKey is the in-process tracker that ensures a single
 // (repo, agent, pid) sees the marker at most once per lifetime. Keyed
@@ -285,6 +309,38 @@ func writeWakeUpMarkerLastFire(path string, t time.Time) error {
 	return nil
 }
 
+// wakeUpMarkerPendingFile resolves the per-(repo, agent) consume-once
+// payload path under p.Root/runtime/<repo>/<agent>/wakeup-marker.pending.
+// Same sanitization contract as wakeUpMarkerStateFile.
+func wakeUpMarkerPendingFile(root, repo, agent string) (string, error) {
+	repoSeg, err := sanitizeWakeUpMarkerPathSegment(repo)
+	if err != nil {
+		return "", err
+	}
+	agentSeg, err := sanitizeWakeUpMarkerPathSegment(agent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, wakeUpMarkerDirName, repoSeg, agentSeg, wakeUpMarkerPendingFileName), nil
+}
+
+// writeWakeUpMarkerPending writes the marker text atomically via .tmp +
+// rename so the agent runtime never reads a half-written payload.
+func writeWakeUpMarkerPending(path, text string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create wake-up marker dir: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(text), 0o644); err != nil {
+		return fmt.Errorf("write wake-up marker pending tmp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename wake-up marker pending: %w", err)
+	}
+	return nil
+}
+
 // WakeUpMarkerTrigger names the spawn path that asked for a marker.
 // Surfaces in the audit-log line for postmortem analysis; "rate-
 // limited" is the synthetic value used when the marker was suppressed.
@@ -470,4 +526,97 @@ func (d *Daemon) injectWakeUpMarker(repoName, agentName string, agent state.Agen
 		"wakeup_marker_injected: repo=%s agent=%s pid=%d trigger=%s",
 		repoName, agentName, pid, trigger,
 	)
+}
+
+// prepareWakeUpMarkerFile is the (re)spawn-time analog of
+// injectWakeUpMarker. Rather than racing a PTY write against the agent's
+// not-yet-ready terminal UI — which fused the marker into the user's
+// first message — it writes the marker text to a consume-once file and
+// returns its path. The caller adds OAT_ASSISTANT_WAKEUP_MARKER_FILE=<path>
+// to the spawn env so the agent runtime injects the marker as the first
+// thread message (silent context, no model turn) before accepting input.
+//
+// Returns "" when no marker should fire (non-assistant, disabled, or
+// rate-limited); the caller then omits the env var and the runtime
+// injects nothing.
+//
+// Shares the disable + rate-limit gates and the on-disk timestamp file
+// with injectWakeUpMarker (still used for the adopted-already-running
+// process path, where the UI is ready and a PTY write is safe), so the
+// once-per-interval suppression stays consistent across both delivery
+// mechanisms. Best-effort: all failures are logged and degrade to "no
+// marker" rather than blocking the spawn.
+func (d *Daemon) prepareWakeUpMarkerFile(repoName, agentName string, agentType state.AgentType) string {
+	if agentType != state.AgentTypeAssistant {
+		return ""
+	}
+
+	if wakeUpMarkerDisabled() {
+		d.logger.Info(
+			"wake-up marker skipped for %s/%s: %s=1",
+			repoName, agentName, wakeUpMarkerDisabledEnv,
+		)
+		return ""
+	}
+
+	statePath, err := wakeUpMarkerStateFile(d.paths.Root, repoName, agentName)
+	if err != nil {
+		d.logger.Warn(
+			"wake-up marker skipped for %s/%s: rate-limit path sanitization failed: %v",
+			repoName, agentName, err,
+		)
+		return ""
+	}
+
+	interval := wakeUpMarkerInterval()
+	now := time.Now()
+
+	lastFire, readErr := readWakeUpMarkerLastFire(statePath)
+	if readErr != nil {
+		// Fail-open: a corrupt/unreadable timestamp is strictly less
+		// harmful than a missing marker. Mirrors injectWakeUpMarker.
+		d.logger.Warn(
+			"wake-up marker for %s/%s: rate-limit read failed (%v); proceeding without suppression",
+			repoName, agentName, readErr,
+		)
+	}
+	if !lastFire.IsZero() && interval > 0 && now.Sub(lastFire) < interval {
+		d.logger.Info(
+			"wake-up marker rate-limited for %s/%s (last_fire=%s, interval=%s)",
+			repoName, agentName, lastFire.Format(time.RFC3339), interval,
+		)
+		return ""
+	}
+
+	pendingPath, err := wakeUpMarkerPendingFile(d.paths.Root, repoName, agentName)
+	if err != nil {
+		d.logger.Warn(
+			"wake-up marker skipped for %s/%s: pending path sanitization failed: %v",
+			repoName, agentName, err,
+		)
+		return ""
+	}
+
+	marker := buildWakeUpMarker(repoName, agentName)
+	if err := writeWakeUpMarkerPending(pendingPath, marker); err != nil {
+		d.logger.Warn(
+			"wake-up marker skipped for %s/%s: pending write failed: %v",
+			repoName, agentName, err,
+		)
+		return ""
+	}
+
+	if err := writeWakeUpMarkerLastFire(statePath, now); err != nil {
+		// Non-fatal: payload already written. Mirrors injectWakeUpMarker.
+		d.logger.Warn(
+			"wake-up marker timestamp write failed for %s/%s: %v",
+			repoName, agentName, err,
+		)
+	}
+
+	d.logger.Info(
+		"wakeup_marker_prepared: repo=%s agent=%s delivery=runtime file=%s",
+		repoName, agentName, pendingPath,
+	)
+	return pendingPath
 }

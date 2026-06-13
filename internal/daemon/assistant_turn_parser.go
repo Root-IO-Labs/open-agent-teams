@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -135,6 +136,13 @@ type Event struct {
 	Arg string
 	// ToolStatus is "ok" or "error" for EventToolEnd.
 	ToolStatus string
+	// ErrorMessage is a short, sanitized failure reason for an
+	// EventToolEnd whose ToolStatus is "error" (e.g. the bridge's
+	// EXTENSION_NOT_CONNECTED message). Empty for "ok" results and for
+	// errors with no extractable message. Lets the side panel show the
+	// reason instead of "(detail not attached)" on a failed row. Capped
+	// at toolArgPreviewMaxBytes; the bridge redacts on top.
+	ErrorMessage string
 }
 
 // toolArgPreviewMaxBytes caps the per-tool arg preview the parser
@@ -250,10 +258,13 @@ func parseEvents(lines []string) []Event {
 	}
 
 	flushResult := func() {
-		// The result BODY is intentionally discarded: it can be large
-		// and carries page/tool-derived content (potential secrets).
-		// Only the name + success/error status surface, which is all
-		// the side panel needs to flip the row's terminal state.
+		// The result BODY can be large and carries page/tool-derived
+		// content (potential secrets), so we never surface it verbatim.
+		// We DO inspect it for two narrow signals: a structured-error
+		// envelope (to flip the status, defense-in-depth) and a bounded
+		// error message (Event.ErrorMessage, so a failed row can show
+		// the reason instead of "(detail not attached)").
+		raw := strings.Trim(bodyBuf.String(), "\n")
 		bodyBuf.Reset()
 		if curTool == "" {
 			return
@@ -262,11 +273,26 @@ func parseEvents(lines []string) []Event {
 		if status == "" {
 			status = "ok"
 		}
-		out = append(out, Event{
+		// Defense-in-depth: some tools return a structured-error envelope
+		// ({"ok": false, ...}) in the body while the header was still
+		// tagged success (older logs, or a path that didn't run the
+		// runtime's status-derivation seam). Reclassify from the body so
+		// the side panel flags the row even without an `(error)` suffix.
+		isErr, errMsg := detectStructuredResultError(raw)
+		if status == "ok" && isErr {
+			status = "error"
+		}
+		ev := Event{
 			Kind:       EventToolEnd,
 			Tool:       curTool,
 			ToolStatus: status,
-		})
+		}
+		// Surface a bounded failure reason ONLY for error rows. Cap it so
+		// a verbose body can't bloat the frame; the bridge redacts on top.
+		if status == "error" && errMsg != "" {
+			ev.ErrorMessage = clampToolPreview(sanitizeEmitText(errMsg), toolArgPreviewMaxBytes)
+		}
+		out = append(out, ev)
 	}
 
 	flush := func() {
@@ -371,6 +397,43 @@ func parseResultHeader(tail string) (name, status string) {
 		return name, "error"
 	}
 	return tail, "ok"
+}
+
+// detectStructuredResultError inspects a RESULT body for the in-band
+// structured-error envelope that MCP tools (notably the browser bridge)
+// return on failure: a JSON object whose `ok` is exactly `false`. Returns
+// whether the body is such an envelope plus a best-effort short message
+// (the `message` field, falling back to `error`).
+//
+// Detection is deliberately narrow — only `ok: false` counts — so a plain
+// text result, a truncated/unparseable body, or a legitimate object that
+// merely contains a `code` field is never mistaken for an error. Mirrors
+// the runtime-side `_derive_tool_status` so the daemon stays correct even
+// for logs that predate that seam.
+func detectStructuredResultError(body string) (isError bool, message string) {
+	t := strings.TrimSpace(body)
+	if !strings.HasPrefix(t, "{") {
+		return false, ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(t), &m); err != nil {
+		return false, ""
+	}
+	okVal, hasOK := m["ok"]
+	if !hasOK {
+		return false, ""
+	}
+	okBool, isBool := okVal.(bool)
+	if !isBool || okBool {
+		return false, ""
+	}
+	if s, ok := m["message"].(string); ok && s != "" {
+		return true, s
+	}
+	if s, ok := m["error"].(string); ok && s != "" {
+		return true, s
+	}
+	return true, ""
 }
 
 // buildToolArgPreview folds the leading `key: value` body lines of a

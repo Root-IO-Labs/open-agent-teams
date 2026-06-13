@@ -574,3 +574,98 @@ func TestWriteWakeUpMarkerLastFire_RoundTrip(t *testing.T) {
 		t.Errorf("file contents %q are not a bare integer: %v", body, parseErr)
 	}
 }
+
+// prepareWakeUpMarkerFile is the (re)spawn-time delivery path: it must
+// write the marker payload to a consume-once file and return its path
+// (which the spawn code turns into OAT_ASSISTANT_WAKEUP_MARKER_FILE), and
+// it must NEVER touch the PTY — so the fake backend's SendMessage stays
+// at zero calls regardless of outcome.
+func TestPrepareWakeUpMarkerFile_WritesPayload(t *testing.T) {
+	d, fake, repoName, agentName, cleanup := setupMarkerDaemon(t)
+	defer cleanup()
+
+	t.Setenv(wakeUpMarkerDisabledEnv, "")
+	// interval 0 → never rate-limited, so the decision is purely "assistant?"
+	t.Setenv(wakeUpMarkerIntervalEnv, "0")
+
+	path := d.prepareWakeUpMarkerFile(repoName, agentName, state.AgentTypeAssistant)
+	if path == "" {
+		t.Fatal("expected a non-empty pending-file path for an assistant")
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read pending file: %v", err)
+	}
+	if got, want := string(raw), buildWakeUpMarker(repoName, agentName); got != want {
+		t.Errorf("pending file contents mismatch:\n got: %q\nwant: %q", got, want)
+	}
+
+	// The runtime-delivery path must not write to the PTY.
+	if got := len(fake.calls()); got != 0 {
+		t.Errorf("expected 0 PTY SendMessage from prepareWakeUpMarkerFile, got %d", got)
+	}
+
+	// Timestamp file advanced so a rapid respawn within the interval
+	// would be suppressed (crash-loop guard shared with injectWakeUpMarker).
+	statePath, err := wakeUpMarkerStateFile(d.paths.Root, repoName, agentName)
+	if err != nil {
+		t.Fatalf("wakeUpMarkerStateFile: %v", err)
+	}
+	ts, err := readWakeUpMarkerLastFire(statePath)
+	if err != nil {
+		t.Fatalf("readWakeUpMarkerLastFire: %v", err)
+	}
+	if ts.IsZero() {
+		t.Error("expected last-fire timestamp to be written after a successful prepare")
+	}
+}
+
+// Non-assistant, disabled, and rate-limited all resolve to "" (no env
+// var → runtime injects nothing) and leave no payload behind.
+func TestPrepareWakeUpMarkerFile_SuppressionCases(t *testing.T) {
+	t.Run("non_assistant", func(t *testing.T) {
+		d, _, repoName, agentName, cleanup := setupMarkerDaemon(t)
+		defer cleanup()
+		t.Setenv(wakeUpMarkerDisabledEnv, "")
+		if got := d.prepareWakeUpMarkerFile(repoName, agentName, state.AgentTypeBrowser); got != "" {
+			t.Errorf("expected empty path for browser-agent, got %q", got)
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		d, _, repoName, agentName, cleanup := setupMarkerDaemon(t)
+		defer cleanup()
+		t.Setenv(wakeUpMarkerDisabledEnv, "1")
+		if got := d.prepareWakeUpMarkerFile(repoName, agentName, state.AgentTypeAssistant); got != "" {
+			t.Errorf("expected empty path when disabled, got %q", got)
+		}
+	})
+
+	t.Run("rate_limited", func(t *testing.T) {
+		d, _, repoName, agentName, cleanup := setupMarkerDaemon(t)
+		defer cleanup()
+		t.Setenv(wakeUpMarkerDisabledEnv, "")
+		t.Setenv(wakeUpMarkerIntervalEnv, "60")
+
+		statePath, err := wakeUpMarkerStateFile(d.paths.Root, repoName, agentName)
+		if err != nil {
+			t.Fatalf("wakeUpMarkerStateFile: %v", err)
+		}
+		if err := writeWakeUpMarkerLastFire(statePath, time.Now()); err != nil {
+			t.Fatalf("writeWakeUpMarkerLastFire: %v", err)
+		}
+
+		if got := d.prepareWakeUpMarkerFile(repoName, agentName, state.AgentTypeAssistant); got != "" {
+			t.Errorf("expected empty path when rate-limited, got %q", got)
+		}
+
+		pendingPath, err := wakeUpMarkerPendingFile(d.paths.Root, repoName, agentName)
+		if err != nil {
+			t.Fatalf("wakeUpMarkerPendingFile: %v", err)
+		}
+		if _, statErr := os.Stat(pendingPath); !os.IsNotExist(statErr) {
+			t.Errorf("rate-limited prepare must not write a payload (stat err=%v)", statErr)
+		}
+	})
+}
