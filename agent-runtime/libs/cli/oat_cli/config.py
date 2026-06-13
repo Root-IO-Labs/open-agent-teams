@@ -1412,6 +1412,374 @@ def _apply_profile_overrides(
         )
 
 
+# Providers that talk to a locally-hosted model. These are unaffected by
+# internet drops (the "network" is localhost) and can legitimately take a
+# long time to load a model before the first token, so they keep generous
+# timeouts and are not forced into fast-fail / retry behavior.
+_LOCAL_PROVIDERS = frozenset(
+    {"ollama", "lmstudio", "lm-studio", "llamacpp", "llama-cpp", "local", "vllm"}
+)
+
+# Cloud default: a dropped connection mid-stream should surface in seconds,
+# not the old 30-minute hang. This is a per-chunk *read* timeout (httpx
+# semantics for the httpx-based provider SDKs), so a long answer that keeps
+# streaming tokens is fine — only genuine silence (e.g. WiFi dropped
+# mid-generation) trips it. Tunable via OAT_API_TIMEOUT.
+_CLOUD_API_TIMEOUT_DEFAULT = 90
+# Local default stays generous: a cold local model can take minutes to load
+# before the first token.
+_LOCAL_API_TIMEOUT_DEFAULT = 1800
+# Cloud connect timeout: how long to wait for the *connection* (DNS + TCP +
+# TLS) to establish, distinct from the read timeout above. Kept short so a
+# message sent while offline (or with a half-up wifi link whose DNS hangs)
+# fails in seconds instead of riding the full read timeout — multiplied by
+# retries — into a multi-minute "thinking…" hang. A slow-but-alive stream is
+# unaffected: once connected, the (long) read timeout governs. Tunable via
+# OAT_API_CONNECT_TIMEOUT.
+_CLOUD_CONNECT_TIMEOUT_DEFAULT = 10
+
+
+def _cloud_connect_timeout(read_timeout_s: int) -> int:
+    """Resolve the cloud connect timeout, never exceeding the read timeout."""
+    connect_s = int(
+        os.environ.get("OAT_API_CONNECT_TIMEOUT", str(_CLOUD_CONNECT_TIMEOUT_DEFAULT))
+    )
+    return max(1, min(connect_s, read_timeout_s))
+
+
+def is_network_error(exc: BaseException) -> bool:
+    """Whether an exception (or its cause chain) is a network/timeout failure.
+
+    Used to turn a dropped-connection or model-timeout into a clear,
+    actionable message and to drive recovery handling. Walks
+    `__cause__`/`__context__` because provider SDKs wrap the underlying
+    httpx error (e.g. an ``APIConnectionError`` caused by an
+    ``httpx.ConnectError``). Detection is by base type plus a class-name
+    heuristic so it works without importing every provider SDK's exceptions.
+
+    Args:
+        exc: The raised exception to classify.
+
+    Returns:
+        True if the exception (or any in its cause chain) is a network or
+        timeout failure.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (TimeoutError, ConnectionError)):
+            return True
+        name = type(cur).__name__.lower()
+        if any(token in name for token in ("timeout", "connect", "network")):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _is_local_model(provider: str, kwargs: dict[str, Any]) -> bool:
+    """Whether a model is locally hosted (and thus network-drop immune).
+
+    True for known local providers or any model pointed at a custom
+    `base_url` (Ollama, LM Studio, a self-hosted proxy) — those endpoints
+    may load slowly and cannot "drop" the way a cloud connection can.
+
+    Args:
+        provider: Resolved provider name (e.g. "anthropic", "ollama").
+        kwargs: Model kwargs, inspected for a custom `base_url`.
+
+    Returns:
+        True if the model is treated as local/self-hosted.
+    """
+    if provider in _LOCAL_PROVIDERS:
+        return True
+    return bool(kwargs.get("base_url"))
+
+
+def _network_resilience_kwargs(provider: str, *, is_local: bool) -> dict[str, Any]:
+    """Timeout + retry kwargs for fast failure and self-healing.
+
+    Cloud calls get a short per-chunk read timeout so a dropped connection
+    fails in seconds, plus a few retries so a brief blip (connection reset
+    before the response lands, or a network that's coming back up after a
+    wifi drop) recovers automatically with the SDK's exponential backoff.
+    Local models keep a generous timeout and are not forced to retry.
+    User-supplied values (config.toml / CLI) still win via the caller's
+    `setdefault`.
+
+    Args:
+        provider: Resolved provider name (e.g. "anthropic", "openai").
+        is_local: Result of :func:`_is_local_model`.
+
+    Returns:
+        Mapping of kwargs to merge (with setdefault) into the model kwargs.
+    """
+    default = _LOCAL_API_TIMEOUT_DEFAULT if is_local else _CLOUD_API_TIMEOUT_DEFAULT
+    timeout_s = int(os.environ.get("OAT_API_TIMEOUT", str(default)))
+    out: dict[str, Any] = {}
+    # Parameter name varies by provider: Anthropic uses
+    # "default_request_timeout", most others use "request_timeout".
+    if provider == "anthropic":
+        # langchain-anthropic only accepts a single float here, which httpx
+        # applies to connect AND read. A connect-aware httpx.Timeout is injected
+        # post-construction in create_model (the field rejects non-floats), so
+        # here we just carry the read budget.
+        out["default_request_timeout"] = timeout_s
+    elif provider == "openai" and not is_local:
+        import httpx
+
+        # request_timeout is typed `... | Any` and passed straight through to
+        # the OpenAI SDK, which accepts an httpx.Timeout. Use one so the connect
+        # phase fails fast while a live stream keeps the full read budget.
+        out["request_timeout"] = httpx.Timeout(
+            timeout_s, connect=_cloud_connect_timeout(timeout_s)
+        )
+    else:
+        out["request_timeout"] = timeout_s
+    if not is_local:
+        # 3 retries (was 2). The SDK retries with exponential backoff, so this
+        # widens the self-heal window to a few seconds — enough to ride out the
+        # gap where the OS has re-enabled wifi but hasn't finished re-associating
+        # / DHCP yet. Without it, the first message after a reconnect fires into
+        # a still-unreachable network, all retries exhaust in ~1.5s, and the user
+        # has to resend. A true outage still surfaces in a few seconds.
+        out["max_retries"] = int(os.environ.get("OAT_API_MAX_RETRIES", "3"))
+        if provider == "openai":
+            # langchain-openai (>=1.2) exposes a per-content-chunk timeout
+            # that — unlike httpx's read timeout — is NOT reset by SSE
+            # keepalive comments. It therefore also catches a NAT/LB "silent
+            # drop" where keepalives keep the socket looking alive but no
+            # content arrives. Anthropic has no equivalent field yet, so it
+            # relies on the read timeout above. Tunable via
+            # OAT_STREAM_CHUNK_TIMEOUT (defaults to the request timeout).
+            out["stream_chunk_timeout"] = int(
+                os.environ.get("OAT_STREAM_CHUNK_TIMEOUT", str(timeout_s))
+            )
+    return out
+
+
+def _keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """Socket options that let the OS detect a dead/half-open TCP connection.
+
+    A request issued just after the network drops reuses a connection the OS
+    still believes is ESTABLISHED (the peer vanished without a FIN/RST). The
+    read then blocks with no bytes and no error, and the per-read timeout
+    never fires because providers trickle SSE keepalive bytes that reset it.
+    Enabling TCP keepalive probes (plus a hard unacked-data cap where the
+    platform supports it) makes the kernel tear such a connection down within
+    a bounded window, so a blocked read errors out in tens of seconds instead
+    of hanging for minutes — independent of the async event loop's state.
+
+    Tunable via ``OAT_TCP_KEEPALIVE_IDLE`` / ``OAT_TCP_KEEPALIVE_INTVL`` /
+    ``OAT_TCP_KEEPALIVE_CNT``. Set ``OAT_TCP_KEEPALIVE_IDLE=0`` to disable.
+
+    Returns:
+        A list of ``(level, optname, value)`` tuples for ``setsockopt``,
+        filtered to those the running platform actually supports.
+    """
+    import socket
+
+    idle = int(os.environ.get("OAT_TCP_KEEPALIVE_IDLE", "15"))
+    intvl = int(os.environ.get("OAT_TCP_KEEPALIVE_INTVL", "5"))
+    cnt = int(os.environ.get("OAT_TCP_KEEPALIVE_CNT", "3"))
+    if idle <= 0:
+        return []
+
+    opts: list[tuple[int, int, int]] = [
+        (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    ]
+    # Idle time before the first probe: Linux uses TCP_KEEPIDLE, macOS/BSD
+    # spell the same knob TCP_KEEPALIVE.
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, idle))
+    elif hasattr(socket, "TCP_KEEPALIVE"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, idle))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, intvl))
+    if hasattr(socket, "TCP_KEEPCNT"):
+        opts.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, cnt))
+    # Linux-only hard cap: drop the connection after this long with unacked
+    # data, regardless of keepalive accounting. Mirrors the keepalive budget.
+    if hasattr(socket, "TCP_USER_TIMEOUT"):
+        opts.append(
+            (socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, (idle + intvl * cnt) * 1000)
+        )
+    return opts
+
+
+def _apply_anthropic_connect_timeout(model: BaseChatModel) -> None:
+    """Give a ChatAnthropic model a short connect timeout, long read timeout.
+
+    langchain-anthropic exposes only ``default_request_timeout: float`` and
+    feeds it to httpx as a single value, so connect and read share the same
+    budget. That makes an offline send hang on the connect/DNS phase for the
+    full read timeout (times the retry count) before failing — the
+    "thinking… forever" symptom. The field can't take an ``httpx.Timeout``
+    (pydantic rejects it and a ``> 0`` guard would crash), so we rebuild the
+    underlying anthropic HTTP clients after construction with
+    ``httpx.Timeout(read, connect=short)``.
+
+    Fully best-effort: it reaches into langchain-anthropic + anthropic-sdk
+    internals (``_client_params``, the cached ``_client`` / ``_async_client``),
+    so any version drift just falls back to the float-timeout behavior — no
+    regression, the connect phase simply isn't shortened. The anthropic SDK's
+    own default connect is already 5s, so the only case this helps is when our
+    float read timeout has overridden that with a long connect.
+    """
+    try:
+        import anthropic
+        import httpx
+
+        read_to = getattr(model, "default_request_timeout", None)
+        if not isinstance(read_to, (int, float)) or read_to <= 0:
+            return
+        connect_s = _cloud_connect_timeout(int(read_to))
+        if connect_s >= read_to:
+            return
+        timeout = httpx.Timeout(float(read_to), connect=float(connect_s))
+        client_params = dict(model._client_params)
+        client_params["timeout"] = timeout
+
+        # TCP keepalive on the underlying sockets so a half-open connection
+        # (e.g. a send right after wifi dropped, reusing a pooled socket) is
+        # torn down by the kernel in tens of seconds. Anthropic has no
+        # keepalive-immune per-chunk stream timeout like langchain-openai's
+        # `stream_chunk_timeout`, so this is its fast-fail for silent drops.
+        # `proxy` must live on the transport (httpx forbids passing both a
+        # `proxy` and an explicit `transport` to the client).
+        sock_opts = _keepalive_socket_options()
+        transport_kwargs: dict[str, Any] = {
+            "limits": httpx.Limits(
+                max_connections=1000, max_keepalive_connections=100
+            ),
+            "socket_options": sock_opts,
+        }
+        proxy = getattr(model, "anthropic_proxy", None)
+        if proxy:
+            transport_kwargs["proxy"] = proxy
+        http_kwargs: dict[str, Any] = {"timeout": timeout}
+        base_url = client_params.get("base_url")
+        if base_url:
+            http_kwargs["base_url"] = base_url
+        # cached_property stores its result in the instance __dict__; seeding it
+        # before first access pre-empts the default (float-timeout) client build.
+        sync_http = anthropic.DefaultHttpxClient(
+            transport=httpx.HTTPTransport(**transport_kwargs),
+            **http_kwargs,
+        )
+        async_http = anthropic.DefaultAsyncHttpxClient(
+            transport=httpx.AsyncHTTPTransport(**transport_kwargs),
+            **http_kwargs,
+        )
+        model.__dict__["_client"] = anthropic.Client(
+            **{**client_params, "http_client": sync_http}
+        )
+        model.__dict__["_async_client"] = anthropic.AsyncClient(
+            **{**client_params, "http_client": async_http}
+        )
+    except Exception:  # internal-coupling; fall back to float timeout
+        logger.debug("anthropic connect-timeout injection skipped", exc_info=True)
+
+
+def _base_url_is_loopback(base_url: str | None) -> bool:
+    """Whether a base_url points at the local loopback interface.
+
+    A loopback endpoint (Ollama / LM Studio / a local proxy on
+    127.0.0.1 or localhost) cannot suffer a network drop, so it does not
+    need the connect-timeout + TCP-keepalive fast-fail. A custom base_url
+    on a *remote* host (e.g. a DGX box reached over Tailscale, or a cloud
+    OpenAI-compatible gateway) very much can drop and does need it.
+
+    A missing base_url means the provider's default cloud endpoint, which
+    is NOT loopback.
+
+    Args:
+        base_url: The configured base URL, or None for the default cloud
+            endpoint.
+
+    Returns:
+        True only for an explicitly loopback host.
+    """
+    if not base_url:
+        return False
+    from urllib.parse import urlparse
+
+    host = (urlparse(base_url).hostname or "").lower()
+    if host in {"localhost", "::1"}:
+        return True
+    return host.startswith("127.")
+
+
+def _inject_openai_keepalive(kwargs: dict[str, Any]) -> None:
+    """Give an OpenAI-compatible (ChatOpenAI) model fast-fail networking.
+
+    ChatOpenAI reads ``request_timeout``, ``http_client`` and
+    ``http_async_client`` at construction (its ``validate_environment``
+    model-validator builds the underlying openai SDK clients from them),
+    so — unlike the Anthropic path which has to rebuild clients
+    afterwards — we inject here, before the model is built.
+
+    Two failure modes are covered, both of which otherwise hang a send
+    issued just as the network drops (wifi off, laptop sleep, VPN flap):
+
+      * connect phase — a short connect timeout (``_cloud_connect_timeout``)
+        so an unreachable endpoint fails in seconds instead of blocking
+        for the full read budget. The (possibly generous) read budget is
+        preserved, so a slow self-hosted model still gets time to emit
+        its first token.
+      * established-but-dead socket — TCP keepalive probes
+        (``_keepalive_socket_options``) tear down a half-open connection
+        whose peer vanished without a FIN/RST. Safe for a slow model: a
+        reachable peer ACKs the probes even while generating, so keepalive
+        only fires when the peer is genuinely gone.
+
+    All values use ``setdefault`` semantics (an explicit ``http_client`` /
+    ``http_async_client`` from user config wins); ``request_timeout`` is
+    only rewritten when it is a bare number (wrapping it as the read budget
+    with a fast connect), never when the user supplied an ``httpx.Timeout``.
+
+    Args:
+        kwargs: The model constructor kwargs, mutated in place.
+    """
+    try:
+        import httpx
+
+        existing = kwargs.get("request_timeout")
+        if isinstance(existing, httpx.Timeout):
+            timeout = existing
+        else:
+            if isinstance(existing, (int, float)) and existing > 0:
+                read_to = float(existing)
+            else:
+                read_to = float(_CLOUD_API_TIMEOUT_DEFAULT)
+            connect_s = float(min(_cloud_connect_timeout(int(read_to)), read_to))
+            timeout = httpx.Timeout(read_to, connect=connect_s)
+            # Rewrite (not setdefault): the bare number was the overall
+            # budget; we keep it as the read budget and add a fast connect.
+            kwargs["request_timeout"] = timeout
+
+        limits = httpx.Limits(max_connections=1000, max_keepalive_connections=100)
+        sock_opts = _keepalive_socket_options()
+        kwargs.setdefault(
+            "http_client",
+            httpx.Client(
+                timeout=timeout,
+                transport=httpx.HTTPTransport(limits=limits, socket_options=sock_opts),
+            ),
+        )
+        kwargs.setdefault(
+            "http_async_client",
+            httpx.AsyncClient(
+                timeout=timeout,
+                transport=httpx.AsyncHTTPTransport(
+                    limits=limits, socket_options=sock_opts
+                ),
+            ),
+        )
+    except Exception:  # internal-coupling; fall back to plain timeout
+        logger.debug("openai keepalive injection skipped", exc_info=True)
+
+
 def create_model(
     model_spec: str | None = None,
     *,
@@ -1484,15 +1852,16 @@ def create_model(
     # Provider-specific kwargs (with per-model overrides)
     kwargs = _get_provider_kwargs(provider, model_name=model_name)
 
-    # Safety net: generous hard timeout to prevent indefinite API hangs.
-    # Configurable via OAT_API_TIMEOUT (seconds, default 1800 = 30 min).
-    # Parameter name varies by provider: Anthropic uses "default_request_timeout",
-    # most others use "request_timeout".
-    _api_timeout = int(os.environ.get("OAT_API_TIMEOUT", "1800"))
-    if provider == "anthropic":
-        kwargs.setdefault("default_request_timeout", _api_timeout)
-    else:
-        kwargs.setdefault("request_timeout", _api_timeout)
+    # Network resilience: fast-fail + retry for cloud, patient for local.
+    # A cloud connection that drops mid-stream now surfaces in ~OAT_API_TIMEOUT
+    # seconds (default 90, a per-chunk read timeout) instead of the old 30-min
+    # hang, and brief blips self-heal via the SDK's retries. Local models keep
+    # a generous timeout and aren't forced to retry. setdefault preserves any
+    # user-supplied config.toml/CLI values.
+    local_model = _is_local_model(provider, kwargs)
+    resilience = _network_resilience_kwargs(provider, is_local=local_model)
+    for key, value in resilience.items():
+        kwargs.setdefault(key, value)
 
     # CLI --model-params take highest priority
     if extra_kwargs:
@@ -1502,10 +1871,27 @@ def create_model(
     config = ModelConfig.load()
     class_path = config.get_class_path(provider) if provider else None
 
+    # OpenAI-compatible models (native openai, plus anything wired to
+    # langchain_openai:ChatOpenAI such as a DGX/vLLM box or OpenRouter) get
+    # connect-timeout + TCP keepalive so a send during a network drop
+    # fast-fails instead of hanging. ChatOpenAI consumes these at
+    # construction, so inject before building. Loopback endpoints can't drop,
+    # so they keep their patient, fast-fail-free behavior.
+    is_openai_compatible = provider == "openai" or (
+        class_path is not None and class_path.rsplit(":", 1)[-1] == "ChatOpenAI"
+    )
+    if is_openai_compatible and not _base_url_is_loopback(kwargs.get("base_url")):
+        _inject_openai_keepalive(kwargs)
+
     if class_path:
         model = _create_model_from_class(class_path, model_name, provider, kwargs)
     else:
         model = _create_model_via_init(model_name, provider, kwargs)
+
+    # Anthropic can't take a connect-aware httpx.Timeout via its field, so we
+    # inject one post-construction (cloud only). See helper for the why.
+    if provider == "anthropic" and not local_model:
+        _apply_anthropic_connect_timeout(model)
 
     resolved_provider = provider or getattr(model, "_model_provider", provider)
 

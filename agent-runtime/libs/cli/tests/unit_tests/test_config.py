@@ -12,13 +12,19 @@ from oat_cli.config import (
     RECOMMENDED_SAFE_SHELL_COMMANDS,
     ModelResult,
     Settings,
+    _base_url_is_loopback,
     _create_model_from_class,
     _get_provider_kwargs,
+    _inject_openai_keepalive,
+    _is_local_model,
+    _keepalive_socket_options,
+    _network_resilience_kwargs,
     build_langsmith_thread_url,
     create_model,
     detect_provider,
     fetch_langsmith_project_url,
     get_langsmith_project_name,
+    is_network_error,
     parse_shell_allow_list,
     reset_langsmith_url_cache,
     settings,
@@ -413,6 +419,164 @@ class TestCreateModelProfileExtraction:
 
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit is None
+
+
+class TestIsLocalModel:
+    """Tests for `_is_local_model` local/cloud classification."""
+
+    def test_known_local_provider_is_local(self) -> None:
+        assert _is_local_model("ollama", {}) is True
+        assert _is_local_model("lmstudio", {}) is True
+        assert _is_local_model("vllm", {}) is True
+
+    def test_custom_base_url_is_local(self) -> None:
+        assert _is_local_model("openai", {"base_url": "http://localhost:11434"}) is True
+
+    def test_cloud_provider_without_base_url_is_not_local(self) -> None:
+        assert _is_local_model("anthropic", {}) is False
+        assert _is_local_model("openai", {}) is False
+
+    def test_empty_base_url_is_not_local(self) -> None:
+        assert _is_local_model("openai", {"base_url": ""}) is False
+
+
+class TestNetworkResilienceKwargs:
+    """Tests for `_network_resilience_kwargs` timeout/retry policy."""
+
+    def test_cloud_anthropic_uses_default_request_timeout(self) -> None:
+        out = _network_resilience_kwargs("anthropic", is_local=False)
+        assert out["default_request_timeout"] == 90
+        assert "request_timeout" not in out
+        assert out["max_retries"] == 3
+        # Anthropic has no stream_chunk_timeout field yet.
+        assert "stream_chunk_timeout" not in out
+
+    def test_cloud_openai_uses_request_timeout(self) -> None:
+        import httpx
+
+        out = _network_resilience_kwargs("openai", is_local=False)
+        # Connect-aware httpx.Timeout: short connect, long read, so an offline
+        # send fails fast on connect instead of riding the full read budget.
+        assert isinstance(out["request_timeout"], httpx.Timeout)
+        assert out["request_timeout"].read == 90
+        assert out["request_timeout"].connect == 10
+        assert "default_request_timeout" not in out
+        assert out["max_retries"] == 3
+        # OpenAI gets the keepalive-immune per-chunk timeout too.
+        assert out["stream_chunk_timeout"] == 90
+
+    def test_cloud_openai_connect_timeout_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OAT_API_CONNECT_TIMEOUT", "5")
+        out = _network_resilience_kwargs("openai", is_local=False)
+        assert out["request_timeout"].connect == 5
+        assert out["request_timeout"].read == 90
+
+    def test_cloud_openai_connect_timeout_capped_at_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A connect timeout larger than the read budget is clamped down.
+        monkeypatch.setenv("OAT_API_TIMEOUT", "8")
+        monkeypatch.setenv("OAT_API_CONNECT_TIMEOUT", "30")
+        out = _network_resilience_kwargs("openai", is_local=False)
+        assert out["request_timeout"].connect == 8
+        assert out["request_timeout"].read == 8
+
+    def test_local_openai_compatible_skips_stream_chunk_timeout(self) -> None:
+        out = _network_resilience_kwargs("openai", is_local=True)
+        assert "stream_chunk_timeout" not in out
+        assert "max_retries" not in out
+
+    def test_stream_chunk_timeout_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OAT_STREAM_CHUNK_TIMEOUT", "45")
+        out = _network_resilience_kwargs("openai", is_local=False)
+        assert out["stream_chunk_timeout"] == 45
+
+    def test_local_keeps_generous_timeout_and_no_forced_retries(self) -> None:
+        out = _network_resilience_kwargs("ollama", is_local=True)
+        assert out["request_timeout"] == 1800
+        assert "max_retries" not in out
+
+    def test_env_overrides_timeout_and_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OAT_API_TIMEOUT", "30")
+        monkeypatch.setenv("OAT_API_MAX_RETRIES", "5")
+        out = _network_resilience_kwargs("openai", is_local=False)
+        assert out["request_timeout"].read == 30
+        assert out["max_retries"] == 5
+
+    def test_env_timeout_applies_to_local_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OAT_API_TIMEOUT", "600")
+        out = _network_resilience_kwargs("ollama", is_local=True)
+        assert out["request_timeout"] == 600
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_create_model_passes_fast_timeout_for_cloud(
+        self, mock_init_chat_model: Mock
+    ) -> None:
+        mock_init_chat_model.return_value = Mock(spec=["invoke"])
+        create_model("anthropic:claude-sonnet-4-5")
+        _, kwargs = mock_init_chat_model.call_args
+        assert kwargs["default_request_timeout"] == 90
+        assert kwargs["max_retries"] == 3
+
+    def test_create_model_injects_anthropic_connect_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End-to-end: a real ChatAnthropic should end up with a connect-aware
+        # httpx timeout on both clients so an offline send fails fast on connect
+        # rather than hanging for the full read budget.
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-dummy")
+        result = create_model("anthropic:claude-sonnet-4-5")
+        async_timeout = result.model._async_client.timeout
+        assert async_timeout.connect == pytest.approx(10.0)
+        assert async_timeout.read == pytest.approx(90.0)
+        sync_timeout = result.model._client.timeout
+        assert sync_timeout.connect == pytest.approx(10.0)
+        assert sync_timeout.read == pytest.approx(90.0)
+
+
+class TestIsNetworkError:
+    """Tests for `is_network_error` classification of failures."""
+
+    def test_builtin_timeout_and_connection_errors(self) -> None:
+        assert is_network_error(TimeoutError("timed out")) is True
+        assert is_network_error(ConnectionError("reset")) is True
+        assert is_network_error(ConnectionResetError("reset")) is True
+
+    def test_provider_error_by_class_name(self) -> None:
+        # Names deliberately mirror real SDK exceptions (anthropic/openai
+        # APIConnectionError, httpx.ReadTimeout).
+        class APIConnectionError(Exception):
+            pass
+
+        class ReadTimeout(Exception):  # noqa: N818  # mirrors httpx.ReadTimeout
+            pass
+
+        assert is_network_error(APIConnectionError("down")) is True
+        assert is_network_error(ReadTimeout("slow")) is True
+
+    def test_wrapped_cause_chain_is_detected(self) -> None:
+        wrapped = Exception("model failed")
+        wrapped.__cause__ = TimeoutError("read timeout")
+        assert is_network_error(wrapped) is True
+
+    def test_non_network_error_is_false(self) -> None:
+        assert is_network_error(ValueError("bad value")) is False
+        assert is_network_error(KeyError("missing")) is False
+
+    def test_cyclic_cause_chain_terminates(self) -> None:
+        a = ValueError("a")
+        b = ValueError("b")
+        a.__cause__ = b
+        b.__cause__ = a
+        assert is_network_error(a) is False
 
 
 class TestCreateModelProfileOverrides:
@@ -1607,3 +1771,117 @@ class TestDetectProvider:
             assert detect_provider("GPT-4o") == "openai"
         finally:
             settings.anthropic_api_key = None
+
+
+class TestKeepaliveSocketOptions:
+    """Tests for the TCP keepalive socket options helper."""
+
+    def test_enables_keepalive_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SO_KEEPALIVE is always present so the kernel probes idle sockets."""
+        import socket
+
+        for var in (
+            "OAT_TCP_KEEPALIVE_IDLE",
+            "OAT_TCP_KEEPALIVE_INTVL",
+            "OAT_TCP_KEEPALIVE_CNT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        opts = _keepalive_socket_options()
+        assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in opts
+        # Every option is a 3-tuple of ints suitable for setsockopt.
+        assert all(
+            len(o) == 3 and all(isinstance(v, int) for v in o) for o in opts
+        )
+
+    def test_idle_zero_disables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OAT_TCP_KEEPALIVE_IDLE=0 opts out entirely (empty list)."""
+        monkeypatch.setenv("OAT_TCP_KEEPALIVE_IDLE", "0")
+        assert _keepalive_socket_options() == []
+
+    def test_idle_value_is_applied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The configured idle time is carried on the platform's idle knob."""
+        import socket
+
+        monkeypatch.setenv("OAT_TCP_KEEPALIVE_IDLE", "20")
+        opts = _keepalive_socket_options()
+        idle_opt = socket.TCP_KEEPIDLE if hasattr(
+            socket, "TCP_KEEPIDLE"
+        ) else getattr(socket, "TCP_KEEPALIVE", None)
+        if idle_opt is not None:
+            assert (socket.IPPROTO_TCP, idle_opt, 20) in opts
+
+
+class TestBaseURLIsLoopback:
+    """Tests for loopback detection that gates the openai-compat fast-fail."""
+
+    def test_none_is_not_loopback(self) -> None:
+        """A missing base_url means the default cloud endpoint (not loopback)."""
+        assert _base_url_is_loopback(None) is False
+        assert _base_url_is_loopback("") is False
+
+    def test_localhost_variants_are_loopback(self) -> None:
+        """Localhost / 127.x / ::1 all count as loopback (cannot drop)."""
+        assert _base_url_is_loopback("http://localhost:11434/v1") is True
+        assert _base_url_is_loopback("http://127.0.0.1:1234/v1") is True
+        assert _base_url_is_loopback("http://127.5.5.5:8000") is True
+        assert _base_url_is_loopback("http://[::1]:8000/v1") is True
+
+    def test_remote_hosts_are_not_loopback(self) -> None:
+        """A Tailscale/self-hosted/cloud host can drop, so it is NOT loopback."""
+        assert _base_url_is_loopback("http://rootllm:8000/v1") is False
+        assert _base_url_is_loopback("https://openrouter.ai/api/v1") is False
+        assert _base_url_is_loopback("http://100.64.0.1:8000/v1") is False
+
+
+class TestInjectOpenAIKeepalive:
+    """Tests for the OpenAI-compatible connect-timeout + keepalive injection."""
+
+    def test_bare_number_becomes_connect_aware_timeout(self) -> None:
+        """A float request_timeout is kept as the read budget with a fast connect."""
+        import httpx
+
+        kwargs: dict = {"request_timeout": 1800, "base_url": "http://rootllm:8000/v1"}
+        _inject_openai_keepalive(kwargs)
+        t = kwargs["request_timeout"]
+        assert isinstance(t, httpx.Timeout)
+        assert t.read == pytest.approx(1800.0)
+        # Connect is short and never exceeds the read budget.
+        assert t.connect is not None
+        assert t.connect <= t.read
+        assert t.connect == pytest.approx(10.0)
+        assert isinstance(kwargs["http_client"], httpx.Client)
+        assert isinstance(kwargs["http_async_client"], httpx.AsyncClient)
+
+    def test_existing_httpx_timeout_is_preserved(self) -> None:
+        """An explicit httpx.Timeout (e.g. native openai path) is left intact."""
+        import httpx
+
+        provided = httpx.Timeout(90, connect=10)
+        kwargs: dict = {"request_timeout": provided}
+        _inject_openai_keepalive(kwargs)
+        assert kwargs["request_timeout"] is provided
+        assert isinstance(kwargs["http_async_client"], httpx.AsyncClient)
+
+    def test_user_http_client_wins(self) -> None:
+        """A user-supplied http_client is not overwritten (setdefault)."""
+        import httpx
+
+        sentinel = httpx.Client()
+        kwargs: dict = {"request_timeout": 60, "http_client": sentinel}
+        _inject_openai_keepalive(kwargs)
+        assert kwargs["http_client"] is sentinel
+
+    def test_missing_timeout_falls_back_to_cloud_default(self) -> None:
+        """No request_timeout at all still yields a connect-aware timeout."""
+        import httpx
+
+        kwargs: dict = {}
+        _inject_openai_keepalive(kwargs)
+        t = kwargs["request_timeout"]
+        assert isinstance(t, httpx.Timeout)
+        assert t.connect is not None
+        assert t.connect <= t.read
