@@ -1877,8 +1877,10 @@ def create_model(
     # fast-fails instead of hanging. ChatOpenAI consumes these at
     # construction, so inject before building. Loopback endpoints can't drop,
     # so they keep their patient, fast-fail-free behavior.
+    # Recognize ChatOpenAI and its subclasses (e.g. ReasoningFallbackChatOpenAI)
+    # so a custom-class provider still gets connect-timeout + TCP keepalive.
     is_openai_compatible = provider == "openai" or (
-        class_path is not None and class_path.rsplit(":", 1)[-1] == "ChatOpenAI"
+        class_path is not None and class_path.rsplit(":", 1)[-1].endswith("ChatOpenAI")
     )
     if is_openai_compatible and not _base_url_is_loopback(kwargs.get("base_url")):
         _inject_openai_keepalive(kwargs)
