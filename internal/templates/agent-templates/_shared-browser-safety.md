@@ -84,3 +84,66 @@ What this means in practice:
 - If `browser_show_window` / `browser_hide_window` return `NO_AGENT_WINDOW`, you haven't created the agent window yet this session — call `browser_new_tab` first, then retry.
 - If the user manually drags an agent tab out of the agent window into one of their normal Chrome windows, the tab keeps working but becomes subject to non-active-tab input throttling whenever the user has another tab foregrounded in that window. The extension surfaces this passively via an amber `!` badge on its toolbar icon; you do not get a tool-result warning. If a sequence of tool calls against one specific `tabId` starts behaving strangely (clicks not registering, type events dropping characters), check whether the tab has been dragged.
 - Hands-off operation on macOS: the user can drag the visible-small agent window into its own Mission Control Space themselves (swipe up with three fingers, drag the window onto a new desktop). The window will keep running there with no input throttling, and the user gets their original Space back without you needing to call `browser_hide_window`.
+
+<!--
+The sections below are shared browsing MECHANICS (not safety-critical, but
+genuinely common to both AgentTypeBrowser and AgentTypeAssistant). They were
+consolidated here from browser.md / assistant.md so a fix in one reaches both.
+Keep them written in a neutral voice that reads correctly for a dispatched
+workflow helper AND a persistent side-panel assistant.
+-->
+
+## Web apps vs. desktop-app launchers
+
+Prefer a product's **web-app URL** over its marketing/launcher page. Many apps (team chat, video calls, music, IDEs, etc.) serve a landing page whose "Open"/"Launch" button fires a custom-scheme deep link (e.g. `someapp://…`) to hand off to an installed desktop app. That deep link pops a **native browser "Open <app>?" dialog, which is OS-level browser chrome — not page content.** You cannot see it in a `browser_snapshot`, and no `browser_*` tool can dismiss it: `browser_handle_dialog` only covers in-page JS dialogs (`alert`/`confirm`/`prompt`), not native protocol prompts. It will silently block the task.
+
+So navigate straight to the product's in-browser client (typically an `app.`/`web.` subdomain or a documented web-client URL) instead of its landing page, so the desktop handoff is never triggered. If you're already stuck behind such a dialog you cannot clear it programmatically — say so, and either reopen the web-client URL in a fresh `browser_new_tab` or ask the user to dismiss it / open the web client.
+
+## Messaging, inbox, and chat-style apps
+
+Conversation UIs — email, DMs, team chat, support inboxes — share a layout pattern that defeats naive perception. Reading them the same way you'd read an article wastes steps and tokens and often returns the wrong text. The rules below are general to the whole UI class, not any one product:
+
+1. **A preview overlay is not the conversation.** A popover or hover-card launched from a feed/list page typically shows only the thread *preview* (sender + a one-line snippet), and that content frequently isn't in the accessibility tree at all. If a snapshot/`browser_get_text` of an overlay comes back empty or shows only a snippet, do NOT keep re-reading it — it doesn't contain the message body.
+2. **Go to the dedicated full conversation view.** Open the app's messaging/inbox route by its own URL (e.g. via `browser_new_tab`) instead of reading an overlay launched from another page. The full-page view exposes the thread in the AX tree and is far cheaper and more reliable to read.
+3. **Open the SPECIFIC thread/channel you were asked about before reading or sending.** Inbox/sidebar lists show many conversations and the top one is usually NOT the one requested. `browser_find {query: "<person/thread/channel name>"}` → click it → confirm the right one is open before doing anything else. Skipping this is how you end up reading — or posting to — the wrong conversation.
+4. **Verify the destination before you type or send.** After clicking a thread/channel, confirm the open conversation is the intended one — check that the header (or the message box's accessible label, e.g. "Message to <name>") matches the EXACT name you were given, character for character, before typing. A single click may not have switched focus; the compose box can still be bound to the previous channel. Sending to "marketing-bot-test" when you were asked for "marketing-reports-test" is a destination error, not a typo, and it is not recoverable after send. If the header doesn't match, re-click and re-verify; never type into an unverified compose box.
+5. **Then take ONE scoped read.** Once the correct thread is open, `browser_snapshot {interactiveOnly: false}` to get the message-list container ref, then `browser_get_text {ref: <that-ref>, maxChars: 4000}` (or a ref-scoped snapshot) of just that container. Never full-page `browser_get_text`/snapshot a messaging app — the surrounding inbox/feed chrome is large and pure token waste.
+
+Worked shape — "read the latest message from <person>":
+
+```
+1. browser_new_tab { url: "<app's messaging route>" }   // not the feed/overlay
+2. browser_find { query: "<person>" }  → browser_click { ref }
+3. browser_wait_for { text: "<a word you expect in the thread>" }   // confirm it loaded
+4. browser_snapshot { interactiveOnly: false }  → ref of the message-list container
+5. browser_get_text { ref: <that-ref>, maxChars: 4000 }   // the messages, scoped
+```
+
+This collapses the ~20-step "wander the feed overlay, take broad reads" path into ~5 scoped calls.
+
+## Click fallback ladder
+
+When a click does not produce the expected effect (no navigation, no DOM change, snapshot looks identical), don't repeat the same call hoping for a different outcome — climb this ladder one step at a time until the action succeeds:
+
+1. **`browser_click` by ref** — the default. Cheap and stable when the snapshot's element refs are accurate.
+2. **Take a fresh `browser_snapshot`, get a new ref, retry `browser_click`.** Refs become stale after DOM mutations, SPA route changes, or framework re-renders. The new snapshot is also your evidence that the previous click did nothing.
+3. **`browser_click` with explicit coordinates** (using the `x` and `y` parameters) — useful when the element is occluded by an overlay, custom-rendered, or has a click handler the ref-based dispatch missed.
+4. **`browser_screenshot` + `browser_zoom`, then `browser_click` with coordinates derived from the zoomed image.** Use this for canvas, SVG, charts, custom-drawn UIs, or any element with no meaningful accessibility tree entry.
+5. **`browser_press_key` with `Tab` + `Enter` or `Space`** — keyboard activation works on widgets whose click handler is wired through a deep-nested delegate or container that the click dispatch missed but whose focused-element keydown handler activates directly (custom dropdowns, menu items, listbox options).
+
+If step 5 still fails, stop and report the page + element to the user; do not loop. Each retry costs tokens and trips the circuit breaker faster.
+
+## Truncated read-tool results
+
+The bridge caps the visible size of every read-tool response (`browser_get_text`, `browser_snapshot`, `browser_extract`, `browser_find`, `browser_observe`, `browser_console_messages`, `browser_network_requests`, `browser_evaluate`, `browser_cookies_list`) so a single Wikipedia-class page can't blow your entire context window in one call. When that fires you'll see a structured marker at the END of the tool result:
+
+```
+[TRUNCATED: original=612345 chars, showing=32768, blob_id=<uuid>. Recovery: use browser_extract(selector) for a scoped portion, browser_find(text) to locate a section, browser_get_text(range=[N,M]) to paginate, OR browser_fetch_blob(id="<uuid>", range=[N,M]) for additional bytes from the cached full result (blob expires in ~5 min or on bridge restart — if BLOB_EXPIRED, re-run the original tool with a scoped variant).]
+```
+
+Recovery rules:
+
+- **Don't re-call the same tool with the same args** — you'll just hit the cap again. Use a SCOPED variant: `browser_extract` with a CSS selector, `browser_find` with text to locate, or `browser_get_text` with `range=[N,M]` to paginate.
+- **Use `browser_fetch_blob(id, range)` to read additional bytes** from the cached full result. The blob holds the full pre-truncation content for ~5 minutes; pass a `range` like `[32768, 65536]` to continue where the visible content cut off. The fetched slice is subject to the same cap, so you may get a NEW marker with a new `blob_id` — paginate by adjusting `range`.
+- **On `BLOB_EXPIRED`**, the cache evicted the blob (LRU, TTL, or bridge restart). Re-run the original tool with a scoped variant — don't just retry `browser_fetch_blob` with the same id.
+- The truncation marker is NOT an error; the visible content above it is real partial data you can use.

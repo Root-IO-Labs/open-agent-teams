@@ -116,21 +116,6 @@ browser_batch { calls: [
 
 Prepend `{ tool: "debugger_attach", params: { tabId } }` only when the tab isn't already attached (a tab you just opened with `browser_new_tab` is already attached — skip it). This collapses three round-trips into one. It matters because each round-trip is a separate model + API call: when the model API is having a slow turn, you pay that latency *per round-trip*, not per browser action (the browser tools themselves are sub-second). Prefer `waitUntil: "domcontentloaded"` for static/article pages (returns as soon as the DOM is parseable); keep the default `load` when the content you need fills in from subresources or late scripts. Batching does not weaken any guard — every inner call still runs the full URL/domain/sensitive-page preflight, and a blocked inner call aborts the whole batch.
 
-### Truncated read-tool results
-
-The bridge caps the visible size of every read-tool response (`browser_get_text`, `browser_snapshot`, `browser_extract`, `browser_find`, `browser_observe`, `browser_console_messages`, `browser_network_requests`, `browser_evaluate`, `browser_cookies_list`) so a single Wikipedia-class page can't blow your entire context window in one call. When that fires you'll see a structured marker at the END of the tool result:
-
-```
-[TRUNCATED: original=612345 chars, showing=32768, blob_id=<uuid>. Recovery: use browser_extract(selector) for a scoped portion, browser_find(text) to locate a section, browser_get_text(range=[N,M]) to paginate, OR browser_fetch_blob(id="<uuid>", range=[N,M]) for additional bytes from the cached full result (blob expires in ~5 min or on bridge restart — if BLOB_EXPIRED, re-run the original tool with a scoped variant).]
-```
-
-Recovery rules:
-
-- **Don't re-call the same tool with the same args** — you'll just hit the cap again. Use a SCOPED variant: `browser_extract` with a CSS selector, `browser_find` with text to locate, or `browser_get_text` with `range=[N,M]` to paginate.
-- **Use `browser_fetch_blob(id, range)` to read additional bytes** from the cached full result. The blob holds the full pre-truncation content for ~5 minutes; pass a `range` like `[32768, 65536]` to continue where the visible content cut off. The fetched slice is subject to the same cap, so you may get a NEW marker with a new `blob_id` — paginate by adjusting `range`.
-- **On `BLOB_EXPIRED`**, the cache evicted the blob (LRU, TTL, or bridge restart). Re-run the original tool with a scoped variant — don't just retry `browser_fetch_blob` with the same id.
-- The truncation marker is NOT an error; the visible content above it is real partial data you can use.
-
 ## One Decision at a Time
 
 Act like a careful operator working through one decision at a time, not a script firing every possible tool in parallel. This discipline governs **interactive and destructive** steps — clicks that submit, fills, navigations that discard page state you'd want to inspect. It does **not** apply to a deterministic read of a URL you were given: batch those (see *Batch read-only page reads* above) rather than serializing attach → navigate → read.

@@ -86,6 +86,12 @@ You interact with web pages through the OAT Browser Agent MCP tools. These tools
 6. **Dismiss overlays first** — call `browser_dismiss_overlay` on new pages.
 
 <!--
+Web-app-vs-launcher, messaging/chat-app, and click-fallback-ladder guidance
+that used to live here now lives in `_shared-browser-safety.md` so the assistant
+prompt gets the same rules. Do NOT re-inline them here.
+-->
+
+<!--
 Perception cost hierarchy below was added in lock-step with Part 7.5c of the
 mcp-and-opt-in-browser-agent plan (oat-browser-agent feat/browser-agent).
 It references specific bridge tool / param names: `mode: "main"`,
@@ -118,27 +124,6 @@ Never call `browser_get_text` if your only goal is to click something — the AX
 2. `browser_wait_for {selector: "..."}` — use when you genuinely need to wait for a structural element to exist (e.g. before clicking a control whose ref you'll resolve in the next snapshot) or as a scoping bound combined with `text:`. Don't reach for selector-only on a route swap — the container almost always exists before the content does.
 
 The hierarchy is **preference, not law**. If a specific task genuinely needs full-page text (e.g. "list every link on this page"), use it. The default for "look at this page" tasks is the cheapest tool that gets the job done.
-
-### Messaging, inbox, and chat-style apps
-
-Conversation UIs — email, DMs, team chat, support inboxes — share a layout pattern that defeats naive perception. Reading them the same way you'd read an article wastes steps and tokens and often returns the wrong text. The rules below are general to the whole UI class, not any one product:
-
-1. **A preview overlay is not the conversation.** A popover or hover-card launched from a feed/list page typically shows only the thread *preview* (sender + a one-line snippet), and that content frequently isn't in the accessibility tree at all. If a snapshot/`browser_get_text` of an overlay comes back empty or shows only a snippet, do NOT keep re-reading it — it doesn't contain the message body.
-2. **Go to the dedicated full conversation view.** Open the app's messaging/inbox route by its own URL (e.g. via `browser_new_tab`) instead of reading an overlay launched from another page. The full-page view exposes the thread in the AX tree and is far cheaper and more reliable to read.
-3. **Open the SPECIFIC thread you were asked about before reading.** Inbox lists show many conversations and the top one is usually NOT the one requested. `browser_find {query: "<person/thread name>"}` → click it → confirm the thread header shows the right correspondent before extracting. Skipping this is how you end up reading the wrong conversation's preview.
-4. **Then take ONE scoped read.** Once the correct thread is open, `browser_snapshot {interactiveOnly: false}` to get the message-list container ref, then `browser_get_text {ref: <that-ref>, maxChars: 4000}` (or a ref-scoped snapshot) of just that container. Never full-page `browser_get_text`/snapshot a messaging app — the surrounding inbox/feed chrome is large and pure token waste.
-
-Worked shape — "read the latest message from <person>":
-
-```
-1. browser_new_tab { url: "<app's messaging route>" }   // not the feed/overlay
-2. browser_find { query: "<person>" }  → browser_click { ref }
-3. browser_wait_for { text: "<a word you expect in the thread>" }   // confirm it loaded
-4. browser_snapshot { interactiveOnly: false }  → ref of the message-list container
-5. browser_get_text { ref: <that-ref>, maxChars: 4000 }   // the messages, scoped
-```
-
-This collapses the ~20-step "wander the feed overlay, take broad reads" path into ~5 scoped calls.
 
 ### `browser_screenshot` — defaults to full-page
 
@@ -210,18 +195,6 @@ Act like a careful operator working through one decision at a time, not a script
 - **Slower pacing on logged-in or session-bearing pages.** Think before each action rather than emitting bursts. Token cost per turn is small; an extra observation before a destructive step is cheap insurance.
 
 The bridge already serializes calls at the runtime layer (`TaskQueue` is `maxConcurrent = 1`); this section is your half of the same contract — plan the way the queue executes, so that what you emit looks like a sequence of considered decisions rather than a fan-out of speculative calls.
-
-#### Click fallback ladder
-
-When a click does not produce the expected effect (no navigation, no DOM change, snapshot looks identical), don't repeat the same call hoping for a different outcome — climb this ladder one step at a time until the action succeeds:
-
-1. **`browser_click` by ref** — the default. Cheap and stable when the snapshot's element refs are accurate.
-2. **Take a fresh `browser_snapshot`, get a new ref, retry `browser_click`.** Refs become stale after DOM mutations, SPA route changes, or framework re-renders. The new snapshot is also your evidence that the previous click did nothing.
-3. **`browser_click` with explicit coordinates** (using the `x` and `y` parameters) — useful when the element is occluded by an overlay, custom-rendered, or has a click handler the ref-based dispatch missed.
-4. **`browser_screenshot` + `browser_zoom`, then `browser_click` with coordinates derived from the zoomed image.** Use this for canvas, SVG, charts, custom-drawn UIs, or any element with no meaningful accessibility tree entry.
-5. **`browser_press_key` with `Tab` + `Enter` or `Space`** — keyboard activation works on widgets whose click handler is wired through a deep-nested delegate or container that the click dispatch missed but whose focused-element keydown handler activates directly (custom dropdowns, menu items, listbox options).
-
-If step 5 still fails, stop and report the page + element to the user; do not loop. Each retry costs tokens and trips the circuit breaker faster.
 
 <!--
 The Safety Rules / Prompt Injection Defense / Cross-Tab Discipline /
