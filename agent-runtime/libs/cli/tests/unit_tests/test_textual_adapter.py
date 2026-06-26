@@ -403,25 +403,48 @@ class TestExecuteTaskTextualNetworkFailure:
         assert "ASSISTANT:" in log_text
         assert "Lost connection to the model" in log_text
 
-    async def test_non_network_error_propagates(self, tmp_path: Path) -> None:
-        """A non-network exception still bubbles to the app-level handler."""
+    async def test_non_network_error_writes_final_assistant_block(
+        self, tmp_path: Path
+    ) -> None:
+        """A non-network model error (e.g. HTTP 404) is handled, not propagated.
+
+        It must fail the turn cleanly and write a final ASSISTANT block (with
+        the user-facing error and the exception detail) so the daemon tailer
+        emits a final chat_response and the side panel's "thinking…" indicator
+        clears instead of spinning forever.
+        """
+        mounted: list[object] = []
+
+        async def mount_message(widget: object) -> None:
+            await asyncio.sleep(0)
+            mounted.append(widget)
+
         log_path = tmp_path / "conversation.log"
         adapter = TextualUIAdapter(
-            mount_message=_mock_mount,
+            mount_message=mount_message,
             update_status=_noop_status,
             request_approval=_mock_approval,
             set_spinner=_noop_spinner,
         )
 
-        with pytest.raises(ValueError, match="boom"):
-            await execute_task_textual(
-                user_input="hello",
-                agent=_RaisingAgent(ValueError("boom")),
-                assistant_id="assistant",
-                session_state=SimpleNamespace(thread_id="t-x", auto_approve=False),
-                adapter=adapter,
-                conversation_log_path=str(log_path),
-            )
+        # Must not raise — the error is handled internally so the turn queue
+        # drains and the side panel is told the turn ended.
+        await execute_task_textual(
+            user_input="hello",
+            agent=_RaisingAgent(
+                ValueError("Error code: 404 - model `foo` does not exist")
+            ),
+            assistant_id="assistant",
+            session_state=SimpleNamespace(thread_id="t-x", auto_approve=False),
+            adapter=adapter,
+            conversation_log_path=str(log_path),
+        )
+
+        log_text = log_path.read_text(encoding="utf-8")
+        assert "ASSISTANT:" in log_text
+        assert "could not complete this turn" in log_text
+        # The provider's error detail is surfaced so the user knows the cause.
+        assert "does not exist" in log_text
 
 
 class TestExecuteTaskTextualSummarizationFeedback:

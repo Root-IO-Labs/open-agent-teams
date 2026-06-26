@@ -387,6 +387,12 @@ _STREAM_FIRST_CHUNK_TIMEOUT_S = int(
     os.environ.get("OAT_STREAM_FIRST_CHUNK_TIMEOUT", "45")
 )
 
+# Max characters of a raw exception string to surface to the user when a turn
+# fails. Long enough to carry a provider's error message (e.g. an HTTP 404
+# "model does not exist" body) without dumping an unbounded traceback into the
+# chat / side panel.
+_TURN_ERROR_DETAIL_MAX = 800
+
 
 class _StreamIdleTimeoutError(Exception):
     """Raised when the model stream produces no data for too long.
@@ -1341,19 +1347,40 @@ async def execute_task_textual(
     except Exception as exc:  # noqa: BLE001
         from oat_cli.config import is_network_error
 
-        # Only handle network/timeout failures here; anything else propagates
-        # to the app-level handler which renders it as a generic "Agent error".
-        if not is_network_error(exc):
-            raise
+        # Fail the turn CLEANLY for ANY model/turn error — not just network
+        # drops. Whatever the cause (a dropped connection, or an HTTP error
+        # such as a 404 for an unconfigured/unavailable model, a 401 auth
+        # failure, a 400 bad request, …), we must:
+        #   1. surface a clear, actionable message to the user, and
+        #   2. write a final ASSISTANT block to the conversation log so the
+        #      daemon tailer emits a final chat_response and the side panel's
+        #      "thinking…" indicator clears (turn_end ALONE does NOT clear it),
+        # then return so the turn queue drains rather than wedging behind the
+        # error. Previously only network errors were handled here and anything
+        # else was re-raised to the app-level handler; that handler renders an
+        # error in the Textual UI and emits turn_end, but never writes a final
+        # chat_response — so a fast-failing error (e.g. 404 model-not-found)
+        # left the browser side panel spinning on "thinking…" forever with no
+        # explanation and no way for the user to know what went wrong.
+        if is_network_error(exc):
+            logger.warning("Model call failed (network/timeout): %s", exc)
+            error_text = (
+                "Lost connection to the model (network error or timeout). "
+                "Check your internet and send your message again."
+            )
+        else:
+            logger.warning("Model call failed: %s", exc, exc_info=True)
+            detail = str(exc).strip()
+            if len(detail) > _TURN_ERROR_DETAIL_MAX:
+                detail = detail[:_TURN_ERROR_DETAIL_MAX] + "…"
+            error_text = (
+                "The model could not complete this turn. This usually means "
+                "the configured model is unavailable or misconfigured — check "
+                "your model settings and try again."
+            )
+            if detail:
+                error_text += f"\n\nDetails: {detail}"
 
-        # A dropped connection / model timeout, surfaced fast by the model's
-        # per-chunk read timeout + exhausted retries (see config.py). Fail the
-        # turn cleanly and — crucially — write a final ASSISTANT block to the
-        # conversation log so the daemon tailer emits a final chat_response and
-        # the side panel's "thinking…" indicator clears (turn_end alone does
-        # NOT clear it). Then return so the turn queue drains rather than
-        # wedging behind the error.
-        logger.warning("Model call failed (network/timeout): %s", exc)
         if adapter._set_active_message:
             adapter._set_active_message(None)
         if adapter._set_spinner:
@@ -1364,13 +1391,9 @@ async def execute_task_textual(
             tool_msg.set_rejected()
         adapter._current_tool_messages.clear()
 
-        network_error_text = (
-            "Lost connection to the model (network error or timeout). "
-            "Check your internet and send your message again."
-        )
-        await adapter._mount_message(AppMessage(network_error_text))
+        await adapter._mount_message(AppMessage(error_text))
         if conv_log:
-            conv_log.log_assistant(network_error_text)
+            conv_log.log_assistant(error_text)
 
         # Failed work still counts as spend.
         _commit_token_tracking(
