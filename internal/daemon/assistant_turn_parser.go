@@ -84,6 +84,17 @@ var nextMarkerRE = regexp.MustCompile(`^(\[\d{1,2}:\d{2}:\d{2}\] [A-Z]+:|\[OAT_[
 // sync if that constant ever changes.
 const sidePanelSentinelBody = "[SIDE-PANEL CHAT]"
 
+// echoedSidePanelPrefixRE matches a `[SIDE-PANEL CHAT]` sentinel (plus the
+// optional `[active-tab-id: <N>]` hint) parroted back at the very START of an
+// assistant reply. The daemon prepends this framing to the user's message on
+// the way IN (handleAgentInput); models with weaker instruction-following
+// (observed with Nemotron) sometimes echo it on the way OUT, leaking internal
+// scaffolding into the chat bubble. Stripping it at this single render
+// chokepoint keeps the bubble clean regardless of model. Anchored to the
+// start so only a leading echo is removed — a legitimate later mention is
+// left intact.
+var echoedSidePanelPrefixRE = regexp.MustCompile(`^\s*\[SIDE-PANEL CHAT\]\s*(?:\[active-tab-id:\s*\d+\]\s*)?`)
+
 // oatBrowserStatusPrefix marks the agent's status-reporting sentinel.
 // The browser.md prompt instructs the agent to emit
 // `[OAT_BROWSER] status: <msg>` lines for the daemon's OutputWatcher;
@@ -211,6 +222,9 @@ func parseEvents(lines []string) []Event {
 			cleaned.WriteByte('\n')
 		}
 		sanitized := sanitizeEmitText(strings.Trim(cleaned.String(), "\n"))
+		// Defensive: strip a `[SIDE-PANEL CHAT]` sentinel the model echoed
+		// back as the first thing in its reply (see echoedSidePanelPrefixRE).
+		sanitized = strings.TrimSpace(echoedSidePanelPrefixRE.ReplaceAllString(sanitized, ""))
 		sanitized = truncateUTF8(sanitized, emitTurnMaxBytes)
 		if sanitized == "" {
 			return

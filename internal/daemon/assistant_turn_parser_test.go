@@ -284,6 +284,65 @@ func TestParseAssistantTurns(t *testing.T) {
 		}
 	})
 
+	t.Run("echoed [SIDE-PANEL CHAT] sentinel is stripped from reply", func(t *testing.T) {
+		// Weaker models (observed with Nemotron) parrot the input
+		// framing back at the start of their reply. The leading
+		// sentinel must not leak into the chat bubble.
+		lines := []string{
+			"[12:00:00] ASSISTANT:",
+			"  [SIDE-PANEL CHAT] It's a test message. I see it arrived.",
+			"",
+			"[12:00:01] TOOL: execute",
+		}
+		turns := parseAssistantTurns(lines)
+		if len(turns) != 1 {
+			t.Fatalf("expected 1 turn, got %d", len(turns))
+		}
+		if strings.Contains(turns[0].SanitizedText, "SIDE-PANEL CHAT") {
+			t.Errorf("echoed sentinel leaked into chat body: %q", turns[0].SanitizedText)
+		}
+		if !strings.HasPrefix(turns[0].SanitizedText, "It's a test message") {
+			t.Errorf("legit content damaged after scrub: %q", turns[0].SanitizedText)
+		}
+	})
+
+	t.Run("echoed sentinel with active-tab-id hint is stripped", func(t *testing.T) {
+		lines := []string{
+			"[12:00:00] ASSISTANT:",
+			"  [SIDE-PANEL CHAT] [active-tab-id: 1817124657] Here's what the page says.",
+			"",
+			"[12:00:01] TOOL: execute",
+		}
+		turns := parseAssistantTurns(lines)
+		if len(turns) != 1 {
+			t.Fatalf("expected 1 turn, got %d", len(turns))
+		}
+		if strings.Contains(turns[0].SanitizedText, "SIDE-PANEL CHAT") || strings.Contains(turns[0].SanitizedText, "active-tab-id") {
+			t.Errorf("echoed framing leaked into chat body: %q", turns[0].SanitizedText)
+		}
+		if !strings.HasPrefix(turns[0].SanitizedText, "Here's what the page says") {
+			t.Errorf("legit content damaged after scrub: %q", turns[0].SanitizedText)
+		}
+	})
+
+	t.Run("a later mention of the sentinel is left intact", func(t *testing.T) {
+		// Only a LEADING echo is scrubbed; a legitimate mid-reply
+		// reference (e.g. the agent explaining the protocol) survives.
+		lines := []string{
+			"[12:00:00] ASSISTANT:",
+			"  Your messages arrive prefixed with [SIDE-PANEL CHAT].",
+			"",
+			"[12:00:01] TOOL: execute",
+		}
+		turns := parseAssistantTurns(lines)
+		if len(turns) != 1 {
+			t.Fatalf("expected 1 turn, got %d", len(turns))
+		}
+		if !strings.Contains(turns[0].SanitizedText, "[SIDE-PANEL CHAT]") {
+			t.Errorf("non-leading mention should be preserved: %q", turns[0].SanitizedText)
+		}
+	})
+
 	t.Run("turn that is JUST a [OAT_BROWSER] status produces no turn", func(t *testing.T) {
 		// The earlier-screenshot bug: a status-only ASSISTANT turn
 		// rendered as a chat bubble. After stripping it must
