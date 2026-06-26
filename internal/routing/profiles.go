@@ -28,7 +28,21 @@ type AgentRole int
 const (
 	RoleWorker AgentRole = iota
 	RoleOrchestrator
+	// RoleAssistant is the capability bar for conversational tool-using agents
+	// (the personal assistant and the browser agent). They converse and call
+	// their bound tools (browser/MCP) but never run a coding worker's build/
+	// test/shell loop, so they are gated on tool-calling capability rather than
+	// the worker/orchestrator shell-and-restricted gates.
+	RoleAssistant
 )
+
+// AssistantToolThreshold is the minimum tool_reliability (0.0–1.0) a model must
+// have to back an assistant/browser agent. It mirrors the tool_calling probe's
+// pass bar (a model that emits a structured tool call scores >= 0.7). Assistant
+// eligibility deliberately ignores shell_roundtrip and "restricted" status: a
+// model can be a perfectly good chat/tool assistant while failing the coding-
+// worker probes.
+const AssistantToolThreshold = 0.7
 
 func (r AgentRole) String() string {
 	switch r {
@@ -36,6 +50,8 @@ func (r AgentRole) String() string {
 		return "worker"
 	case RoleOrchestrator:
 		return "orchestrator"
+	case RoleAssistant:
+		return "assistant"
 	default:
 		return "unknown"
 	}
@@ -115,15 +131,28 @@ type ModelProfile struct {
 }
 
 // IsEligible checks whether this profile is eligible for the given role.
+//
+// Worker and orchestrator roles require the model to be non-restricted AND
+// carry the matching contract flag (the worker/orchestrator probes gate on
+// shell_roundtrip, multi-turn, etc.). The assistant role is deliberately
+// looser: a conversational tool-using agent only needs reliable tool calling,
+// so it is gated on tool_reliability alone and is NOT blocked by "restricted"
+// status or a failed shell_roundtrip — a model can be a fine chat/tool
+// assistant while failing the coding-worker bar.
 func (p *ModelProfile) IsEligible(role AgentRole) bool {
-	if p.Status == "restricted" {
-		return false
-	}
 	switch role {
+	case RoleAssistant:
+		// Assistant is the loosest role: it only needs reliable tool calling.
+		// A model that already qualifies as a worker or orchestrator necessarily
+		// calls tools well, so accept those too even when the standalone
+		// tool_reliability score isn't populated. Restricted status and a failed
+		// shell_roundtrip are intentionally NOT disqualifiers here — a model can
+		// be a fine chat/tool assistant while failing the coding-worker bar.
+		return p.ToolReliability >= AssistantToolThreshold || p.WorkerEligible || p.OrchestratorEligible
 	case RoleWorker:
-		return p.WorkerEligible
+		return p.Status != "restricted" && p.WorkerEligible
 	case RoleOrchestrator:
-		return p.OrchestratorEligible
+		return p.Status != "restricted" && p.OrchestratorEligible
 	default:
 		return false
 	}

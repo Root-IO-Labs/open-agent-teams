@@ -206,6 +206,75 @@ func TestProfileStore_Get(t *testing.T) {
 	}
 }
 
+func TestModelProfile_IsEligible_Roles(t *testing.T) {
+	tests := []struct {
+		name string
+		p    *ModelProfile
+		role AgentRole
+		want bool
+	}{
+		// Assistant role: gated on tool_reliability only; restricted status and
+		// shell/worker eligibility are intentionally ignored.
+		{
+			name: "assistant: restricted + tool-capable -> eligible",
+			p:    &ModelProfile{Status: "restricted", ToolReliability: 1.0, WorkerEligible: false},
+			role: RoleAssistant,
+			want: true,
+		},
+		{
+			name: "assistant: exactly at threshold -> eligible",
+			p:    &ModelProfile{Status: "restricted", ToolReliability: AssistantToolThreshold},
+			role: RoleAssistant,
+			want: true,
+		},
+		{
+			name: "assistant: below threshold + not worker/orch -> not eligible",
+			p:    &ModelProfile{Status: "known", ToolReliability: 0.5},
+			role: RoleAssistant,
+			want: false,
+		},
+		{
+			name: "assistant: worker-eligible implies tool-capable -> eligible",
+			p:    &ModelProfile{Status: "known", ToolReliability: 0, WorkerEligible: true},
+			role: RoleAssistant,
+			want: true,
+		},
+		// Worker role: still blocked by restricted status (no weakening).
+		{
+			name: "worker: restricted blocked even if tool-capable + worker_eligible",
+			p:    &ModelProfile{Status: "restricted", ToolReliability: 1.0, WorkerEligible: true},
+			role: RoleWorker,
+			want: false,
+		},
+		{
+			name: "worker: known + worker_eligible -> eligible",
+			p:    &ModelProfile{Status: "known", WorkerEligible: true},
+			role: RoleWorker,
+			want: true,
+		},
+		// Orchestrator role: unchanged restricted gating.
+		{
+			name: "orchestrator: restricted blocked",
+			p:    &ModelProfile{Status: "restricted", OrchestratorEligible: true},
+			role: RoleOrchestrator,
+			want: false,
+		},
+		{
+			name: "orchestrator: known + orchestrator_eligible -> eligible",
+			p:    &ModelProfile{Status: "known", OrchestratorEligible: true},
+			role: RoleOrchestrator,
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.p.IsEligible(tt.role); got != tt.want {
+				t.Errorf("IsEligible(%v) = %v, want %v", tt.role, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestProfileStore_GetRestricted(t *testing.T) {
 	dir := setupTestProfiles(t)
 	ps, _ := NewProfileStore(dir)
@@ -587,6 +656,9 @@ func TestAgentRole_String(t *testing.T) {
 	}
 	if RoleOrchestrator.String() != "orchestrator" {
 		t.Errorf("RoleOrchestrator.String() = %q", RoleOrchestrator.String())
+	}
+	if RoleAssistant.String() != "assistant" {
+		t.Errorf("RoleAssistant.String() = %q", RoleAssistant.String())
 	}
 }
 

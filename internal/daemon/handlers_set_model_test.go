@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Root-IO-Labs/open-agent-teams/internal/routing"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/socket"
 	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
@@ -33,6 +34,34 @@ import (
 //   - Response data with prior_model + new_model + changed +
 //     requires_restart so the CLI can render the right wording
 //     and decide whether to nudge the user.
+
+// TestRoleForAgentType pins the agent-type → routing-role mapping that
+// gates model eligibility. It is the single source of truth for the
+// model-validation call sites (handleAddAgent, handleSetAgentModel,
+// validateModelForAgentType, and resolveAndValidateModelWithSource).
+// Regression guard: the restart path (resolveAndValidateModelWithSource)
+// once inlined its own switch that omitted the assistant/browser case,
+// so a Nemotron-backed assistant validated as a worker, failed, and got
+// auto-swapped to a fallback model on every restart.
+func TestRoleForAgentType(t *testing.T) {
+	cases := []struct {
+		agentType state.AgentType
+		want      routing.AgentRole
+	}{
+		{state.AgentTypeSupervisor, routing.RoleOrchestrator},
+		{state.AgentTypeWorkspace, routing.RoleOrchestrator},
+		{state.AgentTypeMergeQueue, routing.RoleOrchestrator},
+		{state.AgentTypePRShepherd, routing.RoleOrchestrator},
+		{state.AgentTypeAssistant, routing.RoleAssistant},
+		{state.AgentTypeBrowser, routing.RoleAssistant},
+		{state.AgentTypeWorker, routing.RoleWorker},
+	}
+	for _, tc := range cases {
+		if got := roleForAgentType(tc.agentType); got != tc.want {
+			t.Errorf("roleForAgentType(%s) = %s, want %s", tc.agentType, got, tc.want)
+		}
+	}
+}
 
 func setupSetModelTestState(t *testing.T) *Daemon {
 	t.Helper()

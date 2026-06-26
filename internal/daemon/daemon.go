@@ -2563,11 +2563,7 @@ func (d *Daemon) handleAddAgent(req socket.Request) socket.Response {
 	// converges on the same shape as `oat model onboard` registrations.
 	if rawModel := getOptionalStringArg(req.Args, "model", ""); rawModel != "" {
 		repo, _ := d.state.GetRepo(repoName)
-		role := routing.RoleWorker
-		switch agent.Type {
-		case state.AgentTypeSupervisor, state.AgentTypeWorkspace, state.AgentTypeMergeQueue, state.AgentTypePRShepherd:
-			role = routing.RoleOrchestrator
-		}
+		role := roleForAgentType(agent.Type)
 		if d.modelProfiles != nil && d.modelProfiles.Count() > 0 {
 			canonical, vErr := d.modelProfiles.ValidateAndCanonicalize(rawModel, role)
 			if vErr != nil {
@@ -2662,11 +2658,7 @@ func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
 	// model-override branch). The canonical (always-prefixed) form
 	// is what gets persisted so state converges on the same shape
 	// as `oat model onboard` registrations.
-	role := routing.RoleWorker
-	switch agent.Type {
-	case state.AgentTypeSupervisor, state.AgentTypeWorkspace, state.AgentTypeMergeQueue, state.AgentTypePRShepherd:
-		role = routing.RoleOrchestrator
-	}
+	role := roleForAgentType(agent.Type)
 	canonical := rawModel
 	if d.modelProfiles != nil && d.modelProfiles.Count() > 0 {
 		c, vErr := d.modelProfiles.ValidateAndCanonicalize(rawModel, role)
@@ -8990,6 +8982,25 @@ func (d *Daemon) rotateAssistantSessionIfNeeded(repoName, agentName string) {
 // restart / restore) and just need the "is this still allowed?" check. It is
 // the chokepoint closing the startRegisteredAgent bypass identified in the
 // Phase 5 audit.
+// roleForAgentType maps an agent type to the routing capability role used for
+// model-eligibility checks. Orchestration agents (supervisor/workspace/merge-
+// queue/pr-shepherd) need orchestrator-grade models; the assistant and browser
+// agents are conversational tool-users gated on the lighter assistant bar
+// (tool calling, no shell_roundtrip); everything else (workers) needs
+// worker-grade models. Single source of truth for the three call sites that
+// previously each inlined this switch (handleAddAgent's model override,
+// handleSetAgentModel, validateModelForAgentType).
+func roleForAgentType(agentType state.AgentType) routing.AgentRole {
+	switch agentType {
+	case state.AgentTypeSupervisor, state.AgentTypeWorkspace, state.AgentTypeMergeQueue, state.AgentTypePRShepherd:
+		return routing.RoleOrchestrator
+	case state.AgentTypeAssistant, state.AgentTypeBrowser:
+		return routing.RoleAssistant
+	default:
+		return routing.RoleWorker
+	}
+}
+
 func (d *Daemon) validateModelForAgentType(model string, agentType state.AgentType, allowedModels []string) error {
 	if model == "" {
 		return nil // caller handles empty-model defaulting
@@ -8998,10 +9009,7 @@ func (d *Daemon) validateModelForAgentType(model string, agentType state.AgentTy
 		return nil // no profiles — can't validate, pass through
 	}
 
-	role := routing.RoleWorker
-	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace || agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd {
-		role = routing.RoleOrchestrator
-	}
+	role := roleForAgentType(agentType)
 
 	canonical, err := d.modelProfiles.ValidateAndCanonicalize(model, role)
 	if err != nil {
@@ -9064,11 +9072,7 @@ func (d *Daemon) resolveAndValidateModelWithSource(explicitModel string, repoMod
 		return repoModel, RoutingSourcePassthrough, nil
 	}
 
-	role := routing.RoleWorker
-	if agentType == state.AgentTypeSupervisor || agentType == state.AgentTypeWorkspace ||
-		agentType == state.AgentTypeMergeQueue || agentType == state.AgentTypePRShepherd {
-		role = routing.RoleOrchestrator
-	}
+	role := roleForAgentType(agentType)
 
 	// Build allowed set for workers (only enforced for worker role)
 	isWorker := role == routing.RoleWorker
