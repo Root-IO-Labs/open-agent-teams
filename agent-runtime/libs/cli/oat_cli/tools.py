@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
+    import requests
     from tavily import TavilyClient
 
 _UNSET = object()
@@ -32,6 +36,117 @@ def _get_tavily_client() -> TavilyClient | None:
     return _tavily_client
 
 
+class BlockedRequestError(Exception):
+    """Raised when an outbound HTTP request targets a disallowed address.
+
+    This is a narrow SSRF guard. The agent chooses the URL for
+    ``http_request`` / ``fetch_url`` and processes untrusted input, so a
+    successful prompt injection could otherwise coax it into hitting an
+    internal endpoint. We block the highest-impact escalation path only:
+    link-local addresses (IPv4 ``169.254.0.0/16`` — which includes the
+    cloud metadata endpoint ``169.254.169.254`` — and IPv6 ``fe80::/10``)
+    and any non-http(s) URL scheme. Loopback and private LAN ranges are
+    intentionally still reachable so agents can fetch localhost dev
+    servers and internal services.
+    """
+
+
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+
+def _is_blocked_ip(value: str) -> bool:
+    """Return True if ``value`` is a link-local IP literal.
+
+    Non-IP strings (hostnames) return False; callers resolve hostnames
+    separately and pass each resolved IP here.
+    """
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return addr.is_link_local
+
+
+def _resolved_ips(host: str) -> list[str]:
+    """Resolve ``host`` to its A/AAAA records.
+
+    A transient DNS failure (no network, NXDOMAIN) must not become a hard
+    block, and unit tests stay hermetic, so resolution failures yield an
+    empty list and the request proceeds (failing later at connect time).
+
+    Args:
+        host: Hostname or IP literal to resolve.
+
+    Returns:
+        The list of resolved IP address strings, or ``[]`` on failure.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return []
+    return [info[4][0] for info in infos]
+
+
+def _assert_url_allowed(url: str) -> None:
+    """Reject non-http(s) schemes and link-local/metadata destinations.
+
+    Args:
+        url: The URL about to be requested.
+
+    Raises:
+        BlockedRequestError: if the scheme is not http/https, the URL has
+            no host, or the host is (or resolves to) a link-local address.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in _ALLOWED_SCHEMES:
+        msg = f"refusing non-http(s) URL scheme: {scheme or '(none)'!r}"
+        raise BlockedRequestError(msg)
+    host = parts.hostname
+    if not host:
+        msg = "refusing URL with no host"
+        raise BlockedRequestError(msg)
+    if _is_blocked_ip(host):
+        msg = f"refusing link-local/metadata address: {host}"
+        raise BlockedRequestError(msg)
+    for ip in _resolved_ips(host):
+        if _is_blocked_ip(ip):
+            msg = f"refusing {host!r}: resolves to link-local/metadata address {ip}"
+            raise BlockedRequestError(msg)
+
+
+def _guarded_session() -> requests.Session:
+    """Build a ``requests.Session`` that validates every request hop.
+
+    The guard is mounted as a transport adapter, so it runs on the
+    initial request *and* on each redirect hop (requests re-enters the
+    adapter for every ``3xx`` Location), closing the redirect-to-metadata
+    bypass that a one-shot pre-flight check would miss.
+
+    Returns:
+        A session whose http/https adapters reject link-local/metadata
+        targets before connecting.
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+
+    class _GuardedAdapter(HTTPAdapter):
+        def send(
+            self,
+            request: requests.PreparedRequest,
+            *args: Any,
+            **kwargs: Any,
+        ) -> requests.Response:
+            _assert_url_allowed(request.url or "")
+            return super().send(request, *args, **kwargs)
+
+    session = requests.Session()
+    adapter = _GuardedAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
 def http_request(
     url: str,
     method: str = "GET",
@@ -55,7 +170,13 @@ def http_request(
     """
     import requests
 
+    session = _guarded_session()
     try:
+        # Validate the initial URL up front (scheme + host). The mounted
+        # adapter re-checks every redirect hop, but a non-http(s) scheme
+        # never reaches an adapter, so it must be caught here.
+        _assert_url_allowed(url)
+
         kwargs: dict[str, Any] = {}
 
         if headers:
@@ -68,7 +189,7 @@ def http_request(
             else:
                 kwargs["data"] = data
 
-        response = requests.request(method.upper(), url, timeout=timeout, **kwargs)
+        response = session.request(method.upper(), url, timeout=timeout, **kwargs)
 
         try:
             content = response.json()
@@ -83,6 +204,14 @@ def http_request(
             "url": response.url,
         }
 
+    except BlockedRequestError as e:
+        return {
+            "success": False,
+            "status_code": 0,
+            "headers": {},
+            "content": f"Request blocked: {e!s}",
+            "url": url,
+        }
     except requests.exceptions.Timeout:
         return {
             "success": False,
@@ -99,6 +228,8 @@ def http_request(
             "content": f"Request error: {e!s}",
             "url": url,
         }
+    finally:
+        session.close()
 
 
 def web_search(  # noqa: ANN201  # Return type depends on dynamic tool configuration
@@ -215,8 +346,13 @@ def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:
             "url": url,
         }
 
+    session = _guarded_session()
     try:
-        response = requests.get(
+        # Validate up front so non-http(s) schemes (which never reach the
+        # mounted adapter) are rejected; the adapter covers redirect hops.
+        _assert_url_allowed(url)
+
+        response = session.get(
             url,
             timeout=timeout,
             headers={"User-Agent": "Mozilla/5.0 (compatible; OatSdks/1.0)"},
@@ -232,5 +368,9 @@ def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:
             "status_code": response.status_code,
             "content_length": len(markdown_content),
         }
+    except BlockedRequestError as e:
+        return {"error": f"Fetch URL blocked: {e!s}", "url": url}
     except requests.exceptions.RequestException as e:
         return {"error": f"Fetch URL error: {e!s}", "url": url}
+    finally:
+        session.close()
