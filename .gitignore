@@ -101,3 +101,6 @@ docs/bedrock-benchmarking.md
 # GoReleaser output and staging
 /dist/
 /.release-stage/
+
+# DGX Spark browser-assistant setup guide (internal; contains private Tailscale endpoints)
+docs/BROWSER_ASSISTANT_DGX_SPARK_SETUP.md
