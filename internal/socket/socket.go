@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -277,8 +278,14 @@ func (s *Server) Serve() error {
 		select {
 		case sem <- struct{}{}:
 			go func(c net.Conn) {
-				defer func() { <-sem }()
-				s.handleConnection(c)
+				// The slot is released by handleConnection: immediately
+				// at stream hand-off (streams are long-lived and run with
+				// their own write deadlines, so they must NOT count against
+				// the non-stream cap), or when the synchronous handler
+				// finishes. Passing the release as a callback — instead of
+				// a blanket defer here — is what makes the documented
+				// "streams are exempt" contract actually hold.
+				s.handleConnection(c, func() { <-sem })
 			}(conn)
 		default:
 			// Over capacity — fail the client fast with a bounded write so
@@ -326,7 +333,17 @@ const handlerTimeout = 20 * time.Second
 // slow or stuck clients from tying up handler goroutines indefinitely.
 // If the command starts with "stream_" and a StreamHandler is set,
 // the connection is handed off for long-lived streaming (no deadline).
-func (s *Server) handleConnection(conn net.Conn) {
+func (s *Server) handleConnection(conn net.Conn, release func()) {
+	// release frees the caller's concurrency-semaphore slot. It must run
+	// exactly once: the deferred call covers every error/early-return and
+	// the normal synchronous-handler path, while the stream branch calls
+	// it explicitly at hand-off so a long-lived stream stops occupying a
+	// non-stream slot for its entire lifetime. sync.Once makes the
+	// explicit call + the defer safe to both fire.
+	var releaseOnce sync.Once
+	releaseSlot := func() { releaseOnce.Do(release) }
+	defer releaseSlot()
+
 	// Set initial deadline for reading the request
 	if err := conn.SetDeadline(time.Now().Add(serverConnectionTimeout)); err != nil {
 		conn.Close()
@@ -354,6 +371,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 		if err := conn.SetDeadline(time.Time{}); err != nil {
 			log.Printf("Failed to clear connection deadline: %v", err)
 		} //nolint:errcheck
+		// Free the semaphore slot BEFORE handing off: HandleStream blocks
+		// for the stream's whole lifetime, so holding the slot here is what
+		// caused long-lived subscribers (one per chat-capable agent, fanned
+		// out by the bridge multiplexers) to exhaust maxConcurrentHandlers
+		// and make ordinary request/response verbs fail with "daemon busy".
+		releaseSlot()
 		// StreamHandler owns the connection — do NOT defer conn.Close()
 		s.streamHandler.HandleStream(req, conn)
 		return

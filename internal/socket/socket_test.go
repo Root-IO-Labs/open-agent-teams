@@ -302,6 +302,106 @@ func TestServerInvalidJSON(t *testing.T) {
 	}
 }
 
+// blockingStreamHandler mimics the real daemon stream handlers: it sends
+// the streaming handshake and then blocks for the lifetime of the
+// connection (until the client disconnects), exactly like
+// handleStreamOutput's for/select loop. It signals `active` once it has
+// sent the handshake and entered its blocking read so the test can
+// sequence stream establishment deterministically.
+type blockingStreamHandler struct {
+	active chan struct{}
+}
+
+func (h *blockingStreamHandler) HandleStream(req Request, conn net.Conn) {
+	if err := json.NewEncoder(conn).Encode(Response{Success: true, Stream: true}); err != nil {
+		conn.Close()
+		return
+	}
+	if h.active != nil {
+		h.active <- struct{}{}
+	}
+	// Block until the client closes the connection.
+	buf := make([]byte, 1)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			conn.Close()
+			return
+		}
+	}
+}
+
+// TestStreamsExemptFromHandlerCap is a regression test for the bug where
+// long-lived stream connections held a maxConcurrentHandlers semaphore
+// slot for their entire lifetime, so a fleet of subscribers (one per
+// chat-capable agent, fanned out by the bridge multiplexers) would
+// saturate the cap and make ordinary request/response verbs fail with
+// "daemon busy: too many concurrent handlers". After the fix the slot is
+// released at stream hand-off, so streams no longer count against the cap.
+func TestStreamsExemptFromHandlerCap(t *testing.T) {
+	// Use a short temp dir (not t.TempDir(), whose path embeds this long
+	// test name) so the Unix socket path stays under the ~104-char limit.
+	tmpDir, err := os.MkdirTemp("", "oatsk")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+	sockPath := filepath.Join(tmpDir, "t.sock")
+
+	handler := HandlerFunc(func(req Request) Response {
+		return Response{Success: true, Data: "ok"}
+	})
+	sh := &blockingStreamHandler{active: make(chan struct{}, 1)}
+	server := NewServer(sockPath, handler, WithStreamHandler(sh))
+	if err := server.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	defer server.Stop()
+	go server.Serve()
+	time.Sleep(100 * time.Millisecond)
+
+	// Open well more than the handler cap in long-lived streams. Each one
+	// blocks server-side; pre-fix the (cap+1)-th would itself be rejected
+	// with the busy response because all slots are held.
+	n := maxConcurrentHandlers + 10
+	conns := make([]net.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	for i := 0; i < n; i++ {
+		c, err := net.Dial("unix", sockPath)
+		if err != nil {
+			t.Fatalf("dial stream %d: %v", i, err)
+		}
+		if _, err := c.Write([]byte(`{"command":"stream_test"}` + "\n")); err != nil {
+			t.Fatalf("write stream %d: %v", i, err)
+		}
+		var resp Response
+		if err := json.NewDecoder(c).Decode(&resp); err != nil {
+			t.Fatalf("stream %d handshake decode: %v", i, err)
+		}
+		if !resp.Success || !resp.Stream {
+			t.Fatalf("stream %d did not get a streaming handshake (success=%v stream=%v error=%q); "+
+				"the handler-cap semaphore is starving streams", i, resp.Success, resp.Stream, resp.Error)
+		}
+		conns = append(conns, c)
+		<-sh.active // handler has entered its blocking loop
+	}
+
+	// With n (> cap) live streams, a normal request/response verb must
+	// still succeed. Pre-fix this returned "daemon busy".
+	client := NewClient(sockPath)
+	resp, err := client.Send(Request{Command: "ping"})
+	if err != nil {
+		t.Fatalf("normal request after %d live streams failed: %v", n, err)
+	}
+	if !resp.Success {
+		t.Fatalf("normal request after %d live streams got failure: %q", n, resp.Error)
+	}
+}
+
 func TestServerStopWithNilListener(t *testing.T) {
 	tmpDir := t.TempDir()
 	sockPath := filepath.Join(tmpDir, "test.sock")
