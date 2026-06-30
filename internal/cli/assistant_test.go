@@ -610,6 +610,91 @@ func TestAssistantStop_SendsStopAgentVerb_Part7Commit1(t *testing.T) {
 	}
 }
 
+// TestAssistantRemove_SendsRemoveRepoVerb pins the stale-assistant
+// cleanup fix: `oat assistant remove` must drop the virtual repo entry
+// via the `remove_repo` daemon verb, not just `remove_agent`. Both
+// `oat assistant list` and the side panel enumerate virtual repos, so
+// removing only the agent record left the assistant listed forever
+// ("removed but still there"), and the orphaned repos kept accruing
+// dormant stream subscribers. Asserting the verb is sent (with the
+// correct `_assistant-<name>` repo key) keeps the deletion honest.
+func TestAssistantRemove_SendsRemoveRepoVerb(t *testing.T) {
+	// macOS Unix sockets cap at 104 bytes; root under /tmp keeps the
+	// socket path short enough.
+	tmpDir, err := os.MkdirTemp("/tmp", "oat-rm-")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	sockPath := filepath.Join(tmpDir, "d.sock")
+	pidPath := filepath.Join(tmpDir, "d.pid")
+
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		t.Fatalf("plant pid file: %v", err)
+	}
+
+	var recordedMu sync.Mutex
+	recorded := make([]socket.Request, 0, 3)
+	handler := socket.HandlerFunc(func(req socket.Request) socket.Response {
+		recordedMu.Lock()
+		recorded = append(recorded, req)
+		recordedMu.Unlock()
+		return socket.Response{Success: true, Data: nil}
+	})
+
+	server := socket.NewServer(sockPath, handler)
+	if err := server.Start(); err != nil {
+		t.Fatalf("server.Start: %v", err)
+	}
+	defer server.Stop()
+	go server.Serve()
+	time.Sleep(100 * time.Millisecond)
+
+	paths := &config.Paths{
+		Root:       tmpDir,
+		DaemonSock: sockPath,
+		DaemonPID:  pidPath,
+		ReposDir:   filepath.Join(tmpDir, "repos"),
+		OutputDir:  filepath.Join(tmpDir, "output"),
+	}
+	c := NewWithPaths(paths)
+
+	stdout := os.Stdout
+	devNull, _ := os.Open(os.DevNull)
+	os.Stdout = devNull
+	t.Cleanup(func() {
+		os.Stdout = stdout
+		devNull.Close()
+	})
+
+	if err := c.assistantRemove([]string{"myassistant", "--yes"}); err != nil {
+		t.Fatalf("assistantRemove returned error: %v", err)
+	}
+
+	recordedMu.Lock()
+	defer recordedMu.Unlock()
+
+	var sawRemoveRepo, sawRemoveAgent bool
+	for _, r := range recorded {
+		switch r.Command {
+		case "remove_repo":
+			sawRemoveRepo = true
+			if name, _ := r.Args["name"].(string); name != "_assistant-myassistant" {
+				t.Errorf("remove_repo name arg = %q, want %q", name, "_assistant-myassistant")
+			}
+		case "remove_agent":
+			sawRemoveAgent = true
+		}
+	}
+	if !sawRemoveAgent {
+		t.Errorf("expected a remove_agent request, got verbs: %+v", recorded)
+	}
+	if !sawRemoveRepo {
+		t.Errorf("REGRESSION: assistantRemove did not send remove_repo; the virtual repo "+
+			"survives and the assistant stays listed. verbs: %+v", recorded)
+	}
+}
+
 // TestAssistantStop_NotRunningIsSoftSuccess_Part7Commit1 pins the
 // "agent already gone" branch: stop_agent returning an error whose
 // message contains "not found" must be turned into nil + a friendly

@@ -504,6 +504,20 @@ func (c *CLI) assistantRemove(args []string) error {
 		fmt.Printf("  Warning: remove_agent returned: %v (continuing with on-disk cleanup)\n", err)
 	}
 
+	// Step 5.5: drop the virtual repo entry itself. remove_agent only
+	// clears the agent record *inside* the repo; the `_assistant-<name>`
+	// repo stays registered in daemon state, and both `oat assistant
+	// list` and the side panel enumerate virtual repos — so without this
+	// a "removed" assistant keeps reappearing (the stale-assistant bug,
+	// which also kept piling up dormant stream subscribers). A not-found
+	// repo means it's already gone, so treat that as success (idempotent
+	// re-runs / racing side-panel deletes).
+	if _, err := c.sendDaemonRequest("remove_repo", map[string]interface{}{
+		"name": repoKey,
+	}); err != nil && !isAgentNotFoundError(err) {
+		fmt.Printf("  Warning: remove_repo returned: %v (continuing with on-disk cleanup)\n", err)
+	}
+
 	// Step 6: delete the virtual repo dir with a canonicalisation
 	// guard. The check enforces: (a) the path is exactly
 	// <reposDir>/<basename> with NO extra slashes or `..` segments
