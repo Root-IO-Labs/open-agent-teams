@@ -366,7 +366,7 @@ except PermissionError:
         # Add glob pattern if specified
         glob_pattern = ""
         if glob:
-            glob_pattern = f"--include='{glob}'"
+            glob_pattern = f"--include={shlex.quote(glob)}"
 
         # Escape pattern for shell
         pattern_escaped = shlex.quote(pattern)
