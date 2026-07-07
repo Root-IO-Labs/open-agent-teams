@@ -563,10 +563,94 @@ func TestBuildCommandWithModelParams(t *testing.T) {
 		t.Errorf("expected no --model-params flag when ModelParams is empty, got %q", cmd)
 	}
 
-	// With model params: --model-params should appear with the correct value
-	cmd = runner.buildCommand("test-session", Config{ModelParams: `'{"max_tokens":32000}'`})
+	// With model params: --model-params should appear with the correct value (properly quoted)
+	cmd = runner.buildCommand("test-session", Config{ModelParams: `{"max_tokens":32000}`})
 	if !strings.Contains(cmd, `--model-params '{"max_tokens":32000}'`) {
-		t.Errorf("expected --model-params with JSON, got %q", cmd)
+		t.Errorf("expected --model-params with properly quoted JSON, got %q", cmd)
+	}
+}
+
+func TestBuildCommandShellInjectionPrevention(t *testing.T) {
+	runner := NewRunner(WithBinaryPath("oat-agent"), WithPermissions(true))
+
+	tests := []struct {
+		name        string
+		config      Config
+		shouldQuote string
+		description string
+	}{
+		{
+			name:        "ModelParams with shell metacharacters",
+			config:      Config{ModelParams: `{"key":"value"}; echo pwned`},
+			shouldQuote: `'{"key":"value"}; echo pwned'`,
+			description: "semicolon should be quoted",
+		},
+		{
+			name:        "ModelParams with command substitution",
+			config:      Config{ModelParams: `$(whoami)`},
+			shouldQuote: `'$(whoami)'`,
+			description: "command substitution should be quoted",
+		},
+		{
+			name:        "ModelParams with pipe",
+			config:      Config{ModelParams: `{"key":"value"} | cat`},
+			shouldQuote: `'{"key":"value"} | cat'`,
+			description: "pipe should be quoted",
+		},
+		{
+			name:        "Model with shell metacharacters",
+			config:      Config{Model: `claude; rm -rf /`},
+			shouldQuote: `'claude; rm -rf /'`,
+			description: "model with semicolon should be quoted",
+		},
+		{
+			name:        "SessionID with shell metacharacters",
+			config:      Config{SessionID: `session; echo pwned`},
+			shouldQuote: `'session; echo pwned'`,
+			description: "session ID with semicolon should be quoted",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := tt.config.SessionID
+			if sessionID == "" {
+				sessionID = "test-session"
+			}
+			cmd := runner.buildCommand(sessionID, tt.config)
+			if !strings.Contains(cmd, tt.shouldQuote) {
+				t.Errorf("%s: expected command to contain %q, got %q", tt.description, tt.shouldQuote, cmd)
+			}
+		})
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"simple", "simple"},
+		{"oat-agent", "oat-agent"},
+		{"/usr/bin/oat-agent", "/usr/bin/oat-agent"},
+		{"hello world", "'hello world'"},
+		{`{"max_tokens":32000}`, `'{"max_tokens":32000}'`},
+		{"it's", `'it'"'"'s'`},
+		{"", "''"},
+		{"; echo pwned", "'; echo pwned'"},
+		{"$(whoami)", "'$(whoami)'"},
+		{"`whoami`", "'`whoami`'"},
+		{"a|b", "'a|b'"},
+		{"a&b", "'a&b'"},
+		{"a>b", "'a>b'"},
+		{"a<b", "'a<b'"},
+		{"$VAR", "'$VAR'"},
+	}
+	for _, tt := range tests {
+		got := shellQuote(tt.input)
+		if got != tt.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
+		}
 	}
 }
 

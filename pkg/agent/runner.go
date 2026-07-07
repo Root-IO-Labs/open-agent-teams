@@ -319,11 +319,11 @@ func (r *Runner) buildCommand(sessionID string, cfg Config) string {
 		cmd += fmt.Sprintf("cd %q && ", cfg.WorkDir)
 	}
 
-	cmd += r.BinaryPath
+	cmd += shellQuote(r.BinaryPath)
 
 	// Session identity
 	if cfg.Resume {
-		cmd += fmt.Sprintf(" --resume %s", sessionID)
+		cmd += fmt.Sprintf(" --resume %s", shellQuote(sessionID))
 	}
 
 	// Auto-approve for non-interactive use
@@ -332,14 +332,35 @@ func (r *Runner) buildCommand(sessionID string, cfg Config) string {
 	}
 
 	if cfg.Model != "" {
-		cmd += fmt.Sprintf(" -M %s", cfg.Model)
+		cmd += fmt.Sprintf(" -M %s", shellQuote(cfg.Model))
 	}
 
 	if cfg.ModelParams != "" {
-		cmd += fmt.Sprintf(" --model-params %s", cfg.ModelParams)
+		cmd += fmt.Sprintf(" --model-params %s", shellQuote(cfg.ModelParams))
 	}
 
 	return cmd
+}
+
+// shellQuote returns a shell-safe representation of s.
+// If s contains no special characters, it's returned as-is.
+// Otherwise, it's wrapped in single quotes with internal single quotes escaped.
+func shellQuote(s string) string {
+	// If it looks safe, return as-is
+	safe := true
+	for _, c := range s {
+		isAlnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		isSpecialSafe := c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == '=' || c == ','
+		if !isAlnum && !isSpecialSafe {
+			safe = false
+			break
+		}
+	}
+	if safe && len(s) > 0 {
+		return s
+	}
+	// Wrap in single quotes, escaping any internal single quotes
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 // SendMessage sends a message to a running agent instance.
