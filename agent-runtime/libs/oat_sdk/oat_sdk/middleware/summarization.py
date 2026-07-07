@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 import warnings
 from datetime import UTC, datetime
@@ -358,21 +359,66 @@ class _OatSdksSummarizationMiddleware(AgentMiddleware):
             return self._backend(tool_runtime)  # ty: ignore[call-top-callable, invalid-argument-type]
         return self._backend
 
+    def _sanitize_thread_id(self, thread_id: str) -> str:
+        """Sanitize thread_id to prevent path traversal attacks.
+
+        Thread IDs are caller-controlled identifiers that get interpolated into
+        filesystem paths. This method ensures they cannot escape the intended
+        directory by removing path separators and traversal sequences.
+
+        Args:
+            thread_id: Raw thread ID from config.
+
+        Returns:
+            Sanitized thread ID safe for use in file paths.
+        """
+        original = thread_id
+        
+        # Replace path separators and backslashes with underscores
+        sanitized = thread_id.replace("/", "_").replace("\\", "_")
+        
+        # Replace sequences of dots that could be used for traversal
+        # This handles "..", "...", etc. while preserving single dots in filenames
+        sanitized = re.sub(r"\.\.+", "_", sanitized)
+        
+        # Remove leading tildes (home directory expansion)
+        sanitized = sanitized.lstrip("~")
+        
+        # If the result is empty or only whitespace, generate a safe ID
+        if not sanitized or not sanitized.strip():
+            sanitized = f"sanitized_{uuid.uuid4().hex[:8]}"
+            logger.warning(
+                "thread_id '%s' sanitized to empty string; using generated ID: %s",
+                original,
+                sanitized,
+            )
+        elif sanitized != original:
+            logger.warning(
+                "thread_id '%s' contained path traversal sequences and was sanitized to '%s'",
+                original,
+                sanitized,
+            )
+        
+        return sanitized
+
     def _get_thread_id(self) -> str:
         """Extract `thread_id` from langgraph config.
 
         Uses `get_config()` to access the `RunnableConfig` from langgraph's
         `contextvar`. Falls back to a generated session ID if not available.
 
+        The thread_id is sanitized to prevent path traversal attacks since it
+        is used to construct filesystem paths for conversation history storage.
+
         Returns:
-            Thread ID string from config, or a generated session ID
+            Sanitized thread ID string from config, or a generated session ID
                 (e.g., `'session_a1b2c3d4'`) if not in a runnable context.
         """
         try:
             config = get_config()
             thread_id = config.get("configurable", {}).get("thread_id")
             if thread_id is not None:
-                return str(thread_id)
+                return self._sanitize_thread_id(str(thread_id))
         except RuntimeError:
             # Not in a runnable context
             pass
