@@ -541,7 +541,10 @@ func (d *Daemon) buildMergeQueueCISummary(repoPath string) string {
 	lines := []string{"Open PRs:"}
 	for _, pr := range prs {
 		ciStatus := d.getBranchCIStatus(repoPath, pr.HeadRefName)
-		lines = append(lines, fmt.Sprintf("  PR #%d (%s) CI: %s", pr.Number, pr.HeadRefName, ciStatus))
+		// Branch names are attacker-controlled (fork branches can have arbitrary names).
+		// Wrap in backticks to prevent prompt injection.
+		escapedBranch := escapeUntrustedText(pr.HeadRefName)
+		lines = append(lines, fmt.Sprintf("  PR #%d (%s) CI: %s", pr.Number, escapedBranch, ciStatus))
 	}
 	return strings.Join(lines, "\n")
 }
