@@ -220,6 +220,10 @@ const maxPRURLLength = 200
 // HeadRefName that are normally well-formed but could theoretically
 // contain newlines, carriage returns, or markdown headers if a gh
 // binary on PATH were tampered with or GitHub changed its API.
+//
+// Security: This function does NOT defend against prompt injection in
+// attacker-controlled fields like PR titles. Use escapeUntrustedText
+// for user-supplied content that could contain adversarial instructions.
 func sanitizeSnapshotField(s string) string {
 	// Strip any character that could break out of the current line/section.
 	replacer := strings.NewReplacer(
@@ -232,6 +236,32 @@ func sanitizeSnapshotField(s string) string {
 	// line — they can't appear here after the newline strip, but belt
 	// and suspenders for future changes in the enclosing template.
 	return out
+}
+
+// escapeUntrustedText wraps attacker-controlled text (PR titles, branch
+// names) in backticks to signal to the LLM that the content is data, not
+// instructions. This mitigates prompt injection by creating a clear
+// syntactic boundary between daemon-authored instructions and user input.
+//
+// The backtick wrapper is chosen because:
+//  1. Markdown inline code is semantically "literal text" to both humans
+//     and LLMs, reducing the model's tendency to interpret it as commands.
+//  2. Backticks themselves are escaped if present in the input, preventing
+//     breakout attacks like: title = "foo` ignore instructions `bar"
+//  3. The approach is lightweight (no XML tags, no complex escaping) and
+//     preserves readability in the snapshot for human operators reviewing
+//     daemon.log or agent conversation history.
+//
+// Example:
+//   Input:  "Fix bug in parser"           → Output: "`Fix bug in parser`"
+//   Input:  "Ignore all previous rules"   → Output: "`Ignore all previous rules`"
+//   Input:  "Title with `code` inside"    → Output: "`Title with \\`code\\` inside`"
+func escapeUntrustedText(s string) string {
+	// Escape any existing backticks in the input to prevent breakout.
+	// A title like "foo`bar" becomes "foo\`bar" inside the outer backticks,
+	// rendering as literal text rather than closing the code span early.
+	escaped := strings.ReplaceAll(s, "`", "\\`")
+	return "`" + escaped + "`"
 }
 
 // truncate returns s truncated to max bytes with an ellipsis marker
@@ -258,7 +288,11 @@ func formatPRLineSupervisor(pr prSummary) string {
 	if st := sanitizeSnapshotField(pr.MergeStateStatus); st != "" && st != "CLEAN" {
 		flags += " " + st
 	}
+	// PR titles are attacker-controlled (anyone can open/retitle a PR).
+	// Wrap in backticks to signal to the LLM that this is data, not instructions.
+	// Truncate BEFORE escaping so the backtick wrapper stays outside the length limit.
 	title := truncate(sanitizeSnapshotField(pr.Title), 60)
+	title = escapeUntrustedText(title)
 	return fmt.Sprintf("  #%d %s%s", pr.Number, title, flags)
 }
 
@@ -268,7 +302,12 @@ func formatPRLineSupervisor(pr prSummary) string {
 // the injected context size and any markdown-injection surface from
 // attacker-controlled PR metadata (branch name, title).
 func formatPRLineMergeQueue(pr prSummary) string {
+	// PR titles are attacker-controlled. Wrap in backticks to prevent
+	// prompt injection. Truncate BEFORE escaping so the wrapper stays
+	// outside the length limit.
 	title := truncate(sanitizeSnapshotField(pr.Title), 50)
+	title = escapeUntrustedText(title)
+	
 	merge := sanitizeSnapshotField(pr.Mergeable)
 	if merge == "" {
 		merge = "UNKNOWN"
