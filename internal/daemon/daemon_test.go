@@ -4311,3 +4311,101 @@ func TestRecordTaskHistoryWithSummary(t *testing.T) {
 		t.Errorf("History entry summary = %q, want 'Implemented the feature successfully'", history[0].Summary)
 	}
 }
+
+// TestBuildAgentEnvPrefixBlocksExecutionControlVars tests that execution-control
+// environment variables from repository .env files are blocked to prevent
+// redirection attacks.
+func TestBuildAgentEnvPrefixBlocksExecutionControlVars(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	repoName := "test-repo"
+	repoDir := d.paths.RepoDir(repoName)
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		t.Fatalf("Failed to create repo dir: %v", err)
+	}
+
+	// Create a malicious repo .env file with execution-control variables
+	repoEnvPath := filepath.Join(repoDir, ".env")
+	repoEnvContent := `# Malicious .env attempting to redirect execution
+OAT_AGENT_RUNTIME_DIR=/tmp/malicious/runtime
+PATH=/tmp/malicious/bin:/usr/bin
+LD_LIBRARY_PATH=/tmp/malicious/lib
+SAFE_VAR=allowed_value
+`
+	if err := os.WriteFile(repoEnvPath, []byte(repoEnvContent), 0644); err != nil {
+		t.Fatalf("Failed to write repo .env: %v", err)
+	}
+
+	// Create a trusted global .env file
+	globalEnvPath := filepath.Join(d.paths.Root, ".env")
+	globalEnvContent := `# Trusted global .env
+OAT_AGENT_RUNTIME_DIR=/trusted/runtime
+GLOBAL_VAR=global_value
+`
+	if err := os.WriteFile(globalEnvPath, []byte(globalEnvContent), 0644); err != nil {
+		t.Fatalf("Failed to write global .env: %v", err)
+	}
+
+	// Build the env prefix
+	envPrefix := buildAgentEnvPrefix(d.paths, repoName)
+
+	// Verify that OAT_AGENT_RUNTIME_DIR from global .env is present
+	if !strings.Contains(envPrefix, "OAT_AGENT_RUNTIME_DIR='/trusted/runtime'") {
+		t.Error("Global OAT_AGENT_RUNTIME_DIR should be exported")
+	}
+
+	// Verify that OAT_AGENT_RUNTIME_DIR from repo .env is NOT present
+	if strings.Contains(envPrefix, "/tmp/malicious/runtime") {
+		t.Error("Repo OAT_AGENT_RUNTIME_DIR should be blocked")
+	}
+
+	// Verify that PATH from repo .env is NOT present
+	if strings.Contains(envPrefix, "PATH='/tmp/malicious/bin") {
+		t.Error("Repo PATH should be blocked")
+	}
+
+	// Verify that LD_LIBRARY_PATH from repo .env is NOT present
+	if strings.Contains(envPrefix, "LD_LIBRARY_PATH='/tmp/malicious/lib'") {
+		t.Error("Repo LD_LIBRARY_PATH should be blocked")
+	}
+
+	// Verify that safe variables from repo .env ARE present
+	if !strings.Contains(envPrefix, "SAFE_VAR='allowed_value'") {
+		t.Error("Safe repo variables should be exported")
+	}
+
+	// Verify that global variables ARE present
+	if !strings.Contains(envPrefix, "GLOBAL_VAR='global_value'") {
+		t.Error("Global variables should be exported")
+	}
+}
+
+// TestIsBlockedEnvKey tests the isBlockedEnvKey function
+func TestIsBlockedEnvKey(t *testing.T) {
+	tests := []struct {
+		key     string
+		blocked bool
+	}{
+		{"OAT_AGENT_RUNTIME_DIR", true},
+		{"PATH", true},
+		{"LD_LIBRARY_PATH", true},
+		{"DYLD_LIBRARY_PATH", true},
+		{"LD_PRELOAD", true},
+		{"DYLD_INSERT_LIBRARIES", true},
+		{"GITHUB_TOKEN", false},
+		{"ANTHROPIC_API_KEY", false},
+		{"MY_CUSTOM_VAR", false},
+		{"PYTHONPATH", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			got := isBlockedEnvKey(tt.key)
+			if got != tt.blocked {
+				t.Errorf("isBlockedEnvKey(%q) = %v, want %v", tt.key, got, tt.blocked)
+			}
+		})
+	}
+}
+

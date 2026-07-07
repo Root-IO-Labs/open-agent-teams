@@ -5986,8 +5986,30 @@ func buildAgentEnvPrefix(paths *config.Paths, repoName string) string {
 		exeDir := filepath.Dir(exePath)
 		prefix += pathPrependGuard(exeDir)
 	}
-	// Load optional .env files (global then per-repo); repo overrides
-	envVars := loadEnvFiles(paths.Root, paths.RepoDir(repoName))
+	// Load optional .env files: global (trusted) and per-repo (untrusted).
+	// Repo-controlled .env files cross a trust boundary, so we must filter
+	// execution-control variables that could redirect oat-agent to attacker-
+	// controlled binaries.
+	globalEnvVars := loadEnvFiles(paths.Root, "")
+	repoEnvVars := loadEnvFiles("", paths.RepoDir(repoName))
+	
+	// Merge env vars: repo overrides global, except for blocklisted keys.
+	// Blocklisted keys are only honored from the global (trusted) .env file.
+	envVars := make(map[string]string)
+	for k, v := range globalEnvVars {
+		envVars[k] = v
+	}
+	for k, v := range repoEnvVars {
+		// SECURITY: Block execution-control variables from repo .env files.
+		// OAT_AGENT_RUNTIME_DIR controls where oat-agent searches for the
+		// Python interpreter. A repo-controlled value can redirect execution
+		// to an attacker-supplied binary at <runtime>/libs/cli/.venv/bin/python.
+		if isBlockedEnvKey(k) {
+			continue
+		}
+		envVars[k] = v
+	}
+	
 	if len(envVars) > 0 {
 		for k, v := range envVars {
 			// SECURITY: env keys are interpolated raw into a shell string
@@ -6005,6 +6027,29 @@ func buildAgentEnvPrefix(paths *config.Paths, repoName string) string {
 		prefix += "export TERM_PROGRAM=terminal; "
 	}
 	return prefix
+}
+
+// isBlockedEnvKey returns true if the given environment variable key should
+// not be honored from repository-controlled .env files. These variables control
+// execution paths or other security-sensitive behavior and must only come from
+// the operator's global ~/.oat/.env file.
+func isBlockedEnvKey(key string) bool {
+	// OAT_AGENT_RUNTIME_DIR controls where oat-agent searches for the Python
+	// interpreter. A malicious repo .env can set this to a repo-controlled
+	// directory tree containing a fake python binary at the expected path
+	// (libs/cli/.venv/bin/python), achieving arbitrary code execution as the
+	// daemon user during agent startup.
+	blockedKeys := map[string]bool{
+		"OAT_AGENT_RUNTIME_DIR": true,
+		// Block PATH to prevent similar redirection attacks via system commands
+		"PATH": true,
+		// Block other execution-control variables
+		"LD_LIBRARY_PATH":   true,
+		"DYLD_LIBRARY_PATH": true,
+		"LD_PRELOAD":        true,
+		"DYLD_INSERT_LIBRARIES": true,
+	}
+	return blockedKeys[key]
 }
 
 // loadEnvFiles reads KEY=value from globalEnvPath and repoEnvPath (.env files).
