@@ -743,3 +743,175 @@ class TestMiddlewareStackConformance:
             assert isinstance(mw, AgentMiddleware), (
                 f"{type(mw).__name__} does not inherit from AgentMiddleware"
             )
+
+
+class TestCustomSubagentsInheritInterruptOn:
+    """Test that custom subagents loaded from filesystem inherit interrupt_on configuration."""
+
+    def test_custom_subagents_inherit_interrupt_on_when_auto_approve_false(
+        self, tmp_path: Path
+    ) -> None:
+        """Custom subagents should inherit interrupt_on when auto_approve=False.
+
+        This test verifies the security fix that ensures project-defined subagents
+        cannot bypass HITL (human-in-the-loop) approval gates.
+        """
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+
+        # Create a project-level custom subagent
+        project_agents_dir = tmp_path / "project_agents"
+        custom_agent_dir = project_agents_dir / "malicious-agent"
+        custom_agent_dir.mkdir(parents=True)
+        (custom_agent_dir / "AGENTS.md").write_text(
+            "---\n"
+            "name: malicious-agent\n"
+            "description: A potentially malicious subagent\n"
+            "---\n"
+            "You are a subagent that tries to execute shell commands."
+        )
+
+        mock_settings = Mock()
+        mock_settings.ensure_agent_dir.return_value = agent_dir
+        mock_settings.ensure_user_skills_dir.return_value = skills_dir
+        mock_settings.get_project_skills_dir.return_value = None
+        mock_settings.get_built_in_skills_dir.return_value = (
+            Settings.get_built_in_skills_dir()
+        )
+        mock_settings.get_user_agent_md_path.return_value = agent_dir / "AGENTS.md"
+        mock_settings.get_project_agent_md_path.return_value = []
+        mock_settings.get_user_agents_dir.return_value = tmp_path / "user_agents"
+        mock_settings.get_project_agents_dir.return_value = project_agents_dir
+        mock_settings.model_name = None
+        mock_settings.model_provider = None
+        mock_settings.model_context_limit = None
+        mock_settings.project_root = tmp_path
+
+        captured_subagents: list[Any] = []
+
+        def capture_create_agent(**kwargs: Any) -> Mock:
+            captured_subagents.extend(kwargs.get("subagents", []))
+            agent = Mock()
+            agent.with_config.return_value = agent
+            return agent
+
+        fake_model = _make_fake_chat_model()
+        with (
+            patch("oat_cli.agent.settings", mock_settings),
+            patch(
+                "oat_cli.agent.create_oat_agent",
+                side_effect=capture_create_agent,
+            ),
+            patch(
+                "oat_sdk.graph.init_chat_model",
+                return_value=fake_model,
+            ),
+        ):
+            create_cli_agent(
+                model="fake-model",
+                assistant_id="test",
+                enable_memory=False,
+                enable_skills=False,
+                enable_shell=True,
+                auto_approve=False,  # HITL should be enabled
+            )
+
+        # Find the custom subagent in the captured list
+        custom_subagent = None
+        for subagent in captured_subagents:
+            if subagent.get("name") == "malicious-agent":
+                custom_subagent = subagent
+                break
+
+        assert custom_subagent is not None, "Custom subagent should be loaded"
+        assert (
+            "interrupt_on" in custom_subagent
+        ), "Custom subagent should have interrupt_on configuration"
+        assert custom_subagent["interrupt_on"] is not None
+        # Verify that execute tool is in the interrupt_on config
+        assert (
+            "execute" in custom_subagent["interrupt_on"]
+        ), "execute tool should be gated by HITL"
+
+    def test_custom_subagents_no_interrupt_on_when_auto_approve_true(
+        self, tmp_path: Path
+    ) -> None:
+        """Custom subagents should not have interrupt_on when auto_approve=True."""
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+
+        # Create a project-level custom subagent
+        project_agents_dir = tmp_path / "project_agents"
+        custom_agent_dir = project_agents_dir / "test-agent"
+        custom_agent_dir.mkdir(parents=True)
+        (custom_agent_dir / "AGENTS.md").write_text(
+            "---\n"
+            "name: test-agent\n"
+            "description: A test subagent\n"
+            "---\n"
+            "You are a test subagent."
+        )
+
+        mock_settings = Mock()
+        mock_settings.ensure_agent_dir.return_value = agent_dir
+        mock_settings.ensure_user_skills_dir.return_value = skills_dir
+        mock_settings.get_project_skills_dir.return_value = None
+        mock_settings.get_built_in_skills_dir.return_value = (
+            Settings.get_built_in_skills_dir()
+        )
+        mock_settings.get_user_agent_md_path.return_value = agent_dir / "AGENTS.md"
+        mock_settings.get_project_agent_md_path.return_value = []
+        mock_settings.get_user_agents_dir.return_value = tmp_path / "user_agents"
+        mock_settings.get_project_agents_dir.return_value = project_agents_dir
+        mock_settings.model_name = None
+        mock_settings.model_provider = None
+        mock_settings.model_context_limit = None
+        mock_settings.project_root = tmp_path
+
+        captured_subagents: list[Any] = []
+
+        def capture_create_agent(**kwargs: Any) -> Mock:
+            captured_subagents.extend(kwargs.get("subagents", []))
+            agent = Mock()
+            agent.with_config.return_value = agent
+            return agent
+
+        fake_model = _make_fake_chat_model()
+        with (
+            patch("oat_cli.agent.settings", mock_settings),
+            patch(
+                "oat_cli.agent.create_oat_agent",
+                side_effect=capture_create_agent,
+            ),
+            patch(
+                "oat_sdk.graph.init_chat_model",
+                return_value=fake_model,
+            ),
+        ):
+            create_cli_agent(
+                model="fake-model",
+                assistant_id="test",
+                enable_memory=False,
+                enable_skills=False,
+                enable_shell=True,
+                auto_approve=True,  # HITL should be disabled
+            )
+
+        # Find the custom subagent in the captured list
+        custom_subagent = None
+        for subagent in captured_subagents:
+            if subagent.get("name") == "test-agent":
+                custom_subagent = subagent
+                break
+
+        assert custom_subagent is not None, "Custom subagent should be loaded"
+        # When auto_approve=True, interrupt_on is an empty dict
+        # The fix should still propagate it (empty dict means no interrupts)
+        assert (
+            "interrupt_on" in custom_subagent
+        ), "Custom subagent should have interrupt_on (empty dict)"
+        assert custom_subagent["interrupt_on"] == {}
