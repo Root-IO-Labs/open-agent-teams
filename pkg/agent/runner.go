@@ -204,6 +204,7 @@ type Config struct {
 
 	// MOTD is an optional message of the day to display before starting the agent.
 	// This is useful for showing restart instructions or other information.
+	// The message is displayed literally without shell interpretation.
 	// If empty, no MOTD is displayed.
 	MOTD string
 
@@ -259,8 +260,12 @@ func (r *Runner) Start(ctx context.Context, session, window string, cfg Config) 
 	}
 
 	// Print MOTD before starting the agent if configured. Non-fatal on error.
+	// Use printf with single quotes to prevent shell command injection.
+	// Single quotes prevent all shell expansions ($(...), `...`, $VAR, etc.).
+	// Escape any single quotes in the MOTD by replacing ' with '\''
 	if cfg.MOTD != "" {
-		motd := fmt.Sprintf("echo %q", cfg.MOTD)
+		escaped := strings.ReplaceAll(cfg.MOTD, "'", "'\\''")
+		motd := fmt.Sprintf("printf '%%s\\n' '%s'", escaped)
 		_ = r.Terminal.SendKeys(ctx, session, window, motd)
 	}
 

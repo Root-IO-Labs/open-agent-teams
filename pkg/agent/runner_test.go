@@ -208,10 +208,113 @@ func TestStartWithMOTD(t *testing.T) {
 	if !strings.Contains(motdCall.text, "Welcome to the agent session!") {
 		t.Errorf("expected MOTD to contain message, got %q", motdCall.text)
 	}
+	// Verify printf format is used (not echo) for security
+	if !strings.Contains(motdCall.text, "printf") {
+		t.Errorf("expected MOTD to use printf for security, got %q", motdCall.text)
+	}
 
 	cmdCall := terminal.sendKeysCalls[1]
 	if !strings.Contains(cmdCall.text, "/path/to/oat-agent") {
 		t.Errorf("expected command to contain binary path, got %q", cmdCall.text)
+	}
+}
+
+// TestStartWithMOTDCommandInjectionPrevention verifies that MOTD content
+// containing shell metacharacters is properly escaped to prevent command injection.
+func TestStartWithMOTDCommandInjectionPrevention(t *testing.T) {
+	testCases := []struct {
+		name         string
+		motd         string
+		shouldNotRun string // command that should NOT be executed
+	}{
+		{
+			name:         "command substitution with $()",
+			motd:         "$(touch /tmp/pwned)",
+			shouldNotRun: "touch",
+		},
+		{
+			name:         "command substitution with backticks",
+			motd:         "`rm -rf /tmp/test`",
+			shouldNotRun: "rm",
+		},
+		{
+			name:         "variable expansion",
+			motd:         "$HOME/test",
+			shouldNotRun: "$HOME",
+		},
+		{
+			name:         "semicolon command separator",
+			motd:         "hello; rm -rf /",
+			shouldNotRun: "rm",
+		},
+		{
+			name:         "pipe to command",
+			motd:         "hello | cat /etc/passwd",
+			shouldNotRun: "cat",
+		},
+		{
+			name:         "single quote in message",
+			motd:         "It's a test",
+			shouldNotRun: "",
+		},
+		{
+			name:         "multiple single quotes",
+			motd:         "It's Bob's test",
+			shouldNotRun: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			terminal := &mockTerminal{
+				getPanePIDReturn: 12345,
+			}
+
+			runner := NewRunner(
+				WithTerminal(terminal),
+				WithBinaryPath("/path/to/oat-agent"),
+				WithStartupDelay(0),
+			)
+
+			_, err := runner.Start(ctx, "my-session", "my-window", Config{
+				MOTD: tc.motd,
+			})
+
+			if err != nil {
+				t.Fatalf("Start() failed: %v", err)
+			}
+
+			if len(terminal.sendKeysCalls) != 2 {
+				t.Fatalf("expected 2 SendKeys calls, got %d", len(terminal.sendKeysCalls))
+			}
+
+			motdCall := terminal.sendKeysCalls[0]
+
+			// Verify printf with single quotes is used (prevents shell expansion)
+			if !strings.Contains(motdCall.text, "printf") {
+				t.Errorf("expected printf to be used, got %q", motdCall.text)
+			}
+
+			// Verify the MOTD content is present (escaped)
+			if !strings.Contains(motdCall.text, tc.motd) && tc.shouldNotRun == "" {
+				// For single quotes, the content will be escaped differently
+				if !strings.Contains(tc.motd, "'") {
+					t.Errorf("expected MOTD content to be present, got %q", motdCall.text)
+				}
+			}
+
+			// Verify single quotes are used (not double quotes which allow expansion)
+			// The format should be: printf '%s\n' '...'
+			if !strings.Contains(motdCall.text, "'%s\\n'") {
+				t.Errorf("expected printf format with single quotes, got %q", motdCall.text)
+			}
+
+			// Verify that echo with double quotes is NOT used (vulnerable pattern)
+			if strings.Contains(motdCall.text, "echo \"") {
+				t.Errorf("vulnerable echo with double quotes detected: %q", motdCall.text)
+			}
+		})
 	}
 }
 
@@ -586,5 +689,73 @@ func TestIsBinaryAvailable(t *testing.T) {
 	runner = NewRunner(WithBinaryPath("/nonexistent/binary/path"))
 	if runner.IsBinaryAvailable() {
 		t.Error("IsBinaryAvailable() should return false for nonexistent binary")
+	}
+}
+
+// TestMOTDEscapingFormat verifies the exact format of the MOTD command
+// to ensure it uses printf with single quotes for security.
+func TestMOTDEscapingFormat(t *testing.T) {
+	testCases := []struct {
+		name           string
+		motd           string
+		expectedFormat string
+	}{
+		{
+			name:           "simple message",
+			motd:           "Hello World",
+			expectedFormat: "printf '%s\\n' 'Hello World'",
+		},
+		{
+			name:           "message with single quote",
+			motd:           "It's working",
+			expectedFormat: "printf '%s\\n' 'It'\\''s working'",
+		},
+		{
+			name:           "message with command substitution attempt",
+			motd:           "$(whoami)",
+			expectedFormat: "printf '%s\\n' '$(whoami)'",
+		},
+		{
+			name:           "message with backticks",
+			motd:           "`date`",
+			expectedFormat: "printf '%s\\n' '`date`'",
+		},
+		{
+			name:           "message with variable",
+			motd:           "$HOME",
+			expectedFormat: "printf '%s\\n' '$HOME'",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			terminal := &mockTerminal{
+				getPanePIDReturn: 12345,
+			}
+
+			runner := NewRunner(
+				WithTerminal(terminal),
+				WithBinaryPath("/path/to/oat-agent"),
+				WithStartupDelay(0),
+			)
+
+			_, err := runner.Start(ctx, "session", "window", Config{
+				MOTD: tc.motd,
+			})
+
+			if err != nil {
+				t.Fatalf("Start() failed: %v", err)
+			}
+
+			if len(terminal.sendKeysCalls) != 2 {
+				t.Fatalf("expected 2 SendKeys calls, got %d", len(terminal.sendKeysCalls))
+			}
+
+			motdCall := terminal.sendKeysCalls[0]
+			if motdCall.text != tc.expectedFormat {
+				t.Errorf("MOTD format mismatch:\nexpected: %q\ngot:      %q", tc.expectedFormat, motdCall.text)
+			}
+		})
 	}
 }
