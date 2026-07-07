@@ -1004,6 +1004,83 @@ class TestThreadIdExtraction:
         assert "session_" in path
         assert path.endswith(".md")
 
+    def test_thread_id_sanitization_prevents_path_traversal(self) -> None:
+        """Test that thread_id with path traversal sequences is sanitized."""
+        backend = MockBackend()
+        mock_model = make_mock_model()
+
+        middleware = SummarizationMiddleware(
+            model=mock_model,
+            backend=backend,
+            trigger=("messages", 5),
+            keep=("messages", 2),
+        )
+
+        messages = make_conversation_messages(num_old=6, num_recent=2)
+        state = cast("AgentState[Any]", {"messages": messages})
+        runtime = make_mock_runtime()
+
+        # Test path traversal attempt
+        with mock_get_config(thread_id="../../../../tmp/pwned"):
+            call_wrap_model_call(middleware, state, runtime)
+
+        path, _ = backend.write_calls[0]
+        
+        # Path should be sanitized - no traversal sequences
+        assert ".." not in path
+        assert path == "/conversation_history/_______tmp_pwned.md"
+
+    def test_thread_id_sanitization_handles_absolute_paths(self) -> None:
+        """Test that thread_id with absolute paths is sanitized."""
+        backend = MockBackend()
+        mock_model = make_mock_model()
+
+        middleware = SummarizationMiddleware(
+            model=mock_model,
+            backend=backend,
+            trigger=("messages", 5),
+            keep=("messages", 2),
+        )
+
+        messages = make_conversation_messages(num_old=6, num_recent=2)
+        state = cast("AgentState[Any]", {"messages": messages})
+        runtime = make_mock_runtime()
+
+        # Test absolute path attempt
+        with mock_get_config(thread_id="/etc/passwd"):
+            call_wrap_model_call(middleware, state, runtime)
+
+        path, _ = backend.write_calls[0]
+        
+        # Path should be sanitized - no leading slash in thread_id
+        assert path == "/conversation_history/_etc_passwd.md"
+
+    def test_thread_id_sanitization_handles_backslashes(self) -> None:
+        """Test that thread_id with backslashes (Windows paths) is sanitized."""
+        backend = MockBackend()
+        mock_model = make_mock_model()
+
+        middleware = SummarizationMiddleware(
+            model=mock_model,
+            backend=backend,
+            trigger=("messages", 5),
+            keep=("messages", 2),
+        )
+
+        messages = make_conversation_messages(num_old=6, num_recent=2)
+        state = cast("AgentState[Any]", {"messages": messages})
+        runtime = make_mock_runtime()
+
+        # Test Windows path attempt
+        with mock_get_config(thread_id="C:\\Windows\\System32"):
+            call_wrap_model_call(middleware, state, runtime)
+
+        path, _ = backend.write_calls[0]
+        
+        # Path should be sanitized - backslashes replaced
+        assert "\\" not in path
+        assert path == "/conversation_history/C__Windows_System32.md"
+
 
 class TestAsyncBehavior:
     """Tests for async version of `before_model`."""
