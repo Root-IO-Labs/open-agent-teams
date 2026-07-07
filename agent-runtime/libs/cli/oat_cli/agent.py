@@ -468,6 +468,16 @@ def create_cli_agent(
         project_skills_dir = settings.get_project_skills_dir()
         project_agent_skills_dir = settings.get_project_agent_skills_dir()
 
+    # Configure interrupt_on based on auto_approve setting
+    # This must be done before loading custom subagents so they can inherit the policy
+    interrupt_on: dict[str, bool | InterruptOnConfig] | None = None
+    if auto_approve:  # noqa: SIM108  # if-else more readable for interrupt_on config
+        # No interrupts - all tools run automatically
+        interrupt_on = {}
+    else:
+        # Full HITL for destructive operations
+        interrupt_on = _add_interrupt_on()  # type: ignore[assignment]  # InterruptOnConfig is compatible at runtime
+
     # Load custom subagents from filesystem
     custom_subagents: list[SubAgent | CompiledSubAgent] = []
     user_agents_dir = settings.get_user_agents_dir(assistant_id)
@@ -484,6 +494,10 @@ def create_cli_agent(
         }
         if subagent_meta["model"]:
             subagent["model"] = subagent_meta["model"]
+        # Propagate the main agent's interrupt_on configuration to subagents
+        # to ensure HITL policies apply consistently across all agents
+        if interrupt_on:
+            subagent["interrupt_on"] = interrupt_on
         custom_subagents.append(subagent)
 
     # Build middleware stack based on enabled features
@@ -558,15 +572,6 @@ def create_cli_agent(
         system_prompt = get_system_prompt(
             assistant_id=assistant_id, sandbox_type=sandbox_type
         )
-
-    # Configure interrupt_on based on auto_approve setting
-    interrupt_on: dict[str, bool | InterruptOnConfig] | None = None
-    if auto_approve:  # noqa: SIM108  # if-else more readable for interrupt_on config
-        # No interrupts - all tools run automatically
-        interrupt_on = {}
-    else:
-        # Full HITL for destructive operations
-        interrupt_on = _add_interrupt_on()  # type: ignore[assignment]  # InterruptOnConfig is compatible at runtime
 
     # Set up composite backend with routing
     # For local FilesystemBackend, route large tool results to /tmp to avoid polluting
