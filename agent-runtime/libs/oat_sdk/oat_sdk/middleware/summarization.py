@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 import warnings
 from datetime import UTC, datetime
@@ -859,6 +860,68 @@ A condensed summary follows:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
             return path
 
+    # Matches the daemon's defaultMaxTokens (internal/daemon/daemon.go). Used as
+    # the assumed ceiling so this defense-in-depth cap only ever REDUCES the
+    # per-call output budget, never raises it above the normal configured value.
+    _ASSUMED_MAX_OUTPUT_TOKENS = 32000
+    # Never cap output below this — a near-zero max_tokens makes the reply
+    # useless (or errors on some providers). When the window is this tight the
+    # real fix is summarization, which the surrounding code already performs.
+    _MIN_OUTPUT_TOKENS = 512
+
+    def _cap_output_tokens(self, request: ModelRequest, total_tokens: int) -> ModelRequest:
+        """Defense-in-depth: shrink the per-call output ``max_tokens`` so that
+        ``input_tokens + max_tokens`` cannot exceed the model's context window.
+
+        Phase 1 root-fix (profile-override wiring + daemon output-headroom
+        reservation + auto-compaction) should normally prevent a near-full
+        input from ever reaching the model. This is the last line of defense for
+        the case where a custom/self-hosted model's window is still tight on a
+        given turn: rather than let ``input + configured_max_tokens`` overflow
+        the window and 400, we cap the reply budget to what actually fits.
+
+        Only ever reduces the budget (bounded by the assumed default output
+        ceiling) and only when the remaining window is tighter than that
+        ceiling, so it never raises an operator's configured ``max_tokens`` and
+        is a no-op on the common (roomy) case. Gated by
+        ``OAT_DISABLE_OUTPUT_TOKEN_CAP`` for a clean rollback.
+        """
+        if os.getenv("OAT_DISABLE_OUTPUT_TOKEN_CAP", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return request
+        limit = self._get_profile_limits()
+        if not limit or limit <= 0:
+            return request  # unknown window — nothing to reserve against
+        margin = max(256, int(limit * 0.01))  # slack for token-count approximation error
+        available = limit - total_tokens - margin
+        cap = min(available, self._ASSUMED_MAX_OUTPUT_TOKENS)
+        # Roomy turn: the window comfortably fits a full-size reply — leave the
+        # request untouched so we never shrink output unnecessarily.
+        if cap >= self._ASSUMED_MAX_OUTPUT_TOKENS:
+            return request
+        if cap < self._MIN_OUTPUT_TOKENS:
+            cap = self._MIN_OUTPUT_TOKENS
+        # Never raise an already-lower configured max_tokens.
+        current = None
+        model_settings = getattr(request, "model_settings", None)
+        if isinstance(model_settings, dict):
+            current = model_settings.get("max_tokens")
+        if isinstance(current, int) and current <= cap:
+            return request
+        new_settings = dict(model_settings) if isinstance(model_settings, dict) else {}
+        new_settings["max_tokens"] = cap
+        try:
+            capped = request.override(model_settings=new_settings)
+        except TypeError:
+            # Older langchain ModelRequest.override without model_settings —
+            # silently skip (the Phase 1 root fixes still apply).
+            logger.debug("ModelRequest.override does not accept model_settings; skipping output-token cap")
+            return request
+        logger.info(
+            "output-token cap: reduced max_tokens to %d (window=%d, input≈%d, margin=%d)",
+            cap, limit, total_tokens, margin,
+        )
+        return capped
+
     def wrap_model_call(
         self,
         request: ModelRequest,
@@ -912,10 +975,14 @@ A condensed summary follows:
             total_tokens = self.token_counter(counted_messages)
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
-        # If no summarization needed, return with truncated messages
+        # If no summarization needed, return with truncated messages. Apply the
+        # defense-in-depth output-token cap here where total_tokens reflects the
+        # exact input being sent (on the summarization path below the input is
+        # shrunk, so no cap is needed).
         if not should_summarize:
+            capped_request = self._cap_output_tokens(request.override(messages=truncated_messages), total_tokens)
             try:
-                return handler(request.override(messages=truncated_messages))
+                return handler(capped_request)
             except ContextOverflowError:
                 pass
                 # Fallback to summarization on context overflow
@@ -1016,10 +1083,14 @@ A condensed summary follows:
             total_tokens = self.token_counter(counted_messages)
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
-        # If no summarization needed, return with truncated messages
+        # If no summarization needed, return with truncated messages. Apply the
+        # defense-in-depth output-token cap here where total_tokens reflects the
+        # exact input being sent (on the summarization path below the input is
+        # shrunk, so no cap is needed).
         if not should_summarize:
+            capped_request = self._cap_output_tokens(request.override(messages=truncated_messages), total_tokens)
             try:
-                return await handler(request.override(messages=truncated_messages))
+                return await handler(capped_request)
             except ContextOverflowError:
                 pass
                 # Fallback to summarization on context overflow

@@ -76,17 +76,53 @@ const fetchFailureThreshold = 3
 // is zero this default is used. Profiles can tune this value independently.
 const defaultMaxTokens = 32000
 
-// modelParamsJSON returns the raw JSON string passed via --model-params for a
-// given model, honoring the per-profile MaxTokens override when non-zero.
-// Keep the JSON simple; backends handle shell quoting when constructing commands.
-func (d *Daemon) modelParamsJSON(modelID string) string {
+// resolveOutputMaxTokens is the single source of truth for the output-token
+// budget (max_tokens) an agent is spawned with. Both modelParamsJSON (which
+// sends it to the Python runtime) and the context-capacity output-headroom
+// reservation (context_capacity.go) call this so the number they use can never
+// drift. Honors the per-profile Runtime.MaxTokens override when non-zero,
+// otherwise defaultMaxTokens.
+func (d *Daemon) resolveOutputMaxTokens(modelID string) int {
 	maxTokens := defaultMaxTokens
 	if d.modelProfiles != nil && modelID != "" {
 		if p := d.modelProfiles.Get(modelID); p != nil && p.Runtime.MaxTokens > 0 {
 			maxTokens = p.Runtime.MaxTokens
 		}
 	}
-	return fmt.Sprintf(`{"max_tokens":%d}`, maxTokens)
+	return maxTokens
+}
+
+// modelParamsJSON returns the raw JSON string passed via --model-params for a
+// given model, honoring the per-profile MaxTokens override when non-zero.
+// Keep the JSON simple; backends handle shell quoting when constructing commands.
+func (d *Daemon) modelParamsJSON(modelID string) string {
+	return fmt.Sprintf(`{"max_tokens":%d}`, d.resolveOutputMaxTokens(modelID))
+}
+
+// profileOverrideJSON returns the JSON string for the --profile-override flag
+// (consumed by the Python runtime's create_model / SummarizationMiddleware) so
+// the onboarded ModelProfile.MaxInputTokens actually reaches the process that
+// calls the LLM. Without this, an unrecognized/custom model (e.g. a self-hosted
+// Qwen endpoint not in LangChain's registry) gets no profile on the Python side,
+// its auto-compaction trigger falls back to an oversized default, and the
+// context window silently overflows. Returns ("", false) when no profile with a
+// positive MaxInputTokens exists, so the caller omits the flag entirely rather
+// than inventing a value LangChain might already know better. Built with
+// json.Marshal (not string concat) so a future multi-field override stays
+// well-formed.
+func (d *Daemon) profileOverrideJSON(modelID string) (string, bool) {
+	if d.modelProfiles == nil || modelID == "" {
+		return "", false
+	}
+	p := d.modelProfiles.Get(modelID)
+	if p == nil || p.MaxInputTokens <= 0 {
+		return "", false
+	}
+	payload, err := json.Marshal(map[string]int64{"max_input_tokens": p.MaxInputTokens})
+	if err != nil {
+		return "", false
+	}
+	return string(payload), true
 }
 
 // denyToolArgs returns the `--deny-tool NAME` argv pairs that must be appended
@@ -5315,6 +5351,9 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 			}
 		}
 		args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
+		if po, ok := d.profileOverrideJSON(resolvedModel); ok {
+			args = append(args, "--profile-override", po)
+		}
 		// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
 		args = append(args, denyToolArgs(agent.Type)...)
 
@@ -8006,6 +8045,9 @@ func (d *Daemon) startAgentWithConfig(repoName string, repo *state.Repository, c
 			args = append(args, "-M", resolvedModel)
 		}
 		args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
+		if po, ok := d.profileOverrideJSON(resolvedModel); ok {
+			args = append(args, "--profile-override", po)
+		}
 		// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
 		args = append(args, denyToolArgs(cfg.agentType)...)
 
@@ -8703,6 +8745,9 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 		args = append(args, "-M", resolvedModel)
 	}
 	args = append(args, "--model-params", d.modelParamsJSON(resolvedModel))
+	if po, ok := d.profileOverrideJSON(resolvedModel); ok {
+		args = append(args, "--profile-override", po)
+	}
 	// Browser-agent tool catalog filter. See denyToolArgs() for rationale.
 	args = append(args, denyToolArgs(agent.Type)...)
 

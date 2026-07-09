@@ -136,6 +136,17 @@ const (
 	// (fail-safe: a typo in the env var shouldn't silently leave
 	// the user vulnerable to the crash loop).
 	safetyNetEnvVar = "OAT_CONTEXT_SAFETY_NET"
+
+	// outputReservationEnvVar gates the Phase 1 output-headroom
+	// reservation (default ON). When enabled, the 75%/95% safety-net
+	// tiers are computed against the model's window MINUS the reserved
+	// output-token budget (resolveOutputMaxTokens), so compaction fires
+	// with enough room left for the model to actually generate its reply.
+	// The user-visible ring meter is NOT affected — it always measures
+	// against the real window so "full means full" (Phase 3 item 7).
+	// Feature-flagged per the plan's cross-cutting guidance so a
+	// misbehaving reservation can be disabled without a rollback.
+	outputReservationEnvVar = "OAT_CONTEXT_RESERVE_OUTPUT"
 )
 
 // contextCapacityState holds in-memory dedupe state for the 75%
@@ -305,6 +316,54 @@ func (d *Daemon) effectiveContextLimit(modelID, repoName, agentName string) (lim
 	return contextFallbackTokens, "fallback"
 }
 
+// outputReservationEnabled reads OAT_CONTEXT_RESERVE_OUTPUT. Default ON.
+// Same tri-state parsing as safetyNetEnabled (fail-safe to ON on garbage).
+func outputReservationEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv(outputReservationEnvVar))
+	switch strings.ToLower(raw) {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// effectiveContextBudget returns the INPUT token budget the safety-net TIERS
+// (75% hint, 95% synthetic compaction inject) are computed against: the model's
+// context window (effectiveContextLimit) minus the reserved output-token
+// headroom (resolveOutputMaxTokens, the same value modelParamsJSON sends to the
+// runtime). Reserving output headroom means the daemon nudges the assistant to
+// compact while there's still room for the model to generate its reply, instead
+// of treating the whole window as available for input and only reacting once the
+// request itself would overflow.
+//
+// This is DISTINCT from the display denominator: the user-visible ring always
+// measures used/window (via effectiveContextLimit) so "100% means the model will
+// actually reject the next turn" (Phase 3 item 7 — full means full). Using the
+// smaller budget only for the internal tier decisions keeps the two from
+// fighting (naively subtracting output from the ring would peg it early).
+//
+// Floored at half the window so a pathological max_tokens or a very small window
+// can't collapse the budget to near-zero and make the safety net fire
+// constantly. Returns effectiveContextLimit's source unchanged.
+func (d *Daemon) effectiveContextBudget(modelID, repoName, agentName string) (budget int64, source string) {
+	limit, source := d.effectiveContextLimit(modelID, repoName, agentName)
+	if !outputReservationEnabled() || limit <= 0 {
+		return limit, source
+	}
+	reserved := int64(d.resolveOutputMaxTokens(modelID))
+	budget = limit - reserved
+	if floor := limit / 2; budget < floor {
+		budget = floor
+	}
+	if budget < 1 {
+		budget = limit
+	}
+	return budget, source
+}
+
 // warnf forwards to `d.logger.Warn` and is the WARN sink that
 // `contextEnvOverride` calls (the override doesn't have direct
 // access to the daemon -- threading the sink through the call
@@ -413,9 +472,15 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	if d.contextCap == nil {
 		return
 	}
+	// Two denominators (Phase 1 item 2 + Phase 3 item 7): the ring meter
+	// measures used/window so "full means full", while the internal
+	// 75%/95% tiers measure against window-minus-output so compaction
+	// fires with room left for the reply.
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
+	budget, _ := d.effectiveContextBudget(agent.Model, repoName, agentName)
 	used, known := agentContextOccupancy(agent)
-	pct := computeCapacityPct(used, limit)
+	displayPct := computeCapacityPct(used, limit)
+	tierPct := computeCapacityPct(used, budget)
 
 	// Emit a capacity frame on EVERY token event (i.e. every turn) so
 	// the side-panel ring meter is genuinely live, not a step function
@@ -424,8 +489,9 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	// nudge copy; the per-turn cadence is low (one per reply) so the
 	// broadcaster's small buffer is never stressed. When occupancy is
 	// unknown the frame carries tier "unknown" (neutral/hidden meter).
+	// The ring uses the real-window denominator (displayPct).
 	if repo, ok := d.state.GetRepo(repoName); ok {
-		d.publishCapacityFrame(repoName, agentName, repo.SessionName, pct, used, limit, known)
+		d.publishCapacityFrame(repoName, agentName, repo.SessionName, displayPct, used, limit, known)
 	}
 
 	// Hint + safety net are assistant-only and require a real window
@@ -438,7 +504,7 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 		return
 	}
 
-	if pct < contextTierHint {
+	if tierPct < contextTierHint {
 		return
 	}
 
@@ -458,19 +524,19 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 		return
 	}
 	directive := fmt.Sprintf(
-		"[OAT-system] You are at %.0f%% of your effective context window (%d / %d tokens). Call compact_conversation now to free working memory before your next reply.",
-		pct*100, used, limit,
+		"[OAT-system] You are at %.0f%% of your effective context window (%d / %d tokens, reserving %d for output). Call compact_conversation now to free working memory before your next reply.",
+		tierPct*100, used, budget, limit-budget,
 	)
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, directive); err != nil {
 		d.logger.Warn(
 			"context capacity hint failed for %s/%s at %.0f%%: %v",
-			repoName, agentName, pct*100, err,
+			repoName, agentName, tierPct*100, err,
 		)
 		return
 	}
 	d.logger.Info(
-		"context capacity hint sent to %s/%s: %.0f%% (%d / %d tokens)",
-		repoName, agentName, pct*100, used, limit,
+		"context capacity hint sent to %s/%s: %.0f%% (%d / %d input budget, window %d)",
+		repoName, agentName, tierPct*100, used, budget, limit,
 	)
 }
 
@@ -488,7 +554,9 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 	if !safetyNetEnabled() {
 		return "", false
 	}
-	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
+	// Tier decision uses the output-reserved input budget (Phase 1 item 2),
+	// not the full window, so the inject fires with room left for the reply.
+	budget, _ := d.effectiveContextBudget(agent.Model, repoName, agentName)
 	used, known := agentContextOccupancy(agent)
 	if !known {
 		// No live window reading yet — don't compact off a number we
@@ -496,7 +564,7 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 		// spend and could mis-fire right after a restart/wake).
 		return "", false
 	}
-	pct := computeCapacityPct(used, limit)
+	pct := computeCapacityPct(used, budget)
 	if pct < contextTierSafetyNet {
 		return "", false
 	}
@@ -506,6 +574,6 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 	// can ignore-as-duplicate.
 	return fmt.Sprintf(
 		"[OAT-system] You are at %.0f%% of effective context capacity (%d / %d). Call compact_conversation now before responding to anything else.",
-		pct*100, used, limit,
+		pct*100, used, budget,
 	), true
 }

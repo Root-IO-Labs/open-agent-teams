@@ -9540,6 +9540,37 @@ Do NOT create a new PR. The existing PR will be updated automatically when you p
 	return c.savePromptToFile(agentName, promptText)
 }
 
+// modelSpawnArgs returns the --model-params (and, when the model has an
+// onboarded ModelProfile, --profile-override) argv pairs for spawning an agent
+// with the given model from the CLI path. Mirrors the daemon's
+// Daemon.modelParamsJSON / profileOverrideJSON so a CLI-spawned agent gets the
+// same output-token budget and, critically, so a custom/self-hosted model's
+// onboarded MaxInputTokens reaches the Python runtime instead of falling back to
+// an oversized default that silently overflows the context window.
+func (c *CLI) modelSpawnArgs(model string) []string {
+	maxTokens := 32000
+	var overrideJSON string
+	if model != "" {
+		if profiles, err := routing.NewProfileStore(c.paths.ModelProfilesDir); err == nil {
+			if p := profiles.Get(model); p != nil {
+				if p.Runtime.MaxTokens > 0 {
+					maxTokens = p.Runtime.MaxTokens
+				}
+				if p.MaxInputTokens > 0 {
+					if payload, err := json.Marshal(map[string]int64{"max_input_tokens": p.MaxInputTokens}); err == nil {
+						overrideJSON = string(payload)
+					}
+				}
+			}
+		}
+	}
+	args := []string{"--model-params", fmt.Sprintf(`{"max_tokens":%d}`, maxTokens)}
+	if overrideJSON != "" {
+		args = append(args, "--profile-override", overrideJSON)
+	}
+	return args
+}
+
 // startAgentViaBackend starts an agent using the ProcessBackend abstraction.
 // Returns the PID of the agent process.
 func (c *CLI) startAgentViaBackend(binaryPath, session, agentName, workDir, sessionID, promptFile, repoName string, initialMessage string, model string) (int, error) {
@@ -9582,7 +9613,7 @@ func (c *CLI) startAgentViaBackend(binaryPath, session, agentName, workDir, sess
 	if model != "" {
 		args = append(args, "-M", model)
 	}
-	args = append(args, "--model-params", `{"max_tokens":32000}`)
+	args = append(args, c.modelSpawnArgs(model)...)
 
 	cfg := backend_pkg.AgentConfig{
 		SessionName:   session,
@@ -9799,7 +9830,7 @@ func (c *CLI) deleteBranch(repoPath, branch string) error {
 
 func (c *CLI) modelOnboard(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: oat model onboard <provider:model> [--probe-set minimum|default] [--verbose]")
+		return fmt.Errorf("usage: oat model onboard <provider:model> [--probe-set minimum|default] [--context-window N] [--verbose]")
 	}
 	modelStr := args[0]
 	flags, _ := ParseFlags(args[1:])
@@ -9819,6 +9850,12 @@ func (c *CLI) modelOnboard(args []string) error {
 	// Always save — profiles go to ~/.oat/model-profiles/ for daemon routing
 	// and also to model-routing/profiles/ in the source tree for version control.
 	cmdArgs := []string{probeScript, modelStr, "--probe-set", probeSet, "--save"}
+	// Forward an explicit context-window override so the recovery instruction
+	// printed by printOnboardSummary ("oat model onboard <model> --context-window N")
+	// is actually valid — the probe supports it but the CLI previously dropped it.
+	if cw, ok := flags["context-window"]; ok && cw != "" {
+		cmdArgs = append(cmdArgs, "--context-window", cw)
+	}
 
 	cmd := exec.CommandContext(c.cmdCtx(), "python3", cmdArgs...)
 
@@ -9982,15 +10019,52 @@ func (c *CLI) printOnboardSummary(modelStr, probeSet, stderr string) {
 	home, _ := os.UserHomeDir()
 	filename := strings.ReplaceAll(modelStr, ":", "__")
 	filename = strings.ReplaceAll(filename, "/", "__") + ".yaml"
-	fmt.Printf("  Profile saved to %s\n", filepath.Join(home, ".oat", "model-profiles", filename))
+	profilePath := filepath.Join(home, ".oat", "model-profiles", filename)
+	fmt.Printf("  Profile saved to %s\n", profilePath)
 	fmt.Printf("  (also written to model-routing/profiles/ in source tree)\n")
 
-	// Print any error/warning lines that would otherwise be hidden
+	// Context-window fallback (Phase 1): if the probe could NOT determine the
+	// real context window and silently defaulted it, onboarding still exits 0
+	// and looks like a clean success — but a wrong context window is the exact
+	// cause of silent context-overflow crashes for custom/self-hosted models
+	// (the Qwen bug). In compact mode the probe's multi-line recovery block was
+	// dropped (only single `WARNING:` lines were echoed). Reconstruct and
+	// always surface the full, copy-pasteable recovery block here so the
+	// operator can't miss that the value was guessed.
+	if getField("context_window_defaulted") == "true" {
+		ctxVal := getField("max_input_tokens")
+		if ctxVal == "" {
+			ctxVal = "the default"
+		}
+		envSuffix := strings.ToLower(modelStr)
+		envSuffix = strings.ReplaceAll(envSuffix, ":", "_")
+		envSuffix = strings.ReplaceAll(envSuffix, "/", "_")
+		bar := strings.Repeat("=", 70)
+		fmt.Fprintf(os.Stderr, "\n%s\n", bar)
+		fmt.Fprintf(os.Stderr, "  WARNING: Could not determine the real context window for\n")
+		fmt.Fprintf(os.Stderr, "           %q via API probe — it was DEFAULTED to %s tokens.\n", modelStr, ctxVal)
+		fmt.Fprintf(os.Stderr, "           A wrong context window causes silent context-overflow\n")
+		fmt.Fprintf(os.Stderr, "           crashes for this model. Set the correct value one of:\n\n")
+		fmt.Fprintf(os.Stderr, "             • Edit max_input_tokens in:\n                 %s\n\n", profilePath)
+		fmt.Fprintf(os.Stderr, "             • Re-run with an explicit value:\n                 oat model onboard %s --context-window <N>\n\n", modelStr)
+		fmt.Fprintf(os.Stderr, "             • Set an env override (no file edit needed):\n                 OAT_MODEL_CONTEXT_%s=<tokens>\n", envSuffix)
+		fmt.Fprintf(os.Stderr, "%s\n", bar)
+	}
+
+	// Print any error/warning lines that would otherwise be hidden. Skip the
+	// probe's own defaulted-context WARNING lines — we already surfaced the
+	// full reconstructed recovery block above, so re-echoing the single-line
+	// fragments would be redundant/confusing.
 	for _, line := range strings.Split(stderr, "\n") {
 		upper := strings.ToUpper(line)
-		if strings.Contains(upper, "ERROR:") || strings.Contains(upper, "WARNING:") {
-			fmt.Fprintln(os.Stderr, line)
+		if !strings.Contains(upper, "ERROR:") && !strings.Contains(upper, "WARNING:") {
+			continue
 		}
+		if strings.Contains(line, "Could not determine context window") ||
+			strings.Contains(line, "Defaulted to") {
+			continue
+		}
+		fmt.Fprintln(os.Stderr, line)
 	}
 }
 

@@ -276,6 +276,13 @@ func TestMaybeNudgeContextCapacity_BelowTier_Part5e(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
 
+	// Isolate the tier-threshold logic from the Phase 1 output-headroom
+	// reservation: with reservation ON the tier denominator would be the
+	// window minus reserved output, which is exercised separately by
+	// TestEffectiveContextBudget_ReservesOutput. Here we assert the raw
+	// 75 % tier boundary against the full window.
+	t.Setenv(outputReservationEnvVar, "0")
+
 	if err := d.state.AddRepo("repo", &state.Repository{SessionName: "repo"}); err != nil {
 		t.Fatalf("AddRepo: %v", err)
 	}
@@ -299,6 +306,10 @@ func TestMaybeNudgeContextCapacity_BelowTier_Part5e(t *testing.T) {
 func TestShouldInjectContextSafetyNet_Part5e(t *testing.T) {
 	d, cleanup := setupTestDaemon(t)
 	defer cleanup()
+
+	// Isolate the 95 % tier-threshold logic from the Phase 1 output-headroom
+	// reservation (tested separately). Assert against the full window.
+	t.Setenv(outputReservationEnvVar, "0")
 
 	// 95 % of 128 K fallback = 121 600. Use 122 000 to clearly cross.
 	hot := state.Agent{
@@ -700,5 +711,56 @@ func TestEffectiveContextLimit_EnvOverrideClampedEndToEnd(t *testing.T) {
 	}
 	if limit != contextEnvOverrideMax {
 		t.Errorf("limit = %d, want clamped %d", limit, contextEnvOverrideMax)
+	}
+}
+
+// TestEffectiveContextBudget_ReservesOutput pins the Phase 1 output-headroom
+// reservation: the safety-net budget = window − reserved output tokens, while
+// the display window (effectiveContextLimit) is unchanged so the ring still
+// reads "full means full" (Phase 3 item 7).
+func TestEffectiveContextBudget_ReservesOutput(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	t.Setenv(outputReservationEnvVar, "1")
+	budget, _ := d.effectiveContextBudget("", "repo", "agent")
+	if want := contextFallbackTokens - int64(defaultMaxTokens); budget != want {
+		t.Errorf("budget = %d, want %d (window − reserved output)", budget, want)
+	}
+	limit, _ := d.effectiveContextLimit("", "repo", "agent")
+	if limit != contextFallbackTokens {
+		t.Errorf("display limit = %d, want %d (window must be unchanged)", limit, contextFallbackTokens)
+	}
+
+	// Disabled → budget collapses back to the full window.
+	t.Setenv(outputReservationEnvVar, "0")
+	if budget2, _ := d.effectiveContextBudget("", "repo", "agent"); budget2 != contextFallbackTokens {
+		t.Errorf("with reservation OFF budget = %d, want %d", budget2, contextFallbackTokens)
+	}
+}
+
+// TestShouldInject_ReservedBudgetFiresEarlier verifies the reservation makes
+// the 95 % safety-net inject trip sooner (measured against the reserved input
+// budget) than it would against the full window — the whole point of reserving
+// output headroom so the compaction leaves room for the reply.
+func TestShouldInject_ReservedBudgetFiresEarlier(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	t.Setenv(safetyNetEnvVar, "1")
+
+	// window = 128K, reserved output = 32K → budget = 96K.
+	// 95 % of budget = 91 200; 95 % of window = 121 600.
+	// used = 92 000 is above the budget tier but below the window tier.
+	hot := state.Agent{Type: state.AgentTypeAssistant, ContextWindowTokens: 92_000}
+
+	t.Setenv(outputReservationEnvVar, "1")
+	if _, inject := d.shouldInjectContextSafetyNet(hot, "repo", "agent"); !inject {
+		t.Error("expected inject at >=95 % of the reserved budget")
+	}
+
+	t.Setenv(outputReservationEnvVar, "0")
+	if _, inject := d.shouldInjectContextSafetyNet(hot, "repo", "agent"); inject {
+		t.Error("did not expect inject at ~72 % of the full window (reservation off)")
 	}
 }
