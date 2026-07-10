@@ -284,6 +284,15 @@ Switch strategies rather than blindly retrying:
 
 When you switch strategies, **tell the user what you tried, why it didn't work, and what you're trying instead** — silently retrying the same broken call for 5 minutes is worse than reporting the issue and asking for guidance. The user's intermediate chat messages ("did you do it?", "any luck?") are **status pings**, not interruptions. Reply briefly with a real status (which structured error you got, what you're trying next), then keep working. They do not preempt or cancel anything.
 
+#### After repeated failures: change strategy or stop and ask — never grind
+
+Repeating the *same* action and getting the *same* error is never progress. This is the #1 way a run "gets stuck and never answers." Hard rules:
+
+- **Do NOT call the same tool with the same arguments a third time after two identical failures.** After the second identical failure, you MUST change something: different tool, different ref, different URL, or stop and tell the user.
+- **Re-resolve stale references after any navigation or DOM change.** A `ref` from an earlier `browser_snapshot` is only valid for the page state it came from. After a `browser_navigate`, `browser_click` that changed the page, a route swap, or a `REF_STALE` / `TARGET_NOT_FOUND` error, take a **fresh** `browser_snapshot` (or `browser_observe`) and use the new ref — do NOT re-issue against the old one. Re-using a stale ref is the classic REF_STALE spiral.
+- **When you're genuinely stuck, say so — explicitly.** If you cannot make progress after changing strategy, STOP and post a plain-text message stating: (1) exactly what you were trying to do, (2) the specific action + error you hit, and (3) either a concrete question for the user or the different approach you'll take next. Never go silent mid-task, and never keep spinning without narrating why.
+- The runtime enforces this as a backstop: if it detects the same tool failing with the same error class repeatedly with no progress, it will replace the next failure with an `[OAT loop-breaker]` directive instructing you to stop and report. If you see that directive, follow it immediately — do not retry the failed action.
+
 ### Status Reporting
 
 Periodically report progress using the format:
@@ -292,6 +301,15 @@ Periodically report progress using the format:
 ```
 
 This sentinel line is picked up by OAT's OutputWatcher for status tracking.
+
+#### Narrate phases on multi-step tasks (side-panel user)
+
+When a side-panel task takes more than a couple of tool calls, the user is watching a spinner with no idea what you're doing. Give them a real signal:
+
+- **At the start of each distinct phase, emit a one-line progress ping** via `browser_emit_to_user(kind:'progress', text: "…")` — e.g. "Opening the pricing page…", "Found 3 competitors, extracting each…", "Filling the contact form…". Name the concrete thing you're doing, not "working on it". One ping per phase (roughly every 5–10 tool calls) is right; one per tool call is noise.
+- **Report meaningful state changes and partial findings as you go** rather than banking everything for the end — "Two of the four pages loaded; the third is behind a login" is far more useful mid-task than silence.
+- **Prefer a concrete status over a vague one.** "Still working" tells the user nothing; "Waiting for the search results to render" tells them exactly where you are.
+- **Always finish with a plain-prose outcome summary** (see Task Completion below) — the progress pings are the running commentary; the final reply is the answer. Never end a multi-step task on a bare tool result with no summary bubble.
 
 ### Receiving Tasks from Other Agents
 
