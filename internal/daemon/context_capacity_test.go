@@ -232,8 +232,8 @@ func TestMaybeNudgeContextCapacity_Suppression_Part5e(t *testing.T) {
 	assistant := state.Agent{
 		Type:                state.AgentTypeAssistant,
 		WindowName:          "personal",
-		ContextWindowTokens: 96_000, // 75 % of the 128 K fallback exactly
-		Model:               "",     // forces fallback → 128 K limit → 75 %
+		ContextWindowTokens: 96_000, // above the 75 % hint tier (fallback budget)
+		Model:               "",     // forces fallback source
 	}
 
 	// First call: should record a lastHintAt entry.
@@ -784,40 +784,39 @@ contract:
   onboarding_passed: true
 `
 
-// TestEffectiveDisplayLimit_ProfileAddsOutputReserve pins Phase 3 item 7: the
-// ring denominator approximates the model's REAL window (input budget + reserved
-// output) for a profile-sourced limit, so a conservative-input-budget model
-// (Qwen 96K) no longer pegs the ring at a false 100% ~35K early. Fallback /
-// ceiling / env limits already represent the window, so they're unchanged.
-func TestEffectiveDisplayLimit_ProfileAddsOutputReserve(t *testing.T) {
+// TestEffectiveContextBudget_ProfileNoDoubleReserve pins the DGX-Spark Qwen
+// fix: a profile-sourced limit is already max_input_tokens (which excludes the
+// output budget), so the compaction budget must EQUAL it — not subtract the
+// output reserve a second time. The double-count cut Qwen's 96000 input budget
+// to 64000, so compaction fired at ~50% of the real window while the ring read
+// ~56% ("why did it compact at 56%?"). Window-representing sources (fallback /
+// env) still subtract one output reserve so compaction leaves room for the reply.
+func TestEffectiveContextBudget_ProfileNoDoubleReserve(t *testing.T) {
 	d, cleanup := setupDaemonWithProfiles(t, map[string]string{
 		"qwen.yaml":         testProfileQwenSmall,
 		"gemini-flash.yaml": testProfileGeminiFlash,
 	})
 	defer cleanup()
+	t.Setenv(outputReservationEnvVar, "1")
 
-	// Profile-sourced (96K < 128K ceiling): display = 96K + reserved output.
-	got := d.effectiveDisplayLimit("spark:Qwen/Qwen3.5-35B-A3B-FP8", "repo", "agent")
-	want := int64(96_000 + defaultMaxTokens)
-	if got != want {
-		t.Errorf("profile display limit = %d, want %d (input budget + reserved output)", got, want)
+	const qwen = "spark:Qwen/Qwen3.5-35B-A3B-FP8"
+
+	// Profile source: budget == max_input_tokens; NO second subtraction.
+	if got, src := d.effectiveContextBudget(qwen, "repo", "agent"); got != 96_000 || src != "profile" {
+		t.Errorf("profile budget = %d (src %q), want 96000 profile (no double reserve)", got, src)
 	}
 
-	// Fallback (no profile): already represents the window → unchanged.
-	if got := d.effectiveDisplayLimit("unknown:model-x", "repo", "agent"); got != contextFallbackTokens {
-		t.Errorf("fallback display limit = %d, want %d (unchanged)", got, contextFallbackTokens)
+	// Fallback source: window − one output reserve.
+	fbReserve := int64(d.resolveOutputMaxTokens("unknown:model-x"))
+	if got, src := d.effectiveContextBudget("unknown:model-x", "repo", "agent"); got != contextFallbackTokens-fbReserve || src != "fallback" {
+		t.Errorf("fallback budget = %d (src %q), want %d fallback", got, src, contextFallbackTokens-fbReserve)
 	}
 
-	// Ceiling (profile 1M clamped to 128K): the ceiling is the intended cap →
-	// unchanged, must NOT get an extra output reserve on top.
-	if got := d.effectiveDisplayLimit("google_genai:gemini-2.5-flash", "repo", "agent"); got != contextCeilingTokens {
-		t.Errorf("ceiling display limit = %d, want %d (unchanged)", got, contextCeilingTokens)
-	}
-
-	// Env override: operator's number is the window → unchanged.
+	// Env source: operator number is the window → window − one output reserve.
 	t.Setenv("OAT_MODEL_CONTEXT_spark_qwen_qwen3.5-35b-a3b-fp8", "200000")
-	if got := d.effectiveDisplayLimit("spark:Qwen/Qwen3.5-35B-A3B-FP8", "repo", "agent"); got != 200_000 {
-		t.Errorf("env display limit = %d, want 200000 (unchanged)", got)
+	envReserve := int64(d.resolveOutputMaxTokens(qwen))
+	if got, src := d.effectiveContextBudget(qwen, "repo", "agent"); got != 200_000-envReserve || src != "env" {
+		t.Errorf("env budget = %d (src %q), want %d env", got, src, 200_000-envReserve)
 	}
 }
 

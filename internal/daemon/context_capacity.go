@@ -130,6 +130,19 @@ const (
 	// re-nudged within human-noticeable time.
 	contextHintSuppressionWindow = 5 * time.Minute
 
+	// contextSafetyNetCooldown suppresses back-to-back 95% safety-net injects.
+	// The daemon only learns the post-compaction occupancy from the NEXT
+	// [OAT_TOKENS] event, so between "compact now" and that event the stored
+	// ContextWindowTokens is still the pre-compaction high. Without a cooldown
+	// the daemon re-injects "compact now" off that stale number — the agent
+	// compacts again ("nothing to compact") AND the directive hijacks the very
+	// next user message (e.g. "are you still working?"), so the agent compacts
+	// instead of answering. 2 minutes comfortably covers a compaction round-trip
+	// plus the fresh token event on a slow local model (Qwen-on-Spark took
+	// ~70s to summarize in the real repro), while still re-arming quickly enough
+	// that a genuinely-still-hot session gets nudged again.
+	contextSafetyNetCooldown = 2 * time.Minute
+
 	// safetyNetEnvVar is read at daemon startup. Empty / "1" /
 	// "true" mean enabled (default ON). "0" / "false" mean
 	// disabled. Anything else logs a WARN and defaults to ON
@@ -173,6 +186,11 @@ type contextCapacityState struct {
 	mu          sync.Mutex
 	lastHintAt  map[string]time.Time
 	fallbackLog map[string]bool // dedupe the "no profile, falling back" WARN per-agent
+	// lastSafetyNetInjectAt is the most-recent time the 95% safety-net inject
+	// fired for an agent. Read+written under mu; drives contextSafetyNetCooldown
+	// so a stale-occupancy re-fire can't spam redundant compactions or hijack
+	// the user's next message.
+	lastSafetyNetInjectAt map[string]time.Time
 	// lastTier (Part 5e Slice B) is the most-recent tier the daemon
 	// observed for this agent. publishCapacityFrameIfTierChanged
 	// reads + writes it under the same mutex above so the
@@ -184,9 +202,10 @@ type contextCapacityState struct {
 
 func newContextCapacityState() *contextCapacityState {
 	return &contextCapacityState{
-		lastHintAt:  make(map[string]time.Time),
-		fallbackLog: make(map[string]bool),
-		lastTier:    make(map[string]string),
+		lastHintAt:            make(map[string]time.Time),
+		fallbackLog:           make(map[string]bool),
+		lastTier:              make(map[string]string),
+		lastSafetyNetInjectAt: make(map[string]time.Time),
 	}
 }
 
@@ -367,6 +386,21 @@ func (d *Daemon) effectiveContextBudget(modelID, repoName, agentName string) (bu
 	if !outputReservationEnabled() || limit <= 0 {
 		return limit, source
 	}
+	// A "profile" limit is the model's max_input_tokens, which ALREADY excludes
+	// the output budget (max_input ≈ real_window − max_output). Subtracting the
+	// output reserve AGAIN here double-counts it: the DGX-Spark Qwen has
+	// max_input_tokens=96000, and the extra subtraction cut the budget to 64000
+	// — so compaction fired at ~50% of the real window while the ring (measured
+	// against the reconstructed ~128000 window) still read ~56%. That mismatch
+	// is exactly the "why did it compact at 56%?" report. For the profile
+	// source the input budget IS the compaction budget; no further reservation.
+	//
+	// The window-representing sources (env / ceiling / fallback) DO carry a
+	// single reservation, because for them `limit` is the full context window,
+	// so we must subtract output headroom once to leave room for the reply.
+	if source == "profile" {
+		return limit, source
+	}
 	reserved := int64(d.resolveOutputMaxTokens(modelID))
 	budget = limit - reserved
 	if floor := limit / 2; budget < floor {
@@ -376,44 +410,6 @@ func (d *Daemon) effectiveContextBudget(modelID, repoName, agentName string) (bu
 		budget = limit
 	}
 	return budget, source
-}
-
-// effectiveDisplayLimit returns the denominator the USER-VISIBLE ring meter
-// measures occupancy against — an approximation of the model's REAL usable
-// context window, so "100% means the model will actually reject the next turn"
-// (Phase 3 decision 3, "full means full").
-//
-// Why this differs from effectiveContextLimit: an onboarded ModelProfile records
-// only `max_input_tokens` (the PROMPT budget ≈ real_window − max_output), never
-// the full context window. For the DGX-Spark Qwen that's max_input_tokens=96000
-// while the model's real hard limit is ~131072 — so pegging the ring at 96000
-// shows a permanent, broken-looking 100% while the model happily keeps accepting
-// turns (exactly John's "indicators say 100% but it keeps working"). The real
-// window isn't stored anywhere in OAT's data, so when the limit came from a
-// profile's input budget we approximate the window as input_budget + reserved
-// output headroom (≈ real_window, because max_input_tokens ≈ real_window −
-// max_output). For Qwen: 96000 + 32000 = 128000 ≈ the real 131072.
-//
-// Only the "profile" source is adjusted. "env" (operator-set), "ceiling" (the
-// 128K attention-degradation cap) and "fallback" (the 128K "assume the modern
-// floor" guess) already represent the intended WINDOW, not an input budget, so
-// they are returned unchanged — this also keeps them from over-stating.
-//
-// This is an approximation, not a probed value; a dedicated real-context-window
-// profile field would let the ring be exact (noted as a follow-up). The internal
-// safety-net TIERS keep using the smaller effectiveContextBudget so compaction
-// still fires early — the display denominator is deliberately larger than the
-// tier denominator.
-func (d *Daemon) effectiveDisplayLimit(modelID, repoName, agentName string) int64 {
-	limit, source := d.effectiveContextLimit(modelID, repoName, agentName)
-	if source != "profile" || limit <= 0 {
-		return limit
-	}
-	reserved := int64(d.resolveOutputMaxTokens(modelID))
-	if reserved <= 0 {
-		return limit
-	}
-	return limit + reserved
 }
 
 // warnf forwards to `d.logger.Warn` and is the WARN sink that
@@ -524,31 +520,28 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	if d.contextCap == nil {
 		return
 	}
-	// Three denominators (Phase 1 item 2 + Phase 3 item 7):
-	//   - displayLimit: the ring meter's real-window approximation so
-	//     "full means full" and a profile-input-budget model (Qwen 96K)
-	//     doesn't peg at a false 100% ~35K early.
-	//   - budget: the internal 75%/95% tiers measure against
-	//     window-minus-output so compaction fires with room for the reply.
-	//   - limit: the raw effectiveContextLimit, used only for the hint's
-	//     human-readable "window" figure below.
+	// ONE denominator for everything the user and the daemon act on: the
+	// compaction budget. Earlier this split into a larger "display" window for
+	// the ring and a smaller budget for the tiers, so the ring read ~56% at the
+	// exact moment the daemon force-compacted — the "why compact at 56%?" bug.
+	// Measuring the ring, its amber/red colour tiers, the 75% hint and the 95%
+	// safety-net inject against the same `budget` keeps them consistent: the
+	// ring hits 75% precisely when the hint fires and ~100% when compaction
+	// fires. `limit` is retained only for the hint's human-readable figures.
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
-	displayLimit := d.effectiveDisplayLimit(agent.Model, repoName, agentName)
 	budget, _ := d.effectiveContextBudget(agent.Model, repoName, agentName)
 	used, known := agentContextOccupancy(agent)
-	displayPct := computeCapacityPct(used, displayLimit)
 	tierPct := computeCapacityPct(used, budget)
 
 	// Emit a capacity frame on EVERY token event (i.e. every turn) so
 	// the side-panel ring meter is genuinely live, not a step function
-	// that only moves on tier boundaries. The frame still carries the
-	// tier name so the extension can drive the amber/red colour shift +
-	// nudge copy; the per-turn cadence is low (one per reply) so the
+	// that only moves on tier boundaries. The frame carries the tier
+	// name so the extension can drive the amber/red colour shift + nudge
+	// copy; the per-turn cadence is low (one per reply) so the
 	// broadcaster's small buffer is never stressed. When occupancy is
 	// unknown the frame carries tier "unknown" (neutral/hidden meter).
-	// The ring uses the real-window denominator (displayPct).
 	if repo, ok := d.state.GetRepo(repoName); ok {
-		d.publishCapacityFrame(repoName, agentName, repo.SessionName, displayPct, used, displayLimit, known)
+		d.publishCapacityFrame(repoName, agentName, repo.SessionName, tierPct, used, budget, known)
 	}
 
 	// Hint + safety net are assistant-only and require a real window
@@ -581,8 +574,8 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 		return
 	}
 	directive := fmt.Sprintf(
-		"[OAT-system] You are at %.0f%% of your effective context window (%d / %d tokens, reserving %d for output). Call compact_conversation now to free working memory before your next reply.",
-		tierPct*100, used, budget, limit-budget,
+		"[OAT-system] You are at %.0f%% of your usable context (%d / %d tokens; model window ~%d). Call compact_conversation soon to free working memory before it fills.",
+		tierPct*100, used, budget, limit,
 	)
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, directive); err != nil {
 		d.logger.Warn(
@@ -625,12 +618,28 @@ func (d *Daemon) shouldInjectContextSafetyNet(agent state.Agent, repoName, agent
 	if pct < contextTierSafetyNet {
 		return "", false
 	}
-	// Wording deliberately matches the `oat assistant compact`
-	// directive in internal/cli/assistant.go so an assistant
-	// receiving either path sees the same instruction shape and
-	// can ignore-as-duplicate.
+	// Cooldown guard: don't re-inject off a stale (pre-compaction) occupancy
+	// reading. See contextSafetyNetCooldown. Recorded optimistically when we
+	// decide to inject; a rare failed SendMessage at the call site just means
+	// we skip the inject for one cooldown window (the 75% PTY hint still nudges).
+	if d.contextCap != nil {
+		key := agentKey(repoName, agentName)
+		now := time.Now()
+		d.contextCap.mu.Lock()
+		last := d.contextCap.lastSafetyNetInjectAt[key]
+		if !last.IsZero() && now.Sub(last) < contextSafetyNetCooldown {
+			d.contextCap.mu.Unlock()
+			return "", false
+		}
+		d.contextCap.lastSafetyNetInjectAt[key] = now
+		d.contextCap.mu.Unlock()
+	}
+	// The directive is PREPENDED to the user's message, so it must NOT tell the
+	// agent to ignore the user (the old "before responding to anything else"
+	// wording made the agent compact and drop direct questions like "are you
+	// still working?"). Instruct it to compact first, then still answer.
 	return fmt.Sprintf(
-		"[OAT-system] You are at %.0f%% of effective context capacity (%d / %d). Call compact_conversation now before responding to anything else.",
+		"[OAT-system] You are at %.0f%% of usable context (%d / %d tokens). Call compact_conversation to free working memory, then respond to the user's message below — if they asked a direct question (e.g. whether you're still working), answer it first in one line.",
 		pct*100, used, budget,
 	), true
 }

@@ -341,8 +341,8 @@ func (d *Daemon) publishUnknownCapacityFrame(repoName, agentName string, agent s
 	if !ok {
 		return
 	}
-	limit := d.effectiveDisplayLimit(agent.Model, repoName, agentName)
-	d.publishCapacityFrame(repoName, agentName, repo.SessionName, 0, 0, limit, false)
+	budget, _ := d.effectiveContextBudget(agent.Model, repoName, agentName)
+	d.publishCapacityFrame(repoName, agentName, repo.SessionName, 0, 0, budget, false)
 }
 
 // publishCapacityFrameIfTierChanged builds a contextCapacityFrame

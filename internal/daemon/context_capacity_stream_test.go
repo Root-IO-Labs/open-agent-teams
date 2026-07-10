@@ -410,6 +410,11 @@ func TestMaybeNudgeContextCapacity_EmitsClearFrame_Part5eSliceB(t *testing.T) {
 	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
 	defer subCancel()
 
+	// Isolate frame mechanics from the output-headroom reservation so the
+	// denominator is the full window (budget == limit); the reservation math
+	// is covered by TestEffectiveContextBudget_* instead.
+	t.Setenv(outputReservationEnvVar, "0")
+
 	// Climb to hint (80% of 128K fallback = 102_400). Drive the live
 	// window reading (ContextWindowTokens), not cumulative TotalTokens
 	// — the meter is computed from window occupancy now.
@@ -452,6 +457,9 @@ func TestMaybeNudgeContextCapacity_BrowserPublishesFrameNoHint(t *testing.T) {
 	_, sub, subCancel := subscribeForTest(t, d, session, agent)
 	defer subCancel()
 
+	// Isolate frame mechanics from the reservation (budget == full window).
+	t.Setenv(outputReservationEnvVar, "0")
+
 	// 80% of the 128K fallback = 102_400 → would be a "hint" tier.
 	d.maybeNudgeContextCapacity(repo, agent, state.Agent{
 		Type:                state.AgentTypeBrowser,
@@ -488,6 +496,9 @@ func TestMaybeNudgeContextCapacity_UnknownPublishesUnknownFrame(t *testing.T) {
 
 	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
 	defer subCancel()
+
+	// Isolate frame mechanics from the reservation (budget == full window).
+	t.Setenv(outputReservationEnvVar, "0")
 
 	// No live window reading yet; cumulative TotalTokens must NOT be
 	// used to fabricate a percentage.
@@ -528,6 +539,9 @@ func TestHandleTokenUsageEvent_FrameRefreshesOnLowerReading(t *testing.T) {
 
 	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
 	defer subCancel()
+
+	// Isolate frame mechanics from the reservation (budget == full window).
+	t.Setenv(outputReservationEnvVar, "0")
 
 	// High reading: 124K of the 128K fallback window (~96.9%) → safety_net tier.
 	d.handleTokenUsageEvent(repo, agent, `{"cumulative_input":124000,"cumulative_output":0,"context_input":124000}`)

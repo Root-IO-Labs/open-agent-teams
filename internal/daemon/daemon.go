@@ -8412,7 +8412,7 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 		// (no strictly-lower value ever follows once it floors). Only reject
 		// readings FAR above the model's real window — see
 		// contextOccupancySanityFactor. Distinct WARN so it's diagnosable.
-		dispLimit := d.effectiveDisplayLimit(agent.Model, repoName, agentName)
+		dispLimit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
 		sanityCeiling := dispLimit * contextOccupancySanityFactor
 		if sanityCeiling > 0 && newOccupancy > sanityCeiling {
 			d.logger.Warn(
