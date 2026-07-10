@@ -80,7 +80,7 @@ func turnKey(sessionName, agentName string) string {
 // the tailer publish TOOL/RESULT blocks as tool_start/tool_end
 // activity frames. Browser agents already surface tool rows via the
 // bridge's MCP hooks, so enabling it for them would double-render.
-func (d *Daemon) startAssistantTurnTailer(sessionName, agentName, logPath string, emitToolEvents bool) {
+func (d *Daemon) startAssistantTurnTailer(repoName, sessionName, agentName, logPath string, emitToolEvents bool) {
 	key := turnKey(sessionName, agentName)
 	d.assistantTurnTailersMu.Lock()
 	hadExisting := false
@@ -100,6 +100,15 @@ func (d *Daemon) startAssistantTurnTailer(sessionName, agentName, logPath string
 	// reply / hand it to the bridge?".
 	broadcaster := newTurnBroadcaster(d.logger.Info)
 	tailer := newAssistantTurnTailer(logPath, broadcaster, emitToolEvents, d.logger.Info)
+	// Wire Layer 2 auto-recovery ONLY for assistants. emitToolEvents is
+	// true iff agent.Type == AgentTypeAssistant (see the call sites), so
+	// it doubles as the assistant gate here. Browser agents get a nil
+	// callback (turn_end still publishes, just with recovering=false).
+	if emitToolEvents {
+		tailer.onTurnEnd = func(info turnEndInfo) bool {
+			return d.maybeRecoverAssistantTurn(repoName, sessionName, agentName, info)
+		}
+	}
 	d.assistantTurnTailers[key] = tailer
 	d.assistantTurnTailersMu.Unlock()
 	tailer.Start(d.ctx)
@@ -154,6 +163,12 @@ func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string) {
 	if t != nil {
 		t.markSidePanelActive()
 	}
+	// A genuine user message ends any in-progress "stuck sequence": the
+	// user has taken over, so the auto-recovery budget resets. Recovery
+	// re-prompts are injected via backend.SendMessage (NOT this path), so
+	// they never reset the budget — only real user input does. Keyed by
+	// (session, agent) via turnKey, matching the controller's map key.
+	d.assistantRecovery.resetForUser(sessionName, agentName)
 }
 
 // stopAllAssistantTurnTailers tears down every active tailer.

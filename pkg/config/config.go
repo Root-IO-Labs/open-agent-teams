@@ -114,6 +114,15 @@ func (p *Paths) WorkersOutputDir(repoName string) string {
 	return filepath.Join(p.RepoOutputDir(repoName), "workers")
 }
 
+// RepoDownloadsDir returns the per-repo download/screenshot sandbox
+// (~/.oat/downloads/<repo>/). This is the canonical location the browser
+// bridge writes browser_file_download results and browser_save_screenshot
+// PNGs to; passed to the bridge via OAT_BROWSER_AGENT_DOWNLOAD_DIR at spawn
+// so the bridge's file sandbox is repo-scoped without teaching it about repos.
+func (p *Paths) RepoDownloadsDir(repoName string) string {
+	return filepath.Join(p.Root, "downloads", repoName)
+}
+
 // AgentLogFile returns the path to an agent's log file
 func (p *Paths) AgentLogFile(repoName, agentName string, isWorker bool) string {
 	if isWorker {

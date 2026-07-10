@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Self-healing turn ladder for the assistant (auto-recovery from silent tool
+  errors).** When an assistant turn ends with its last tool call in error and no
+  visible reply to the user — the "agent went silent after a tool error" symptom
+  — the daemon now injects exactly ONE bounded `[OAT-system]` recovery re-prompt
+  so the model re-plans and continues on its own, instead of the user having to
+  prod it. The re-prompt is **code-only** (built from a curated
+  `code → generic-instruction` allowlist; the raw tool error message is never
+  echoed, so no page-derived bytes reach the planning model) and fail-closed
+  (only genuinely model-fixable codes recover — stale refs, wrong/closed tab,
+  bad args, transient screenshot failures; security/policy/user-recoverable
+  codes like `EXTENSION_NOT_CONNECTED` are always surfaced). Budget is one
+  attempt per stuck sequence, reset on a fresh user message or any visible
+  reply, with a same-code loop guard. New env var **`OAT_ASSISTANT_RECOVERY_MAX`**
+  (default `1`; `0` disables) and a no-op under `OAT_TEST_MODE`. Implemented in
+  `internal/daemon/assistant_recovery.go`.
+- **Authoritative once-per-turn end signal (`[OAT_TURN_END]` sentinel +
+  `turn_end` frame).** The Python agent-runtime now writes a dedicated
+  `[OAT_TURN_END] <turn_id>` line to `OAT_TOOL_LOG` from `emit_turn_end` (exactly
+  once per turn, on every completion path), and the daemon parses it into a new
+  `turn_end` agent-activity frame carrying the turn's outcome (`hadError`,
+  `code`, `retryable`, `visibleReply`, `recovering`). This replaces keying
+  turn-end on `[OAT_TOKENS]` (which also fires after a mid-turn compaction and
+  would false-fire). The side panel uses it to stop the spinner on a silent,
+  tool-only turn and to render the self-healing outcome.
+- **`browser_save_screenshot` — save a page capture to a file for documents.**
+  Captures a page and writes a PNG into a per-repo file sandbox
+  (`~/.oat/downloads/<repo>/`, passed to the bridge via the new
+  **`OAT_BROWSER_AGENT_DOWNLOAD_DIR`** env var), returning `{ok, path, bytes,
+  mime}`. The bytes never enter the model context or the chat; the agent
+  references the returned path with `![](path)` when building a doc. The
+  destination path is sandbox-confined (must end in `.png`; traversal, symlink
+  escape, and clobbering a symlink/non-regular file are rejected).
+
 ### Changed
 
 - **Assistant prompt: always report when done + narration reflects the live UI.**
@@ -19,6 +54,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once the turn ends — so progress pings add the human "why", not the mechanical
   "what". (`browser.md` already carried the equivalent "never go silent" +
   "finish with an outcome summary" rules.)
+- **Prompt reinforcement: report errors early, never fake artifacts, use
+  `browser_save_screenshot` for docs.** `assistant.md` (and the shared bits of
+  `browser.md`) now instruct the agent to report a blocking/connection error on
+  the FIRST failure rather than waiting to be prodded, to never claim an artifact
+  was produced/shown/saved unless the tool result confirms it (the false
+  "screenshots shown inline" bug), to send a short progress ping before a slow
+  step like writing a large file, and to embed screenshots in documents via
+  `browser_save_screenshot` + `![](path)` rather than "insert screenshot here"
+  placeholders.
+- **Green-error classification.** The daemon's turn parser and the runtime's
+  textual adapter now flag structured tool results that omit `ok:false` but carry
+  an UPPER_SNAKE `code` (e.g. `EXTENSION_NOT_CONNECTED`) or a non-empty
+  `error`/`errorMessage` as errors, so a failed tool call renders red and drives
+  recovery instead of being mistaken for success.
 
 ### Documentation
 

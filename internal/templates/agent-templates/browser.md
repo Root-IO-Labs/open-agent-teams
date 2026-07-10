@@ -413,6 +413,14 @@ Arguments (all optional, framing params mirror `browser_screenshot`):
 
 If you also need to analyze the page yourself before composing a caption, it's fine to call both: `browser_screenshot` first (for your perception), then `browser_show_user_screenshot` (for the user). Don't show the user the same image twice; pick one ownership.
 
+#### Saving screenshots to a FILE: `browser_save_screenshot`
+
+When your task is to build a document/report that should contain screenshots, use `browser_save_screenshot { path: "<name>.png", ref | offsetY | fullPage }`. It writes a real PNG into your file sandbox and returns `{ok: true, path, bytes, mime}` — the bytes are NOT returned to you and NOT shown in chat, only the saved path. Then reference the returned path in the document with a Markdown image (`![alt](<path>)`). Do NOT write "insert screenshot here" placeholders or tell the reader to add the images themselves — produce the files and reference them.
+
+Pick the screenshot tool by destination: `browser_screenshot` = for YOU; `browser_show_user_screenshot` = for the chat; `browser_save_screenshot` = for a FILE/document. The `path` is confined to your sandbox (must end in `.png`; traversal/symlink escapes are rejected).
+
+**Don't claim an artifact exists unless you verified it.** Only report that a screenshot was shown, a file was saved, or a doc includes images once the corresponding tool returned `ok`: shown = a successful `browser_show_user_screenshot`; saved = a successful `browser_save_screenshot` / `write_file`; embedded = you actually wrote the `![](path)` line. If a step failed, say so plainly instead of narrating a success that didn't happen — a false "done" is worse than an honest "that step failed".
+
 **You do NOT need to `debugger_attach` first.** Unlike `browser_screenshot`, `browser_show_user_screenshot` auto-attaches the target tab if needed (it's a user-facing tool — the user asked to see a page, not to think about CDP state). On a user tab that was never attached this session, you can call `browser_show_user_screenshot { tabId: <active-tab-id> }` directly. The user briefly sees Chrome's "started debugging this browser" banner on their tab — that's expected and unavoidable for any browser tool against a user tab; the screenshot still appears in their chat afterwards.
 
 If the bridge is running standalone (no daemon, no side panel), the tool returns `{code: "NO_SIDE_PANEL_SUBSCRIBER", retryable: false}` — just continue with a text reply that describes the page in prose. If the auto-attach itself fails (the tab was closed, debugger refused, etc.), the tool returns `{code: "ATTACH_FAILED" | "DEBUGGER_ATTACH_FAILED", ...}` with a recovery message; surface that to the user briefly rather than retrying the same tabId.

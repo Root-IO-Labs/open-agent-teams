@@ -220,14 +220,38 @@ def emit_turn_start(user_input: str, turn_id: Optional[str] = None) -> Optional[
 
 
 def emit_turn_end() -> None:
-    """Emit a turn_end event for the current turn_id, then clear it."""
+    """Emit a turn_end event for the current turn_id, then clear it.
+
+    Also writes a dedicated ``[OAT_TURN_END]`` sentinel to ``OAT_TOOL_LOG``
+    (the file the daemon's assistant-turn tailer reads) so the daemon can
+    detect the end of a silent, tool-only turn and stop the side panel's
+    spinner / run its self-healing recovery ladder. This is DISTINCT from
+    ``[OAT_TOKENS]`` on purpose: ``[OAT_TOKENS]`` is also emitted right after
+    a mid-turn compaction, so keying turn-end on it would false-fire; this
+    sentinel fires only from ``emit_turn_end``, which the adapter calls
+    exactly once per turn on every completion path (incl. the app.py
+    exception-path finally). The ``tid is not None`` guard makes the write
+    exactly-once: ``set_turn_id(None)`` below means the idempotent finally
+    call is a no-op.
+    """
     c = _get_client()
     tid = _turn_id()
-    if c is not None and tid is not None:
-        try:
-            c.emit(turn_end(seq=_next_seq(), turn_id=tid))
-        except Exception as e:  # noqa: BLE001
-            _log.warning("sidecar_emitter: emit_turn_end failed: %s", e)
+    if tid is not None:
+        if c is not None:
+            try:
+                c.emit(turn_end(seq=_next_seq(), turn_id=tid))
+            except Exception as e:  # noqa: BLE001
+                _log.warning("sidecar_emitter: emit_turn_end failed: %s", e)
+        # Best-effort sentinel append; a logging/IO failure must never
+        # interrupt the agent (mirrors _emit_oat_tokens' direct-write path).
+        log_path = os.environ.get("OAT_TOOL_LOG")
+        if log_path:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"[OAT_TURN_END] {tid}\n")
+                    f.flush()
+            except OSError:
+                pass
     set_turn_id(None)
 
 

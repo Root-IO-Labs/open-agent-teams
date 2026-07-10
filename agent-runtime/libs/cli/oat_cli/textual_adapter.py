@@ -99,6 +99,13 @@ def _is_summarization_chunk(metadata: dict | None) -> bool:
     return metadata.get("lc_source") == "summarization"
 
 
+# Matches an UPPER_SNAKE structured error code (mandatory underscore) so a
+# real bridge code like EXTENSION_NOT_CONNECTED / STALE_REF is flagged while
+# a benign short code like "X" in a {code, value} success payload is not.
+# Kept in sync with errorCodeRE in the daemon's assistant_turn_parser.go.
+_ERROR_CODE_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
+
+
 def _derive_tool_status(reported_status: str, tool_content_str: str) -> str:
     """Promote a "success" tool result to "error" when its body is a
     structured-error envelope.
@@ -111,11 +118,22 @@ def _derive_tool_status(reported_status: str, tool_content_str: str) -> str:
     keeps the conversation log and the side-panel label honest: inspect the
     body and reclassify.
 
-    Detection is deliberately narrow — only an object whose ``ok`` is exactly
-    ``False`` counts — so a legitimate result that merely happens to contain a
-    ``code`` field is never mislabeled. Anything that does not parse as such an
-    envelope (plain text, truncated/"too large" results, multi-content blocks,
-    a successful ``{"ok": true}``) leaves the reported status untouched.
+    Two shapes are recognised (kept in sync with the daemon-side
+    ``detectStructuredResultError`` in ``assistant_turn_parser.go``):
+
+    - Explicit: an object whose ``ok`` is exactly ``False``. When ``ok`` is
+      present it is authoritative (``ok: true`` leaves the status untouched).
+    - Implicit (bridge envelopes that omit ``ok``): a non-empty
+      ``error``/``errorMessage`` string, or a ``code`` string shaped like an
+      UPPER_SNAKE error code (e.g. ``EXTENSION_NOT_CONNECTED``). This catches
+      the green-error bug where a failure envelope with no ``ok`` field was
+      reported as success.
+
+    The benign ``{"code": "X", "value": 2}`` success payload stays "success":
+    no ``ok``, no message/error string, and its short non-snake code fails the
+    error-code shape test. Anything that does not parse as an object (plain
+    text, truncated/"too large" results, multi-content blocks) leaves the
+    reported status untouched.
 
     Args:
         reported_status: The status LangChain attached to the ToolMessage.
@@ -134,7 +152,22 @@ def _derive_tool_status(reported_status: str, tool_content_str: str) -> str:
         parsed = json.loads(text)
     except (ValueError, TypeError):
         return reported_status
-    if isinstance(parsed, dict) and parsed.get("ok") is False:
+    if not isinstance(parsed, dict):
+        return reported_status
+    # Explicit `ok` is authoritative when present.
+    if "ok" in parsed:
+        if parsed.get("ok") is False:
+            return "error"
+        return reported_status
+    # No `ok` field: infer from error signals.
+    err = parsed.get("error")
+    if isinstance(err, str) and err:
+        return "error"
+    err_msg = parsed.get("errorMessage")
+    if isinstance(err_msg, str) and err_msg:
+        return "error"
+    code = parsed.get("code")
+    if isinstance(code, str) and _ERROR_CODE_RE.match(code):
         return "error"
     return reported_status
 

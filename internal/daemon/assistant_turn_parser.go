@@ -128,7 +128,24 @@ const (
 	// successful result, "error" otherwise). Surfaced as the
 	// matching `tool_end` activity-row update.
 	EventToolEnd
+	// EventTurnEnd fires when the runtime writes the `[OAT_TURN_END]`
+	// sentinel to OAT_TOOL_LOG — the authoritative once-per-turn
+	// end-of-turn marker (emit_turn_end in the Python runtime, which
+	// runs exactly once per turn on every completion path). The tailer
+	// uses it to stop the side panel's spinner on a silent, tool-only
+	// turn and to drive the self-healing recovery ladder. It carries no
+	// direct payload; the tailer accumulates the turn's last-tool
+	// outcome + whether a visible reply was published across the event
+	// stream. Deliberately keyed on this dedicated sentinel and NOT on
+	// `[OAT_TOKENS]` — the latter is ALSO emitted right after a mid-turn
+	// compaction, so it would false-fire mid-turn.
+	EventTurnEnd
 )
+
+// turnEndSentinel is the literal marker the runtime writes to
+// OAT_TOOL_LOG at emit_turn_end. Format: "[OAT_TURN_END] <turn_id>".
+// We match on the prefix only; the trailing turn_id is informational.
+const turnEndSentinel = "[OAT_TURN_END]"
 
 // Event is one item produced by the streaming parser. Exactly one of
 // the kind-specific payload fields is meaningful per the Kind value:
@@ -154,6 +171,18 @@ type Event struct {
 	// reason instead of "(detail not attached)" on a failed row. Capped
 	// at toolArgPreviewMaxBytes; the bridge redacts on top.
 	ErrorMessage string
+	// Code is the bridge error code (e.g. "EXTENSION_NOT_CONNECTED",
+	// "STALE_REF") extracted from a structured-error RESULT body, when
+	// present. Empty for success rows and for errors with no `code`
+	// field. Used by the daemon's recovery controller to classify a
+	// silent errored turn against the recoverable-code allowlist — a
+	// controlled enum, NOT free text, so no page-derived bytes reach
+	// the model on a recovery re-prompt.
+	Code string
+	// Retryable mirrors the bridge error's `retryable` flag when the
+	// RESULT body carries one. Defaults to false when absent. Secondary
+	// signal for recovery classification (the code allowlist is primary).
+	Retryable bool
 }
 
 // toolArgPreviewMaxBytes caps the per-tool arg preview the parser
@@ -306,6 +335,13 @@ func parseEvents(lines []string) []Event {
 		if status == "error" && errMsg != "" {
 			ev.ErrorMessage = clampToolPreview(sanitizeEmitText(errMsg), toolArgPreviewMaxBytes)
 		}
+		// Extract the structured error CODE + retryable flag for error
+		// rows so the recovery controller can classify the turn against
+		// its code allowlist. The code is a controlled enum, never echoed
+		// as free text to the model.
+		if status == "error" {
+			ev.Code, ev.Retryable = extractResultErrorMeta(raw)
+		}
 		out = append(out, ev)
 	}
 
@@ -346,6 +382,16 @@ func parseEvents(lines []string) []Event {
 			flush()
 			current = resultBlock
 			curTool, curStatus = parseResultHeader(m[1])
+			continue
+		}
+		// The dedicated once-per-turn end marker. Detected BEFORE the
+		// `current == none` skip below (and it also matches nextMarkerRE,
+		// so it correctly terminates an open block via flush()). This is
+		// the sole trigger for EventTurnEnd — see the EventTurnEnd doc for
+		// why we do NOT key on `[OAT_TOKENS]`.
+		if strings.HasPrefix(line, turnEndSentinel) {
+			flush()
+			out = append(out, Event{Kind: EventTurnEnd})
 			continue
 		}
 		if current == none {
@@ -413,17 +459,39 @@ func parseResultHeader(tail string) (name, status string) {
 	return tail, "ok"
 }
 
+// errorCodeRE matches an UPPER_SNAKE structured error code — an uppercase
+// leading segment followed by at least one `_`-joined uppercase segment
+// (e.g. STALE_REF, EXTENSION_NOT_CONNECTED, INPUT_ON_USER_TAB_REFUSED).
+// The mandatory underscore is what distinguishes a real bridge error code
+// from a benign short code like "X" in a {code, value} success payload,
+// which must NOT be painted red (see detectStructuredResultError + the
+// "no ok field" test case).
+var errorCodeRE = regexp.MustCompile(`^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$`)
+
+// looksLikeErrorCode reports whether s is shaped like a bridge error code.
+func looksLikeErrorCode(s string) bool {
+	return errorCodeRE.MatchString(s)
+}
+
 // detectStructuredResultError inspects a RESULT body for the in-band
 // structured-error envelope that MCP tools (notably the browser bridge)
-// return on failure: a JSON object whose `ok` is exactly `false`. Returns
-// whether the body is such an envelope plus a best-effort short message
-// (the `message` field, falling back to `error`).
+// return on failure. Returns whether the body is an error envelope plus a
+// best-effort short message (the `message` field, falling back to `error`
+// then `errorMessage`).
 //
-// Detection is deliberately narrow — only `ok: false` counts — so a plain
-// text result, a truncated/unparseable body, or a legitimate object that
-// merely contains a `code` field is never mistaken for an error. Mirrors
-// the runtime-side `_derive_tool_status` so the daemon stays correct even
-// for logs that predate that seam.
+// Two shapes are recognised:
+//   - Explicit: a JSON object whose `ok` is exactly `false`. When `ok` is
+//     present it is authoritative (`ok:true` / non-bool `ok` => not an error).
+//   - Implicit (bridge envelopes that omit `ok`): a non-empty
+//     `error`/`errorMessage` string, OR a `code` string shaped like an
+//     UPPER_SNAKE error code (looksLikeErrorCode). This catches the
+//     green-error bug — e.g. {"code":"EXTENSION_NOT_CONNECTED","message":..}
+//     — that was previously classified "ok" because it has no `ok` field.
+//
+// The benign {"code":"X","value":2} success payload is still NOT an error:
+// it has no `ok`, no message/error string, and its short non-snake code
+// fails looksLikeErrorCode. Mirrors the runtime-side `_derive_tool_status`
+// so the daemon stays correct even for logs that predate that seam.
 func detectStructuredResultError(body string) (isError bool, message string) {
 	t := strings.TrimSpace(body)
 	if !strings.HasPrefix(t, "{") {
@@ -433,21 +501,61 @@ func detectStructuredResultError(body string) (isError bool, message string) {
 	if err := json.Unmarshal([]byte(t), &m); err != nil {
 		return false, ""
 	}
-	okVal, hasOK := m["ok"]
-	if !hasOK {
-		return false, ""
-	}
-	okBool, isBool := okVal.(bool)
-	if !isBool || okBool {
-		return false, ""
-	}
+	// Best-effort short message, shared by both shapes.
+	msg := ""
 	if s, ok := m["message"].(string); ok && s != "" {
-		return true, s
+		msg = s
+	} else if s, ok := m["error"].(string); ok && s != "" {
+		msg = s
+	} else if s, ok := m["errorMessage"].(string); ok && s != "" {
+		msg = s
 	}
+
+	// Explicit `ok` is authoritative when present.
+	if okVal, hasOK := m["ok"]; hasOK {
+		okBool, isBool := okVal.(bool)
+		if isBool && !okBool {
+			return true, msg
+		}
+		return false, ""
+	}
+
+	// No `ok` field: infer from error signals.
 	if s, ok := m["error"].(string); ok && s != "" {
-		return true, s
+		return true, msg
 	}
-	return true, ""
+	if s, ok := m["errorMessage"].(string); ok && s != "" {
+		return true, msg
+	}
+	if s, ok := m["code"].(string); ok && looksLikeErrorCode(s) {
+		return true, msg
+	}
+	return false, ""
+}
+
+// extractResultErrorMeta pulls the structured error `code` (a controlled
+// enum like "STALE_REF" / "EXTENSION_NOT_CONNECTED") and `retryable`
+// flag out of a RESULT body that is a JSON object. Best-effort: returns
+// ("", false) for a non-object, unparseable, or field-less body. The
+// code is used only for classification (not echoed to the model), so a
+// missing code simply means "not on the recoverable allowlist" — the
+// fail-closed default.
+func extractResultErrorMeta(body string) (code string, retryable bool) {
+	t := strings.TrimSpace(body)
+	if !strings.HasPrefix(t, "{") {
+		return "", false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(t), &m); err != nil {
+		return "", false
+	}
+	if s, ok := m["code"].(string); ok {
+		code = s
+	}
+	if b, ok := m["retryable"].(bool); ok {
+		retryable = b
+	}
+	return code, retryable
 }
 
 // buildToolArgPreview folds the leading `key: value` body lines of a

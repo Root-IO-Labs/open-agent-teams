@@ -194,6 +194,27 @@ class TestDeriveToolStatus:
         """Leading/trailing whitespace around the envelope still detected."""
         assert _derive_tool_status("success", '  {"ok": false}\n') == "error"
 
+    def test_code_and_message_without_ok_becomes_error(self) -> None:
+        """Bridge envelope that omits `ok` but carries a snake code + message."""
+        body = '{"code": "EXTENSION_NOT_CONNECTED", "message": "bridge down"}'
+        assert _derive_tool_status("success", body) == "error"
+
+    def test_snake_code_only_without_ok_becomes_error(self) -> None:
+        """A bare UPPER_SNAKE code (no message, no ok) still flags as error."""
+        assert _derive_tool_status("success", '{"code": "STALE_REF"}') == "error"
+
+    def test_error_message_field_without_ok_becomes_error(self) -> None:
+        """A non-empty errorMessage string (no ok) flags as error."""
+        assert _derive_tool_status("success", '{"errorMessage": "kaboom"}') == "error"
+
+    def test_error_field_without_ok_becomes_error(self) -> None:
+        """A non-empty error string (no ok) flags as error."""
+        assert _derive_tool_status("success", '{"error": "boom"}') == "error"
+
+    def test_ok_true_with_snake_code_stays_success(self) -> None:
+        """Explicit ok:true wins even with an error-shaped code present."""
+        assert _derive_tool_status("success", '{"ok": true, "code": "STALE_REF"}') == "success"
+
 
 class TestTextualUIAdapterInit:
     """Tests for `TextualUIAdapter` initialization."""

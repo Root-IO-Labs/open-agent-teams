@@ -40,6 +40,31 @@ type assistantTurnFrame struct {
 	TS           string `json:"ts,omitempty"`
 	Done         bool   `json:"done,omitempty"`
 	Err          string `json:"error,omitempty"`
+
+	// --- turn_end frame fields (Kind == "turn_end") ---
+	// Emitted once per runtime turn (on the `[OAT_TURN_END]` sentinel).
+	// The side panel uses this to stop its spinner even when a turn
+	// produced no visible reply (a silent, tool-only errored turn), and
+	// to render the self-healing outcome. All omitempty so non-turn_end
+	// frames stay byte-identical on the wire (old panels ignore unknown
+	// fields; additive + backward-compatible).
+
+	// HadError is true when the turn's LAST tool call ended in error.
+	HadError bool `json:"hadError,omitempty"`
+	// Code is the last tool error's structured code (controlled enum),
+	// for the panel's code->friendly-message map.
+	Code string `json:"code,omitempty"`
+	// Retryable mirrors the last tool error's retryable flag.
+	Retryable bool `json:"retryable,omitempty"`
+	// VisibleReply is true when the turn published at least one
+	// ASSISTANT chat bubble (final/question). When true the panel shows
+	// no outcome line — the agent already spoke.
+	VisibleReply bool `json:"visibleReply,omitempty"`
+	// Recovering is set by the daemon's recovery controller when it has
+	// injected a bounded auto-recovery re-prompt for this errored turn.
+	// The panel shows a quiet "trying another way" note instead of a
+	// prominent error when true.
+	Recovering bool `json:"recovering,omitempty"`
 }
 
 // turnBroadcaster fans out parsed AssistantTurn values from one
@@ -127,6 +152,23 @@ func (b *turnBroadcaster) PublishTool(kind, tool, arg, status, errorMessage stri
 		ErrorMessage: errorMessage,
 		TS:           time.Now().UTC().Format(time.RFC3339Nano),
 	}, kind, tool)
+}
+
+// PublishTurnEnd broadcasts a turn_end frame — one per runtime turn,
+// fired on the `[OAT_TURN_END]` sentinel. Same fire-and-forget fan-out
+// as Publish. `recovering` reflects whether the daemon's recovery
+// controller injected an auto-recovery re-prompt for this turn.
+func (b *turnBroadcaster) PublishTurnEnd(info turnEndInfo, recovering bool) {
+	b.publishFrame(assistantTurnFrame{
+		Kind:         "turn_end",
+		HadError:     info.HadError,
+		Code:         info.Code,
+		ErrorMessage: info.ErrorMessage,
+		Retryable:    info.Retryable,
+		VisibleReply: info.VisibleReply,
+		Recovering:   recovering,
+		TS:           time.Now().UTC().Format(time.RFC3339Nano),
+	}, "turn_end", info.Code)
 }
 
 // publishFrame is the shared fan-out path for Publish / PublishTool.
@@ -243,6 +285,33 @@ type assistantTurnTailer struct {
 	// no such hook (its tools aren't bridge-mediated), so the log is
 	// the only signal — hence this flag.
 	emitToolEvents bool
+
+	// onTurnEnd, when non-nil, is called by the tailer goroutine the
+	// moment a turn ends (the `[OAT_TURN_END]` sentinel) with the
+	// accumulated turn outcome. It returns whether an auto-recovery
+	// re-prompt was initiated; the tailer stamps that onto the
+	// published turn_end frame's `recovering` field. Set ONLY for
+	// AgentTypeAssistant (recovery is assistant-scoped); nil for the
+	// browser agent and under OAT_TEST_MODE, in which case the frame is
+	// published with recovering=false. The callback runs synchronously
+	// on the tailer goroutine, so it must be fast + non-blocking (the
+	// recovery controller only touches in-memory budget state + a
+	// fire-and-forget backend.SendMessage).
+	onTurnEnd func(info turnEndInfo) (recovering bool)
+}
+
+// turnEndInfo is the accumulated per-turn outcome the tailer hands to
+// PublishTurnEnd and the recovery controller. Built from the ordered
+// event stream since the last turn boundary.
+type turnEndInfo struct {
+	// HadError is true when the turn's LAST tool call ended in error.
+	HadError bool
+	// Code / ErrorMessage / Retryable describe that last tool error.
+	Code         string
+	ErrorMessage string
+	Retryable    bool
+	// VisibleReply is true when the turn published >=1 ASSISTANT bubble.
+	VisibleReply bool
 }
 
 // tailerPollInterval is how often the tailer wakes to check for new
@@ -399,6 +468,21 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 	// reaches the side panel instead of waiting for the next turn.
 	var lastAppend time.Time
 
+	// Per-turn outcome accumulation. Reset at each turn boundary (the
+	// `[OAT_TURN_END]` sentinel) and when a new side-panel USER turn
+	// begins, so the turn_end frame + recovery classification reflect
+	// only the current turn. Held here (not on the struct) because it's
+	// single-goroutine state owned entirely by run().
+	var turnVisibleReply, turnHadError, turnRetryable bool
+	var turnErrCode, turnErrMsg string
+	resetTurnState := func() {
+		turnVisibleReply = false
+		turnHadError = false
+		turnRetryable = false
+		turnErrCode = ""
+		turnErrMsg = ""
+	}
+
 	flushBuffer := func(force bool) {
 		if len(pending) == 0 {
 			return
@@ -511,6 +595,9 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				if !wasActive && t.logf != nil {
 					t.logf("assistantTurnTailer: side-panel sentinel detected, auto-emit ON (%s)", t.logPath)
 				}
+				// A fresh user turn resets the accumulated outcome so a
+				// prior turn's error can't leak into this one.
+				resetTurnState()
 			case EventAssistantTurn:
 				if !t.sidePanelActive.Load() {
 					// Pre-side-panel chatter (startup banner,
@@ -528,6 +615,9 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					continue
 				}
 				t.broadcaster.Publish(ev.Turn)
+				// A published bubble means the turn "spoke" — the panel
+				// suppresses the turn_end outcome line in that case.
+				turnVisibleReply = true
 			case EventToolStart:
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
 					// Tool activity is assistant-only (browser tools
@@ -538,10 +628,55 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				}
 				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "", "")
 			case EventToolEnd:
+				// Track the last tool outcome for the turn_end frame
+				// FIRST — regardless of whether we publish the row.
+				// Browser agents don't emit tool rows from the log
+				// (emitToolEvents=false) but their turn_end still needs
+				// the outcome, so this update sits above the gate.
+				if ev.ToolStatus == "error" {
+					turnHadError = true
+					turnErrCode = ev.Code
+					turnErrMsg = ev.ErrorMessage
+					turnRetryable = ev.Retryable
+				} else {
+					turnHadError = false
+					turnErrCode = ""
+					turnErrMsg = ""
+					turnRetryable = false
+				}
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
 					continue
 				}
 				t.broadcaster.PublishTool("tool_end", ev.Tool, "", ev.ToolStatus, ev.ErrorMessage)
+			case EventTurnEnd:
+				if !t.sidePanelActive.Load() {
+					// Pre-side-panel turn ends aren't surfaced; still
+					// reset so the next (real) turn starts clean.
+					resetTurnState()
+					continue
+				}
+				info := turnEndInfo{
+					HadError:     turnHadError,
+					Code:         turnErrCode,
+					ErrorMessage: turnErrMsg,
+					Retryable:    turnRetryable,
+					VisibleReply: turnVisibleReply,
+				}
+				recovering := false
+				if t.onTurnEnd != nil {
+					// A panicking recovery callback must never take down
+					// the tailer goroutine.
+					func() {
+						defer func() {
+							if r := recover(); r != nil && t.logf != nil {
+								t.logf("assistantTurnTailer: onTurnEnd panic (%s): %v", t.logPath, r)
+							}
+						}()
+						recovering = t.onTurnEnd(info)
+					}()
+				}
+				t.broadcaster.PublishTurnEnd(info, recovering)
+				resetTurnState()
 			}
 		}
 	}

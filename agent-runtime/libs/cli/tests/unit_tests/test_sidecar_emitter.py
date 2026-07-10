@@ -272,3 +272,51 @@ class TestLifecycle:
             assert sidecar_emitter._client is not None
         finally:
             srv.stop()
+
+
+# --- [OAT_TURN_END] tool-log sentinel ---
+
+
+class TestTurnEndSentinel:
+    """emit_turn_end() writes a dedicated ``[OAT_TURN_END] <turn_id>`` line
+    to OAT_TOOL_LOG (the file the daemon's assistant-turn tailer reads) so
+    the daemon can detect the end of a silent, tool-only turn. This is the
+    signal that stops the side-panel spinner and drives the self-healing
+    recovery ladder — distinct from ``[OAT_TOKENS]`` on purpose, since that
+    also fires after a mid-turn compaction."""
+
+    def test_sentinel_written_once_per_turn(self, monkeypatch, tmp_path):
+        sidecar_emitter._reset_for_tests()
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        # No sidecar socket needed — the sentinel write is a best-effort
+        # direct append independent of the socket client.
+        tid = sidecar_emitter.new_turn_id()
+        sidecar_emitter.set_turn_id(tid)
+
+        sidecar_emitter.emit_turn_end()
+
+        contents = log.read_text(encoding="utf-8")
+        assert contents.count("[OAT_TURN_END]") == 1
+        assert f"[OAT_TURN_END] {tid}" in contents
+        # emit_turn_end clears the turn_id, so a second (idempotent finally)
+        # call must NOT write a duplicate sentinel.
+        sidecar_emitter.emit_turn_end()
+        assert log.read_text(encoding="utf-8").count("[OAT_TURN_END]") == 1
+
+    def test_no_sentinel_without_turn_id(self, monkeypatch, tmp_path):
+        sidecar_emitter._reset_for_tests()
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        # No active turn -> emit_turn_end is a no-op, no sentinel written.
+        sidecar_emitter.set_turn_id(None)
+        sidecar_emitter.emit_turn_end()
+        assert not log.exists() or log.read_text(encoding="utf-8") == ""
+
+    def test_sentinel_noop_when_tool_log_unset(self, monkeypatch):
+        # No OAT_TOOL_LOG in the environment -> emit_turn_end must not raise
+        # even though a turn is active (the write is best-effort).
+        sidecar_emitter._reset_for_tests()
+        monkeypatch.delenv("OAT_TOOL_LOG", raising=False)
+        sidecar_emitter.set_turn_id(sidecar_emitter.new_turn_id())
+        sidecar_emitter.emit_turn_end()  # must not raise

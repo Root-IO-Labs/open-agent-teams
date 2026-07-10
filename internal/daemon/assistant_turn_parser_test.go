@@ -1115,6 +1115,14 @@ func TestDetectStructuredResultError(t *testing.T) {
 		{"ok false no message", `{"ok": false, "code": "X"}`, true, ""},
 		{"ok true", `{"ok": true, "result": 1}`, false, ""},
 		{"no ok field", `{"code": "X", "value": 2}`, false, ""},
+		// Green-error bug: bridge envelopes that omit `ok` but carry an
+		// UPPER_SNAKE code / message must be flagged as errors.
+		{"code+message no ok", `{"code": "EXTENSION_NOT_CONNECTED", "message": "bridge down"}`, true, "bridge down"},
+		{"snake code only no ok", `{"code": "STALE_REF"}`, true, ""},
+		{"errorMessage no ok", `{"errorMessage": "kaboom"}`, true, "kaboom"},
+		{"error field no ok", `{"error": "boom"}`, true, "boom"},
+		// ok:true wins even with an error-shaped code present.
+		{"ok true with snake code", `{"ok": true, "code": "STALE_REF"}`, false, ""},
 		{"plain text", "all good", false, ""},
 		{"truncated json", `{"ok": false, "message": "tru`, false, ""},
 		{"leading whitespace", "  {\"ok\": false}\n", true, ""},
@@ -1209,7 +1217,7 @@ func TestTailerEmitsToolActivityFrames(t *testing.T) {
 }
 
 // TestTailerThreadsStructuredErrorReason verifies the end-to-end
-// Section 3 path: a RESULT whose body is a {ok:false,...} envelope is
+// path: a RESULT whose body is a {ok:false,...} envelope is
 // published as a tool_end frame with Status="error" AND a non-empty
 // ErrorMessage carrying the reason, so the side panel can show it
 // instead of "(detail not attached)".

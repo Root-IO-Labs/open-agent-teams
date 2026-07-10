@@ -55,6 +55,20 @@ The 95% safety net is gated by `OAT_CONTEXT_SAFETY_NET` (default `1` / on). Set 
 
 The 85% and 90% tiers (status pill, in-panel banner with Compact / Reset buttons) are planned but not yet shipped.
 
+## Self-healing: the assistant recovers from tool errors on its own
+
+A persistent assistant used to occasionally go silent after a browser tool call failed — you'd have to prod it ("are you stuck?") before it explained what went wrong. That's fixed by a three-layer ladder:
+
+- **Silent retry (bridge):** transient failures on safe, read-only tools are retried automatically before the model ever sees them.
+- **Auto-recovery re-prompt (daemon):** if a turn ends with its last tool call in error and *no* reply to you, the daemon injects one bounded, generic "re-check and try another way" nudge so the assistant re-plans and keeps going. It only does this for genuinely model-fixable errors (stale element refs, wrong/closed tab, bad arguments, a transient screenshot failure); user-fixable problems like the extension needing a reload, security/policy blocks, and emergency stop are always surfaced to you instead. Budget is one attempt per stuck sequence (env `OAT_ASSISTANT_RECOVERY_MAX`, default `1`, `0` to disable). While a recovery is in flight the panel shows a quiet "trying another way" note rather than a red error.
+- **Graceful surface (panel):** anything not auto-recoverable shows as a short plain-language outcome so you always know how the turn ended.
+
+The assistant is also prompted to **always finish with a plain-language outcome** and to **report a blocking error on the first failure** rather than waiting to be asked.
+
+## System status (Manage tab)
+
+The side panel's **Manage** tab has a **System status** card showing the live health of the pieces the assistant depends on — OAT service (daemon), Bridge, Browser (extension/CDP link), and OAT CLI. If any of these goes unhealthy while you're chatting, an amber notice also appears in the chat tab with the fix action (e.g. "run `oat start`" when the daemon is down, or reload the extension when the browser link drops), so you don't have to open the Manage tab to notice.
+
 ## Coexistence with workflow-helper browser-agents
 
 You can have an assistant chatting in the side panel *and* a workflow-helper browser-agent QA-ing a deploy preview at the same time. The extension knows about both — the side panel sticks with the chat-capable assistant; the workflow-helper drives its own Chrome window for non-chat work. See [coexistence-design.md](https://github.com/Root-IO-Labs/oat-browser-agent/blob/main/docs/coexistence-design.md) in the bridge repo for the full trust-model walkthrough.

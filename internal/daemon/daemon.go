@@ -386,6 +386,14 @@ type Daemon struct {
 	// already-alive branch) don't both fire the marker. See
 	// wakeup_marker.go for the full design.
 	wakeUpMarkers *wakeUpMarkerTracker
+
+	// assistantRecovery is Layer 2 of the self-healing turn ladder
+	// (assistant_recovery.go): per-(repo, agent) recovery budget so a
+	// silent, tool-errored assistant turn gets exactly one bounded
+	// auto-recovery re-prompt before the panel surfaces the problem to
+	// the user. Assistant-scoped; nil-safe callers use the
+	// maybeRecoverAssistantTurn method.
+	assistantRecovery *assistantRecoveryController
 }
 
 // routeRateLimitWindow is the minimum interval between
@@ -477,6 +485,7 @@ func New(paths *config.Paths) (*Daemon, error) {
 		routeRateLimit:              make(map[string]time.Time),
 		agentLifecycleBroadcaster:   newAgentLifecycleBroadcaster(logger.Debug),
 		wakeUpMarkers:               newWakeUpMarkerTracker(),
+		assistantRecovery:           newAssistantRecoveryController(),
 	}
 
 	if wakeUpMarkerDisabled() {
@@ -5528,7 +5537,7 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 		// Polling inside tailer.run() handles the "log file does not
 		// exist yet" case until the agent's first write.
 		if usesBrowserBridge(agent.Type) {
-			d.startAssistantTurnTailer(repo.SessionName, agentName, logFile, agent.Type == state.AgentTypeAssistant)
+			d.startAssistantTurnTailer(repoName, repo.SessionName, agentName, logFile, agent.Type == state.AgentTypeAssistant)
 		}
 
 		handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{
@@ -7880,6 +7889,11 @@ func (d *Daemon) buildBrowserAgentMCPConfig(repoName, sessionName, agentName str
 		"transport": "stdio",
 		"env": map[string]string{
 			"OAT_BROWSER_AGENT_AUDIT_LOG_DIR": auditLogDir,
+			// Per-repo file sandbox for browser_file_download +
+			// browser_save_screenshot. The bridge confines
+			// every screenshot write to this dir (or the agent's cwd);
+			// scoping it per-repo here keeps the bridge repo-agnostic.
+			"OAT_BROWSER_AGENT_DOWNLOAD_DIR": d.paths.RepoDownloadsDir(repoName),
 			// Identity plumbing (Part 2a). The bridge uses these to
 			// scope `agent_input` / `agent_output_subscribe` socket
 			// calls to the right PTY. Empty values are a deliberate
@@ -8973,7 +8987,7 @@ func (d *Daemon) restartAgent(repoName, agentName string, agent state.Agent, rep
 	// log file exists, so registering early when the file may not
 	// yet be created is safe.
 	if os.Getenv("OAT_TEST_MODE") != "1" && usesBrowserBridge(agent.Type) {
-		d.startAssistantTurnTailer(repo.SessionName, agentName, logFile, agent.Type == state.AgentTypeAssistant)
+		d.startAssistantTurnTailer(repoName, repo.SessionName, agentName, logFile, agent.Type == state.AgentTypeAssistant)
 	}
 
 	handle, err := d.backend.StartAgent(d.ctx, backend_pkg.AgentConfig{

@@ -285,6 +285,8 @@ The Personal Assistant is a separate agent type from the workflow-helper Browser
 - Uses the same bridge + MCP wiring as the Browser Agent (`usesBrowserBridge()`), so the same `_shared-browser-safety.md` fragment governs safety, prompt-injection defense, cross-tab discipline, and dedicated-agent-window topology.
 - **Differs from Browser Agent in tool catalog**: assistant keeps `compact_conversation` (denied for browser). The 95% context-capacity safety net relies on it.
 - **Defense-in-depth**: if the assistant ever calls `oat agent complete`, the daemon returns success/no-op + WARN instead of actually completing it. The assistant prompt teaches it not to call complete; the daemon enforces.
+- **Self-healing turn ladder**: when an assistant turn ends with its last tool call in error and no visible reply, the daemon injects one bounded, code-only recovery re-prompt so the assistant re-plans instead of going silent (`internal/daemon/assistant_recovery.go`; fail-closed allowlist; budget `OAT_ASSISTANT_RECOVERY_MAX`, default 1; no-op under `OAT_TEST_MODE`). The turn boundary comes from the `[OAT_TURN_END]` sentinel the runtime writes to `OAT_TOOL_LOG`, surfaced to the panel as a `turn_end` agent-activity frame. See the root `AGENTS.md` "Self-healing turn ladder" note for the full three-layer description.
+- **`browser_save_screenshot`**: assistants (and browser agents) can save a page capture to a PNG file in the per-repo sandbox (`~/.oat/downloads/<repo>/`, via `OAT_BROWSER_AGENT_DOWNLOAD_DIR`) for embedding into documents; the bytes never enter the model context.
 
 **Context capacity safety net**: the daemon polls `[OAT_TOKENS]` events vs the effective context limit (see below) and:
 
