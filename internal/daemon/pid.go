@@ -109,11 +109,23 @@ func processIsDefinitelyNotDaemon(pid int) bool {
 	// Match loosely (either token) rather than both: this is a POSITIVE-exclude
 	// check, so we only declare "stale" when NEITHER token appears — i.e. the
 	// reused PID clearly belongs to some unrelated process (bash, node, Chrome,
-	// postgres, …). Loose matching also keeps the guard correct under the test
-	// binary (`daemon.test`) and any future oat-daemon argv variant. A reused
-	// PID whose argv coincidentally contains one of these tokens stays a
-	// (harmless) false-"running", never a duplicate-daemon race.
-	looksLikeDaemon := strings.Contains(cmdline, "oat") || strings.Contains(cmdline, "daemon")
+	// postgres, …). A reused PID whose argv coincidentally contains one of these
+	// tokens stays a (harmless) false-"running", never a duplicate-daemon race.
+	//
+	// Go test binaries are also treated as "could be the daemon" (return false):
+	// tests across packages plant `os.Getpid()` as a fake live-daemon PID to
+	// exercise the "daemon already up" path (e.g. internal/cli assistant Stop/
+	// Remove). Those binaries are named per-package — `daemon.test`, `cli.test`,
+	// … — so matching on the daemon tokens alone only rescued `daemon.test` by
+	// luck and left `cli.test` misclassified as stale (it spuriously tried to
+	// spawn a real daemon). Recognising the `.test` suffix generalises the
+	// accommodation to every package's test binary. Production is unaffected: the
+	// real daemon is never a `.test` binary, and the failure direction here is the
+	// conservative "assume running", so at worst a genuinely-reused `.test` PID
+	// stays a harmless false-"running".
+	looksLikeDaemon := strings.Contains(cmdline, "oat") ||
+		strings.Contains(cmdline, "daemon") ||
+		strings.Contains(cmdline, ".test")
 	return !looksLikeDaemon
 }
 

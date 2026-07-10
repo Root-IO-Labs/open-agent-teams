@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`go test ./internal/cli/...` no longer spuriously tries to spawn a real
+  daemon.** The PID-reuse guard (`processIsDefinitelyNotDaemon`) classifies a
+  live PID as stale when `ps` shows its argv contains neither `oat` nor
+  `daemon`. Assistant CLI tests plant `os.Getpid()` (the test binary) as a fake
+  live-daemon PID; the `daemon` package's binary (`daemon.test`) matched by luck
+  but the `cli` package's (`cli.test`) did not, so those tests fell through to
+  `ensureDaemonRunning` → `RunDetached` and failed with "failed to start
+  daemon". The guard now also treats any Go test binary (`.test`) as
+  "could be the daemon", generalising the accommodation to every package.
+  Production is unaffected (the real daemon is never a `.test` binary; the
+  failure direction is the conservative "assume running").
+
 - **Agents recover from unstable networks instead of hanging on
   "thinking…" for ~30 minutes.** A WiFi/network drop mid-generation left
   the model call blocked on the SDK's default ~30-minute request timeout,
