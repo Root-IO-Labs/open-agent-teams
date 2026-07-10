@@ -277,6 +277,10 @@ See `docs/AGENTS.md` for detailed agent documentation including:
 
 **Rejection cap:** Workers are auto-completed after repeated verification rejections (default: 3, configurable via `OAT_MAX_REJECTIONS`). The daemon escalates to the supervisor for task reassignment, preventing unbounded token waste from stuck workers.
 
+**Loop-breaker (retry-spiral backstop):** An agent-runtime middleware (`agent-runtime` `loop_breaker.py`, wired in `graph.py`) stops an agent that hits **N consecutive same-tool + same-error-code** failures with no intervening progress (e.g. `REF_STALE`×3, a repeated auth/session-expiry) and reports what it tried instead of grinding forever. The counter resets on any successful tool call or DOM/URL change so benign polling (`browser_wait_for`) doesn't trip it. Threshold `OAT_LOOP_BREAKER_MAX` (default 3). In side-panel chat mode it stops and asks the user; for task-bound agents it escalates. Reuses the `OAT_MAX_REJECTIONS` philosophy rather than a parallel mechanism.
+
+**Model-suitability guard (advisory):** `oat agent add browser-agent` / `oat agent set-model` prints a non-fatal WARN when a Browser/Assistant model's profile is a poor fit for interactive browsing (low `shell_recovery` / very high `basic_inference_ms`), tunable via `OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY` / `OAT_BROWSER_MODEL_MAX_INFERENCE_MS`. Advisory only — bring-your-own-model still works. See `docs/AGENTS.md`.
+
 ## Extensibility
 
 External tools can integrate via:
@@ -371,6 +375,14 @@ whitelist that gates `stop_agent` and `pause_web_agents`:
 
 Non-pausable agents return `RPC_AGENT_TYPE_NOT_PAUSABLE`
 from `stop_agent` with a pointer at `oat repo hibernate`.
+
+`stop_agent` (pause) is distinct from **interrupt-and-redirect**
+(side-panel Stop / `oat agent interrupt` — cancels the current
+turn but keeps the process alive so the next message continues
+the thread; propagates MCP cancellation to the bridge with
+`OAT_BRIDGE_CANCEL`) and from **Emergency Stop**
+(`emergency_stop_all` — hard kill until resumed). Full table:
+`docs/AGENTS.md` § "Three distinct 'stop' mechanisms".
 
 ## Common Operations
 

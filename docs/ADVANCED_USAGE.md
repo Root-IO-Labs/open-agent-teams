@@ -279,6 +279,12 @@ The verification agent **never modifies the worker's branch**. It operates read-
 | `OAT_CORE_AGENT_SOFT_TIMEOUT` | `5` | Minutes before ESC + nudge for stuck merge-queue/supervisor |
 | `OAT_CORE_AGENT_HARD_TIMEOUT` | `15` | Minutes before restarting stuck merge-queue/supervisor |
 | `OAT_TEST_MODE` | (unset) | Skip real agent spawning (for tests) |
+| `OAT_CONTEXT_RESERVE_OUTPUT` | `on` | Reserve output headroom: capacity tiers use the (window − output) budget, the ring uses the full window (tri-state, fail-safe ON) |
+| `OAT_DISABLE_OUTPUT_TOKEN_CAP` | (unset) | Disable the per-call output-token cap defense-in-depth in summarization (cap is ON by default) |
+| `OAT_LOOP_BREAKER_MAX` | `3` | Consecutive same-tool + same-error tool failures before the agent-runtime loop-breaker stops and reports (invalid → 3) |
+| `OAT_BRIDGE_CANCEL` | `on` | On interrupt, propagate MCP `notifications/cancelled` to the browser bridge so the in-flight tool call aborts |
+
+> The complete env-var reference (bridge tool-output caps, `OAT_MODEL_CONTEXT_*` overrides, browser model-suitability thresholds, etc.) is in the top-level [`AGENTS.md`](../AGENTS.md).
 
 ---
 

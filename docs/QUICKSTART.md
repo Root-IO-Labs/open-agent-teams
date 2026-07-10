@@ -140,6 +140,8 @@ export OAT_MODEL_CONTEXT_<normalized-id>=200000   # see AGENTS.md for the normal
 
 If you forget to onboard before `oat agent add --model <id>`, the CLI fails with the exact `oat model onboard` command you need to run — copy-paste and proceed.
 
+**Browser/assistant model suitability (advisory).** When you point the browser agent (or an assistant) at a model whose onboarded profile is a poor fit for interactive browsing — low `shell_recovery` or very slow `basic_inference_ms` — `oat agent add` / `oat agent set-model` prints an advisory WARN pointing you at a better-suited model. It's advisory only (bring-your-own-model still works); thresholds are tunable via `OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY` / `OAT_BROWSER_MODEL_MAX_INFERENCE_MS`.
+
 ## Start the Daemon
 
 ```bash
@@ -148,6 +150,8 @@ oat status          # verify: should show the daemon running
 ```
 
 The daemon is a background process that manages all agent sessions, routes messages, monitors PRs, and handles lifecycle. It must be running for any OAT operation.
+
+**Want it always-on (macOS)?** `oat start` survives closing the terminal, but if you want the daemon to auto-start at login and auto-restart on crash, install the opt-in launchd supervisor: `oat daemon install-service` (undo with `oat daemon uninstall-service`). See [CRASH_RECOVERY.md](CRASH_RECOVERY.md).
 
 ## Initialize a Repository
 
@@ -325,6 +329,8 @@ oat start                            # start daemon
 oat stop                             # stop daemon
 oat restart                          # restart daemon
 oat status                           # system overview
+oat daemon install-service           # macOS: auto-start at login + auto-restart (opt-in)
+oat daemon uninstall-service         # remove the launchd supervisor
 
 # Repos
 oat init <github-url> [--model M]    # initialize a repo
@@ -375,6 +381,12 @@ oat cleanup                          # clean orphaned worktrees/messages
 | `OAT_STUCK_MAX_NUDGE` | `40` | Nudge count before force-removal |
 | `OAT_WAKE_INTERVAL_SECONDS` | `60` | Wake/nudge loop interval |
 | `OAT_TEST_MODE` | *(unset)* | Skip real agent spawning (for tests) |
+| `OAT_CONTEXT_RESERVE_OUTPUT` | `on` | Reserve output headroom: capacity tiers use the (window − output) budget; the ring uses the full window (tri-state, fail-safe ON) |
+| `OAT_DISABLE_OUTPUT_TOKEN_CAP` | *(unset)* | Disable the per-call output-token cap defense-in-depth in summarization (cap is ON by default) |
+| `OAT_LOOP_BREAKER_MAX` | `3` | Consecutive same-tool + same-error tool failures before the loop-breaker stops and reports (invalid → 3) |
+| `OAT_BRIDGE_CANCEL` | `on` | Propagate MCP `notifications/cancelled` to the browser bridge on interrupt so the in-flight tool call aborts |
+
+> The full env-var reference (including bridge tool-output caps, context overrides, and browser model-suitability thresholds) lives in the repo's top-level [`AGENTS.md`](../AGENTS.md).
 
 ## Directory Structure
 

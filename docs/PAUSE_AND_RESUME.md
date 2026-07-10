@@ -2,6 +2,14 @@
 
 How to stop OAT when you need your machine for other things, and pick up where you left off later.
 
+## Pause vs. interrupt vs. Emergency Stop (chat-capable agents)
+
+For the side-panel chat agents (assistants + browser-agent) there are three different "stop" gestures — don't confuse them (full wire-level table in [AGENTS.md](AGENTS.md#three-distinct-stop-mechanisms-do-not-conflate)):
+
+- **Interrupt-and-redirect** — the side-panel inline **Stop** button (or `oat agent interrupt <name>`). This is *not* a pause: it sends `Ctrl-C` to cancel the current turn (and, with `OAT_BRIDGE_CANCEL`, the in-flight browser tool call), the process stays alive, and your next message is delivered as a normal continuation turn. Use it to course-correct ("actually, do X instead") without losing the conversation. The Stop button is always visible and is enabled only while a turn is in flight.
+- **Pause** — `oat assistant stop <name>` / `oat agent stop <name>` (see below). Kills the process but preserves state; resume later. This is the "I need my machine back" gesture.
+- **Emergency Stop** — the side-panel **Emergency Stop** (wire verb `emergency_stop_all`). Hard kill: the bridge rejects every subsequent tool call and detaches tabs until you explicitly resume. For "stop everything right now". Recovery is via the side panel's Resume control (it clears the panic state); a plain restart also clears it.
+
 ## Assistants
 
 Assistants are interactive, chat-style agents (the side-panel

@@ -12,11 +12,21 @@ oat stop               # Go to sleep
 oat restart            # Stop then start (with a short delay)
 oat daemon status      # You alive? (also shows which repos are idle vs active by name)
 oat daemon logs -f     # What are you thinking?
+oat daemon nuke        # Force-kill the daemon (last resort; leaves agents to be re-adopted)
 oat stop-all           # Kill everything
 oat stop-all --clean   # Kill everything and forget it ever happened
 ```
 
 `oat start`, `oat stop`, and `oat restart` are short aliases for `oat daemon start`, `oat daemon stop`, and `oat daemon restart`.
+
+**Keep the daemon alive across logout/crash (macOS, opt-in):**
+
+```bash
+oat daemon install-service     # Register a launchd LaunchAgent (auto-start at login, auto-restart on crash)
+oat daemon uninstall-service   # Remove it (launchctl bootout + delete wrapper/plist)
+```
+
+Once installed, launchd owns liveness: `oat daemon stop` halts the process but launchd's `KeepAlive` may relaunch it, so "stop for good" means `oat daemon uninstall-service`. See [CRASH_RECOVERY.md](CRASH_RECOVERY.md) for the full launchd walkthrough.
 
 **Status:** `oat status` (root command) shows a system overview including idle vs active per repo when the daemon is running.
 
@@ -352,6 +362,12 @@ oat agent stop  --name merge-queue --repo fizzbuzz # explicit-flag alternative
 oat agent tell  --name browser-agent "Check CI"    # `tell`'s message stays positional
 ```
 
+**Three ways to stop an agent** (don't confuse them — full table in [AGENTS.md](AGENTS.md#three-distinct-stop-mechanisms-do-not-conflate)):
+
+- **Interrupt-and-redirect** (`oat agent interrupt <name>`, or the side-panel inline **Stop** button): sends `Ctrl-C` to cancel the in-flight turn (and, with `OAT_BRIDGE_CANCEL`, the in-flight browser tool call). The process stays alive; your next message is a normal continuation, so you can course-correct. This is the everyday "wait, do this instead" control.
+- **Pause** (`oat agent stop <name>`): pauses a pausable agent (Assistant + browser-agent). Resume by sending it a message. Non-pausable agents (workers, supervisor, merge-queue, …) use `oat repo hibernate` instead.
+- **Emergency Stop** (side-panel Emergency Stop / `emergency_stop_all`): hard kill — rejects all subsequent tool calls until explicitly resumed. For "stop everything now".
+
 Combining positional and `--name` in the same call is rejected as ambiguous so a typo doesn't silently target the wrong agent.
 
 ### `oat agent remove`
@@ -435,15 +451,19 @@ Inside agent sessions, agents get these superpowers:
 
 ## Browser Agent
 
-The browser agent is a persistent agent that controls Chrome through MCP tools for web-based tasks (scraping, form filling, web research, etc.). It auto-starts with the repo and runs as a singleton alongside the supervisor and merge queue.
+The browser agent is a persistent agent that controls Chrome through MCP tools for web-based tasks (scraping, form filling, web research, etc.). It is **opt-in per repo** — add it with `oat agent add browser-agent` (it does not auto-start with the repo) — and then runs as a singleton alongside the supervisor and merge queue.
 
 ```bash
+oat agent add browser-agent               # Opt in (per repo); writes <worktree>/.oat/mcp.json
+oat agent add browser-agent --model <id>  # Opt in with a specific model
 oat attach browser-agent                  # Watch the browser agent work
 oat attach browser-agent --read-only      # Observe without interacting
 oat message send browser-agent "Navigate to https://example.com and extract the pricing table"
 oat agent tell browser-agent "Check the CI dashboard for failures"
 oat agent restart browser-agent           # Restart if stuck
 ```
+
+**Model suitability (advisory).** Interactive browsing needs a model that recovers from tool failures and responds reasonably fast. At `oat agent add browser-agent --model <id>` / `oat agent set-model` time, OAT prints an advisory WARN (never a hard block — bring-your-own-model still works) if the model's onboarded profile is a poor fit, e.g. low `shell_recovery` or very high `basic_inference_ms`. Thresholds are tunable via `OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY` and `OAT_BROWSER_MODEL_MAX_INFERENCE_MS`.
 
 Other agents can delegate web tasks to the browser agent via inter-agent messaging:
 

@@ -670,8 +670,17 @@ func (c *CLI) registerCommands() {
 	modelCmd.Subcommands["onboard"] = &Command{
 		Name:        "onboard",
 		Description: "Probe a model's capabilities and generate a profile",
-		Usage:       "oat model onboard <provider:model> [--probe-set minimum|default] [--verbose]",
-		Run:         c.modelOnboard,
+		Usage: "oat model onboard <provider:model> [--probe-set minimum|default] [--verbose] [--context-window N]\n\n" +
+			"Writes a YAML capability profile to ~/.oat/model-profiles/. The probe\n" +
+			"measures context window, tool-calling reliability, shell_recovery, and\n" +
+			"basic_inference_ms — the latter two feed the advisory browsing-fit guard\n" +
+			"at `oat agent add browser-agent` / `oat agent set-model` time.\n\n" +
+			"Flags:\n" +
+			"  --probe-set minimum|default   How thorough the probe is (default: default).\n" +
+			"  --context-window N            Skip context detection and set the window\n" +
+			"                                directly (CI / scripted onboarding).\n" +
+			"  --verbose                     Stream probe detail.",
+		Run: c.modelOnboard,
 	}
 
 	modelCmd.Subcommands["list"] = &Command{
@@ -916,6 +925,10 @@ func (c *CLI) registerCommands() {
 			"The model must already be onboarded (`oat model onboard <id>`). The\n" +
 			"command is a no-op when the agent is already on the requested model;\n" +
 			"--restart still fires in that case if requested.\n\n" +
+			"For Browser/Assistant agents, an ADVISORY (non-fatal) warning is printed\n" +
+			"if the chosen model's profile is a poor fit for interactive browsing\n" +
+			"(low shell_recovery or very high basic_inference_ms). Tune/silence via\n" +
+			"OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY / OAT_BROWSER_MODEL_MAX_INFERENCE_MS.\n\n" +
 			"Examples:\n" +
 			"  oat agent set-model browser-agent --model anthropic:claude-opus-4-7 --restart\n" +
 			"  oat agent set-model worker-swift-eagle --model openai:gpt-5-5 --repo myrepo",
@@ -978,7 +991,12 @@ func (c *CLI) registerCommands() {
 			"                  persisted. Validated against loaded profiles up\n" +
 			"                  front so typos fail at registration rather than\n" +
 			"                  silently triggering a swap on the first restart.\n" +
-			"                  When omitted the agent inherits the repo default.\n\n" +
+			"                  When omitted the agent inherits the repo default.\n" +
+			"                  An ADVISORY (non-fatal) warning prints if the model\n" +
+			"                  is a poor fit for interactive browsing (low\n" +
+			"                  shell_recovery / very high basic_inference_ms); tune\n" +
+			"                  via OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY /\n" +
+			"                  OAT_BROWSER_MODEL_MAX_INFERENCE_MS.\n\n" +
 			"Idempotency: re-adding a healthy browser-agent is a no-op. If a\n" +
 			"previous browser-agent record exists but the process is dead, it\n" +
 			"is respawned (rather than failing).",
