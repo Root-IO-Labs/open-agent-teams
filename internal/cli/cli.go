@@ -1608,6 +1608,11 @@ func (c *CLI) systemStatus(args []string) error {
 		fmt.Printf("  Daemon: %s\n", format.Red.Sprint("not running"))
 		fmt.Println()
 		format.Dimmed("Start with: oat start")
+		// Disambiguate the two failure modes users conflate (Phase 7 item 8):
+		// a dead daemon (this branch) vs. a browser/assistant agent that
+		// auto-disabled after repeated bridge failures while the daemon is
+		// fine. If the daemon is down, that is the thing to fix first.
+		format.Dimmed("(If the browser side panel says \"Bridge not running,\" the daemon being down is the cause — start it first, then `oat agent restart browser-agent`.)")
 		return nil
 	}
 
@@ -1694,6 +1699,14 @@ func (c *CLI) systemStatus(args []string) error {
 		// auto-resolved restart left an agent running on the wrong model.
 		if v, ok := repoMap["swapped_model_count"].(float64); ok && v > 0 {
 			format.Yellow.Printf("      ⚠ %d agent(s) running on auto-swapped model — run `oat worker list --repo %s` for details\n", int(v), name)
+		}
+
+		// Surface stopped/auto-disabled browser/assistant agents distinctly
+		// from the (healthy) daemon above (Phase 7 item 8): the daemon line
+		// already reads "running", so this line makes clear the agent — not
+		// the daemon — is what's stopped, and points at the exact fix.
+		if v, ok := repoMap["stopped_web_agent_count"].(float64); ok && v > 0 {
+			format.Yellow.Printf("      ⚠ %d browser/assistant agent(s) stopped (daemon is up) — restart with `oat agent restart browser-agent --repo %s` (or `oat assistant restart <name>`)\n", int(v), name)
 		}
 
 		// Show fork info if applicable

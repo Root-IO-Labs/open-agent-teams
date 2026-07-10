@@ -194,6 +194,7 @@ The first-run issues that actually show up in practice:
 | `ripgrep not found` warning at daemon start | `rg` missing | Non-fatal, but search is faster with it: `brew install ripgrep` (macOS) or `apt install ripgrep` (Debian/Ubuntu). |
 | `Python 3.10 is below required Python 3.11` | System Python too old | Install Python 3.11+ and ensure `python3 --version` reports it. On macOS: `brew install python@3.12`. |
 | `oat ui` shows no agents after `oat init` | Daemon crashed or never started | `oat daemon status`; if not running, `oat start`; check `~/.oat/daemon.log`. |
+| Daemon keeps dying / "Bridge not running" in the browser side panel | Daemon OOM-killed or not detached from a closed shell (bridge cascades down with it) | On macOS, `oat daemon install-service` (launchd auto-restart + start-at-login). Clean recovery: `oat daemon nuke && oat start`. Full runbook: [docs/CRASH_RECOVERY.md](docs/CRASH_RECOVERY.md). |
 
 If `oat doctor` reports everything green and you're still stuck, run the offending command with `OAT_DEBUG=1` set and attach the output to a [new issue](https://github.com/Root-IO-Labs/open-agent-teams/issues/new/choose).
 

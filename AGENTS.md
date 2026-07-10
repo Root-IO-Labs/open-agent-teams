@@ -388,6 +388,21 @@ oat cleanup --dry-run  # See what would be cleaned
 oat cleanup            # Actually clean up
 ```
 
+### Keep the daemon alive / recover from a crash (macOS)
+
+```bash
+# Auto-restart on crash + start at login (opt-in launchd supervisor)
+oat daemon install-service     # oat daemon uninstall-service to remove
+
+# Clean recovery after a bad crash / stale pid+sock / "Bridge not running"
+oat daemon nuke && oat start && oat agent restart browser-agent --repo <repo>
+```
+
+`oat status` distinguishes a **dead daemon** from a **stopped/auto-disabled
+browser-agent** (the daemon can be up while the agent is down). Full runbook —
+including the daemon→bridge cascade and launchd setup — in
+[docs/CRASH_RECOVERY.md](docs/CRASH_RECOVERY.md).
+
 ### Change which model an agent uses
 
 ```bash

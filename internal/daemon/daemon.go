@@ -2381,6 +2381,13 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 		// Count agents by type
 		workerCount := 0
 		swappedModelCount := 0
+		// stoppedWebAgentCount tracks chat-capable agents (browser/assistant)
+		// that are not currently running (PID==0) AND carry a LastError — the
+		// "agent stopped/auto-disabled" state users routinely mistake for a
+		// dead daemon (Phase 7 item 8). Surfaced in `oat status` so the two are
+		// visibly distinct: the daemon line says "running" while these show as
+		// stopped-with-reason.
+		stoppedWebAgentCount := 0
 		totalAgents := len(repo.Agents)
 		for _, agent := range repo.Agents {
 			if agent.Type == state.AgentTypeWorker {
@@ -2388,6 +2395,9 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 			}
 			if agent.ModelSwappedOnRestart {
 				swappedModelCount++
+			}
+			if usesBrowserBridge(agent.Type) && agent.PID == 0 && agent.LastError != "" {
+				stoppedWebAgentCount++
 			}
 		}
 
@@ -2404,19 +2414,20 @@ func (d *Daemon) handleListRepos(req socket.Request) socket.Response {
 		}
 
 		repoDetails = append(repoDetails, map[string]interface{}{
-			"name":                repoName,
-			"github_url":          repo.GithubURL,
-			"session_name":        repo.SessionName,
-			"total_agents":        totalAgents,
-			"worker_count":        workerCount,
-			"session_healthy":     sessionHealthy,
-			"is_fork":             repo.ForkConfig.IsFork,
-			"upstream_owner":      repo.ForkConfig.UpstreamOwner,
-			"upstream_repo":       repo.ForkConfig.UpstreamRepo,
-			"pr_management_mode":  prManagementMode,
-			"idle_mode":           repo.IdleMode,
-			"swapped_model_count": swappedModelCount,
-			"is_virtual":          repo.IsVirtual,
+			"name":                    repoName,
+			"github_url":              repo.GithubURL,
+			"session_name":            repo.SessionName,
+			"total_agents":            totalAgents,
+			"worker_count":            workerCount,
+			"session_healthy":         sessionHealthy,
+			"is_fork":                 repo.ForkConfig.IsFork,
+			"upstream_owner":          repo.ForkConfig.UpstreamOwner,
+			"upstream_repo":           repo.ForkConfig.UpstreamRepo,
+			"pr_management_mode":      prManagementMode,
+			"idle_mode":               repo.IdleMode,
+			"swapped_model_count":     swappedModelCount,
+			"stopped_web_agent_count": stoppedWebAgentCount,
+			"is_virtual":              repo.IsVirtual,
 		})
 	}
 

@@ -55,6 +55,79 @@ oat daemon status
 - No periodic status nudges
 - On restart, daemon restores sessions and relaunches agents from state
 
+**Cascade into the browser bridge (browser-agent / assistant users):**
+When the daemon dies, the `oat-browser-agent` bridge loses its Unix socket to
+the daemon (`daemon socket closed unexpectedly` → `ECONNREFUSED`), Chrome's side
+panel shows **"Bridge not running,"** and the bridge shuts down because its
+parent is gone. This looks like a browser-extension problem but the root cause is
+the dead daemon — **fix the daemon first**, then the bridge/side panel recovers
+on the next agent start. Do not conflate this with a browser-agent that
+*auto-disabled itself* after repeated bridge failures while the daemon is
+healthy (see "Daemon down vs. agent disabled" below).
+
+**Why the daemon died (common causes on macOS):**
+- **OS OOM-kill (jetsam SIGKILL)** — the daemon log stops abruptly mid-line with
+  no Go stack trace and there is **no** `Stopping daemon` entry. Screenshot-heavy
+  browser tasks are the usual trigger. Uncatchable by the process; the launchd
+  supervisor (below) auto-restarts it.
+- **SIGHUP on shell close** — historically, a daemon started from a terminal
+  died when that terminal closed. The detach path now calls `setsid` so a
+  manually-started daemon survives shell exit; if you are on an older build,
+  rebuild.
+- **A Go panic** — leaves a `panic:` + goroutine stack in `~/.oat/daemon.log`.
+  These are bugs; capture the stack and report it.
+
+#### Daemon down vs. agent disabled (don't conflate them)
+
+Two different failures look similar from the side panel:
+
+| Symptom | What actually happened | Check | Fix |
+|---------|------------------------|-------|-----|
+| Side panel "Bridge not running"; `oat status` says **Daemon: not running** | The daemon crashed/was killed; the bridge cascaded down with it | `oat status` (daemon line) | `oat daemon nuke` (clears stale pid/sock) → `oat start` → `oat agent restart browser-agent` (or `oat assistant restart <name>`) |
+| `oat status` says **Daemon: running** but a ⚠ line reports a stopped browser/assistant agent | The daemon is fine; the browser-agent/assistant **auto-disabled** after 3 bridge-unreachable failures in 10 min (backoff to stop a doomed respawn loop) | `oat status` per-repo ⚠ line; `~/.oat/daemon.log` for "auto-restart disabled" | Fix the underlying bridge cause, then `oat agent restart browser-agent --repo <repo>` / `oat assistant restart <name>` (this also clears the failure counter) |
+
+#### Recommended: run the daemon under launchd (macOS)
+
+If the daemon keeps dying (OOM churn) or you want it always-on across logins,
+install the launchd supervisor. It runs `oat daemon _run` outside any terminal
+(survives shell/session close) and auto-restarts on crash:
+
+```bash
+# Install + enable (writes a wrapper script + ~/Library/LaunchAgents plist,
+# then bootstraps it). Opt-in — plain `oat daemon start` still works as before.
+oat daemon install-service
+
+# Verify
+oat daemon status
+launchctl print gui/$(id -u)/io.oat.daemon | grep -E "state|pid"
+
+# Remove the supervisor (launchctl bootout + delete wrapper/plist)
+oat daemon uninstall-service
+```
+
+Notes once the service is installed:
+- launchd **owns liveness**: it starts the daemon at login and relaunches it on
+  crash (`KeepAlive` with `SuccessfulExit:false`, `ThrottleInterval` 30s to avoid
+  a hot crash-loop).
+- The install generates a small **wrapper script** that sources your login-shell
+  environment before `exec`ing the daemon, so the daemon inherits `PATH`, `node`
+  (the bridge is a node process), `git`/`gh`, and your model API keys / `GH_TOKEN`.
+  Secrets are **not** written into the plist (which would be world-readable) —
+  they come from your shell env via the wrapper.
+- **"Why won't it stay stopped?"** With the service installed, `oat daemon stop`
+  halts the process but launchd's `KeepAlive` immediately relaunches it. To stop
+  it for good, run `oat daemon uninstall-service` (or `launchctl bootout`).
+- `oat daemon start` / `stop` / `nuke` all still work; the PID-file guard keeps a
+  manual `oat start` from spawning a duplicate alongside the launchd-managed one.
+
+Clean-recovery sequence after a bad crash / stale files / overlapping daemons:
+
+```bash
+oat daemon nuke              # clear stale daemon.pid + daemon.sock, kill strays
+oat start                    # (or let launchd relaunch if install-service'd)
+oat assistant restart <name> # or: oat agent restart browser-agent --repo <repo>
+```
+
 ---
 
 ### 2. Supervisor Crash
@@ -442,8 +515,11 @@ If text sent to agents (nudges, task messages, or manual `oat agent tell`) appea
 
 ### System Configuration
 
-1. **Process supervisor** - Use systemd/launchd to auto-restart daemon
-3. **Log rotation** - Daemon log can grow large
+1. **Process supervisor** — on macOS, run `oat daemon install-service` to have
+   launchd auto-restart the daemon on crash and start it at login (see
+   "Recommended: run the daemon under launchd" under Daemon Crash above). This is
+   the supported replacement for hand-rolled plists / `nohup`.
+2. **Log rotation** - Daemon log can grow large
 
 ---
 
