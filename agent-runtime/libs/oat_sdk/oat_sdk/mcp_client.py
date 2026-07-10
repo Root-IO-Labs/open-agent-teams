@@ -40,7 +40,7 @@ import logging
 import os
 import time
 import uuid
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -344,6 +344,57 @@ def _build_input_schema(mcp_tool: Any) -> dict[str, Any] | None:  # noqa: ANN401
     return None
 
 
+def _bridge_cancel_enabled() -> bool:
+    """Whether to propagate interrupt-and-redirect cancellation to the bridge.
+
+    Mirrors the bridge-side ``OAT_BRIDGE_CANCEL`` flag (default ON) so both
+    ends of the wire are toggled by a single env var. When OFF, an interrupted
+    tool call is abandoned locally (legacy behavior) and the bridge runs the
+    in-flight action to completion.
+    """
+    raw = os.environ.get("OAT_BRIDGE_CANCEL", "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+async def _notify_cancelled(session: Any, request_id: int) -> None:  # noqa: ANN401
+    """Send an MCP ``notifications/cancelled`` for one in-flight request.
+
+    The installed ``mcp`` client (1.23.x) does NOT emit a cancellation
+    notification when the ``send_request`` await is cancelled -- it just drops
+    the local response stream. Without this, hitting Stop mid-tool-call cancels
+    the Python reasoning loop but the browser action (e.g. ``browser_navigate``)
+    keeps running to completion on the bridge/extension side -- exactly the
+    "Stop doesn't really stop, it keeps going" symptom. Emitting the standard
+    notification lets the bridge abort the in-flight tool (see
+    ``raceExecutorWithCancel`` / the request ``AbortSignal`` in
+    ``oat-browser-agent bridge/src/mcp/server.ts``).
+
+    Best-effort and defensive: never raises back into the cancellation path.
+    """
+    try:
+        from mcp.types import (  # noqa: PLC0415
+            CancelledNotification,
+            CancelledNotificationParams,
+            ClientNotification,
+        )
+
+        note = ClientNotification(
+            CancelledNotification(
+                method="notifications/cancelled",
+                params=CancelledNotificationParams(
+                    requestId=request_id,
+                    reason="user interrupted (OAT Stop)",
+                ),
+            )
+        )
+        await session.send_notification(note, related_request_id=request_id)
+    # Blind except: this runs during task cancellation/teardown where the
+    # session or transport may already be gone; a failure to notify must never
+    # mask the original CancelledError or crash the interrupt path.
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to send MCP cancellation for request %s", request_id, exc_info=True)
+
+
 async def _make_tool_wrapper(
     *,
     session: Any,  # noqa: ANN401
@@ -369,7 +420,26 @@ async def _make_tool_wrapper(
         _emit_sidecar_tool_call(public_name, kwargs, call_id)
         try:
             async with session_lock:
-                result = await session.call_tool(raw_name, kwargs)
+                # Capture the request id the SDK is about to assign so that, if
+                # this await is cancelled (Stop button), we can send an explicit
+                # notifications/cancelled for THIS request. Safe to read under
+                # the lock: only send_request mutates _request_id and all tool
+                # calls on this session are serialized by session_lock.
+                expected_request_id = getattr(session, "_request_id", None)
+                try:
+                    result = await session.call_tool(raw_name, kwargs)
+                except asyncio.CancelledError:
+                    if _bridge_cancel_enabled() and isinstance(expected_request_id, int):
+                        # Fire the cancellation on a detached task: awaiting it
+                        # directly here would immediately re-raise CancelledError
+                        # (this task is being cancelled) before the write lands.
+                        # The app's event loop keeps running after an interrupt,
+                        # so the detached send completes.
+                        with suppress(RuntimeError):
+                            asyncio.get_running_loop().create_task(
+                                _notify_cancelled(session, expected_request_id)
+                            )
+                    raise
             text_repr, _multimodal = _stringify_mcp_result(result)
             # MCP servers surface user-visible errors via
             # ``CallToolResult.isError=True`` rather than raising over

@@ -289,6 +289,39 @@ def _build_interrupted_ai_message(
     )
 
 
+def _build_cancelled_tool_results(
+    current_tool_messages: dict[str, Any],
+) -> list[ToolMessage]:
+    """Build synthetic error `tool_result`s for every in-flight tool call.
+
+    CRITICAL for interrupt-and-redirect (Phase 2): when Stop lands mid-tool-call,
+    the resumed LangGraph history can contain an assistant `tool_use` block with
+    no matching `tool_result`. The very next (correction) turn then hard-400s on
+    Anthropic ("tool_use ids ... without tool_result"), so the redirect silently
+    fails on the first message. Appending a "[cancelled by user]" error result
+    for each in-flight tool call keeps the message history valid so the
+    correction turn resumes cleanly.
+
+    Must be called with the SAME `current_tool_messages` used to reconstruct the
+    interrupted AIMessage (so tool_call ids line up) and BEFORE they are cleared.
+
+    Returns:
+        A list of error ``ToolMessage``s, one per in-flight tool call id.
+    """
+    results: list[ToolMessage] = []
+    for tool_id in list(current_tool_messages.keys()):
+        if not tool_id:
+            continue
+        results.append(
+            ToolMessage(
+                content="[cancelled by user]",
+                tool_call_id=tool_id,
+                status="error",
+            )
+        )
+    return results
+
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -1263,6 +1296,15 @@ async def execute_task_textual(
             )
             if interrupted_msg:
                 await agent.aupdate_state(config, {"messages": [interrupted_msg]})
+                # Append synthetic error tool_results for any in-flight tool
+                # calls so the resumed history has no dangling tool_use block
+                # (otherwise the next correction turn hard-400s). Must run
+                # before _current_tool_messages is cleared below.
+                cancelled_results = _build_cancelled_tool_results(
+                    adapter._current_tool_messages
+                )
+                if cancelled_results:
+                    await agent.aupdate_state(config, {"messages": cancelled_results})
 
             cancellation_msg = HumanMessage(
                 content="[SYSTEM] Task interrupted by user. "
@@ -1315,6 +1357,13 @@ async def execute_task_textual(
             )
             if interrupted_msg:
                 await agent.aupdate_state(config, {"messages": [interrupted_msg]})
+                # See CancelledError handler above: keep history valid by
+                # closing every in-flight tool_use with a synthetic error result.
+                cancelled_results = _build_cancelled_tool_results(
+                    adapter._current_tool_messages
+                )
+                if cancelled_results:
+                    await agent.aupdate_state(config, {"messages": cancelled_results})
 
             cancellation_msg = HumanMessage(
                 content="[SYSTEM] Task interrupted by user. "
