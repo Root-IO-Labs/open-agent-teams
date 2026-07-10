@@ -49,7 +49,17 @@ OAT_BRIDGE_TOOL_OUTPUT_CAP_FRACTION=0.20      # Bridge cap on a single tool resu
 OAT_BRIDGE_TOOL_OUTPUT_CAP_CHARS=32000        # Absolute char cap on a single tool result; takes precedence over fraction; clamped [4096, 8000000]
 OAT_BRIDGE_BLOB_CACHE_MAX_BYTES=50000000      # Bridge blob-cache hard cap for over-cap tool results (default 50 MB; clamped [4096, 1000000000])
 OAT_BRIDGE_BLOB_CACHE_TTL_MS=300000           # Blob cache entry TTL (default 5 min; clamped [1000, 86400000])
+OAT_CONTEXT_RESERVE_OUTPUT=0                   # Reserve output headroom: tiers use (window-output) budget, ring uses full window (default: ON; tri-state, fail-safe ON)
+OAT_DISABLE_OUTPUT_TOKEN_CAP=1                # Disable the per-call output-token cap defense-in-depth in summarization (default: cap ON)
+OAT_LOOP_BREAKER_MAX=3                        # Consecutive same-tool+same-error trips before the loop-breaker stops+reports (default: 3; invalid falls back to 3)
+OAT_BRIDGE_CANCEL=0                           # Propagate MCP notifications/cancelled to the bridge on interrupt so in-flight browser tool calls abort (default: ON)
 ```
+
+> **Browser-agent (oat-browser-agent) env:** `OAT_SCREENSHOT_BYTE_CAP` sets the
+> bridge-side base64 byte cap that drops+explains an oversized screenshot image
+> block before it reaches the model (default ~4.5 MB, provider-safe). The
+> extension also enforces a ≤2000px/side long-edge clamp + PNG downscale to the
+> same byte budget pre-send.
 
 **`OAT_MODEL_CONTEXT_<modelID>` env override.** Highest-precedence
 context-window source consulted by the daemon: env override >
