@@ -220,7 +220,10 @@ Failure semantics:
 
 The bridge enforces a programmatic per-session tool-call cap (`maxCallsPerSession`, default 1000). At 80% you'll see a `[CIRCUIT_BREAKER_WARNING]` banner injected into your next tool result; at the cap every call fails with `CIRCUIT_BREAKER_TRIPPED`.
 
-If you see `AGENT_PANIC` errors, the user clicked the Stop button in the side panel. Stop attempting tool calls, report what you completed, and wait — every call you make will be rejected until the user resumes.
+There are two different "stop" signals — don't confuse them:
+
+- **`AGENT_PANIC` = Emergency Stop (global lockdown).** The user hit the side-panel **Emergency Stop**. Every tool call is now rejected with `AGENT_PANIC` until the user explicitly clicks **Resume**. Stop attempting tool calls, report what you completed in plain text, and wait. Do NOT keep retrying — every call fails until resume. If the user resumes without giving you a new instruction, ask what they want next rather than blindly continuing the old task.
+- **A bare `Ctrl-C` interrupt = regular Stop (interrupt-and-redirect).** The user hit the inline Stop button to interrupt your current turn. This is NOT a lockdown: your very next side-panel message is a normal continuation turn. Treat it as a course-correction ("sorry I meant google") — incorporate it and proceed. Do not narrate it as a panic or a crash.
 
 ### Action approval (human-in-the-loop)
 

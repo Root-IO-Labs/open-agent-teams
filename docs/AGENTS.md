@@ -55,6 +55,25 @@ security boundary for the side-panel / native-messaging
 socket surface — the side panel cannot route to or pause
 non-whitelisted types even from a compromised extension.
 
+#### Three distinct "stop" mechanisms (do not conflate)
+
+Chat-capable agents (Assistant, Browser) can be halted three
+different ways. They are separate socket verbs with different
+scope, blast radius, and recovery — keep them straight:
+
+| Mechanism | Verb / trigger | Scope | What it does | How to resume |
+|-----------|----------------|-------|--------------|---------------|
+| **Interrupt-and-redirect** (regular "Stop") | `route_user_message` with `interrupt: true` (side-panel inline Stop button) | ONE agent | Sends a single `Ctrl-C` (`0x03`) to the agent's PTY, cancelling the in-flight reasoning turn (and, with `OAT_BRIDGE_CANCEL`, the in-flight browser tool call). The process stays alive and the conversation thread is preserved. | Just type the next message — it is delivered as a normal continuation turn, so the agent incorporates the correction ("sorry I meant google") and keeps going. This is the Cursor-style flow. |
+| **Pause / kill** | `stop_agent` (`oat agent stop` / side-panel Stop-record) | ONE agent | Kills the agent **process** (SIGTERM→SIGKILL) but preserves its `state.Agent` record + session JSONL. Only Assistant/Browser are pausable (`IsPausable()`). | `restart_agent` (`oat agent restart`) resumes from the preserved session. |
+| **Emergency Stop** (global panic) | `emergency_stop_all` → `AGENT_PANIC` | ALL agents / all bridges | **Full lockdown.** Sets each bridge's `panicState` so every subsequent tool call is instantly rejected with `AGENT_PANIC`. Processes stay alive but can do nothing. Intentionally NOT an "inject feedback and proceed" flow — it is a "halt everything now" kill-switch. | `emergency_resume_all` (the side-panel **Resume** control) clears `panicState` across all bridges. Until resume is issued, the agent cannot act or be redirected — so **for guiding a misbehaving run, use the regular Stop (interrupt-and-redirect), not Emergency Stop.** |
+
+Guidance for operators: reach for **regular Stop** to
+course-correct a single agent mid-task (interrupt, type a
+correction, continue). Reserve **Emergency Stop** for "stop
+everything immediately," and remember it must be explicitly
+**released via Resume** (`emergency_resume_all`) before any
+agent can respond again — there is no auto-expiry.
+
 **User-initiated cleanup with reason propagation:** the side-
 panel Delete flow calls `remove_agent` with
 `reason: "user_cleanup_after_pause"`.
@@ -243,7 +262,7 @@ It interacts with web pages through the OAT Browser Agent extension and MCP brid
   - Untrusted-content delimiters wrap page-derived text returned to the LLM.
   - Per-call defenses also run inside `browser_batch` (no batch-bypass).
   - Programmatic circuit breaker (`maxCallsPerSession`, default 1000) with 80% warning.
-  - Side-panel "Stop agent" button issues an `AGENT_PANIC` halt that propagates across four layers.
+  - Side-panel **Emergency Stop** issues an `AGENT_PANIC` global halt that propagates across four layers (released only via **Resume** / `emergency_resume_all`). This is distinct from the regular inline **Stop** button, which is a per-agent interrupt-and-redirect (`route_user_message` with `interrupt: true`) — see "Three distinct 'stop' mechanisms" under Lifecycle controls.
 
 The Browser Agent requires the `oat-browser-agent` Chrome extension and bridge to be installed. See:
 - [oat-browser-agent repository](https://github.com/Root-IO-Labs/oat-browser-agent) — setup instructions and full configuration reference.

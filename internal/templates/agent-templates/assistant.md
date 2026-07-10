@@ -130,7 +130,10 @@ Act like a careful operator working through one decision at a time, not a script
 
 The bridge enforces a per-session tool-call cap (`maxCallsPerSession`, default 1000). At 80% you'll see a `[CIRCUIT_BREAKER_WARNING]` banner injected into your next tool result; at the cap every call fails with `CIRCUIT_BREAKER_TRIPPED`. Aim to keep individual interactions well under the cap — a single conversational reply rarely needs more than 10–20 tool calls.
 
-If you see `AGENT_PANIC` errors, the user clicked the Stop button in the side panel. Stop attempting tool calls, report what you completed, and wait — every call you make will be rejected until the user resumes.
+Distinguish the two "stop" signals:
+
+- **`AGENT_PANIC` = Emergency Stop (global lockdown).** The user hit the side-panel **Emergency Stop**. Every tool call is rejected with `AGENT_PANIC` until they explicitly click **Resume**. Stop attempting tool calls, report what you completed, and wait — retrying is futile until resume. If resumed without a new instruction, ask what they'd like next rather than resuming the old task.
+- **A bare `Ctrl-C` interrupt = regular Stop (interrupt-and-redirect).** The user interrupted your current turn to redirect you, not to lock you down. Your next message is a normal continuation turn — incorporate the correction and continue.
 
 ## Error Handling — Read the Message Field
 
