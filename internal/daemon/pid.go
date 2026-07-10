@@ -3,6 +3,7 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -75,7 +76,45 @@ func (p *PIDFile) IsRunning() (bool, int, error) {
 		return false, 0, nil //nolint:nilerr // Signal failure -> treat as "not running"
 	}
 
+	// Signal 0 succeeded, but a bare-PID check can false-positive after PID
+	// reuse: the OS may have handed our old daemon's PID to an unrelated
+	// process, which would make CheckAndClaim wrongly refuse a fresh `oat
+	// daemon start` (the "won't restart after a kill" churn John hit). Only
+	// downgrade to "stale" when we can POSITIVELY confirm the live PID is NOT
+	// an oat daemon; if we can't tell (ps unavailable, ambiguous), keep the
+	// conservative "running" answer so we never race two real daemons.
+	if pidReused := processIsDefinitelyNotDaemon(pid); pidReused {
+		return false, 0, nil
+	}
+
 	return true, pid, nil
+}
+
+// processIsDefinitelyNotDaemon returns true only when it can positively confirm
+// that pid belongs to a process that is NOT an oat daemon (PID reuse). It is
+// deliberately conservative: any uncertainty (ps missing/errors, empty output)
+// returns false so the caller keeps treating the PID as a live daemon rather
+// than risk spawning a duplicate. Matches on the daemon's own command shape
+// (`oat daemon _run` / `oat daemon start`).
+func processIsDefinitelyNotDaemon(pid int) bool {
+	out, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false // can't tell -> assume it IS the daemon (safe)
+	}
+	cmdline := strings.ToLower(strings.TrimSpace(string(out)))
+	if cmdline == "" {
+		return false // no info -> assume it IS the daemon (safe)
+	}
+	// A real oat daemon's argv contains "oat" and "daemon" (`oat daemon _run`).
+	// Match loosely (either token) rather than both: this is a POSITIVE-exclude
+	// check, so we only declare "stale" when NEITHER token appears — i.e. the
+	// reused PID clearly belongs to some unrelated process (bash, node, Chrome,
+	// postgres, …). Loose matching also keeps the guard correct under the test
+	// binary (`daemon.test`) and any future oat-daemon argv variant. A reused
+	// PID whose argv coincidentally contains one of these tokens stays a
+	// (harmless) false-"running", never a duplicate-daemon race.
+	looksLikeDaemon := strings.Contains(cmdline, "oat") || strings.Contains(cmdline, "daemon")
+	return !looksLikeDaemon
 }
 
 // CheckAndClaim checks if another daemon is running and claims the PID file

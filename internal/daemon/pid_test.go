@@ -2,9 +2,43 @@ package daemon
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
+
+// TestPIDFileIsRunning_StalePIDReuse verifies the PID-reuse hardening (Phase 7
+// edge): a live PID that clearly belongs to some OTHER process (here a `sleep`)
+// is treated as a STALE pidfile, so `oat daemon start` isn't wrongly blocked
+// after the real daemon died and the OS handed its PID to something else.
+func TestPIDFileIsRunning_StalePIDReuse(t *testing.T) {
+	// A long-lived, definitely-not-oat process whose argv contains neither
+	// "oat" nor "daemon".
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper process: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	tmpDir := t.TempDir()
+	pidPath := filepath.Join(tmpDir, "test.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	pf := NewPIDFile(pidPath)
+	running, _, err := pf.IsRunning()
+	if err != nil {
+		t.Fatalf("IsRunning: %v", err)
+	}
+	if running {
+		t.Error("IsRunning() = true for a reused PID owned by an unrelated (`sleep`) process; expected stale/false")
+	}
+}
 
 func TestPIDFileWriteRead(t *testing.T) {
 	tmpDir := t.TempDir()

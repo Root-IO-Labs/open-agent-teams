@@ -81,6 +81,55 @@ func TestClientServerCommunication(t *testing.T) {
 	}
 }
 
+// TestServerRecoversHandlerPanic verifies that a panicking RPC handler is
+// recovered (daemon survives), the client gets a structured error, and the
+// RecoveredPanics counter increments so the panic isn't silent (Phase 7 edge).
+func TestServerRecoversHandlerPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	sockPath := filepath.Join(tmpDir, "test.sock")
+
+	handler := HandlerFunc(func(req Request) Response {
+		if req.Command == "boom" {
+			panic("intentional test panic")
+		}
+		return Response{Success: true}
+	})
+
+	server := NewServer(sockPath, handler)
+	if err := server.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	defer server.Stop()
+	go func() { _ = server.Serve() }()
+	time.Sleep(100 * time.Millisecond)
+
+	if got := server.RecoveredPanics(); got != 0 {
+		t.Fatalf("RecoveredPanics() = %d before any panic, want 0", got)
+	}
+
+	client := NewClient(sockPath)
+	resp, err := client.Send(Request{Command: "boom"})
+	if err != nil {
+		t.Fatalf("Send() failed (daemon should have survived the panic): %v", err)
+	}
+	if resp.Success {
+		t.Error("expected Success=false for a panicking handler")
+	}
+
+	if got := server.RecoveredPanics(); got != 1 {
+		t.Errorf("RecoveredPanics() = %d after one panic, want 1", got)
+	}
+
+	// The server must still serve subsequent requests.
+	resp, err = client.Send(Request{Command: "ok"})
+	if err != nil {
+		t.Fatalf("Send() after panic failed: %v", err)
+	}
+	if !resp.Success {
+		t.Error("server should still serve requests after recovering a panic")
+	}
+}
+
 func TestServerMultipleRequests(t *testing.T) {
 	tmpDir := t.TempDir()
 	sockPath := filepath.Join(tmpDir, "test.sock")

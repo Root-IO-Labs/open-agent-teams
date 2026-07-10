@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -185,6 +186,20 @@ type Server struct {
 	listener      net.Listener
 	handler       Handler
 	streamHandler StreamHandler
+
+	// recoveredPanics counts handler panics that were caught by the recover()
+	// guards below (stream + RPC paths) rather than crashing the daemon. Exposed
+	// via RecoveredPanics() so the daemon can surface a non-silent signal that a
+	// panic happened (Phase 7 edge: "recovered panics aren't silent"). Atomic —
+	// incremented from per-connection goroutines.
+	recoveredPanics atomic.Int64
+}
+
+// RecoveredPanics returns the number of handler panics recovered so far (stream
+// + RPC paths). A non-zero value means the daemon survived one or more panics
+// that would otherwise have been fatal — worth surfacing/alerting on.
+func (s *Server) RecoveredPanics() int64 {
+	return s.recoveredPanics.Load()
 }
 
 // Handler processes requests
@@ -389,7 +404,8 @@ func (s *Server) handleConnection(conn net.Conn, release func()) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("Stream handler panicked on command %q: %v", req.Command, r)
+					n := s.recoveredPanics.Add(1)
+					log.Printf("Stream handler panicked on command %q: %v (recovered; total recovered panics=%d)", req.Command, r, n)
 					conn.Close()
 				}
 			}()
@@ -410,7 +426,8 @@ func (s *Server) handleConnection(conn net.Conn, release func()) {
 		// reported as an error response to the client and logged for postmortem.
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Handler panicked on command %q: %v", req.Command, r)
+				n := s.recoveredPanics.Add(1)
+				log.Printf("Handler panicked on command %q: %v (recovered; total recovered panics=%d)", req.Command, r, n)
 				done <- Response{Success: false, Error: fmt.Sprintf("handler panic: %v", r)}
 			}
 		}()
