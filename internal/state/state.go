@@ -358,6 +358,12 @@ type State struct {
 	CurrentRepo string                 `json:"current_repo,omitempty"`
 	mu          sync.RWMutex
 	path        string
+
+	// LoadWarning is a non-persisted, one-shot message set by Load when it had
+	// to recover from a corrupt state file (restored the .bak, or fell back to
+	// empty). The caller (daemon.New) logs it loudly. Empty on a clean load.
+	// json:"-" so it never round-trips into the on-disk state.
+	LoadWarning string `json:"-"`
 }
 
 // New creates a new empty state
@@ -381,7 +387,14 @@ func Load(path string) (*State, error) {
 
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
-		return nil, fmt.Errorf("failed to parse state file: %w", err)
+		// Corrupt state file. Rather than block daemon startup forever
+		// (the old behavior — a single bad byte in state.json meant
+		// `oat` couldn't start until the user manually deleted it), try to
+		// recover from the rolling last-good backup, else start empty.
+		// Either way we NEVER return an error here so startup proceeds; the
+		// LoadWarning surfaces the recovery loudly to the caller's log
+		// (Phase 7 item 6 + corrupt-state edge case).
+		return recoverCorruptState(path, data, err), nil
 	}
 
 	s.path = path
@@ -392,6 +405,46 @@ func Load(path string) (*State, error) {
 	}
 
 	return &s, nil
+}
+
+// recoverCorruptState is the corrupt-state fallback for Load. It preserves the
+// unparseable file for forensics, then attempts to restore the rolling
+// last-good backup (state.json.bak, written on every successful save). If the
+// backup is present and valid it is adopted and immediately re-persisted so the
+// main file becomes valid again; otherwise a fresh empty state is returned so
+// the daemon can still start. The returned State's LoadWarning explains what
+// happened (logged by the caller).
+func recoverCorruptState(path string, corrupt []byte, parseErr error) *State {
+	// Preserve the corrupt bytes for postmortem (best-effort).
+	corruptPath := fmt.Sprintf("%s.corrupt-%d", path, time.Now().UnixNano())
+	_ = os.WriteFile(corruptPath, corrupt, 0o600)
+
+	bakPath := path + ".bak"
+	if bakData, err := os.ReadFile(bakPath); err == nil {
+		var s State
+		if json.Unmarshal(bakData, &s) == nil {
+			s.path = path
+			if s.Repos == nil {
+				s.Repos = make(map[string]*Repository)
+			}
+			// Re-persist the recovered good state so the main file is valid
+			// again for the next load (best-effort).
+			_ = atomicWrite(path, bakData)
+			s.LoadWarning = fmt.Sprintf(
+				"state file %s was corrupt (%v); RESTORED last-good backup %s; corrupt copy saved to %s",
+				path, parseErr, bakPath, corruptPath,
+			)
+			return &s
+		}
+	}
+
+	// No usable backup — start blank rather than block startup.
+	fresh := New(path)
+	fresh.LoadWarning = fmt.Sprintf(
+		"state file %s was corrupt (%v) and no valid backup existed; starting with EMPTY state; corrupt copy saved to %s",
+		path, parseErr, corruptPath,
+	)
+	return fresh
 }
 
 // atomicWrite writes data to a file atomically using a temp file and rename.
@@ -940,5 +993,17 @@ func (s *State) saveUnlocked() error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	return atomicWrite(s.path, data)
+	if err := atomicWrite(s.path, data); err != nil {
+		return err
+	}
+
+	// Rolling last-good backup: mirror the just-saved (valid) bytes to
+	// state.json.bak so a later corruption of the main file can be recovered
+	// by recoverCorruptState on the next Load. Best-effort — a backup write
+	// failure must not fail the save (the primary write already succeeded).
+	if s.path != "" {
+		_ = atomicWrite(s.path+".bak", data)
+	}
+
+	return nil
 }

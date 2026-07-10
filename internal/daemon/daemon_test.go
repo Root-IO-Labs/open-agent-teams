@@ -1871,6 +1871,93 @@ func TestHandleRouteUserMessage_Interrupt(t *testing.T) {
 	})
 }
 
+// TestHandleRouteUserMessage_BrowserInterruptAndRedirect pins Phase 2 items
+// 2 + 3: the interrupt path must work for a Browser agent (not just Assistant),
+// and the subsequent correction message must be delivered as a normal
+// continuation turn (the "hit Stop, then type 'sorry I meant google'" flow).
+// Root cause the plan flagged: the interrupt block is gated by
+// IsRoutableTarget() which includes Browser, and delivery keys off
+// agent.WindowName — both agent-type-agnostic — but there was no regression
+// test locking that in for the Browser type specifically.
+func TestHandleRouteUserMessage_BrowserInterruptAndRedirect(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+	fake := &routeTestBackend{}
+	d.backend = fake
+
+	if err := d.state.AddRepo("test-repo", &state.Repository{
+		GithubURL:   "https://github.com/test/repo",
+		SessionName: "test-session",
+		Agents:      make(map[string]state.Agent),
+	}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	// A Browser agent — the type John was driving from the side panel.
+	if err := d.state.AddAgent("test-repo", "browser1", state.Agent{
+		Type:       state.AgentTypeBrowser,
+		WindowName: "win-browser1",
+		PID:        7777,
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	// Step 1: Stop — an interrupt must succeed for a Browser agent and
+	// deliver exactly the lone Ctrl-C to the browser's PTY window.
+	resp := d.handleRouteUserMessage(socket.Request{
+		Command: "route_user_message",
+		Args: map[string]interface{}{
+			"repo":      "test-repo",
+			"agent":     "browser1",
+			"text":      "\x03",
+			"interrupt": true,
+		},
+	})
+	if !resp.Success {
+		t.Fatalf("browser interrupt should succeed; got: %s", resp.Error)
+	}
+	calls := fake.calls()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 SendMessage for the interrupt, got %d", len(calls))
+	}
+	if calls[0].Agent != "win-browser1" {
+		t.Errorf("interrupt delivered to window %q, want %q (must key off agent.WindowName)", calls[0].Agent, "win-browser1")
+	}
+	if calls[0].Message != "\x03" {
+		t.Errorf("browser interrupt must deliver exactly \\x03, got %q", calls[0].Message)
+	}
+
+	// Step 2: Redirect — a normal correction turn ("sorry I meant google")
+	// must then be delivered to the same browser window as an ordinary chat
+	// message (carrying the side-panel sentinel), proving interrupt-and-redirect
+	// resumes as a continuation rather than being dropped.
+	resp = d.handleRouteUserMessage(socket.Request{
+		Command: "route_user_message",
+		Args: map[string]interface{}{
+			"repo":  "test-repo",
+			"agent": "browser1",
+			"text":  "sorry I meant google.com",
+		},
+	})
+	if !resp.Success {
+		t.Fatalf("browser correction message should succeed; got: %s", resp.Error)
+	}
+	calls = fake.calls()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 SendMessage calls after the correction, got %d", len(calls))
+	}
+	last := calls[len(calls)-1]
+	if last.Agent != "win-browser1" {
+		t.Errorf("correction delivered to window %q, want %q", last.Agent, "win-browser1")
+	}
+	if !strings.Contains(last.Message, "sorry I meant google.com") {
+		t.Errorf("correction message body not delivered verbatim; got %q", last.Message)
+	}
+	if !strings.Contains(last.Message, sidePanelInputSentinel) {
+		t.Errorf("correction should be a normal chat turn carrying the side-panel sentinel; got %q", last.Message)
+	}
+}
+
 // TestHandleRouteUserMessage_System pins the system-directive carve-out
 // used by the routed "Compact now" path: the text must be delivered
 // verbatim (no `[SIDE-PANEL CHAT]` sentinel / active-tab prefix) and

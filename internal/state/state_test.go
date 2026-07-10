@@ -1031,18 +1031,77 @@ func TestListAgentsNonExistentRepo(t *testing.T) {
 	}
 }
 
+// TestLoadInvalidJSON: with the Phase 7 corrupt-state recovery, a corrupt
+// state file with NO backup no longer blocks startup — Load returns an empty
+// recovered state (not an error), records a LoadWarning, and preserves the
+// corrupt bytes in a .corrupt-* sidecar for forensics.
 func TestLoadInvalidJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	statePath := filepath.Join(tmpDir, "invalid.json")
 
-	// Write invalid JSON
+	// Write invalid JSON (and NO .bak alongside it).
 	if err := os.WriteFile(statePath, []byte("not valid json"), 0644); err != nil {
 		t.Fatalf("Failed to write test file: %v", err)
 	}
 
-	_, err := Load(statePath)
-	if err == nil {
-		t.Error("Load() should fail for invalid JSON")
+	s, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("Load() should not error on corrupt file (graceful recovery); got %v", err)
+	}
+	if s == nil {
+		t.Fatal("Load() returned nil state")
+	}
+	if len(s.ListRepos()) != 0 {
+		t.Errorf("recovered state should be empty with no backup; got %d repos", len(s.ListRepos()))
+	}
+	if s.LoadWarning == "" {
+		t.Error("expected a LoadWarning describing the corrupt-file recovery")
+	}
+	// The corrupt bytes must be preserved for forensics.
+	matches, _ := filepath.Glob(statePath + ".corrupt-*")
+	if len(matches) == 0 {
+		t.Error("corrupt state file was not preserved as a .corrupt-* sidecar")
+	}
+}
+
+// TestLoadRecoversFromBackup: a corrupt main file WITH a valid rolling
+// state.json.bak is recovered from the backup (not blanked), the recovered
+// repos are present, and the main file is re-persisted as valid.
+func TestLoadRecoversFromBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	statePath := filepath.Join(tmpDir, "state.json")
+
+	// Produce a valid state + its rolling .bak via a normal save.
+	good := New(statePath)
+	if err := good.AddRepo("kept-repo", &Repository{SessionName: "oat-kept", Agents: map[string]Agent{}}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if _, err := os.Stat(statePath + ".bak"); err != nil {
+		t.Fatalf("expected rolling backup to exist after save: %v", err)
+	}
+
+	// Corrupt the main file; the .bak stays intact.
+	if err := os.WriteFile(statePath, []byte("{ corrupt"), 0644); err != nil {
+		t.Fatalf("corrupt write: %v", err)
+	}
+
+	recovered, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("Load() should recover from backup, not error; got %v", err)
+	}
+	if _, ok := recovered.GetRepo("kept-repo"); !ok {
+		t.Error("recovered state is missing the repo present in the backup")
+	}
+	if recovered.LoadWarning == "" {
+		t.Error("expected a LoadWarning noting the backup restore")
+	}
+	// The main file must have been re-persisted as valid JSON.
+	reloaded, err := Load(statePath)
+	if err != nil {
+		t.Fatalf("re-persisted main file should load cleanly; got %v", err)
+	}
+	if _, ok := reloaded.GetRepo("kept-repo"); !ok {
+		t.Error("re-persisted main file is missing the recovered repo")
 	}
 }
 

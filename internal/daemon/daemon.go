@@ -435,6 +435,12 @@ func New(paths *config.Paths) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load state: %w", err)
 	}
+	// Load never errors on a corrupt file anymore — it recovers (restores the
+	// last-good .bak or starts empty) and records why in LoadWarning. Surface
+	// that loudly so a silent blank-slate recovery is visible in the log.
+	if st.LoadWarning != "" {
+		logger.Error("state recovery: %s", st.LoadWarning)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1963,6 +1969,14 @@ func (d *Daemon) refreshWorktrees() {
 
 	repos := d.state.GetAllRepos()
 	for repoName, repo := range repos {
+		// Virtual assistant repos have no .git; without this guard the loop
+		// reaches wt.GetUpstreamRemote() and logs "Could not get remote for
+		// _assistant-<name>" every cycle. Same IsVirtual gate as the two
+		// cleanup loops + restoreRepoAgents.
+		if repo.IsVirtual {
+			continue
+		}
+
 		if d.isRepoFetchDisabled(repoName) {
 			continue
 		}
@@ -7073,6 +7087,17 @@ func (d *Daemon) handleSpawnAgent(req socket.Request) socket.Response {
 func (d *Daemon) cleanupOrphanedWorktrees(recentlyRemovedPaths []string) {
 	repoNames := d.state.ListRepos()
 	for _, repoName := range repoNames {
+		// Virtual assistant repos (_assistant-<name>, IsVirtual=true) have no
+		// .git and no worktrees — running git against them spams a per-cycle
+		// WARN ("Failed to prune worktrees") + ERROR ("Failed to cleanup
+		// orphaned worktrees") that buries real signal (confirmed in a real
+		// daemon log, 2026-07-09). The os.Stat(wtRootDir) check below does NOT
+		// spare them because the wts/<repo> dir exists. Mirror the IsVirtual
+		// gate in restoreRepoAgents.
+		if repo, ok := d.state.GetRepo(repoName); ok && repo.IsVirtual {
+			continue
+		}
+
 		repoPath := d.paths.RepoDir(repoName)
 		wtRootDir := d.paths.WorktreeDir(repoName)
 
@@ -7133,6 +7158,13 @@ func (d *Daemon) cleanupMergedBranches() {
 
 	repoNames := d.state.ListRepos()
 	for _, repoName := range repoNames {
+		// Skip virtual assistant repos: no .git, so CleanupMergedBranches
+		// spams "failed to get upstream remote" every cycle. Same guard as
+		// cleanupOrphanedWorktrees + restoreRepoAgents.
+		if repo, ok := d.state.GetRepo(repoName); ok && repo.IsVirtual {
+			continue
+		}
+
 		if d.isRepoFetchDisabled(repoName) {
 			continue
 		}
@@ -9430,7 +9462,18 @@ func RunDetached() error {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 
-	// Fork and daemonize
+	// Fork and daemonize.
+	//
+	// Setsid puts the forked `oat daemon _run` in its OWN session (new
+	// session leader), detached from the launching terminal's session and
+	// process group. Without it the child stays in the terminal's session and
+	// receives SIGHUP when that terminal closes — precisely John's "the daemon
+	// dies when the launching shell exits / short-lived shells couldn't keep it
+	// alive" symptom (Phase 7 item 1). Always-on, no flag: it alone fixes the
+	// reported crash; the launchd supervisor (opt-in) is separate. On the
+	// launchd path we invoke `oat daemon _run` directly (already detached), so
+	// Setsid here only affects the manual `oat daemon start` path — no
+	// double-daemonize risk.
 	attr := &os.ProcAttr{
 		Dir: filepath.Dir(paths.Root),
 		Env: os.Environ(),
@@ -9439,7 +9482,7 @@ func RunDetached() error {
 			logFile, // stdout
 			logFile, // stderr
 		},
-		Sys: nil,
+		Sys: &syscall.SysProcAttr{Setsid: true},
 	}
 
 	// Start daemon process

@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+// outputWatcherMaxLineBytes bounds a single tailed line so an abnormally long
+// line can't balloon this reader's memory. Set well above the 4 MiB PTY line
+// cap (maxAnsiLineBytes in pkg/backend) so any line that reached the log file
+// fits without truncation; only truly pathological input is clipped, and even
+// then tracking continues (Phase 7 item 5).
+const outputWatcherMaxLineBytes = 8 << 20 // 8 MiB
+
 // EventType categorizes agent output events.
 type EventType int
 
@@ -151,8 +158,16 @@ func (w *OutputWatcher) watch(r io.Reader) {
 	// watcher's done channel stops the retry loop.
 	tr := &tailReader{r: r, done: w.done, pollInterval: 250 * time.Millisecond}
 
-	scanner := bufio.NewScanner(tr)
-	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	// Use a bufio.Reader (not bufio.Scanner) so an oversized line degrades
+	// gracefully instead of silently killing token/capacity tracking forever.
+	// The old Scanner had a 256KB max-token cap: a single line over that
+	// (a big [OAT_TOKENS] payload, a stray base64 blob) made scanner.Scan()
+	// return false with bufio.ErrTooLong, ending the goroutine and stopping
+	// ALL tracking with no error surfaced — directly worsening the Phase 1/3
+	// symptoms (Phase 7 item 5). ReadString has no line-length cap; we bound
+	// memory defensively at outputWatcherMaxLineBytes by truncating an
+	// abnormally long line rather than erroring on it.
+	reader := bufio.NewReader(tr)
 
 	idleTicker := time.NewTicker(30 * time.Second)
 	defer idleTicker.Stop()
@@ -160,11 +175,28 @@ func (w *OutputWatcher) watch(r io.Reader) {
 	lineCh := make(chan string, 32)
 	go func() {
 		defer close(lineCh)
-		for scanner.Scan() {
-			select {
-			case lineCh <- scanner.Text():
-			case <-w.done:
-				return // watcher stopped — exit to avoid goroutine leak
+		for {
+			line, err := reader.ReadString('\n')
+			if len(line) > 0 {
+				line = strings.TrimRight(line, "\r\n")
+				if len(line) > outputWatcherMaxLineBytes {
+					line = line[:outputWatcherMaxLineBytes] + " …[OAT: truncated]"
+				}
+				select {
+				case lineCh <- line:
+				case <-w.done:
+					return // watcher stopped — exit to avoid goroutine leak
+				}
+			}
+			if err != nil {
+				// tailReader only returns io.EOF once the watcher's done
+				// channel is closed (otherwise it blocks at EOF), so any error
+				// here means we should stop. Non-EOF errors are unexpected;
+				// surface them rather than dying silently.
+				if err != io.EOF {
+					w.emit(EventError, "output watcher read error: "+err.Error())
+				}
+				return
 			}
 		}
 	}()

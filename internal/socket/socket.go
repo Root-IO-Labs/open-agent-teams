@@ -377,8 +377,24 @@ func (s *Server) handleConnection(conn net.Conn, release func()) {
 		// out by the bridge multiplexers) to exhaust maxConcurrentHandlers
 		// and make ordinary request/response verbs fail with "daemon busy".
 		releaseSlot()
-		// StreamHandler owns the connection — do NOT defer conn.Close()
-		s.streamHandler.HandleStream(req, conn)
+		// StreamHandler owns the connection — do NOT defer conn.Close() on the
+		// normal path. But wrap the call in recover() so a panic in ANY stream
+		// handler (stream_agent_output, stream_context_capacity,
+		// stream_assistant_turns, ...) downs only THIS stream instead of
+		// crashing the whole daemon — mirroring the RPC handler recover below.
+		// John's side panel holds several of these streams open continuously,
+		// so an unprotected panic here is a whole-daemon crash vector (Phase 7
+		// item 3). On recover we close the connection (the handler no longer
+		// owns it); a double-close is harmless.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Stream handler panicked on command %q: %v", req.Command, r)
+					conn.Close()
+				}
+			}()
+			s.streamHandler.HandleStream(req, conn)
+		}()
 		return
 	}
 

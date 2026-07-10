@@ -10,6 +10,22 @@ import (
 // with the same content are suppressed.
 const screenBufRows = 100
 
+// maxAnsiLineBytes bounds a single accumulated line so a pathological
+// multi-megabyte PTY line (e.g. a base64 screenshot emitted without newlines)
+// can't grow lineBuf without limit and OOM-kill the daemon — the leading
+// suspect for why John's screenshot-heavy runs got OS-killed (Phase 7 item 4).
+// Once a line reaches this cap we append a one-time marker and DROP further
+// bytes until the next newline, so memory is bounded at ~cap regardless of how
+// long the runaway line is. A `var` (not `const`) purely so tests can shrink
+// it. 4 MiB is far above any legitimate log/`[OAT_TOKENS]` line (those are a
+// few hundred bytes), so real output — including token-usage sentinels the
+// capacity meter parses — is never truncated.
+var maxAnsiLineBytes = 4 << 20 // 4 MiB
+
+// ansiTruncationMarker is appended once when a line hits maxAnsiLineBytes so the
+// truncation is visible in logs/streams rather than silently swallowed.
+const ansiTruncationMarker = "…[OAT: line truncated — exceeded max line length]"
+
 // ansiStripper is a byte-level state machine that strips ANSI escape sequences
 // from raw PTY output and emits clean lines via a callback.
 //
@@ -24,11 +40,12 @@ const screenBufRows = 100
 // This is the shared core used by both cleanLogWriter (file-based log dedup)
 // and rawBroadcaster (live streaming to TUI).
 type ansiStripper struct {
-	state    int    // 0=normal 1=esc 2=csi 3=osc 4=osc-esc
-	lineBuf  []byte // current line accumulator
-	csiParam []byte // accumulates CSI parameter bytes (digits, semicolons)
-	sawCR    bool   // bare \r tracking
-	onLine   func(string)
+	state         int    // 0=normal 1=esc 2=csi 3=osc 4=osc-esc
+	lineBuf       []byte // current line accumulator
+	csiParam      []byte // accumulates CSI parameter bytes (digits, semicolons)
+	sawCR         bool   // bare \r tracking
+	lineTruncated bool   // current line already hit maxAnsiLineBytes (drop rest until \n)
+	onLine        func(string)
 
 	// Virtual screen buffer for CUP-based redraw detection.
 	// Maps row number → trimmed content last written to that row.
@@ -62,7 +79,21 @@ func (s *ansiStripper) Write(p []byte) {
 			case b >= 0x20 || b == '\t':
 				if s.sawCR {
 					s.lineBuf = s.lineBuf[:0]
+					s.lineTruncated = false
 					s.sawCR = false
+				}
+				// Cap the line: once at the limit, append the marker exactly
+				// once and drop every further byte until the next newline. This
+				// bounds memory at ~maxAnsiLineBytes for a runaway line while
+				// preserving the START of the line (where log prefixes /
+				// `[OAT_TOKENS]` payloads live — those never reach the cap).
+				if s.lineTruncated {
+					continue
+				}
+				if len(s.lineBuf) >= maxAnsiLineBytes {
+					s.lineBuf = append(s.lineBuf, ansiTruncationMarker...)
+					s.lineTruncated = true
+					continue
 				}
 				s.lineBuf = append(s.lineBuf, b)
 			}
@@ -129,6 +160,7 @@ func (s *ansiStripper) handleCSIFinal(final byte) {
 
 	case 'K': // EL (Erase Line) — clear current line buffer
 		s.lineBuf = s.lineBuf[:0]
+		s.lineTruncated = false
 	}
 }
 
@@ -142,6 +174,7 @@ func (s *ansiStripper) Flush() {
 func (s *ansiStripper) flushLine() {
 	line := strings.TrimRight(string(s.lineBuf), " \t")
 	s.lineBuf = s.lineBuf[:0]
+	s.lineTruncated = false
 
 	// Strip trailing Textual sidebar characters (▌, ▎) that get concatenated
 	// with content when the TUI renders text + sidebar on the same row.
