@@ -507,6 +507,37 @@ func TestMaybeNudgeContextCapacity_UnknownPublishesUnknownFrame(t *testing.T) {
 	}
 }
 
+// TestHandleTokenUsageEvent_FrameRefreshesOnLowerReading pins Phase 3 item 3:
+// after a compact (or session reset) the NEXT token event carries a lower
+// context-window reading, and the daemon must publish a fresh capacity frame
+// reflecting the drop — proving the ring/tier isn't stranded at the pre-compact
+// value. Drives the real handleTokenUsageEvent path (not maybeNudge directly)
+// so the state-persist → publish wiring is exercised end-to-end.
+func TestHandleTokenUsageEvent_FrameRefreshesOnLowerReading(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	const repo = "_assistant-personal"
+	const agent = "personal"
+	if err := d.state.AddRepo(repo, &state.Repository{SessionName: repo, Agents: map[string]state.Agent{}}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent(repo, agent, state.Agent{Type: state.AgentTypeAssistant, PID: 1}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	_, sub, subCancel := subscribeForTest(t, d, repo, agent)
+	defer subCancel()
+
+	// High reading: 124K of the 128K fallback window (~96.9%) → safety_net tier.
+	d.handleTokenUsageEvent(repo, agent, `{"cumulative_input":124000,"cumulative_output":0,"context_input":124000}`)
+	expectFrameWithin(t, sub, "high reading", 200*time.Millisecond, capacityTierSafetyNet, 0, 124_000, 128_000)
+
+	// Post-compact reading: 20K → ok tier. The frame MUST refresh downward.
+	d.handleTokenUsageEvent(repo, agent, `{"cumulative_input":130000,"cumulative_output":0,"context_input":20000}`)
+	expectFrameWithin(t, sub, "post-compact reading", 200*time.Millisecond, capacityTierOK, 0, 20_000, 128_000)
+}
+
 // subscribeForTest wires a fresh subscriber to the (session, agent)
 // broadcaster. Returns the broadcaster, the channel, and a cancel
 // fn the caller MUST defer.

@@ -764,3 +764,89 @@ func TestShouldInject_ReservedBudgetFiresEarlier(t *testing.T) {
 		t.Error("did not expect inject at ~72 % of the full window (reservation off)")
 	}
 }
+
+// testProfileQwenSmall mimics the DGX-Spark Qwen profile that triggered the
+// Phase 3 meter bug: a conservative max_input_tokens BELOW the 128K ceiling
+// (so effectiveContextLimit source == "profile"), while the model's real
+// window is larger. 96000 is the exact value from the real profile YAML.
+const testProfileQwenSmall = `model_id: "spark:Qwen/Qwen3.5-35B-A3B-FP8"
+status: known
+provider:
+  name: spark
+capabilities:
+  tool_reliability: 0.9
+  token_reporting: 0.85
+routing:
+  autonomy_tier: limited
+  overall_score: 40
+max_input_tokens: 96000
+contract:
+  onboarding_passed: true
+`
+
+// TestEffectiveDisplayLimit_ProfileAddsOutputReserve pins Phase 3 item 7: the
+// ring denominator approximates the model's REAL window (input budget + reserved
+// output) for a profile-sourced limit, so a conservative-input-budget model
+// (Qwen 96K) no longer pegs the ring at a false 100% ~35K early. Fallback /
+// ceiling / env limits already represent the window, so they're unchanged.
+func TestEffectiveDisplayLimit_ProfileAddsOutputReserve(t *testing.T) {
+	d, cleanup := setupDaemonWithProfiles(t, map[string]string{
+		"qwen.yaml":         testProfileQwenSmall,
+		"gemini-flash.yaml": testProfileGeminiFlash,
+	})
+	defer cleanup()
+
+	// Profile-sourced (96K < 128K ceiling): display = 96K + reserved output.
+	got := d.effectiveDisplayLimit("spark:Qwen/Qwen3.5-35B-A3B-FP8", "repo", "agent")
+	want := int64(96_000 + defaultMaxTokens)
+	if got != want {
+		t.Errorf("profile display limit = %d, want %d (input budget + reserved output)", got, want)
+	}
+
+	// Fallback (no profile): already represents the window → unchanged.
+	if got := d.effectiveDisplayLimit("unknown:model-x", "repo", "agent"); got != contextFallbackTokens {
+		t.Errorf("fallback display limit = %d, want %d (unchanged)", got, contextFallbackTokens)
+	}
+
+	// Ceiling (profile 1M clamped to 128K): the ceiling is the intended cap →
+	// unchanged, must NOT get an extra output reserve on top.
+	if got := d.effectiveDisplayLimit("google_genai:gemini-2.5-flash", "repo", "agent"); got != contextCeilingTokens {
+		t.Errorf("ceiling display limit = %d, want %d (unchanged)", got, contextCeilingTokens)
+	}
+
+	// Env override: operator's number is the window → unchanged.
+	t.Setenv("OAT_MODEL_CONTEXT_spark_qwen_qwen3.5-35b-a3b-fp8", "200000")
+	if got := d.effectiveDisplayLimit("spark:Qwen/Qwen3.5-35B-A3B-FP8", "repo", "agent"); got != 200_000 {
+		t.Errorf("env display limit = %d, want 200000 (unchanged)", got)
+	}
+}
+
+// TestHandleTokenUsageEvent_ClampsImplausibleOccupancy pins Phase 3 item 8: a
+// single wildly-huge context reading (flaky-reporting model) must NOT be stored,
+// so it can't pin the ring at 100% forever. A subsequent sane reading updates
+// normally, proving the meter isn't stranded.
+func TestHandleTokenUsageEvent_ClampsImplausibleOccupancy(t *testing.T) {
+	d, cleanup := setupTestDaemon(t)
+	defer cleanup()
+
+	const repo = "_assistant-personal"
+	const agent = "personal"
+	if err := d.state.AddRepo(repo, &state.Repository{SessionName: repo, Agents: map[string]state.Agent{}}); err != nil {
+		t.Fatalf("AddRepo: %v", err)
+	}
+	if err := d.state.AddAgent(repo, agent, state.Agent{Type: state.AgentTypeAssistant, PID: 1}); err != nil {
+		t.Fatalf("AddAgent: %v", err)
+	}
+
+	// Implausible reading (14M vs 128K fallback window) — must be ignored.
+	d.handleTokenUsageEvent(repo, agent, `{"cumulative_input":100,"cumulative_output":0,"context_input":14185804}`)
+	if got, _ := d.state.GetAgent(repo, agent); got.ContextWindowTokens != 0 {
+		t.Errorf("implausible occupancy was stored (%d); expected it to be rejected", got.ContextWindowTokens)
+	}
+
+	// A sane reading afterwards updates normally (meter not stranded).
+	d.handleTokenUsageEvent(repo, agent, `{"cumulative_input":50000,"cumulative_output":0,"context_input":50000}`)
+	if got, _ := d.state.GetAgent(repo, agent); got.ContextWindowTokens != 50_000 {
+		t.Errorf("sane occupancy = %d, want 50000 (meter must recover after a bad reading)", got.ContextWindowTokens)
+	}
+}

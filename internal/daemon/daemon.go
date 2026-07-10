@@ -4125,6 +4125,32 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 		})
 	}
 
+	// Resolve the PTY window name once, up here, so both the safety-net
+	// directive and the user message below target the same window.
+	windowName := agent.WindowName
+	if windowName == "" {
+		windowName = agentName
+	}
+
+	// Part 5e safety net (parity with handleAgentInput ~3072): if the
+	// target is at >= 95 % effective context capacity, prepend a synthetic
+	// compact-conversation directive as a SEPARATE PTY message BEFORE the
+	// user's. Previously only handleAgentInput (the bonded path) did this,
+	// so the multi-agent picker path (route_user_message) never fired the
+	// 95% safety net — a confirmed gap that let the picker-routed chat sail
+	// past the limit. Non-interrupt / non-system only (an interrupt carries
+	// no chat turn; a system directive is already a compact-class control),
+	// matching the same carve-outs above.
+	if !interrupt && !system {
+		if directive, inject := d.shouldInjectContextSafetyNet(agent, repoName, agentName); inject {
+			if err := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, directive); err != nil {
+				d.logger.Warn("route_user_message: context safety-net inject failed for %s/%s: %v", repoName, agentName, err)
+			} else {
+				d.logger.Warn("route_user_message: context safety-net injected for %s/%s before user message (capacity threshold crossed)", repoName, agentName)
+			}
+		}
+	}
+
 	// Prepend the side-panel sentinel + optional active-tab-id
 	// prefix. The assistantTurnTailer gates assistant-reply
 	// broadcast on having seen at least one `[SIDE-PANEL CHAT]`
@@ -4148,11 +4174,7 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// serialisation inside DirectBackend, so concurrent routes
 	// to the SAME target serialise at that layer without us
 	// holding daemon-level locks. Concurrent routes to
-	// DIFFERENT targets proceed in parallel.
-	windowName := agent.WindowName
-	if windowName == "" {
-		windowName = agentName
-	}
+	// DIFFERENT targets proceed in parallel. (windowName resolved above.)
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); err != nil {
 		return socket.ErrorResponse("backend.SendMessage failed for %s/%s: %v", repoName, agentName, err)
 	}
@@ -6124,6 +6146,23 @@ func (d *Daemon) handleResetAssistantSession(req socket.Request) socket.Response
 			scratchpadCleared = true
 		}
 	}
+
+	// Zero the live context-window reading and push a neutral "unknown"
+	// capacity frame, mirroring the two restart paths
+	// (handleRestartBrowserAgent ~6007 and the --fresh restart ~6263).
+	// Without this, resetting the session wipes the on-disk .session.jsonl
+	// but the daemon keeps broadcasting the stale pre-reset occupancy/tier
+	// forever — the exact "banner stuck at 100% after Reset session, on
+	// every subsequent message regardless of model" bug John hit. The
+	// persisted 0 seeds the snapshot a reconnecting subscriber gets; the
+	// published frame updates already-connected panels immediately.
+	agent.ContextWindowTokens = 0
+	if mErr := d.state.ModifyAgent(repoName, agentName, func(a *state.Agent) {
+		a.ContextWindowTokens = 0
+	}); mErr != nil {
+		d.logger.Warn("reset_assistant_session: failed to zero ContextWindowTokens for %s/%s: %v", repoName, agentName, mErr)
+	}
+	d.publishUnknownCapacityFrame(repoName, agentName, agent)
 
 	d.logger.Info("reset_assistant_session: wiped %s for %s/%s (full=%v scratchpad_cleared=%v)", jsonlPath, repoName, agentName, full, scratchpadCleared)
 	return socket.SuccessResponse(map[string]interface{}{
@@ -8321,7 +8360,19 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 	occupancyChanged := false
 	if payload.ContextInput > 0 || payload.ContextOutput > 0 {
 		newOccupancy := payload.ContextInput + payload.ContextOutput
-		if newOccupancy != agent.ContextWindowTokens {
+		// Phase 3 item 8 sanity clamp: reject an implausibly-huge reading so a
+		// single flaky [OAT_TOKENS] line can't pin the ring at 100% forever
+		// (no strictly-lower value ever follows once it floors). Only reject
+		// readings FAR above the model's real window — see
+		// contextOccupancySanityFactor. Distinct WARN so it's diagnosable.
+		dispLimit := d.effectiveDisplayLimit(agent.Model, repoName, agentName)
+		sanityCeiling := dispLimit * contextOccupancySanityFactor
+		if sanityCeiling > 0 && newOccupancy > sanityCeiling {
+			d.logger.Warn(
+				"Ignoring implausible context occupancy for %s/%s: %d tokens exceeds %dx the effective window (%d); flaky token reporting? Keeping last good reading.",
+				repoName, agentName, newOccupancy, contextOccupancySanityFactor, dispLimit,
+			)
+		} else if newOccupancy != agent.ContextWindowTokens {
 			agent.ContextWindowTokens = newOccupancy
 			occupancyChanged = true
 		}

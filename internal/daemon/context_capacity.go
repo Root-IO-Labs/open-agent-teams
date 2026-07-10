@@ -137,6 +137,20 @@ const (
 	// the user vulnerable to the crash loop).
 	safetyNetEnvVar = "OAT_CONTEXT_SAFETY_NET"
 
+	// contextOccupancySanityFactor bounds a single incoming context-window
+	// occupancy reading (Phase 3 item 8). A flaky-reporting model (the Qwen
+	// profile shows token_reporting 0.85, no per-chunk usage_metadata) can
+	// emit a wildly-wrong huge reading — the real daemon log showed an
+	// "incoming total 14185804" against a ~128K window — which, once stored,
+	// pins the ring at 100% forever because no strictly-lower value follows.
+	// We reject only readings FAR above the model's real window (this factor ×
+	// the effective limit), never merely-above the conservative input budget
+	// (legit near-limit sessions exceed that), so one bad [OAT_TOKENS] line
+	// can't strand the meter. 4× the window is generous enough to admit any
+	// honest reading (real window ~1.36× the conservative input budget) while
+	// still catching a 100×-type garbage value.
+	contextOccupancySanityFactor = int64(4)
+
 	// outputReservationEnvVar gates the Phase 1 output-headroom
 	// reservation (default ON). When enabled, the 75%/95% safety-net
 	// tiers are computed against the model's window MINUS the reserved
@@ -364,6 +378,44 @@ func (d *Daemon) effectiveContextBudget(modelID, repoName, agentName string) (bu
 	return budget, source
 }
 
+// effectiveDisplayLimit returns the denominator the USER-VISIBLE ring meter
+// measures occupancy against — an approximation of the model's REAL usable
+// context window, so "100% means the model will actually reject the next turn"
+// (Phase 3 decision 3, "full means full").
+//
+// Why this differs from effectiveContextLimit: an onboarded ModelProfile records
+// only `max_input_tokens` (the PROMPT budget ≈ real_window − max_output), never
+// the full context window. For the DGX-Spark Qwen that's max_input_tokens=96000
+// while the model's real hard limit is ~131072 — so pegging the ring at 96000
+// shows a permanent, broken-looking 100% while the model happily keeps accepting
+// turns (exactly John's "indicators say 100% but it keeps working"). The real
+// window isn't stored anywhere in OAT's data, so when the limit came from a
+// profile's input budget we approximate the window as input_budget + reserved
+// output headroom (≈ real_window, because max_input_tokens ≈ real_window −
+// max_output). For Qwen: 96000 + 32000 = 128000 ≈ the real 131072.
+//
+// Only the "profile" source is adjusted. "env" (operator-set), "ceiling" (the
+// 128K attention-degradation cap) and "fallback" (the 128K "assume the modern
+// floor" guess) already represent the intended WINDOW, not an input budget, so
+// they are returned unchanged — this also keeps them from over-stating.
+//
+// This is an approximation, not a probed value; a dedicated real-context-window
+// profile field would let the ring be exact (noted as a follow-up). The internal
+// safety-net TIERS keep using the smaller effectiveContextBudget so compaction
+// still fires early — the display denominator is deliberately larger than the
+// tier denominator.
+func (d *Daemon) effectiveDisplayLimit(modelID, repoName, agentName string) int64 {
+	limit, source := d.effectiveContextLimit(modelID, repoName, agentName)
+	if source != "profile" || limit <= 0 {
+		return limit
+	}
+	reserved := int64(d.resolveOutputMaxTokens(modelID))
+	if reserved <= 0 {
+		return limit
+	}
+	return limit + reserved
+}
+
 // warnf forwards to `d.logger.Warn` and is the WARN sink that
 // `contextEnvOverride` calls (the override doesn't have direct
 // access to the daemon -- threading the sink through the call
@@ -472,14 +524,19 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	if d.contextCap == nil {
 		return
 	}
-	// Two denominators (Phase 1 item 2 + Phase 3 item 7): the ring meter
-	// measures used/window so "full means full", while the internal
-	// 75%/95% tiers measure against window-minus-output so compaction
-	// fires with room left for the reply.
+	// Three denominators (Phase 1 item 2 + Phase 3 item 7):
+	//   - displayLimit: the ring meter's real-window approximation so
+	//     "full means full" and a profile-input-budget model (Qwen 96K)
+	//     doesn't peg at a false 100% ~35K early.
+	//   - budget: the internal 75%/95% tiers measure against
+	//     window-minus-output so compaction fires with room for the reply.
+	//   - limit: the raw effectiveContextLimit, used only for the hint's
+	//     human-readable "window" figure below.
 	limit, _ := d.effectiveContextLimit(agent.Model, repoName, agentName)
+	displayLimit := d.effectiveDisplayLimit(agent.Model, repoName, agentName)
 	budget, _ := d.effectiveContextBudget(agent.Model, repoName, agentName)
 	used, known := agentContextOccupancy(agent)
-	displayPct := computeCapacityPct(used, limit)
+	displayPct := computeCapacityPct(used, displayLimit)
 	tierPct := computeCapacityPct(used, budget)
 
 	// Emit a capacity frame on EVERY token event (i.e. every turn) so
@@ -491,7 +548,7 @@ func (d *Daemon) maybeNudgeContextCapacity(repoName, agentName string, agent sta
 	// unknown the frame carries tier "unknown" (neutral/hidden meter).
 	// The ring uses the real-window denominator (displayPct).
 	if repo, ok := d.state.GetRepo(repoName); ok {
-		d.publishCapacityFrame(repoName, agentName, repo.SessionName, displayPct, used, limit, known)
+		d.publishCapacityFrame(repoName, agentName, repo.SessionName, displayPct, used, displayLimit, known)
 	}
 
 	// Hint + safety net are assistant-only and require a real window
