@@ -62,16 +62,36 @@ const recoveryDefaultMax = 1
 // (bridge/src/{index,mcp/server}.ts, extension/src/messaging.ts).
 var recoverableErrorCodes = map[string]bool{
 	// Tab addressing — model can re-observe tabs / (re)attach.
-	"TAB_CLOSED":        true,
-	"TAB_NOT_ATTACHED":  true,
-	"NO_ACTIVE_TAB":     true,
-	"CROSS_TAB_BLOCKED": true,
-	"MAX_TABS_EXCEEDED": true,
+	// DEBUGGER_ATTACH_FAILED is the weak-model tabId-hallucination
+	// symptom (Qwen `tabId:1`): re-checking tabs + attaching the right
+	// one is exactly the model-fixable recovery.
+	"TAB_CLOSED":             true,
+	"TAB_NOT_ATTACHED":       true,
+	"NO_ACTIVE_TAB":          true,
+	"CROSS_TAB_BLOCKED":      true,
+	"MAX_TABS_EXCEEDED":      true,
+	"DEBUGGER_ATTACH_FAILED": true,
 	// Stale / missing element references — model can re-snapshot.
 	"STALE_REF":         true,
 	"REF_STALE":         true,
 	"ELEMENT_NOT_FOUND": true,
 	"NODE_NOT_FOUND":    true,
+	// Element-interaction failures — model can re-snapshot the page and
+	// retry against a fresh reference (the target moved / re-rendered).
+	"CLICK_FAILED":     true,
+	"TYPE_FAILED":      true,
+	"FILL_FAILED":      true,
+	"SELECT_FAILED":    true,
+	"CHECK_FAILED":     true,
+	"HOVER_FAILED":     true,
+	"DRAG_FAILED":      true,
+	"SCROLL_FAILED":    true,
+	"SCROLL_TO_FAILED": true,
+	"KEY_PRESS_FAILED": true,
+	// Navigation / wait — model can re-check the URL/tab or wait on a
+	// different condition and continue.
+	"NAVIGATION_FAILED": true,
+	"WAIT_TIMEOUT":      true,
 	// Bad tool arguments — model can correct and retry.
 	"UNKNOWN_ARG":    true,
 	"INVALID_PARAMS": true,
@@ -101,10 +121,16 @@ func recoveryMax() int {
 // interpolated. Codes are grouped by remediation shape.
 func recoveryInstructionForCode(code string) string {
 	switch code {
-	case "TAB_CLOSED", "TAB_NOT_ATTACHED", "NO_ACTIVE_TAB", "CROSS_TAB_BLOCKED", "MAX_TABS_EXCEEDED":
+	case "TAB_CLOSED", "TAB_NOT_ATTACHED", "NO_ACTIVE_TAB", "CROSS_TAB_BLOCKED", "MAX_TABS_EXCEEDED", "DEBUGGER_ATTACH_FAILED":
 		return "Re-check which browser tabs are open and attach to the correct one before retrying."
-	case "STALE_REF", "REF_STALE", "ELEMENT_NOT_FOUND", "NODE_NOT_FOUND":
+	case "STALE_REF", "REF_STALE", "ELEMENT_NOT_FOUND", "NODE_NOT_FOUND",
+		"CLICK_FAILED", "TYPE_FAILED", "FILL_FAILED", "SELECT_FAILED", "CHECK_FAILED",
+		"HOVER_FAILED", "DRAG_FAILED", "SCROLL_FAILED", "SCROLL_TO_FAILED", "KEY_PRESS_FAILED":
 		return "Take a fresh snapshot of the page and locate the element again — the reference you used is no longer valid."
+	case "NAVIGATION_FAILED":
+		return "Re-check the URL and the target tab, then try the navigation again."
+	case "WAIT_TIMEOUT":
+		return "The thing you waited for did not appear in time. Re-check the page state and either wait for a different condition or continue with what is available."
 	case "UNKNOWN_ARG", "INVALID_PARAMS", "INVALID_RANGE":
 		return "Re-check the arguments you passed to the tool and correct them."
 	case "SCREENSHOT_EMPTY", "SCREENSHOT_FAILED":

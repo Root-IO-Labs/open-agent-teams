@@ -65,6 +65,12 @@ A persistent assistant used to occasionally go silent after a browser tool call 
 
 The assistant is also prompted to **always finish with a plain-language outcome** and to **report a blocking error on the first failure** rather than waiting to be asked.
 
+## Watching the assistant work
+
+- **Live plan card.** When the assistant plans with `write_todos`, its checklist renders inline in the chat as a single **Plan (done/total)** card that updates in place as items move through pending → in progress → done. It's a compact, read-only card — the full plan, not the truncated one-line tool preview — and it's persisted, so reopening the panel or switching agents replays the latest plan. (Under the hood the runtime writes an `[OAT_TODOS]` line the daemon forwards; the rendered card never re-enters the model's context.)
+- **Narration.** While the assistant works, the activity indicator shows what it's doing right now ("reading a file…", "planning…", "clicking…"). Specific narration is held on screen briefly even for sub-second steps so it doesn't flash past, then falls back to the generic "working…"/"still working…" during genuine idle gaps.
+- **Work in my current tab.** For browser tasks, you can point the assistant at the tab you're already on instead of letting it open a new window: either tick **"Use my current tab"** in the chat header (sticky across sends) or just say so in your message ("use my current tab", "do it here", "in this tab"). The pin makes your current tab the default target for tool calls that omit or mis-guess a tab id, which is especially important with weaker local models. Reads/navigation on the pinned tab are allowed; consequential actions still ask for approval, and every interaction on your own tab is audited.
+
 ## System status (Manage tab)
 
 The side panel's **Manage** tab has a **System status** card showing the live health of the pieces the assistant depends on — OAT service (daemon), Bridge, Browser (extension/CDP link), and OAT CLI. If any of these goes unhealthy while you're chatting, an amber notice also appears in the chat tab with the fix action (e.g. "run `oat start`" when the daemon is down, or reload the extension when the browser link drops), so you don't have to open the Manage tab to notice.

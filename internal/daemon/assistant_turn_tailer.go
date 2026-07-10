@@ -65,6 +65,22 @@ type assistantTurnFrame struct {
 	// The panel shows a quiet "trying another way" note instead of a
 	// prominent error when true.
 	Recovering bool `json:"recovering,omitempty"`
+
+	// --- todos frame fields (Kind == "todos") ---
+	// Emitted on each `[OAT_TODOS]` sentinel (every write_todos call).
+	// Carries the agent's full live plan for the side panel's checklist
+	// card. omitempty so non-todos frames stay byte-identical on the
+	// wire; old panels ignore the unknown field.
+	Todos []todoFrameItem `json:"todos,omitempty"`
+}
+
+// todoFrameItem is the wire shape of one checklist row forwarded to the
+// side panel. Mirrors TodoItem; a distinct type keeps the JSON tags for
+// the frame contract separate from the parser's internal struct.
+type todoFrameItem struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"`
+	ActiveForm string `json:"activeForm,omitempty"`
 }
 
 // turnBroadcaster fans out parsed AssistantTurn values from one
@@ -169,6 +185,25 @@ func (b *turnBroadcaster) PublishTurnEnd(info turnEndInfo, recovering bool) {
 		Recovering:   recovering,
 		TS:           time.Now().UTC().Format(time.RFC3339Nano),
 	}, "turn_end", info.Code)
+}
+
+// PublishTodos broadcasts a todos frame — one per write_todos call
+// (the `[OAT_TODOS]` sentinel). Same fire-and-forget fan-out as Publish.
+// An empty list is valid (the panel clears the card).
+func (b *turnBroadcaster) PublishTodos(items []TodoItem) {
+	frameItems := make([]todoFrameItem, 0, len(items))
+	for _, it := range items {
+		frameItems = append(frameItems, todoFrameItem{
+			Content:    it.Content,
+			Status:     it.Status,
+			ActiveForm: it.ActiveForm,
+		})
+	}
+	b.publishFrame(assistantTurnFrame{
+		Kind:  "todos",
+		Todos: frameItems,
+		TS:    time.Now().UTC().Format(time.RFC3339Nano),
+	}, "todos", "")
 }
 
 // publishFrame is the shared fan-out path for Publish / PublishTool.
@@ -677,6 +712,14 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				}
 				t.broadcaster.PublishTurnEnd(info, recovering)
 				resetTurnState()
+			case EventTodos:
+				// Live plan/checklist. Gated on the same side-panel
+				// sentinel as chat + tool rows so pre-chat plans don't
+				// spam the panel. textContent-only render downstream.
+				if !t.sidePanelActive.Load() {
+					continue
+				}
+				t.broadcaster.PublishTodos(ev.Todos)
 			}
 		}
 	}

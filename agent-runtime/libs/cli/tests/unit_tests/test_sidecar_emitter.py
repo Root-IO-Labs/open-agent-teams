@@ -320,3 +320,73 @@ class TestTurnEndSentinel:
         monkeypatch.delenv("OAT_TOOL_LOG", raising=False)
         sidecar_emitter.set_turn_id(sidecar_emitter.new_turn_id())
         sidecar_emitter.emit_turn_end()  # must not raise
+
+
+# --- [OAT_TODOS] tool-log sentinel ---
+
+
+class TestTodosSentinel:
+    """emit_todos() writes a dedicated ``[OAT_TODOS] <json>`` line to
+    OAT_TOOL_LOG carrying the full plan/checklist, so the daemon can
+    forward it to the side panel's live todo card. The full list bypasses
+    the parser's 200-byte tool-arg preview cap."""
+
+    def test_writes_json_line_from_todos_arg(self, monkeypatch, tmp_path):
+        import json
+
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_todos(
+            {
+                "todos": [
+                    {"content": "A", "status": "completed", "activeForm": "Doing A"},
+                    {"content": "B", "status": "in_progress", "activeForm": "Doing B"},
+                ]
+            }
+        )
+        contents = log.read_text(encoding="utf-8")
+        assert contents.count("[OAT_TODOS]") == 1
+        payload = contents.split("[OAT_TODOS]", 1)[1].strip()
+        parsed = json.loads(payload)
+        assert len(parsed) == 2
+        assert parsed[0] == {"content": "A", "status": "completed", "activeForm": "Doing A"}
+        assert parsed[1]["status"] == "in_progress"
+
+    def test_accepts_bare_list(self, monkeypatch, tmp_path):
+        import json
+
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_todos([{"content": "X", "status": "pending"}])
+        payload = log.read_text(encoding="utf-8").split("[OAT_TODOS]", 1)[1].strip()
+        parsed = json.loads(payload)
+        assert parsed == [{"content": "X", "status": "pending", "activeForm": ""}]
+
+    def test_empty_list_still_emits(self, monkeypatch, tmp_path):
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_todos({"todos": []})
+        assert "[OAT_TODOS] []" in log.read_text(encoding="utf-8")
+
+    def test_non_list_shape_writes_nothing(self, monkeypatch, tmp_path):
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_todos({"not_todos": 1})
+        assert not log.exists() or log.read_text(encoding="utf-8") == ""
+
+    def test_item_count_and_fields_are_bounded(self, monkeypatch, tmp_path):
+        import json
+
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        big = "Z" * 5000
+        items = [{"content": big, "status": "pending"} for _ in range(200)]
+        sidecar_emitter.emit_todos({"todos": items})
+        payload = log.read_text(encoding="utf-8").split("[OAT_TODOS]", 1)[1].strip()
+        parsed = json.loads(payload)
+        assert len(parsed) <= 50
+        assert all(len(it["content"]) <= 500 for it in parsed)
+
+    def test_noop_when_tool_log_unset(self, monkeypatch):
+        monkeypatch.delenv("OAT_TOOL_LOG", raising=False)
+        sidecar_emitter.emit_todos({"todos": [{"content": "A", "status": "pending"}]})  # no raise

@@ -13,10 +13,22 @@ func TestRecoverableErrorCodes_Classification(t *testing.T) {
 		"TAB_CLOSED", "TAB_NOT_ATTACHED", "NO_ACTIVE_TAB", "CROSS_TAB_BLOCKED",
 		"STALE_REF", "ELEMENT_NOT_FOUND", "UNKNOWN_ARG", "INVALID_PARAMS",
 		"SCREENSHOT_EMPTY", "SCREENSHOT_FAILED",
+		// Codes observed in the Qwen test round (weak-model tabId
+		// hallucination, wait/nav failures, element re-render churn) —
+		// all model-fixable by re-observing + retrying once.
+		"DEBUGGER_ATTACH_FAILED", "WAIT_TIMEOUT", "NAVIGATION_FAILED",
+		"CLICK_FAILED", "TYPE_FAILED", "FILL_FAILED", "SELECT_FAILED",
+		"CHECK_FAILED", "HOVER_FAILED", "DRAG_FAILED", "SCROLL_FAILED",
+		"SCROLL_TO_FAILED", "KEY_PRESS_FAILED",
 	}
 	for _, code := range recoverable {
 		if !recoverableErrorCodes[code] {
 			t.Errorf("expected %q to be recoverable", code)
+		}
+		// Every recoverable code must also map to a non-empty generic
+		// instruction (so a re-prompt never ships an empty remediation).
+		if strings.TrimSpace(recoveryInstructionForCode(code)) == "" {
+			t.Errorf("recoverable code %q has an empty recovery instruction", code)
 		}
 	}
 

@@ -1062,6 +1062,12 @@ async def execute_task_textual(
                                     if buffer_id is not None
                                     else "",
                                 )
+                                # Emit the full todo list on its own sentinel
+                                # so the panel's live checklist card gets the
+                                # complete plan — the generic tool-arg preview
+                                # is truncated to 200 bytes upstream.
+                                if buffer_name == "write_todos":
+                                    sidecar_emitter.emit_todos(parsed_args)
 
                                 # Hide spinner before showing tool call
                                 if adapter._set_spinner:
@@ -1251,6 +1257,23 @@ async def execute_task_textual(
                             "Command rejected. Tell the agent what you'd like instead."
                         )
                     )
+                    # Early-return completion path (HITL reject). Mirror the
+                    # other completion paths so the turn's tokens are committed
+                    # and the [OAT_TURN_END] sentinel fires here rather than
+                    # relying on the app.py finally backstop — otherwise a
+                    # rejected turn left the side-panel spinner up.
+                    _commit_token_tracking(
+                        adapter,
+                        latest_main_context_input,
+                        latest_main_context_output,
+                        spend_input_delta,
+                        spend_output_delta,
+                        spend_cache_read_delta,
+                        spend_cache_creation_delta,
+                    )
+                    sidecar_emitter.emit_turn_end()
+                    if conv_log:
+                        conv_log.close()
                     return
 
                 stream_input = Command(resume=hitl_response)

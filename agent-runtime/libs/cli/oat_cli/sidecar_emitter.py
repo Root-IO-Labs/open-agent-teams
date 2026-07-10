@@ -255,6 +255,52 @@ def emit_turn_end() -> None:
     set_turn_id(None)
 
 
+def emit_todos(todos: Any) -> None:
+    """Write a dedicated ``[OAT_TODOS] <json>`` line to ``OAT_TOOL_LOG``.
+
+    Carries the full plan/checklist so the daemon can forward it to the
+    side panel's live todo card — the parser's generic tool-arg preview is
+    truncated to 200 bytes, which is why the card can't ride the ordinary
+    ``TOOL: write_todos`` block. Mirrors ``emit_turn_end``'s best-effort,
+    never-raise, direct-append pattern.
+
+    ``todos`` is the raw ``write_todos`` arg dict (``{"todos": [...]}``) or
+    a bare list. Items are normalized to ``{content, status, activeForm}``,
+    the count is bounded, and each string field is length-capped here so a
+    runaway plan can't bloat the log line (the daemon re-bounds on its side
+    too — defense in depth). A malformed shape emits nothing.
+    """
+    log_path = os.environ.get("OAT_TOOL_LOG")
+    if not log_path:
+        return
+    try:
+        items = todos.get("todos") if isinstance(todos, dict) else todos
+        if not isinstance(items, list):
+            return
+        max_items = 50
+        max_field = 500
+        normalized: list[dict[str, str]] = []
+        for it in items[:max_items]:
+            if not isinstance(it, dict):
+                continue
+            content = str(it.get("content", ""))[:max_field]
+            status = str(it.get("status", "pending"))[:32]
+            active_form = str(it.get("activeForm", ""))[:max_field]
+            normalized.append(
+                {"content": content, "status": status, "activeForm": active_form}
+            )
+        # An empty list is meaningful (plan cleared) — still emit it. Only a
+        # non-list shape bails above.
+        import json as _json
+
+        payload = _json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[OAT_TODOS] {payload}\n")
+            f.flush()
+    except (OSError, TypeError, ValueError) as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: emit_todos failed: %s", e)
+
+
 def emit_assistant_delta(content: str) -> None:
     c = _get_client()
     if c is None:

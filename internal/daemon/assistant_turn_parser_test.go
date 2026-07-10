@@ -1349,3 +1349,159 @@ func TestTailerToolEventsGatedOffForBrowserAgents(t *testing.T) {
 		}
 	}
 }
+
+// TestParseEventsTodosSentinel covers the [OAT_TODOS] round-trip: a
+// well-formed sentinel becomes one EventTodos with the full (bounded)
+// list, and it correctly terminates any open block.
+func TestParseEventsTodosSentinel(t *testing.T) {
+	t.Run("well-formed list parses to EventTodos", func(t *testing.T) {
+		lines := []string{
+			"[10:00:00] ASSISTANT:",
+			"  Planning.",
+			"",
+			`[OAT_TODOS] [{"content":"Open site","status":"completed","activeForm":"Opening site"},{"content":"Take screenshot","status":"in_progress","activeForm":"Taking screenshot"},{"content":"Write doc","status":"pending","activeForm":"Writing doc"}]`,
+		}
+		events := parseEvents(lines)
+		var todos *Event
+		for i := range events {
+			if events[i].Kind == EventTodos {
+				todos = &events[i]
+			}
+		}
+		if todos == nil {
+			t.Fatalf("expected an EventTodos, got %+v", events)
+		}
+		if len(todos.Todos) != 3 {
+			t.Fatalf("expected 3 todo items, got %d", len(todos.Todos))
+		}
+		if todos.Todos[0].Content != "Open site" || todos.Todos[0].Status != "completed" {
+			t.Errorf("item 0 wrong: %+v", todos.Todos[0])
+		}
+		if todos.Todos[1].Status != "in_progress" || todos.Todos[1].ActiveForm != "Taking screenshot" {
+			t.Errorf("item 1 wrong: %+v", todos.Todos[1])
+		}
+	})
+
+	t.Run("malformed JSON yields no EventTodos", func(t *testing.T) {
+		lines := []string{`[OAT_TODOS] {not valid json`}
+		for _, ev := range parseEvents(lines) {
+			if ev.Kind == EventTodos {
+				t.Fatalf("malformed sentinel must not emit EventTodos: %+v", ev)
+			}
+		}
+	})
+
+	t.Run("empty payload yields no EventTodos", func(t *testing.T) {
+		lines := []string{"[OAT_TODOS] "}
+		for _, ev := range parseEvents(lines) {
+			if ev.Kind == EventTodos {
+				t.Fatalf("empty sentinel must not emit EventTodos: %+v", ev)
+			}
+		}
+	})
+
+	t.Run("empty list is valid and emits EventTodos", func(t *testing.T) {
+		lines := []string{"[OAT_TODOS] []"}
+		var found bool
+		for _, ev := range parseEvents(lines) {
+			if ev.Kind == EventTodos {
+				found = true
+				if len(ev.Todos) != 0 {
+					t.Errorf("expected empty todo list, got %d", len(ev.Todos))
+				}
+			}
+		}
+		if !found {
+			t.Fatal("empty [] should still emit EventTodos so the panel can clear the card")
+		}
+	})
+
+	t.Run("item count is bounded", func(t *testing.T) {
+		var sb strings.Builder
+		sb.WriteString("[OAT_TODOS] [")
+		for i := 0; i < todosMaxItems+20; i++ {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`{"content":"x","status":"pending"}`)
+		}
+		sb.WriteByte(']')
+		events := parseEvents([]string{sb.String()})
+		for _, ev := range events {
+			if ev.Kind == EventTodos && len(ev.Todos) > todosMaxItems {
+				t.Fatalf("todo item count not bounded: got %d, cap %d", len(ev.Todos), todosMaxItems)
+			}
+		}
+	})
+
+	t.Run("oversize payload is rejected", func(t *testing.T) {
+		big := strings.Repeat("A", todosMaxBytes+10)
+		lines := []string{`[OAT_TODOS] [{"content":"` + big + `","status":"pending"}]`}
+		for _, ev := range parseEvents(lines) {
+			if ev.Kind == EventTodos {
+				t.Fatalf("oversize sentinel must be rejected: %+v", ev)
+			}
+		}
+	})
+}
+
+// TestTailerPublishesTodosFrame verifies the tailer forwards a parsed
+// [OAT_TODOS] sentinel as a todos frame once side-panel chat is armed.
+func TestTailerPublishesTodosFrame(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, true, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	body := strings.Join([]string{
+		"[08:18:00] USER:",
+		"  [SIDE-PANEL CHAT] go",
+		"",
+		`[OAT_TODOS] [{"content":"Step one","status":"in_progress","activeForm":"Doing step one"}]`,
+		"",
+		"[08:19:20] ASSISTANT:",
+		"  Done.",
+		"",
+		"[OAT_TOKENS] {\"delta_input\": 1}",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case fr := <-ch:
+			if fr.Kind == "todos" {
+				if len(fr.Todos) != 1 || fr.Todos[0].Content != "Step one" {
+					t.Fatalf("todos frame wrong: %+v", fr)
+				}
+				return
+			}
+			if fr.Done {
+				t.Fatal("stream closed before a todos frame arrived")
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for a todos frame")
+		}
+	}
+}

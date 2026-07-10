@@ -140,12 +140,39 @@ const (
 	// `[OAT_TOKENS]` — the latter is ALSO emitted right after a mid-turn
 	// compaction, so it would false-fire mid-turn.
 	EventTurnEnd
+	// EventTodos carries the full plan/checklist the runtime wrote to
+	// OAT_TOOL_LOG via the `[OAT_TODOS] <json>` sentinel (emit_todos,
+	// fired on every write_todos call). Event.Todos holds the structured
+	// list. This rides its own sentinel — NOT the ordinary
+	// `TOOL: write_todos` block — because the generic tool-arg preview is
+	// truncated to toolArgPreviewMaxBytes (200), which would clip any
+	// real plan. The tailer forwards it as a `todos` frame for the side
+	// panel's live checklist card.
+	EventTodos
 )
 
 // turnEndSentinel is the literal marker the runtime writes to
 // OAT_TOOL_LOG at emit_turn_end. Format: "[OAT_TURN_END] <turn_id>".
 // We match on the prefix only; the trailing turn_id is informational.
 const turnEndSentinel = "[OAT_TURN_END]"
+
+// todosSentinel is the literal marker the runtime writes at emit_todos.
+// Format: "[OAT_TODOS] <json-array>". The JSON is the full checklist so
+// it deliberately bypasses the 200-byte tool-arg preview cap.
+const todosSentinel = "[OAT_TODOS]"
+
+// todosMaxBytes bounds the JSON payload we will attempt to json.Unmarshal
+// from an `[OAT_TODOS]` line — an allocation guard against a runaway /
+// forged plan (the sentinel is model-forgeable, same class as
+// [OAT_TURN_END]; a forged card can only draw an inert checklist). The
+// runtime already caps each item, but this is defense-in-depth.
+const todosMaxBytes = 32 * 1024
+
+// todosMaxItems bounds how many items we keep from a single todos frame.
+const todosMaxItems = 50
+
+// todosItemFieldMaxBytes clamps each string field of a parsed todo item.
+const todosItemFieldMaxBytes = 500
 
 // Event is one item produced by the streaming parser. Exactly one of
 // the kind-specific payload fields is meaningful per the Kind value:
@@ -183,6 +210,18 @@ type Event struct {
 	// RESULT body carries one. Defaults to false when absent. Secondary
 	// signal for recovery classification (the code allowlist is primary).
 	Retryable bool
+	// Todos is the parsed checklist for EventTodos. Bounded in count and
+	// per-field length by the parser. Nil for every other kind.
+	Todos []TodoItem
+}
+
+// TodoItem is one entry of an assistant's live plan/checklist, mirroring
+// the runtime's write_todos item shape. Rendered as a live card row in
+// the side panel (textContent-only; never re-enters the model context).
+type TodoItem struct {
+	Content    string `json:"content"`
+	Status     string `json:"status"`
+	ActiveForm string `json:"activeForm"`
 }
 
 // toolArgPreviewMaxBytes caps the per-tool arg preview the parser
@@ -394,6 +433,17 @@ func parseEvents(lines []string) []Event {
 			out = append(out, Event{Kind: EventTurnEnd})
 			continue
 		}
+		// The live-plan checklist sentinel. Like [OAT_TURN_END] it also
+		// matches nextMarkerRE, so flush() correctly terminates any open
+		// block first. The JSON payload is bounded + validated in
+		// parseTodosSentinel; a malformed/oversize line yields no event.
+		if strings.HasPrefix(line, todosSentinel) {
+			flush()
+			if items, ok := parseTodosSentinel(line); ok {
+				out = append(out, Event{Kind: EventTodos, Todos: items})
+			}
+			continue
+		}
 		if current == none {
 			continue
 		}
@@ -556,6 +606,43 @@ func extractResultErrorMeta(body string) (code string, retryable bool) {
 		retryable = b
 	}
 	return code, retryable
+}
+
+// parseTodosSentinel extracts the bounded checklist from an
+// `[OAT_TODOS] <json>` line. Returns (items, true) on a well-formed,
+// in-bounds payload; (nil, false) for a missing/oversize/malformed one
+// (the caller then emits no event). An empty list is valid and returns
+// (nil-or-empty, true) so the panel can clear a stale card. Fail-closed:
+// anything we can't confidently parse is dropped, never surfaced.
+func parseTodosSentinel(line string) ([]TodoItem, bool) {
+	payload := strings.TrimSpace(strings.TrimPrefix(line, todosSentinel))
+	if payload == "" {
+		return nil, false
+	}
+	// Allocation guard: never hand an unbounded blob to json.Unmarshal.
+	if len(payload) > todosMaxBytes {
+		return nil, false
+	}
+	var raw []TodoItem
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		return nil, false
+	}
+	if len(raw) > todosMaxItems {
+		raw = raw[:todosMaxItems]
+	}
+	out := make([]TodoItem, 0, len(raw))
+	for _, it := range raw {
+		status := strings.TrimSpace(it.Status)
+		if status == "" {
+			status = "pending"
+		}
+		out = append(out, TodoItem{
+			Content:    clampToolPreview(sanitizeEmitText(it.Content), todosItemFieldMaxBytes),
+			Status:     clampToolPreview(sanitizeEmitText(status), 32),
+			ActiveForm: clampToolPreview(sanitizeEmitText(it.ActiveForm), todosItemFieldMaxBytes),
+		})
+	}
+	return out, true
 }
 
 // buildToolArgPreview folds the leading `key: value` body lines of a
