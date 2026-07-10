@@ -7514,6 +7514,7 @@ func (c *CLI) setAgentModelCmd(args []string) error {
 		changed      = true
 		needsRestart = true
 		wasRunning   = false
+		agentType    string
 	)
 	if data, ok := resp.Data.(map[string]interface{}); ok {
 		if pm, ok := data["prior_model"].(string); ok {
@@ -7531,6 +7532,16 @@ func (c *CLI) setAgentModelCmd(args []string) error {
 		if w, ok := data["was_running"].(bool); ok {
 			wasRunning = w
 		}
+		if at, ok := data["agent_type"].(string); ok {
+			agentType = at
+		}
+	}
+
+	// Advisory (Phase 10 item 2): only for browser/assistant agents, whose
+	// interactive browsing is what a slow / low-shell_recovery model hurts.
+	// Never blocks — a worker on the same model is a fine choice.
+	if agentType == string(state.AgentTypeBrowser) || agentType == string(state.AgentTypeAssistant) {
+		c.warnIfPoorBrowsingModel(newModel)
 	}
 
 	if changed {
@@ -7711,6 +7722,9 @@ func (c *CLI) addAgentCmd(args []string) error {
 				),
 			)
 		}
+		// Advisory: the model is onboarded but may browse poorly (slow / low
+		// shell-recovery). Warn and proceed — never block BYO-model (Phase 10 item 2).
+		c.warnIfPoorBrowsingModel(model)
 	}
 
 	worktreePath := c.paths.AgentWorktree(repoName, agentName)
@@ -10211,6 +10225,39 @@ func (c *CLI) modelProfileExists(modelID string) bool {
 		}
 	}
 	return false
+}
+
+// warnIfPoorBrowsingModel prints an ADVISORY (non-fatal) warning when modelID
+// is onboarded but a poor fit for an interactive browser/assistant agent —
+// e.g. the DGX-Spark Qwen profile John hit (low shell_recovery + ~40s/step)
+// that grinds and feels frozen (Phase 10 item 2). It never returns an error and
+// never blocks: bring-your-own-model must keep working. Silent when the model
+// isn't onboarded (the caller's onboard preflight handles that), when the fit
+// is fine, or when the profile store can't be read.
+func (c *CLI) warnIfPoorBrowsingModel(modelID string) {
+	if strings.TrimSpace(modelID) == "" {
+		return
+	}
+	profiles, err := routing.NewProfileStore(c.paths.ModelProfilesDir)
+	if err != nil {
+		return
+	}
+	p, _, err := profiles.LookupNormalized(modelID)
+	if err != nil || p == nil {
+		return
+	}
+	warnings := p.BrowsingFitWarnings()
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n⚠️  Model %q may be a poor fit for a browser/assistant agent:\n", modelID)
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "   - %s\n", w)
+	}
+	fmt.Fprintf(os.Stderr,
+		"   Proceeding anyway (advisory only). For smoother interactive browsing, consider a\n"+
+			"   faster model with better shell recovery (e.g. anthropic:claude-sonnet-4-6). Tune or\n"+
+			"   silence this with OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY / OAT_BROWSER_MODEL_MAX_INFERENCE_MS.\n\n")
 }
 
 // normalizeModelIDForEnv mirrors `internal/daemon.normalizeModelIDForEnv`

@@ -2799,6 +2799,10 @@ func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
 		// from state.Agent.PID -- same signal the rest of the
 		// daemon's lifecycle code uses.
 		"was_running": wasRunning,
+		// Agent type so the CLI can scope the browser-model-suitability
+		// advisory (Phase 10 item 2) to browser/assistant agents only —
+		// a slow/low-shell_recovery model is a fair pick for a worker.
+		"agent_type": string(agent.Type),
 	})
 }
 

@@ -158,6 +158,84 @@ func (p *ModelProfile) IsEligible(role AgentRole) bool {
 	}
 }
 
+// Default thresholds for the browser/assistant model-suitability guard
+// (Phase 10 item 2). Env-tunable so an operator running a known-slow local
+// model can quiet the advice without a code change. These are advisory only —
+// they never block a bring-your-own-model setup.
+const (
+	// defaultBrowserMinShellRecovery flags models that recover poorly from a
+	// failed tool/shell step. The DGX-Spark Qwen profile that triggered John's
+	// grind is ~0.44 with an explicit "does not recover from shell failures"
+	// onboarding note; 0.5 catches that class without flagging solid models.
+	defaultBrowserMinShellRecovery = 0.5
+	// defaultBrowserMaxInferenceMs flags very slow models where every stuck
+	// step is expensive and the run "feels frozen." Qwen basic inference is
+	// ~40s/step; 20s is a generous ceiling for interactive browsing.
+	defaultBrowserMaxInferenceMs = 20000
+)
+
+// BrowsingFitWarnings returns human-readable advisories when this model is a
+// poor fit for an interactive browser/assistant agent (Phase 10 item 2). It is
+// ADVISORY ONLY — callers surface the strings as a WARN and proceed; a
+// bring-your-own-model setup must never be hard-blocked. Returns nil (no
+// warnings) for a good fit, an un-probed metric, or a nil profile.
+//
+// Thresholds come from OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY and
+// OAT_BROWSER_MODEL_MAX_INFERENCE_MS (fall back to the defaults above). Setting
+// either to a value that can't be crossed effectively disables that check.
+func (p *ModelProfile) BrowsingFitWarnings() []string {
+	if p == nil {
+		return nil
+	}
+	var warnings []string
+
+	minRecovery := envFloat("OAT_BROWSER_MODEL_MIN_SHELL_RECOVERY", defaultBrowserMinShellRecovery)
+	// Only flag shell_recovery when it was actually probed — an un-probed
+	// metric is 0.0 in the struct, which must NOT be read as "failed."
+	if p.IsProbed("shell_recovery") && p.ShellRecovery > 0 && p.ShellRecovery < minRecovery {
+		warnings = append(warnings, fmt.Sprintf(
+			"low shell_recovery (%.2f < %.2f): this model recovers poorly from a failed tool/page action, so a stuck browser step is more likely to spiral",
+			p.ShellRecovery, minRecovery,
+		))
+	}
+
+	maxInferMs := envInt("OAT_BROWSER_MODEL_MAX_INFERENCE_MS", defaultBrowserMaxInferenceMs)
+	if p.LatencyBasicInferenceMs > 0 && p.LatencyBasicInferenceMs > maxInferMs {
+		warnings = append(warnings, fmt.Sprintf(
+			"slow inference (~%.1fs/step > %.1fs): interactive browsing will feel frozen and each retry is expensive",
+			float64(p.LatencyBasicInferenceMs)/1000.0, float64(maxInferMs)/1000.0,
+		))
+	}
+
+	return warnings
+}
+
+// envFloat reads a float64 from env var name, falling back to def when unset or
+// unparseable.
+func envFloat(name string, def float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	if v, err := strconv.ParseFloat(raw, 64); err == nil {
+		return v
+	}
+	return def
+}
+
+// envInt reads an int from env var name, falling back to def when unset or
+// unparseable.
+func envInt(name string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	if v, err := strconv.Atoi(raw); err == nil {
+		return v
+	}
+	return def
+}
+
 // HasReasoningControls returns true if the model supports reasoning effort tuning.
 func (p *ModelProfile) HasReasoningControls() bool {
 	return p.ReasoningControls != "" && p.ReasoningControls != "none" && p.ReasoningControls != "not_tested"
