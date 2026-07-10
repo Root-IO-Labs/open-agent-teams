@@ -492,6 +492,20 @@ func (c *CLI) registerCommands() {
 		Run:         c.runDaemon,
 	}
 
+	daemonCmd.Subcommands["install-service"] = &Command{
+		Name:        "install-service",
+		Description: "Install the launchd supervisor (macOS): auto-restart on crash + start at login",
+		Usage:       "oat daemon install-service",
+		Run:         c.installDaemonService,
+	}
+
+	daemonCmd.Subcommands["uninstall-service"] = &Command{
+		Name:        "uninstall-service",
+		Description: "Remove the launchd supervisor installed by install-service",
+		Usage:       "oat daemon uninstall-service",
+		Run:         c.uninstallDaemonService,
+	}
+
 	c.rootCmd.Subcommands["daemon"] = daemonCmd
 
 	// Stop-all command (convenience for stopping everything)
@@ -1247,7 +1261,13 @@ Aliases for --allowed-worker-models: --available-worker-models, --allowed-models
 // Daemon command implementations
 
 func (c *CLI) startDaemon(args []string) error {
-	return daemon.RunDetached()
+	if err := daemon.RunDetached(); err != nil {
+		return err
+	}
+	// One-time nudge toward the opt-in launchd supervisor when running
+	// unsupervised. Never fails the start.
+	c.maybePrintLaunchdHint()
+	return nil
 }
 
 func (c *CLI) runDaemon(args []string) error {
