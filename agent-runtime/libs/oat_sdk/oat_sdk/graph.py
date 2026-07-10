@@ -21,6 +21,7 @@ from langgraph.types import Checkpointer
 from oat_sdk.backends import StateBackend
 from oat_sdk.backends.protocol import BackendFactory, BackendProtocol
 from oat_sdk.middleware.filesystem import FilesystemMiddleware
+from oat_sdk.middleware.loop_breaker import LoopBreakerMiddleware
 from oat_sdk.middleware.memory import MemoryMiddleware
 from oat_sdk.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from oat_sdk.middleware.skills import SkillsMiddleware
@@ -409,6 +410,10 @@ def create_oat_agent(  # noqa: C901, PLR0912, PLR0915  # Complex graph assembly 
     main_stack.append(create_summarization_middleware(model, backend))
     if _is_anthropic_model(model):
         main_stack.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+    # Loop-breaker (Phase 10): converts a same-tool+same-error retry spiral into
+    # an explicit "stop and report" directive. Gated by OAT_LOOP_BREAKER_MAX
+    # (<=0 disables the trip). Model-agnostic, so it lives here for every agent.
+    main_stack.append(LoopBreakerMiddleware())
     main_stack.append(PatchToolCallsMiddleware())
     oat_sdk_middleware.extend(main_stack)
 
