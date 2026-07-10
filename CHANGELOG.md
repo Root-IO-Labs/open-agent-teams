@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Assistant prompt: always report when done + narration reflects the live UI.**
+  `internal/templates/agent-templates/assistant.md` gains an explicit "Always
+  report when you're done" rule (every task ends with a plain-language reply
+  stating the outcome — a task is not finished until the user is told what
+  happened), and the narration guidance is corrected to match the new side-panel
+  behavior: the panel now shows the agent's raw tool calls live (including a red
+  row when a tool fails) and collapses them to a "Thought for Ns" summary only
+  once the turn ends — so progress pings add the human "why", not the mechanical
+  "what". (`browser.md` already carried the equivalent "never go silent" +
+  "finish with an outcome summary" rules.)
+
+### Documentation
+
+- **Documented the chat-agent prompt-file split.** `docs/AGENTS.md` now has a
+  dedicated "Chat-capable agent prompts: SEPARATE files, one SHARED fragment"
+  section spelling out that `browser.md` (browser agent) and `assistant.md`
+  (assistant) are independent prompts that share ONLY
+  `_shared-browser-safety.md` (appended after the per-type prompt for both), and
+  that non-safety behavior fixed in one file is NOT inherited by the other —
+  the trap that previously let a fix land in `browser.md` while the assistant
+  kept running the un-fixed `assistant.md`.
+
 ### Fixed
 
 - **Agents recover from unstable networks instead of hanging on

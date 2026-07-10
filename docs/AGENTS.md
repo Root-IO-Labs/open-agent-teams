@@ -613,6 +613,45 @@ Default prompts are embedded at compile time via `//go:embed`:
 var defaultSupervisorPrompt string
 ```
 
+### Chat-capable agent prompts: SEPARATE files, one SHARED safety fragment
+
+The two chat-capable / bridge-using agents each have their **own, independent**
+prompt template — they do **not** share a general prompt, and they do **not**
+read each other's file:
+
+| Agent type (`usesBrowserBridge()`) | Primary prompt template |
+|------------------------------------|-------------------------|
+| Browser agent (`AgentTypeBrowser`) | `internal/templates/agent-templates/browser.md` |
+| Personal assistant (`AgentTypeAssistant`) | `internal/templates/agent-templates/assistant.md` |
+
+The **only** thing they share is the safety fragment
+`internal/templates/agent-templates/_shared-browser-safety.md`, which the daemon
+**concatenates after** the per-type prompt at spawn time (see
+`buildAgentPrompt` / `usesBrowserBridge` in `internal/daemon/daemon.go`, and the
+`_shared-browser-safety` block around the "concatenate the shared fragment"
+comment). That fragment holds only the safety-critical, must-not-drift bits:
+Safety Rules, Prompt-Injection Defense, Cross-Tab Discipline, and the
+Dedicated-Agent-Window topology. Its filename starts with `_` so it can never be
+picked up as a primary prompt by an `AgentType` lookup.
+
+**Practical consequence — the trap to avoid:** any behavioral guidance that is
+NOT in `_shared-browser-safety.md` lives in exactly one of the two files and is
+loaded by exactly one of the two agents. If you fix a behavior only in
+`browser.md`, the assistant does **not** get it, and vice-versa. This has bitten
+us before (e.g. the "stay in the user's specified tab" / STICKY rule was added to
+`browser.md` first while the assistant — the agent actually hitting the bug — was
+still running the un-fixed `assistant.md`). When a change should apply to BOTH
+chat agents, either:
+
+- put it in `_shared-browser-safety.md` (only if it's genuinely safety-critical
+  and identical for both), **or**
+- make the parallel edit in BOTH `browser.md` and `assistant.md` in the same
+  change, and grep both files afterward to confirm they didn't drift.
+
+The invariant "the shared fragment is appended AFTER the per-type prompt for both
+agents" is covered by `internal/daemon/daemon_test.go` and
+`internal/templates/templates_test.go`.
+
 ### Custom Prompts (Configurable Agents System)
 
 Repositories can customize agent behavior by creating markdown files in `.oat/agents/`:
