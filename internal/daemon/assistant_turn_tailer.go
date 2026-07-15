@@ -347,6 +347,12 @@ type turnEndInfo struct {
 	Retryable    bool
 	// VisibleReply is true when the turn published >=1 ASSISTANT bubble.
 	VisibleReply bool
+	// HadTools is true when the turn saw at least one tool_start/tool_end
+	// (used for silent-after-successful-tools incomplete recovery).
+	HadTools bool
+	// HasUnfinishedTodos is true when the last [OAT_TODOS] in this turn
+	// still had pending/in_progress items (refines the incomplete nudge).
+	HasUnfinishedTodos bool
 }
 
 // tailerPollInterval is how often the tailer wakes to check for new
@@ -508,12 +514,14 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 	// begins, so the turn_end frame + recovery classification reflect
 	// only the current turn. Held here (not on the struct) because it's
 	// single-goroutine state owned entirely by run().
-	var turnVisibleReply, turnHadError, turnRetryable bool
+	var turnVisibleReply, turnHadError, turnRetryable, turnHadTools, turnUnfinishedTodos bool
 	var turnErrCode, turnErrMsg string
 	resetTurnState := func() {
 		turnVisibleReply = false
 		turnHadError = false
 		turnRetryable = false
+		turnHadTools = false
+		turnUnfinishedTodos = false
 		turnErrCode = ""
 		turnErrMsg = ""
 	}
@@ -652,6 +660,8 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				t.broadcaster.Publish(ev.Turn)
 				// A published bubble means the turn "spoke" — the panel
 				// suppresses the turn_end outcome line in that case.
+				// Cleared again if a tool runs after this (below): mid-turn
+				// narration is foldable preamble, not a final reply.
 				turnVisibleReply = true
 			case EventToolStart:
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
@@ -661,6 +671,13 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					// / pre-chat tool calls don't spam the panel.
 					continue
 				}
+				// Tools after mid-turn ASSISTANT narration mean that
+				// text was preamble (the panel folds it into Thought),
+				// not a closing reply. Clear so incomplete-silent
+				// recovery can fire when the model later stops without
+				// a post-tool bubble.
+				turnVisibleReply = false
+				turnHadTools = true
 				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "", "")
 			case EventToolEnd:
 				// Track the last tool outcome for the turn_end frame
@@ -668,6 +685,10 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				// Browser agents don't emit tool rows from the log
 				// (emitToolEvents=false) but their turn_end still needs
 				// the outcome, so this update sits above the gate.
+				// Same VisibleReply clear as tool_start: a tool after
+				// narration invalidates "spoke to the user".
+				turnVisibleReply = false
+				turnHadTools = true
 				if ev.ToolStatus == "error" {
 					turnHadError = true
 					turnErrCode = ev.Code
@@ -691,11 +712,13 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					continue
 				}
 				info := turnEndInfo{
-					HadError:     turnHadError,
-					Code:         turnErrCode,
-					ErrorMessage: turnErrMsg,
-					Retryable:    turnRetryable,
-					VisibleReply: turnVisibleReply,
+					HadError:           turnHadError,
+					Code:               turnErrCode,
+					ErrorMessage:       turnErrMsg,
+					Retryable:          turnRetryable,
+					VisibleReply:       turnVisibleReply,
+					HadTools:           turnHadTools,
+					HasUnfinishedTodos: turnUnfinishedTodos,
 				}
 				recovering := false
 				if t.onTurnEnd != nil {
@@ -719,6 +742,7 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				if !t.sidePanelActive.Load() {
 					continue
 				}
+				turnUnfinishedTodos = todosHaveUnfinished(ev.Todos)
 				t.broadcaster.PublishTodos(ev.Todos)
 			}
 		}

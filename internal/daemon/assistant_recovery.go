@@ -152,10 +152,41 @@ func buildRecoveryReprompt(code string) string {
 	)
 }
 
-// assistantRecoveryController holds per-(repo, agent) recovery budget.
+// incompleteSilentCode is the synthetic recovery "code" used for the
+// same-code loop guard when injecting a silent-after-tools nudge.
+const incompleteSilentCode = "INCOMPLETE_SILENT"
+
+// todosHaveUnfinished reports whether any checklist item is not completed.
+func todosHaveUnfinished(items []TodoItem) bool {
+	for _, it := range items {
+		st := strings.ToLower(strings.TrimSpace(it.Status))
+		if st != "completed" && st != "cancelled" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildIncompleteSilentReprompt is the code-only nudge for a turn that
+// ended after tools with no chat bubble (hybrid 2B).
+func buildIncompleteSilentReprompt(hasUnfinishedTodos bool) string {
+	if hasUnfinishedTodos {
+		return "[OAT-system] You ended your turn after tool calls with no message to the user, " +
+			"and your plan still has unfinished items. Either finish the next open plan item now, " +
+			"or tell the user in 1-2 lines what blocked you. Do not restart a giant browse loop; " +
+			"do not apologize-only."
+	}
+	return "[OAT-system] You ended your turn after tool calls with no message to the user. " +
+		"Tell the user in 1-2 lines what you just did and what blocked you or what you will do next, " +
+		"OR continue with one concrete next step. Do not apologize-only; do not go silent again."
+}
+
+// assistantRecoveryController holds per-(repo, agent) recovery budget
+// and interrupt latches.
 type assistantRecoveryController struct {
-	mu     sync.Mutex
-	budget map[string]*recoveryBudget
+	mu          sync.Mutex
+	budget      map[string]*recoveryBudget
+	interrupted map[string]bool
 }
 
 type recoveryBudget struct {
@@ -168,7 +199,38 @@ type recoveryBudget struct {
 }
 
 func newAssistantRecoveryController() *assistantRecoveryController {
-	return &assistantRecoveryController{budget: make(map[string]*recoveryBudget)}
+	return &assistantRecoveryController{
+		budget:      make(map[string]*recoveryBudget),
+		interrupted: make(map[string]bool),
+	}
+}
+
+// markInterrupted records that the current side-panel turn was stopped
+// by the user (Ctrl-C). Cleared when consumed at turn_end or on reset.
+func (c *assistantRecoveryController) markInterrupted(sessionName, agent string) {
+	if c == nil {
+		return
+	}
+	key := turnKey(sessionName, agent)
+	c.mu.Lock()
+	c.interrupted[key] = true
+	c.mu.Unlock()
+}
+
+// consumeInterrupted returns true once if an interrupt was marked since
+// the last consume/reset.
+func (c *assistantRecoveryController) consumeInterrupted(sessionName, agent string) bool {
+	if c == nil {
+		return false
+	}
+	key := turnKey(sessionName, agent)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.interrupted[key] {
+		return false
+	}
+	delete(c.interrupted, key)
+	return true
 }
 
 // resetForUser clears the recovery budget for (session, agent). Called
@@ -176,7 +238,7 @@ func newAssistantRecoveryController() *assistantRecoveryController {
 // (armSidePanelAutoEmit) or when a turn produced a visible reply —
 // either ends the current "stuck sequence", so the next genuine error
 // gets a fresh budget. Keyed by (session, agent) to match the tailer map
-// and armSidePanelAutoEmit.
+// and armSidePanelAutoEmit. Also clears any pending interrupt latch.
 func (c *assistantRecoveryController) resetForUser(sessionName, agent string) {
 	if c == nil {
 		return
@@ -184,6 +246,7 @@ func (c *assistantRecoveryController) resetForUser(sessionName, agent string) {
 	key := turnKey(sessionName, agent)
 	c.mu.Lock()
 	delete(c.budget, key)
+	delete(c.interrupted, key)
 	c.mu.Unlock()
 }
 
@@ -227,31 +290,23 @@ func (d *Daemon) maybeRecoverAssistantTurn(repoName, sessionName, agentName stri
 	if os.Getenv("OAT_TEST_MODE") == "1" {
 		return false
 	}
+	// User Stop: do not inject recovery after an interrupted turn.
+	if d.assistantRecovery.consumeInterrupted(sessionName, agentName) {
+		d.logger.Info(
+			"assistant recovery skipped for %s/%s — turn was interrupted by user",
+			repoName, agentName,
+		)
+		return false
+	}
 	// A turn that spoke to the user ends the stuck sequence — reset the
 	// budget so a later, unrelated error gets a fresh allowance.
 	if info.VisibleReply {
 		d.assistantRecovery.resetForUser(sessionName, agentName)
 		return false
 	}
-	if !info.HadError {
-		return false
-	}
-	code := strings.TrimSpace(info.Code)
-	// Fail-closed: only recover on the curated allowlist. Everything
-	// else (incl. empty code, security/policy/user-recoverable codes)
-	// is surfaced to the user by Layer 3.
-	if code == "" || !recoverableErrorCodes[code] {
-		return false
-	}
+
 	max := recoveryMax()
 	if max <= 0 {
-		return false
-	}
-	if !d.assistantRecovery.tryConsume(sessionName, agentName, code, max) {
-		d.logger.Info(
-			"assistant recovery exhausted/guarded for %s/%s (code=%s) — surfacing to user",
-			repoName, agentName, code,
-		)
 		return false
 	}
 
@@ -260,23 +315,46 @@ func (d *Daemon) maybeRecoverAssistantTurn(repoName, sessionName, agentName stri
 	if !repoOK || !agentOK {
 		return false
 	}
-	// Belt-and-suspenders: the callback is only wired for assistants,
-	// but re-verify so a future call-site change can't widen the scope.
 	if agent.Type != state.AgentTypeAssistant {
 		return false
 	}
 
-	msg := buildRecoveryReprompt(code)
+	var msg string
+	var consumeCode string
+
+	if info.HadError {
+		code := strings.TrimSpace(info.Code)
+		if code == "" || !recoverableErrorCodes[code] {
+			return false
+		}
+		consumeCode = code
+		msg = buildRecoveryReprompt(code)
+	} else if info.HadTools {
+		// Hybrid 2B: silent after successful tools — nudge once.
+		consumeCode = incompleteSilentCode
+		msg = buildIncompleteSilentReprompt(info.HasUnfinishedTodos)
+	} else {
+		return false
+	}
+
+	if !d.assistantRecovery.tryConsume(sessionName, agentName, consumeCode, max) {
+		d.logger.Info(
+			"assistant recovery exhausted/guarded for %s/%s (code=%s) — surfacing to user",
+			repoName, agentName, consumeCode,
+		)
+		return false
+	}
+
 	if err := d.backend.SendMessage(d.ctx, repo.SessionName, agent.WindowName, msg); err != nil {
 		d.logger.Warn(
 			"assistant recovery re-prompt send failed for %s/%s (code=%s): %v",
-			repoName, agentName, code, err,
+			repoName, agentName, consumeCode, err,
 		)
 		return false
 	}
 	d.logger.Info(
 		"assistant_recovery_injected: repo=%s agent=%s code=%s",
-		repoName, agentName, code,
+		repoName, agentName, consumeCode,
 	)
 	return true
 }

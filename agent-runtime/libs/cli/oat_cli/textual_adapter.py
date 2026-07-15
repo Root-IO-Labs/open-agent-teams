@@ -856,7 +856,26 @@ async def execute_task_textual(
                         continue
 
                     if isinstance(message, ToolMessage):
-                        tool_name = getattr(message, "name", "")
+                        tool_name = getattr(message, "name", None) or ""
+                        # LangChain sometimes leaves ToolMessage.name as None
+                        # on middleware-rejected parallel calls (e.g. dual
+                        # write_todos). Recover from the in-flight tool-call
+                        # map so the OAT_TOOL_LOG RESULT line carries the
+                        # real tool name instead of the literal "None"
+                        # (which breaks side-panel row pairing and shows
+                        # "None ERROR" activity rows).
+                        if not tool_name:
+                            tool_id = getattr(message, "tool_call_id", None)
+                            if tool_id and tool_id in adapter._current_tool_messages:
+                                pending = adapter._current_tool_messages[tool_id]
+                                tool_name = (
+                                    getattr(pending, "_tool_name", None)
+                                    or getattr(pending, "tool_name", None)
+                                    or getattr(pending, "name", None)
+                                    or ""
+                                )
+                            if not tool_name:
+                                tool_name = "unknown_tool"
                         tool_status = getattr(message, "status", "success")
                         tool_content = format_tool_message_content(message.content)
                         record = file_op_tracker.complete_with_message(message)

@@ -132,6 +132,43 @@ func TestTryConsume_ZeroBudgetDisables(t *testing.T) {
 	}
 }
 
+func TestBuildIncompleteSilentReprompt(t *testing.T) {
+	withTodos := buildIncompleteSilentReprompt(true)
+	without := buildIncompleteSilentReprompt(false)
+	for _, msg := range []string{withTodos, without} {
+		if !strings.HasPrefix(msg, "[OAT-system]") {
+			t.Errorf("must use [OAT-system] prefix: %q", msg)
+		}
+		if strings.Contains(msg, "apologize-only") == false && !strings.Contains(msg, "Do not apologize") {
+			// both variants mention apology prohibition
+		}
+	}
+	if !strings.Contains(withTodos, "unfinished") {
+		t.Errorf("unfinished-todos variant should mention unfinished plan: %q", withTodos)
+	}
+}
+
+func TestInterruptLatch_BlocksRecoveryBudgetPath(t *testing.T) {
+	c := newAssistantRecoveryController()
+	const session, agent = "_assistant-personal", "personal"
+	c.markInterrupted(session, agent)
+	if !c.consumeInterrupted(session, agent) {
+		t.Fatal("expected interrupt to be consumed once")
+	}
+	if c.consumeInterrupted(session, agent) {
+		t.Fatal("interrupt latch must be one-shot")
+	}
+}
+
+func TestTodosHaveUnfinished(t *testing.T) {
+	if !todosHaveUnfinished([]TodoItem{{Content: "a", Status: "pending"}}) {
+		t.Fatal("pending should count as unfinished")
+	}
+	if todosHaveUnfinished([]TodoItem{{Content: "a", Status: "completed"}}) {
+		t.Fatal("all completed should be finished")
+	}
+}
+
 // TestRecoveryMax_EnvParsing checks the env override + fail-safe fallback.
 func TestRecoveryMax_EnvParsing(t *testing.T) {
 	t.Setenv(recoveryMaxEnv, "")

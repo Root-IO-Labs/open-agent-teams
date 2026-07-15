@@ -3091,7 +3091,18 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 			"agent_input active_tab_id for %s/%s: raw=%v type=%T → prefix=%q",
 			repoName, agentName, rawTabID, rawTabID, prefix,
 		)
-		sanitized = sidePanelInputSentinel + prefix + sanitized
+		// Status-check fast path: pure status → diagnose-first prefix
+		// and keep recovery budget; status+task → brief diagnose then
+		// new instructions (budget resets).
+		statusKind := classifySidePanelUserMessage(sanitized)
+		switch {
+		case statusKind == sidePanelMsgPureStatus:
+			sanitized = statusDiagnosePrefix + sidePanelInputSentinel + prefix + sanitized
+		case looksLikeStatusAsk(sanitized):
+			sanitized = statusPlusTaskPrefix + sidePanelInputSentinel + prefix + sanitized
+		default:
+			sanitized = sidePanelInputSentinel + prefix + sanitized
+		}
 	}
 
 	// Part 5e safety net: if the assistant is at >= 95 % effective
@@ -3129,9 +3140,16 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// Arm side-panel auto-emit at DELIVERY time so the agent's replies
 	// render even if the `[SIDE-PANEL CHAT]` sentinel lands in its log
 	// out of order. Skip interrupts — a bare Ctrl-C carries no chat
-	// turn, and arming on it would be meaningless.
-	if !interrupt {
-		d.armSidePanelAutoEmit(repo.SessionName, agentName)
+	// turn, and arming on it would be meaningless. Mark interrupt so
+	// Layer-2 recovery does not fire after CancelledError + turn_end.
+	if interrupt {
+		d.assistantRecovery.markInterrupted(repo.SessionName, agentName)
+	} else {
+		resetBudget := true
+		if !system {
+			resetBudget = classifySidePanelUserMessage(text) != sidePanelMsgPureStatus
+		}
+		d.armSidePanelAutoEmit(repo.SessionName, agentName, resetBudget)
 	}
 	d.logger.Debug("agent_input delivered to %s/%s (interrupt=%v, len=%d)", repoName, agentName, interrupt, len(sanitized))
 	return socket.SuccessResponse(nil)
@@ -4147,7 +4165,8 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 		// An interrupt carries no chat payload — deliver the raw \x03
 		// straight to the PTY. No sentinel/active-tab prefix (those are
 		// for chat turns), no auto-emit arming (the agent was already
-		// armed by the message being interrupted).
+		// armed by the message being interrupted). Mark interrupted so
+		// Layer-2 recovery does not inject after CancelledError + turn_end.
 		windowName := agent.WindowName
 		if windowName == "" {
 			windowName = agentName
@@ -4155,6 +4174,7 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 		if sendErr := d.backend.SendMessage(d.ctx, repo.SessionName, windowName, sanitized); sendErr != nil {
 			return socket.ErrorResponse("backend.SendMessage failed for %s/%s: %v", repoName, agentName, sendErr)
 		}
+		d.assistantRecovery.markInterrupted(repo.SessionName, agentName)
 		d.logger.Info("route_user_message: interrupt (Ctrl-C) delivered to %s/%s", repoName, agentName)
 		return socket.SuccessResponse(map[string]interface{}{
 			"repo":      repoName,
@@ -4204,7 +4224,15 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// carve-out agent_input makes for the bonded path).
 	if !system {
 		prefix := buildActiveTabPrefix(req.Args["active_tab_id"])
-		sanitized = sidePanelInputSentinel + prefix + sanitized
+		statusKind := classifySidePanelUserMessage(sanitized)
+		switch {
+		case statusKind == sidePanelMsgPureStatus:
+			sanitized = statusDiagnosePrefix + sidePanelInputSentinel + prefix + sanitized
+		case looksLikeStatusAsk(sanitized):
+			sanitized = statusPlusTaskPrefix + sidePanelInputSentinel + prefix + sanitized
+		default:
+			sanitized = sidePanelInputSentinel + prefix + sanitized
+		}
 	}
 
 	// Backend write. We do NOT hold any daemon mutex during the
@@ -4220,10 +4248,13 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// Arm side-panel auto-emit at DELIVERY time (same rationale as
 	// handleAgentInput): the routed target's replies must render even
 	// if the `[SIDE-PANEL CHAT]` sentinel lands in its log after the
-	// reply turns. This is THE path the multi-agent chat picker uses
-	// (e.g. talking to a non-bonded assistant), and it's where the
-	// blackout was observed.
-	d.armSidePanelAutoEmit(repo.SessionName, agentName)
+	// reply turns. Pure status pings keep the recovery budget.
+	if !system {
+		resetBudget := classifySidePanelUserMessage(text) != sidePanelMsgPureStatus
+		d.armSidePanelAutoEmit(repo.SessionName, agentName, resetBudget)
+	} else {
+		d.armSidePanelAutoEmit(repo.SessionName, agentName, true)
+	}
 
 	// Update rate-limit timestamp ONLY on success. See the
 	// routeRateLimit field doc for why failed routes don't

@@ -155,7 +155,11 @@ func (d *Daemon) lookupAssistantTurnBroadcaster(sessionName, agentName string) *
 // log out of order (relying on the sentinel alone can suppress a busy
 // agent's turns). No-op if no tailer is registered yet — the
 // sentinel-parse path still covers that case.
-func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string) {
+//
+// resetRecovery: when true (default for new-work messages), clears the
+// Layer-2 recovery budget. Pure status pings pass false so "are you
+// stuck?" does not wipe the one remaining auto-nudge slot.
+func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string, resetRecovery bool) {
 	key := turnKey(sessionName, agentName)
 	d.assistantTurnTailersMu.Lock()
 	t := d.assistantTurnTailers[key]
@@ -163,12 +167,12 @@ func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string) {
 	if t != nil {
 		t.markSidePanelActive()
 	}
-	// A genuine user message ends any in-progress "stuck sequence": the
-	// user has taken over, so the auto-recovery budget resets. Recovery
-	// re-prompts are injected via backend.SendMessage (NOT this path), so
-	// they never reset the budget — only real user input does. Keyed by
-	// (session, agent) via turnKey, matching the controller's map key.
-	d.assistantRecovery.resetForUser(sessionName, agentName)
+	if resetRecovery {
+		// A genuine new-work user message ends any in-progress stuck
+		// sequence. Recovery re-prompts are injected via backend.SendMessage
+		// (NOT this path), so they never reset the budget.
+		d.assistantRecovery.resetForUser(sessionName, agentName)
+	}
 }
 
 // stopAllAssistantTurnTailers tears down every active tailer.

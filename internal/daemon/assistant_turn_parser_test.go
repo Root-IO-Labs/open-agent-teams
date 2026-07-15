@@ -1445,6 +1445,139 @@ func TestParseEventsTodosSentinel(t *testing.T) {
 	})
 }
 
+// TestTailerClearsVisibleReplyWhenToolsFollowNarration is the
+// incomplete-silent recovery regression: mid-turn ASSISTANT narration
+// must NOT leave VisibleReply=true on turn_end once tools run after it.
+// Otherwise maybeRecoverAssistantTurn skips the silent-after-tools nudge
+// and the assistant stays stuck until the user pokes it.
+func TestTailerClearsVisibleReplyWhenToolsFollowNarration(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, true, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	body := strings.Join([]string{
+		"[08:18:00] USER:",
+		"  [SIDE-PANEL CHAT] map the UI",
+		"",
+		"[08:18:05] ASSISTANT:",
+		"  Let me start by taking a snapshot.",
+		"",
+		"[08:18:10] TOOL: browser_snapshot",
+		"  tabId: 1",
+		"",
+		"[08:18:11] RESULT: browser_snapshot",
+		"  ok",
+		"",
+		"[OAT_TURN_END] abc123",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case fr := <-ch:
+			if fr.Kind == "turn_end" {
+				if fr.VisibleReply {
+					t.Fatalf("VisibleReply should be false after tools follow mid-turn narration; got frame=%+v", fr)
+				}
+				return
+			}
+			if fr.Done {
+				t.Fatal("stream closed before turn_end")
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for turn_end")
+		}
+	}
+}
+
+// TestTailerKeepsVisibleReplyWhenAssistantClosesAfterTools verifies the
+// converse: a closing ASSISTANT bubble AFTER the last tool still counts
+// as a visible reply (no incomplete recovery).
+func TestTailerKeepsVisibleReplyWhenAssistantClosesAfterTools(t *testing.T) {
+	tmp := t.TempDir()
+	logPath := tmp + "/agent.log"
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	b := newTurnBroadcaster(nil)
+	tailer := newAssistantTurnTailer(logPath, b, true, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tailer.Start(ctx)
+	defer tailer.Stop()
+
+	ch, sub := b.Subscribe()
+	defer sub()
+
+	time.Sleep(200 * time.Millisecond)
+
+	body := strings.Join([]string{
+		"[08:18:00] USER:",
+		"  [SIDE-PANEL CHAT] status?",
+		"",
+		"[08:18:10] TOOL: browser_tabs",
+		"",
+		"[08:18:11] RESULT: browser_tabs",
+		"  ok",
+		"",
+		"[08:18:12] ASSISTANT:",
+		"  Still working on the Aikido map.",
+		"",
+		"[OAT_TURN_END] def456",
+		"",
+	}, "\n")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case fr := <-ch:
+			if fr.Kind == "turn_end" {
+				if !fr.VisibleReply {
+					t.Fatalf("VisibleReply should stay true when ASSISTANT closes after tools; got frame=%+v", fr)
+				}
+				return
+			}
+			if fr.Done {
+				t.Fatal("stream closed before turn_end")
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for turn_end")
+		}
+	}
+}
+
 // TestTailerPublishesTodosFrame verifies the tailer forwards a parsed
 // [OAT_TODOS] sentinel as a todos frame once side-panel chat is armed.
 func TestTailerPublishesTodosFrame(t *testing.T) {
