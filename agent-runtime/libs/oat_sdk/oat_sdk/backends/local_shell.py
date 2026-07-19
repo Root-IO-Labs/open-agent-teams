@@ -8,6 +8,7 @@ on the host machine with full system access.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import uuid
 import warnings
@@ -22,6 +23,21 @@ if TYPE_CHECKING:
 
 DEFAULT_EXECUTE_TIMEOUT = 120
 """Default timeout in seconds for shell command execution."""
+
+# Patterns for environment variable names that likely contain sensitive data
+SENSITIVE_ENV_PATTERNS = [
+    r".*_API_KEY$",
+    r".*_TOKEN$",
+    r".*_SECRET$",
+    r".*_PASSWORD$",
+    r".*_APIKEY$",
+    r".*_ACCESS_KEY$",
+    r".*_SECRET_KEY$",
+    r".*_PRIVATE_KEY$",
+    r".*_CREDENTIALS$",
+    r".*_AUTH$",
+]
+"""Regex patterns matching environment variable names that contain sensitive data."""
 
 
 class LocalShellBackend(FilesystemBackend, SandboxBackendProtocol):
@@ -74,6 +90,21 @@ class LocalShellBackend(FilesystemBackend, SandboxBackendProtocol):
         4. For production environments requiring code execution, extend `BaseSandbox`
             to create a properly isolated backend (Docker containers, VMs, or other
             sandboxed execution environments)
+
+        **Output redaction:**
+
+        To mitigate accidental credential exposure, this backend automatically redacts
+        sensitive environment variable values from command output. Variables matching
+        patterns like `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, etc. have
+        their values replaced with `[REDACTED:VAR_NAME]` placeholders in the returned
+        output. This prevents commands like `env` or `echo $API_KEY` from exposing
+        credentials in tool output visible to agents or logs.
+
+        **Important:** Redaction is a defense-in-depth measure, not a security boundary.
+        Commands still have access to the actual environment variables and can use them
+        for their intended purpose. Redaction only affects the output returned to the
+        caller. Malicious or compromised agents could still exfiltrate credentials
+        through side channels (network requests, file writes, etc.).
 
         !!! note
 
@@ -201,6 +232,59 @@ class LocalShellBackend(FilesystemBackend, SandboxBackendProtocol):
         # Generate unique sandbox ID
         self._sandbox_id = f"local-{uuid.uuid4().hex[:8]}"
 
+        # Build redaction map for sensitive environment variables
+        self._redaction_map = self._build_redaction_map()
+
+    def _build_redaction_map(self) -> dict[str, str]:
+        """Build a mapping of sensitive environment variable values to redacted placeholders.
+
+        Scans the environment for variables matching sensitive patterns and creates
+        a dictionary mapping their values to redacted strings for output filtering.
+
+        Returns:
+            Dictionary mapping sensitive values to their redacted replacements.
+        """
+        redaction_map = {}
+        compiled_patterns = [
+            re.compile(pattern, re.IGNORECASE) for pattern in SENSITIVE_ENV_PATTERNS
+        ]
+
+        for var_name, var_value in self._env.items():
+            # Skip empty values
+            if not var_value or not isinstance(var_value, str):
+                continue
+
+            # Check if variable name matches any sensitive pattern
+            if any(pattern.match(var_name) for pattern in compiled_patterns):
+                # Create a redacted placeholder that includes the variable name
+                redacted = f"[REDACTED:{var_name}]"
+                redaction_map[var_value] = redacted
+
+        return redaction_map
+
+    def _redact_output(self, output: str) -> str:
+        """Redact sensitive environment variable values from command output.
+
+        Replaces any occurrence of sensitive environment variable values with
+        redacted placeholders to prevent credential exposure in tool output.
+
+        Args:
+            output: Raw command output that may contain sensitive values.
+
+        Returns:
+            Output with sensitive values replaced by [REDACTED:VAR_NAME] placeholders.
+        """
+        redacted_output = output
+
+        # Sort by length (longest first) to avoid partial replacements
+        for value, redacted in sorted(
+            self._redaction_map.items(), key=lambda x: len(x[0]), reverse=True
+        ):
+            if value in redacted_output:
+                redacted_output = redacted_output.replace(value, redacted)
+
+        return redacted_output
+
     @property
     def id(self) -> str:
         """Unique identifier for this backend instance.
@@ -319,6 +403,9 @@ class LocalShellBackend(FilesystemBackend, SandboxBackendProtocol):
 
             output = "\n".join(output_parts) if output_parts else "<no output>"
 
+            # Redact sensitive environment variable values from output
+            output = self._redact_output(output)
+
             # Check for truncation
             truncated = False
             if len(output) > self._max_output_bytes:
@@ -356,4 +443,4 @@ class LocalShellBackend(FilesystemBackend, SandboxBackendProtocol):
             )
 
 
-__all__ = ["DEFAULT_EXECUTE_TIMEOUT", "LocalShellBackend"]
+__all__ = ["DEFAULT_EXECUTE_TIMEOUT", "SENSITIVE_ENV_PATTERNS", "LocalShellBackend"]
