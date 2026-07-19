@@ -254,6 +254,9 @@ def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:
     3. Synthesize this into a clear, natural language response
     4. NEVER show the raw markdown to the user unless specifically requested
     """
+    if reason := _ssrf_check(url):
+        return {"error": f"Refused to fetch URL: {reason}", "url": url}
+
     try:
         import requests
         from markdownify import markdownify
