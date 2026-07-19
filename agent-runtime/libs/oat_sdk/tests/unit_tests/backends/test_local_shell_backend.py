@@ -297,3 +297,121 @@ async def test_local_shell_backend_async_filesystem_operations() -> None:
         # Verify
         content = await backend.aread("/async_test.txt")
         assert "modified content" in content
+
+
+
+def test_local_shell_backend_redacts_sensitive_env_vars() -> None:
+    """Test that sensitive environment variable values are redacted from output."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create backend with sensitive environment variables
+        sensitive_env = {
+            "ANTHROPIC_API_KEY": "sk-ant-test-secret-12345",
+            "OPENAI_API_KEY": "sk-openai-test-67890",
+            "GITHUB_TOKEN": "ghp_test_token_abcdef",
+            "MY_PASSWORD": "super_secret_pass",
+            "NORMAL_VAR": "this_is_fine",
+            "PATH": "/usr/bin:/bin",
+        }
+        backend = LocalShellBackend(root_dir=tmpdir, env=sensitive_env, inherit_env=False)
+
+        # Test 1: Direct echo of API key should be redacted
+        result = backend.execute("echo $ANTHROPIC_API_KEY")
+        assert result.exit_code == 0
+        assert "sk-ant-test-secret-12345" not in result.output, "API key was not redacted!"
+        assert "[REDACTED:ANTHROPIC_API_KEY]" in result.output, "Redaction placeholder not found!"
+
+        # Test 2: env command should redact all sensitive values
+        result = backend.execute("env")
+        assert "sk-ant-test-secret-12345" not in result.output, "Anthropic key leaked!"
+        assert "sk-openai-test-67890" not in result.output, "OpenAI key leaked!"
+        assert "ghp_test_token_abcdef" not in result.output, "GitHub token leaked!"
+        assert "super_secret_pass" not in result.output, "Password leaked!"
+        # Normal variables should not be redacted
+        assert "this_is_fine" in result.output, "Normal variable was incorrectly redacted!"
+
+        # Test 3: printenv specific variable should be redacted
+        result = backend.execute("printenv OPENAI_API_KEY")
+        assert result.exit_code == 0
+        assert "sk-openai-test-67890" not in result.output, "OpenAI key was not redacted!"
+        assert "[REDACTED:OPENAI_API_KEY]" in result.output, "Redaction placeholder not found!"
+
+
+def test_local_shell_backend_redacts_multiple_occurrences() -> None:
+    """Test that multiple occurrences of the same secret are all redacted."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sensitive_env = {
+            "SECRET_TOKEN": "my-secret-token-123",
+            "PATH": "/usr/bin:/bin",
+        }
+        backend = LocalShellBackend(root_dir=tmpdir, env=sensitive_env, inherit_env=False)
+
+        # Command that outputs the secret multiple times
+        result = backend.execute("echo $SECRET_TOKEN && echo $SECRET_TOKEN && echo $SECRET_TOKEN")
+        assert result.exit_code == 0
+        assert "my-secret-token-123" not in result.output, "Secret token was not redacted!"
+        # Should have multiple redaction placeholders
+        assert result.output.count("[REDACTED:SECRET_TOKEN]") >= 3, "Not all occurrences were redacted!"
+
+
+def test_local_shell_backend_redacts_stderr_output() -> None:
+    """Test that sensitive values in stderr are also redacted."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sensitive_env = {
+            "API_KEY": "secret-key-xyz",
+            "PATH": "/usr/bin:/bin",
+        }
+        backend = LocalShellBackend(root_dir=tmpdir, env=sensitive_env, inherit_env=False)
+
+        # Output to stderr
+        result = backend.execute("echo $API_KEY >&2")
+        assert result.exit_code == 0
+        assert "secret-key-xyz" not in result.output, "Secret in stderr was not redacted!"
+        assert "[REDACTED:API_KEY]" in result.output, "Redaction placeholder not found in stderr!"
+        assert "[stderr]" in result.output, "stderr prefix missing!"
+
+
+def test_local_shell_backend_no_redaction_for_non_sensitive_vars() -> None:
+    """Test that non-sensitive environment variables are not redacted."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        env = {
+            "USER": "testuser",
+            "HOME": "/home/testuser",
+            "LANG": "en_US.UTF-8",
+            "MY_CONFIG": "some_value",
+            "PATH": "/usr/bin:/bin",
+        }
+        backend = LocalShellBackend(root_dir=tmpdir, env=env, inherit_env=False)
+
+        result = backend.execute("env")
+        assert result.exit_code == 0
+        # All non-sensitive values should be visible
+        assert "testuser" in result.output
+        assert "/home/testuser" in result.output
+        assert "en_US.UTF-8" in result.output
+        assert "some_value" in result.output
+        # No redaction markers should appear
+        assert "[REDACTED:" not in result.output
+
+
+def test_local_shell_backend_redacts_with_inherit_env() -> None:
+    """Test that redaction works when inherit_env=True."""
+    import os
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Temporarily set a sensitive env var in the parent process
+        original_value = os.environ.get("TEST_API_KEY")
+        try:
+            os.environ["TEST_API_KEY"] = "test-secret-value-999"
+            
+            backend = LocalShellBackend(root_dir=tmpdir, inherit_env=True)
+            
+            result = backend.execute("echo $TEST_API_KEY")
+            assert result.exit_code == 0
+            assert "test-secret-value-999" not in result.output, "Inherited API key was not redacted!"
+            assert "[REDACTED:TEST_API_KEY]" in result.output, "Redaction placeholder not found!"
+        finally:
+            # Clean up
+            if original_value is None:
+                os.environ.pop("TEST_API_KEY", None)
+            else:
+                os.environ["TEST_API_KEY"] = original_value
