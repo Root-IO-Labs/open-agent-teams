@@ -132,6 +132,115 @@ func TestTryConsume_ZeroBudgetDisables(t *testing.T) {
 	}
 }
 
+// TestIncompleteSilentRefund_AfterToolProgress covers the soft-gap
+// parachute: an INCOMPLETE_SILENT consume is refunded once when the
+// model keeps working with tools, so a later stall can still recover.
+// A second refund in the same sequence is denied (no infinite loop).
+func TestIncompleteSilentRefund_AfterToolProgress(t *testing.T) {
+	c := newAssistantRecoveryController()
+	const session, agent = "_assistant-personal", "personal"
+	const max = 1
+
+	if !c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("first incomplete-silent recovery should be authorized")
+	}
+	// Same-code + budget spent: denied without a refund.
+	if c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("second incomplete-silent without tool progress must be denied")
+	}
+
+	// Model kept working after the nudge → refund once.
+	c.noteToolProgressAfterIncompleteSilent(session, agent)
+	if !c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("after tool-progress refund, one more incomplete-silent should be authorized")
+	}
+
+	// Further tool progress must NOT refund again in this sequence.
+	c.noteToolProgressAfterIncompleteSilent(session, agent)
+	if c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("at most one incomplete-silent refund per stuck sequence")
+	}
+
+	// Fresh user / visible reply clears the refund latch too.
+	c.resetForUser(session, agent)
+	if !c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("after resetForUser, incomplete-silent should be authorized again")
+	}
+}
+
+// TestStuckStatusParachute_ReopensSpentBudgetOnce covers the user
+// "are you stuck?" path: a spent budget is re-opened once so Layer-2
+// can fire again; a second stuck-status ask in the same sequence does
+// not grant another parachute; soft "ping" must not call this.
+func TestStuckStatusParachute_ReopensSpentBudgetOnce(t *testing.T) {
+	c := newAssistantRecoveryController()
+	const session, agent = "_assistant-personal", "personal"
+	const max = 1
+
+	if !c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("seed consume should succeed")
+	}
+	if c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("budget should be spent")
+	}
+	if !c.grantStuckStatusParachute(session, agent) {
+		t.Fatal("first stuck-status parachute should be granted")
+	}
+	if !c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("after parachute, one recovery should be authorized")
+	}
+	if c.grantStuckStatusParachute(session, agent) {
+		t.Fatal("second stuck-status parachute in the same sequence must be denied")
+	}
+	c.resetForUser(session, agent)
+	if !c.tryConsume(session, agent, "STALE_REF", max) {
+		t.Fatal("after reset, recovery should work again")
+	}
+	if !c.grantStuckStatusParachute(session, agent) {
+		t.Fatal("after resetForUser, a new sequence may grant a parachute again")
+	}
+}
+
+func TestLooksLikeStuckStatusAsk(t *testing.T) {
+	stuck := []string{
+		"are you stuck?",
+		"you're stuck again",
+		"ok now you are stuck again, what's the problem",
+		"what happened?",
+		"are you still working?",
+	}
+	for _, s := range stuck {
+		if !looksLikeStuckStatusAsk(s) {
+			t.Errorf("expected stuck-status for %q", s)
+		}
+	}
+	soft := []string{"ping", "hello?", "still there?"}
+	for _, s := range soft {
+		if looksLikeStuckStatusAsk(s) {
+			t.Errorf("soft presence %q must NOT be stuck-status", s)
+		}
+	}
+}
+
+// TestIncompleteSilentRefund_DoesNotTouchErrorConsume ensures an
+// allowlisted error-code consume is not refunded by tool progress.
+func TestIncompleteSilentRefund_DoesNotTouchErrorConsume(t *testing.T) {
+	c := newAssistantRecoveryController()
+	const session, agent = "_assistant-personal", "personal"
+	const max = 1
+
+	if !c.tryConsume(session, agent, "STALE_REF", max) {
+		t.Fatal("error recovery should be authorized")
+	}
+	c.noteToolProgressAfterIncompleteSilent(session, agent)
+	if c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("tool-progress refund must not clear an error-code consume")
+	}
+	if c.tryConsume(session, agent, "STALE_REF", max) {
+		t.Fatal("error-code budget must remain spent after a no-op refund attempt")
+	}
+}
+
 func TestBuildIncompleteSilentReprompt(t *testing.T) {
 	withTodos := buildIncompleteSilentReprompt(true)
 	without := buildIncompleteSilentReprompt(false)

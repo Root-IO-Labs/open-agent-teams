@@ -53,6 +53,9 @@ The bridge enforces hard guardrails in code (you can't bypass them). Reach the s
 - **NEVER** download executable files (`.exe`, `.bat`, `.msi`, `.scr`, `.cmd`, `.ps1`, …) — `DOWNLOAD_BLOCKED`.
 - **NEVER** navigate to URLs blocked by `urlBlocklist` (Chrome internals, anything the operator added) or outside `domainAllowlist` if one is set — `URL_BLOCKED` / `DOMAIN_NOT_ALLOWED`.
 - **NEVER** interact with banking, payment, or login pages. The bridge refuses interactions on detected sensitive pages with `SENSITIVE_PAGE`.
+- **Login / sign-up walls:** if the page is clearly asking the user to authenticate (OAuth buttons, "Sign in" / "Log in" / "Create account", password fields, SSO choosers), stop and ask the user to log in. Do not click marketing/demo headings or OAuth providers unless the user explicitly told you to click that control. Wait for their confirmation, then re-snapshot.
+- **Never invent app paths:** only `browser_navigate` to URLs you have actually seen (current/recent tab URL, link href from a snapshot, or a URL the user/task gave you). Do not guess pretty routes from a product name or from docs you are drafting. Prefer clicking in-app nav over constructing a path.
+- **Soft 404 / empty-app pages:** if the page shows "404", "There's nothing in here", "Page not found", "Go To Feed", or similar empty-state copy, leave once via a real control or last known-good URL — do not re-navigate the same dead path, reload-loop, or treat a visible empty-state as "still loading" / auth flake.
 - **NEVER** make purchases, financial transactions, permanent deletions, account creation, or permission/sharing changes on the user's behalf without explicit authorization in the task.
 - If you encounter a CAPTCHA or 2FA prompt, report it and stop. Don't try to solve it.
 
@@ -116,7 +119,7 @@ Worked shape — "read the latest message from <person>":
 ```
 1. browser_new_tab { url: "<app's messaging route>" }   // not the feed/overlay
 2. browser_find { query: "<person>" }  → browser_click { ref }
-3. browser_wait_for { text: "<a word you expect in the thread>" }   // confirm it loaded
+3. browser_wait_for { text: "<a word you expect in the thread>", timeout: 15000 }   // always pass text or selector — never timeout-only
 4. browser_snapshot { interactiveOnly: false }  → ref of the message-list container
 5. browser_get_text { ref: <that-ref>, maxChars: 4000 }   // the messages, scoped
 ```
@@ -125,10 +128,10 @@ This collapses the ~20-step "wander the feed overlay, take broad reads" path int
 
 ## Click fallback ladder
 
-When a click does not produce the expected effect (no navigation, no DOM change, snapshot looks identical), don't repeat the same call hoping for a different outcome — climb this ladder one step at a time until the action succeeds:
+When a click does not produce the expected effect (no navigation, no DOM change, snapshot looks identical), don't repeat the same call hoping for a different outcome — climb this ladder one step at a time until the action succeeds. A `browser_click` result of `{clicked: true}` only means the event was dispatched; **always verify** (URL/title/snapshot) when you expected a page change, and do not end the turn silent on a no-op.
 
 1. **`browser_click` by ref** — the default. Cheap and stable when the snapshot's element refs are accurate.
-2. **Take a fresh `browser_snapshot`, get a new ref, retry `browser_click`.** Refs become stale after DOM mutations, SPA route changes, or framework re-renders. The new snapshot is also your evidence that the previous click did nothing.
+2. **Take a fresh `browser_snapshot`, get a new ref, retry `browser_click`.** Refs become stale after DOM mutations, SPA route changes, or framework re-renders. The new snapshot is also your evidence that the previous click did nothing. Prefer a real button/link over a non-interactive heading.
 3. **`browser_click` with explicit coordinates** (using the `x` and `y` parameters) — useful when the element is occluded by an overlay, custom-rendered, or has a click handler the ref-based dispatch missed.
 4. **`browser_screenshot` + `browser_zoom`, then `browser_click` with coordinates derived from the zoomed image.** Use this for canvas, SVG, charts, custom-drawn UIs, or any element with no meaningful accessibility tree entry.
 5. **`browser_press_key` with `Tab` + `Enter` or `Space`** — keyboard activation works on widgets whose click handler is wired through a deep-nested delegate or container that the click dispatch missed but whose focused-element keydown handler activates directly (custom dropdowns, menu items, listbox options).

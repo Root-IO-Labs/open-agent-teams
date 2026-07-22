@@ -40,7 +40,11 @@ import (
 //     message (resetForUser, from armSidePanelAutoEmit) or when a turn
 //     produces a visible reply. A recovery turn that errors again — esp.
 //     with the same code — is NOT re-prompted; the panel surfaces it.
-//     This guards against the "loop burning tokens" failure mode.
+//     Soft exception: if an INCOMPLETE_SILENT nudge is followed by more
+//     tool progress (the model kept working), that consume is refunded
+//     once so a later real stall can still get a parachute. At most one
+//     such refund per stuck sequence — guards against infinite silence
+//     loops while fixing "first minor silence ate the only nudge".
 //
 // The daemon's PTY input sanitizer remains the authoritative trust
 // boundary and action-gating still pauses consequential actions during
@@ -196,6 +200,13 @@ type recoveryBudget struct {
 	// lastCode is the error code of the most recent injected recovery,
 	// for the same-code loop guard.
 	lastCode string
+	// incompleteSilentRefunded is true once we've refunded an
+	// INCOMPLETE_SILENT consume after subsequent tool progress.
+	// At most one refund per stuck sequence.
+	incompleteSilentRefunded bool
+	// statusParachuteGranted is true once a stuck-flavored status ping
+	// ("are you stuck?") re-opened a spent budget this sequence.
+	statusParachuteGranted bool
 }
 
 func newAssistantRecoveryController() *assistantRecoveryController {
@@ -248,6 +259,61 @@ func (c *assistantRecoveryController) resetForUser(sessionName, agent string) {
 	delete(c.budget, key)
 	delete(c.interrupted, key)
 	c.mu.Unlock()
+}
+
+// noteToolProgressAfterIncompleteSilent refunds a prior INCOMPLETE_SILENT
+// consume (once per stuck sequence) when the model kept working with
+// tools after that nudge. Soft gaps like "navigate then forgot to
+// narrate" should not permanently spend the parachute needed for a
+// later real stall. Error-code consumes are left untouched. No-op if
+// there is nothing to refund or a refund already happened this sequence.
+func (c *assistantRecoveryController) noteToolProgressAfterIncompleteSilent(sessionName, agent string) {
+	if c == nil {
+		return
+	}
+	key := turnKey(sessionName, agent)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.budget[key]
+	if b == nil {
+		return
+	}
+	if b.lastCode != incompleteSilentCode || b.attempts < 1 || b.incompleteSilentRefunded {
+		return
+	}
+	b.attempts--
+	if b.attempts < 0 {
+		b.attempts = 0
+	}
+	b.lastCode = ""
+	b.incompleteSilentRefunded = true
+}
+
+// grantStuckStatusParachute re-opens a spent recovery budget once when
+// the user reports the agent is stuck (pure status). Soft presence
+// checks ("ping") must not call this. Returns true if a parachute was
+// granted. Cleared by resetForUser.
+func (c *assistantRecoveryController) grantStuckStatusParachute(sessionName, agent string) bool {
+	if c == nil {
+		return false
+	}
+	key := turnKey(sessionName, agent)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.budget[key]
+	if b == nil {
+		return false
+	}
+	if b.statusParachuteGranted {
+		return false
+	}
+	if b.attempts < 1 && b.lastCode == "" {
+		return false
+	}
+	b.attempts = 0
+	b.lastCode = ""
+	b.statusParachuteGranted = true
+	return true
 }
 
 // tryConsume atomically checks + consumes one unit of recovery budget
@@ -317,6 +383,13 @@ func (d *Daemon) maybeRecoverAssistantTurn(repoName, sessionName, agentName stri
 	}
 	if agent.Type != state.AgentTypeAssistant {
 		return false
+	}
+
+	// Tool progress after an incomplete-silent nudge = the soft gap
+	// resolved into more work. Refund that consume once so a later
+	// stall in this sequence can still get a parachute.
+	if info.HadTools {
+		d.assistantRecovery.noteToolProgressAfterIncompleteSilent(sessionName, agentName)
 	}
 
 	var msg string

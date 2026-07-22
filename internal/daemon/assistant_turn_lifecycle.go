@@ -157,9 +157,12 @@ func (d *Daemon) lookupAssistantTurnBroadcaster(sessionName, agentName string) *
 // sentinel-parse path still covers that case.
 //
 // resetRecovery: when true (default for new-work messages), clears the
-// Layer-2 recovery budget. Pure status pings pass false so "are you
-// stuck?" does not wipe the one remaining auto-nudge slot.
-func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string, resetRecovery bool) {
+// Layer-2 recovery budget. Pure status pings pass false so soft checks
+// ("ping") do not wipe the auto-nudge slot. Stuck-flavored status
+// ("are you stuck?") still keeps the sequence, but may grant a one-shot
+// parachute when the budget is already spent (see grantStuckStatusParachute).
+// userText is the raw user message used only for that stuck-status check.
+func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string, resetRecovery bool, userText string) {
 	key := turnKey(sessionName, agentName)
 	d.assistantTurnTailersMu.Lock()
 	t := d.assistantTurnTailers[key]
@@ -172,6 +175,15 @@ func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string, resetRecove
 		// sequence. Recovery re-prompts are injected via backend.SendMessage
 		// (NOT this path), so they never reset the budget.
 		d.assistantRecovery.resetForUser(sessionName, agentName)
+		return
+	}
+	if looksLikeStuckStatusAsk(userText) {
+		if d.assistantRecovery.grantStuckStatusParachute(sessionName, agentName) {
+			d.logger.Info(
+				"assistant recovery stuck-status parachute granted for %s/%s",
+				sessionName, agentName,
+			)
+		}
 	}
 }
 

@@ -39,11 +39,48 @@ var pureStatusPhrases = []string{
 	"you've been stuck",
 	"youve been stuck",
 	"stuck again",
+	"you are stuck",
+	"you're stuck",
+	"youre stuck",
+	"what's going on",
+	"whats going on",
+	"what is going on",
 	"hello???",
 	"hello?",
 	"you there",
 	"still there",
 	"ping",
+}
+
+// stuckStatusPhrases are the pure-status asks that mean "I think you
+// stalled" (vs soft presence checks like "ping" / "hello?"). Matching
+// one of these while the recovery budget is spent grants a one-shot
+// stuck-status parachute so Layer-2 can fire again if the next turn
+// also ends silent.
+var stuckStatusPhrases = []string{
+	"are you stuck",
+	"stuck again",
+	"you are stuck",
+	"you're stuck",
+	"youre stuck",
+	"you seem stuck",
+	"you've been stuck",
+	"youve been stuck",
+	"why are you stuck",
+	"why did you stop",
+	"why don't you answer",
+	"why dont you answer",
+	"what's the problem",
+	"whats the problem",
+	"what is the problem",
+	"what's causing",
+	"whats causing",
+	"what happened",
+	"what's going on",
+	"whats going on",
+	"what is going on",
+	"are you still working",
+	"still working",
 }
 
 // Task-instruction signals — if present alongside a status phrase, treat
@@ -73,11 +110,16 @@ var taskInstructionSignals = []string{
 
 // statusDiagnosePrefix is prepended (as [OAT-system]) before the user's
 // side-panel text for pure status pings. Code-only — does not echo user text.
+// After the short diagnosis the agent must CONTINUE the task (unless
+// blocked waiting on the user) — answering-only then going idle is the
+// "you're stuck again" failure mode this prefix exists to prevent.
 const statusDiagnosePrefix = "[OAT-system] The user asked a status question. " +
-	"Answer in 1-2 short lines with a CONCRETE cause first " +
+	"First answer in 1-2 short lines with a CONCRETE cause " +
 	"(last tool that succeeded or failed and its error code if any, " +
 	"or that you stopped generating after a successful tool with no next step). " +
-	"Do NOT apologize-only. Do NOT call any tools until that answer is sent.\n"
+	"Do NOT apologize-only. " +
+	"THEN continue the task with tools unless you are blocked waiting on the user " +
+	"(e.g. login/SSO). Do not end the turn after only the status answer.\n"
 
 // statusPlusTaskPrefix for status+new-work combos.
 const statusPlusTaskPrefix = "[OAT-system] The user asked about status AND gave new instructions. " +
@@ -168,4 +210,19 @@ func classifySidePanelUserMessage(text string) sidePanelMsgKind {
 func looksLikeStatusAsk(text string) bool {
 	norm := normalizeForStatusMatch(stripSidePanelDecorations(text))
 	return matchesPureStatusPhrase(norm)
+}
+
+// looksLikeStuckStatusAsk is true for "I think you stalled" status
+// phrasing (not soft presence checks like "ping" / "hello?").
+func looksLikeStuckStatusAsk(text string) bool {
+	norm := normalizeForStatusMatch(stripSidePanelDecorations(text))
+	if norm == "" {
+		return false
+	}
+	for _, p := range stuckStatusPhrases {
+		if norm == p || strings.HasPrefix(norm, p) || strings.Contains(norm, p) {
+			return true
+		}
+	}
+	return false
 }

@@ -3149,7 +3149,7 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 		if !system {
 			resetBudget = classifySidePanelUserMessage(text) != sidePanelMsgPureStatus
 		}
-		d.armSidePanelAutoEmit(repo.SessionName, agentName, resetBudget)
+		d.armSidePanelAutoEmit(repo.SessionName, agentName, resetBudget, text)
 	}
 	d.logger.Debug("agent_input delivered to %s/%s (interrupt=%v, len=%d)", repoName, agentName, interrupt, len(sanitized))
 	return socket.SuccessResponse(nil)
@@ -4251,9 +4251,9 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 	// reply turns. Pure status pings keep the recovery budget.
 	if !system {
 		resetBudget := classifySidePanelUserMessage(text) != sidePanelMsgPureStatus
-		d.armSidePanelAutoEmit(repo.SessionName, agentName, resetBudget)
+		d.armSidePanelAutoEmit(repo.SessionName, agentName, resetBudget, text)
 	} else {
-		d.armSidePanelAutoEmit(repo.SessionName, agentName, true)
+		d.armSidePanelAutoEmit(repo.SessionName, agentName, true, "")
 	}
 
 	// Update rate-limit timestamp ONLY on success. See the
