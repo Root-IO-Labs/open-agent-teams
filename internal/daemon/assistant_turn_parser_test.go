@@ -1350,6 +1350,51 @@ func TestTailerToolEventsGatedOffForBrowserAgents(t *testing.T) {
 	}
 }
 
+// TestParseEventsGeneratingSentinel covers [OAT_GENERATING] parse:
+// well-formed tool+bytes → EventGenerating; malformed/oversize rejected.
+func TestParseEventsGeneratingSentinel(t *testing.T) {
+	t.Run("well-formed pulse", func(t *testing.T) {
+		events := parseEvents([]string{`[OAT_GENERATING] {"tool":"write_file","bytes":42000}`})
+		var found *Event
+		for i := range events {
+			if events[i].Kind == EventGenerating {
+				found = &events[i]
+			}
+		}
+		if found == nil {
+			t.Fatalf("expected EventGenerating, got %+v", events)
+		}
+		if found.Tool != "write_file" || found.Bytes != 42000 {
+			t.Fatalf("payload wrong: tool=%q bytes=%d", found.Tool, found.Bytes)
+		}
+	})
+
+	t.Run("malformed JSON rejected", func(t *testing.T) {
+		for _, ev := range parseEvents([]string{`[OAT_GENERATING] {not json`}) {
+			if ev.Kind == EventGenerating {
+				t.Fatalf("malformed must not emit EventGenerating: %+v", ev)
+			}
+		}
+	})
+
+	t.Run("invalid tool name rejected", func(t *testing.T) {
+		for _, ev := range parseEvents([]string{`[OAT_GENERATING] {"tool":"write file!","bytes":1}`}) {
+			if ev.Kind == EventGenerating {
+				t.Fatalf("invalid tool must not emit: %+v", ev)
+			}
+		}
+	})
+
+	t.Run("negative bytes clamped to zero", func(t *testing.T) {
+		events := parseEvents([]string{`[OAT_GENERATING] {"tool":"write_file","bytes":-9}`})
+		for _, ev := range events {
+			if ev.Kind == EventGenerating && ev.Bytes != 0 {
+				t.Fatalf("expected bytes=0, got %d", ev.Bytes)
+			}
+		}
+	})
+}
+
 // TestParseEventsTodosSentinel covers the [OAT_TODOS] round-trip: a
 // well-formed sentinel becomes one EventTodos with the full (bounded)
 // list, and it correctly terminates any open block.

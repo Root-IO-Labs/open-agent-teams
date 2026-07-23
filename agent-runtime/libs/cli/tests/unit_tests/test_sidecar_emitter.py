@@ -390,3 +390,82 @@ class TestTodosSentinel:
     def test_noop_when_tool_log_unset(self, monkeypatch):
         monkeypatch.delenv("OAT_TOOL_LOG", raising=False)
         sidecar_emitter.emit_todos({"todos": [{"content": "A", "status": "pending"}]})  # no raise
+
+
+class TestEmitGenerating:
+    """[OAT_GENERATING] heartbeats — UI only, rate-limited, never raise."""
+
+    def setup_method(self):
+        sidecar_emitter.stop_all_generating_pulses()
+        sidecar_emitter._gen_last_mono.clear()
+
+    def teardown_method(self):
+        sidecar_emitter.stop_all_generating_pulses()
+        sidecar_emitter._gen_last_mono.clear()
+
+    def test_writes_sentinel_with_tool_and_bytes(self, monkeypatch, tmp_path):
+        import json
+
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_generating("write_file", 12345)
+        text = log.read_text(encoding="utf-8")
+        assert text.startswith("[OAT_GENERATING] ")
+        payload = json.loads(text.split("[OAT_GENERATING]", 1)[1].strip())
+        assert payload == {"tool": "write_file", "bytes": 12345}
+
+    def test_rate_limits_same_tool(self, monkeypatch, tmp_path):
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_generating("write_file", 1)
+        sidecar_emitter.emit_generating("write_file", 2)
+        assert log.read_text(encoding="utf-8").count("[OAT_GENERATING]") == 1
+
+    def test_rejects_invalid_tool_name(self, monkeypatch, tmp_path):
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.emit_generating("write file!", 1)
+        assert not log.exists() or log.read_text(encoding="utf-8") == ""
+
+    def test_noop_when_tool_log_unset(self, monkeypatch):
+        monkeypatch.delenv("OAT_TOOL_LOG", raising=False)
+        sidecar_emitter.emit_generating("write_file", 1)  # no raise
+
+    def test_timer_pulse_without_further_chunks(self, monkeypatch, tmp_path):
+        """Buffered arg generation: timer alone keeps [OAT_GENERATING] alive."""
+        import time
+
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        monkeypatch.setattr(sidecar_emitter, "_GEN_MIN_INTERVAL_S", 0.05)
+        sidecar_emitter.start_generating_pulse("buf-0", "write_file")
+        # First emit may be rate-limited against an empty last_mono; clear so
+        # the ticker can write promptly.
+        sidecar_emitter._gen_last_mono.clear()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if log.exists() and log.read_text(encoding="utf-8").count(
+                "[OAT_GENERATING]"
+            ) >= 1:
+                break
+            time.sleep(0.02)
+        assert log.exists()
+        assert "[OAT_GENERATING]" in log.read_text(encoding="utf-8")
+        sidecar_emitter.set_generating_pulse_bytes("buf-0", 42000)
+        sidecar_emitter._gen_last_mono.clear()
+        n_before = log.read_text(encoding="utf-8").count("[OAT_GENERATING]")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if log.read_text(encoding="utf-8").count("[OAT_GENERATING]") > n_before:
+                break
+            time.sleep(0.02)
+        assert log.read_text(encoding="utf-8").count("[OAT_GENERATING]") > n_before
+        assert '"bytes":42000' in log.read_text(encoding="utf-8")
+        sidecar_emitter.stop_generating_pulse("buf-0")
+
+    def test_stop_all_clears_pulses(self, monkeypatch, tmp_path):
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.start_generating_pulse(0, "write_file")
+        sidecar_emitter.stop_all_generating_pulses()
+        assert sidecar_emitter._pulse_state == {}

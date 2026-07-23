@@ -241,6 +241,40 @@ func TestIncompleteSilentRefund_DoesNotTouchErrorConsume(t *testing.T) {
 	}
 }
 
+// TestRecoveryChain_IncompleteSilentThenREF_STALE covers the Jul 23
+// failure mode: incomplete-silent spends the budget, then a silent
+// REF_STALE turn must still get one chained recovery inject.
+func TestRecoveryChain_IncompleteSilentThenREF_STALE(t *testing.T) {
+	c := newAssistantRecoveryController()
+	const session, agent = "_assistant-personal", "personal"
+	const max = 1
+
+	if !c.tryConsume(session, agent, incompleteSilentCode, max) {
+		t.Fatal("first incomplete-silent recovery should be authorized")
+	}
+	// Without a chain refund, REF_STALE would be denied (budget spent).
+	if c.tryConsume(session, agent, "REF_STALE", max) {
+		t.Fatal("REF_STALE must be denied before chain refund")
+	}
+	c.noteRecoverableSilentAfterPriorConsume(session, agent)
+	if !c.tryConsume(session, agent, "REF_STALE", max) {
+		t.Fatal("after chain refund, REF_STALE recovery should be authorized")
+	}
+	// Second chain in the same sequence is denied.
+	c.noteRecoverableSilentAfterPriorConsume(session, agent)
+	if c.tryConsume(session, agent, "STALE_REF", max) {
+		t.Fatal("at most one recovery-chain refund per stuck sequence")
+	}
+	// Same-code repeat still guarded after a fresh reset.
+	c.resetForUser(session, agent)
+	if !c.tryConsume(session, agent, "REF_STALE", max) {
+		t.Fatal("after resetForUser, REF_STALE should be authorized again")
+	}
+	if c.tryConsume(session, agent, "REF_STALE", max) {
+		t.Fatal("same-code REF_STALE loop must still be denied")
+	}
+}
+
 func TestBuildIncompleteSilentReprompt(t *testing.T) {
 	withTodos := buildIncompleteSilentReprompt(true)
 	without := buildIncompleteSilentReprompt(false)

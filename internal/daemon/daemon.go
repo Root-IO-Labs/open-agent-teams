@@ -359,6 +359,11 @@ type Daemon struct {
 	routeRateLimitMu sync.Mutex
 	routeRateLimit   map[string]time.Time
 
+	// routeMidTurnLocks serializes interrupt-then-route per target so
+	// double-sends mid-turn cannot stack Ctrl-C storms. See mid_turn_route.go.
+	routeMidTurnMu    sync.Mutex
+	routeMidTurnLocks map[string]*sync.Mutex
+
 	// agentLifecycleBroadcaster (Part 7 Commit 7.4) fans out
 	// agent-lifecycle events (add/start/stop/remove) to the
 	// stream_agent_lifecycle socket verb. Single GLOBAL
@@ -394,6 +399,11 @@ type Daemon struct {
 	// the user. Assistant-scoped; nil-safe callers use the
 	// maybeRecoverAssistantTurn method.
 	assistantRecovery *assistantRecoveryController
+
+	// planStale is a separate one-shot nudge when progress tools succeed
+	// but write_todos was not called to update an open Plan card
+	// (assistant_plan_nudge.go). Does not share OAT_ASSISTANT_RECOVERY_MAX.
+	planStale *planStaleController
 }
 
 // routeRateLimitWindow is the minimum interval between
@@ -483,9 +493,11 @@ func New(paths *config.Paths) (*Daemon, error) {
 		capacityBroadcasters:        make(map[string]*capacityBroadcaster),
 		agentLifecycleMutexes:       make(map[string]*sync.Mutex),
 		routeRateLimit:              make(map[string]time.Time),
+		routeMidTurnLocks:           make(map[string]*sync.Mutex),
 		agentLifecycleBroadcaster:   newAgentLifecycleBroadcaster(logger.Debug),
 		wakeUpMarkers:               newWakeUpMarkerTracker(),
 		assistantRecovery:           newAssistantRecoveryController(),
+		planStale:                   newPlanStaleController(),
 	}
 
 	if wakeUpMarkerDisabled() {
@@ -3072,6 +3084,18 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 	// "the user's last-focused tab id when they sent this message,"
 	// removing the chrome.tabs.query({}) ambiguity that caused the
 	// agent to act on the wrong tab when multiple windows are open.
+	// Mid-turn side-panel send = interrupt-then-route (no silent queue).
+	midTurnInterrupted := false
+	if !interrupt && !system {
+		windowForInterrupt := agent.WindowName
+		if windowForInterrupt == "" {
+			windowForInterrupt = agentName
+		}
+		midTurnInterrupted = d.interruptMidTurnIfNeeded(
+			repo.SessionName, windowForInterrupt, agentName, repoName,
+		)
+	}
+
 	if !interrupt && !system {
 		// Part 4.K diagnostic (added 2026-05-21): log the inbound
 		// active_tab_id value at INFO so we can correlate "side
@@ -3093,13 +3117,18 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 		)
 		// Status-check fast path: pure status → diagnose-first prefix
 		// and keep recovery budget; status+task → brief diagnose then
-		// new instructions (budget resets).
+		// new instructions (budget resets). Stuck-flavored text does
+		// NOT uniquely trigger interrupt (already decided above); it
+		// only chooses the diagnose prefix. Mid-turn interrupt without
+		// stuck wording gets interruptContinuePrefix.
 		statusKind := classifySidePanelUserMessage(sanitized)
 		switch {
 		case statusKind == sidePanelMsgPureStatus:
 			sanitized = statusDiagnosePrefix + sidePanelInputSentinel + prefix + sanitized
 		case looksLikeStatusAsk(sanitized):
 			sanitized = statusPlusTaskPrefix + sidePanelInputSentinel + prefix + sanitized
+		case midTurnInterrupted:
+			sanitized = interruptContinuePrefix + sidePanelInputSentinel + prefix + sanitized
 		default:
 			sanitized = sidePanelInputSentinel + prefix + sanitized
 		}
@@ -4190,6 +4219,17 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 		windowName = agentName
 	}
 
+	// Mid-turn side-panel send = interrupt-then-route (no silent queue
+	// behind a multi-minute write_file; no busy card). Stuck wording
+	// does not uniquely trigger interrupt — Send while a turn is open
+	// always does; stuck wording only chooses the diagnose prefix.
+	midTurnInterrupted := false
+	if !interrupt && !system {
+		midTurnInterrupted = d.interruptMidTurnIfNeeded(
+			repo.SessionName, windowName, agentName, repoName,
+		)
+	}
+
 	// Part 5e safety net (parity with handleAgentInput ~3072): if the
 	// target is at >= 95 % effective context capacity, prepend a synthetic
 	// compact-conversation directive as a SEPARATE PTY message BEFORE the
@@ -4230,6 +4270,8 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 			sanitized = statusDiagnosePrefix + sidePanelInputSentinel + prefix + sanitized
 		case looksLikeStatusAsk(sanitized):
 			sanitized = statusPlusTaskPrefix + sidePanelInputSentinel + prefix + sanitized
+		case midTurnInterrupted:
+			sanitized = interruptContinuePrefix + sidePanelInputSentinel + prefix + sanitized
 		default:
 			sanitized = sidePanelInputSentinel + prefix + sanitized
 		}
@@ -8477,10 +8519,15 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 	newTotal := payload.CumulativeInput + payload.CumulativeOutput
 	oldTotal := agent.InputTokens + agent.OutputTokens
 	if newTotal < oldTotal {
-		d.logger.Warn(
-			"Dropped stale cumulative token usage for %s/%s: incoming total %d < stored %d (agent or daemon restart replay?)",
-			repoName, agentName, newTotal, oldTotal,
-		)
+		// Expected after agent/daemon restart (session cumulative resets
+		// below stored lifetime). Log once per agent until totals catch
+		// up — every subsequent [OAT_TOKENS] would otherwise re-WARN.
+		if d.contextCap == nil || d.contextCap.shouldWarnStaleCumulative(repoName, agentName) {
+			d.logger.Warn(
+				"Dropped stale cumulative token usage for %s/%s: incoming total %d < stored %d (agent or daemon restart replay? further drops suppressed until cumulative catches up)",
+				repoName, agentName, newTotal, oldTotal,
+			)
+		}
 		// Still persist + publish the fresh occupancy reading so the capacity
 		// ring tracks the restarted agent's live context window.
 		if occupancyChanged {
@@ -8491,6 +8538,9 @@ func (d *Daemon) handleTokenUsageEvent(repoName, agentName, jsonPayload string) 
 			d.maybeNudgeContextCapacity(repoName, agentName, agent)
 		}
 		return
+	}
+	if d.contextCap != nil {
+		d.contextCap.clearStaleCumulativeWarn(repoName, agentName)
 	}
 
 	// Per-field cache monotonicity clamp: cache counters are cumulative lifetime

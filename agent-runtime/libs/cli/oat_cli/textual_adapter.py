@@ -1031,16 +1031,49 @@ async def execute_task_textual(
                             if buffer_name is None:
                                 continue
 
+                            # Early name-only signal so the side panel shows
+                            # "writing a file…" while large args are still
+                            # streaming (UI/observability only — not a model
+                            # prompt). Use [OAT_GENERATING] only — do NOT
+                            # write an early TOOL: line to the conversation
+                            # log (that produced a second tool_start row and
+                            # left orphan RUNNING + OK pairs in the panel).
+                            # Timer heartbeats continue until args parse even
+                            # when the provider buffers the body with no
+                            # further tool_call_chunks.
+                            if not buffer.get("_oat_early_logged"):
+                                buffer["_oat_early_logged"] = True
+                                sidecar_emitter.emit_generating(buffer_name, 0)
+                                sidecar_emitter.start_generating_pulse(
+                                    buffer_key, buffer_name
+                                )
+
                             parsed_args = buffer.get("args")
                             if isinstance(parsed_args, str):
                                 if not parsed_args:
+                                    sidecar_emitter.set_generating_pulse_bytes(
+                                        buffer_key, 0
+                                    )
+                                    sidecar_emitter.emit_generating(buffer_name, 0)
                                     continue
                                 try:
                                     parsed_args = json.loads(parsed_args)
                                 except json.JSONDecodeError:
+                                    n = len(parsed_args)
+                                    sidecar_emitter.set_generating_pulse_bytes(
+                                        buffer_key, n
+                                    )
+                                    sidecar_emitter.emit_generating(buffer_name, n)
                                     continue
                             elif parsed_args is None:
+                                sidecar_emitter.set_generating_pulse_bytes(
+                                    buffer_key, 0
+                                )
+                                sidecar_emitter.emit_generating(buffer_name, 0)
                                 continue
+
+                            # Args parsed — stop timer before final TOOL emit.
+                            sidecar_emitter.stop_generating_pulse(buffer_key)
 
                             if not isinstance(parsed_args, dict):
                                 parsed_args = {"value": parsed_args}
@@ -1343,12 +1376,14 @@ async def execute_task_textual(
             spend_cache_read_delta,
             spend_cache_creation_delta,
         )
+        sidecar_emitter.stop_all_generating_pulses()
         sidecar_emitter.emit_turn_end()
         if conv_log:
             conv_log.close()
         return
 
     except asyncio.CancelledError:
+        sidecar_emitter.stop_all_generating_pulses()
         # Clear active message immediately so it won't block pruning
         # If we don't do this, the store still thinks it's actice and protects
         # from pruning, which breaks get_messages_to_prune(), potentially

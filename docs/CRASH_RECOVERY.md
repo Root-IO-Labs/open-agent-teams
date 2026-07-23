@@ -85,6 +85,7 @@ Two different failures look similar from the side panel:
 |---------|------------------------|-------|-----|
 | Side panel "Bridge not running"; `oat status` says **Daemon: not running** | The daemon crashed/was killed; the bridge cascaded down with it | `oat status` (daemon line) | `oat daemon nuke` (clears stale pid/sock) → `oat start` → `oat agent restart browser-agent` (or `oat assistant restart <name>`) |
 | `oat status` says **Daemon: running** but a ⚠ line reports a stopped browser/assistant agent | The daemon is fine; the browser-agent/assistant **auto-disabled** after 3 bridge-unreachable failures in 10 min (backoff to stop a doomed respawn loop) | `oat status` per-repo ⚠ line; `~/.oat/daemon.log` for "auto-restart disabled" | Fix the underlying bridge cause, then `oat agent restart browser-agent --repo <repo>` / `oat assistant restart <name>` (this also clears the failure counter) |
+| First browser tool after burger / Manage-tab Restart / `oat assistant restart` fails with `EXTENSION_NOT_CONNECTED` | Per-agent tool socket not re-bound yet (registry lag) | Wait for auto-rebind (extension retries NM handshake with jitter; Manage Restart posts the same `refresh_bridge_registry` kick as burger Restart) | Prefer waiting for the panel's auto-reconnect; **reload the OAT extension only if the reconnect budget fails** and the panel shows the reload CTA |
 
 #### Recommended: run the daemon under launchd (macOS)
 

@@ -234,6 +234,9 @@ def emit_turn_end() -> None:
     exactly-once: ``set_turn_id(None)`` below means the idempotent finally
     call is a no-op.
     """
+    # Drop any open arg-generation timer heartbeats so a completed /
+    # interrupted turn cannot keep pulsing into the next one.
+    stop_all_generating_pulses()
     c = _get_client()
     tid = _turn_id()
     if tid is not None:
@@ -253,6 +256,179 @@ def emit_turn_end() -> None:
             except OSError:
                 pass
     set_turn_id(None)
+
+
+# Rate-limit state for [OAT_GENERATING] heartbeats (UI/observability only —
+# never a model prompt). Keyed by sanitized tool name.
+_gen_last_mono: dict[str, float] = {}
+_GEN_MIN_INTERVAL_S = 2.0
+_GEN_BYTES_MAX = 50_000_000
+
+# Per-buffer timer heartbeats: some providers buffer entire tool-arg bodies
+# with few/no further tool_call_chunks. A background ticker keeps emitting
+# [OAT_GENERATING] so the panel/bridge silence clock does not fire "no
+# activity" while args are still being generated. Keyed by buffer id/index.
+_pulse_lock = threading.Lock()
+_pulse_state: dict[str, dict[str, Any]] = {}
+_pulse_thread: threading.Thread | None = None
+_pulse_wake = threading.Event()
+
+
+def _valid_gen_tool_name(name: str) -> bool:
+    if not name or len(name) > 64:
+        return False
+    for ch in name:
+        if not (ch.isalnum() or ch in "_.-"):
+            return False
+    return True
+
+
+def emit_generating(tool: str, byte_count: int = 0) -> None:
+    """Append ``[OAT_GENERATING] {"tool","bytes"}`` to ``OAT_TOOL_LOG``.
+
+    UI/observability only: the daemon forwards this so the side panel can
+    show elapsed "writing…" progress while tool args are still streaming.
+    Never injected into the model context / PTY as a prompt. Rate-limited
+    to ~2s per tool name. Best-effort; never raises.
+    """
+    log_path = os.environ.get("OAT_TOOL_LOG")
+    if not log_path:
+        return
+    try:
+        name = str(tool or "").strip()
+        if not _valid_gen_tool_name(name):
+            return
+        try:
+            n = int(byte_count)
+        except (TypeError, ValueError):
+            return
+        if n < 0:
+            n = 0
+        if n > _GEN_BYTES_MAX:
+            n = _GEN_BYTES_MAX
+        import time as _time
+
+        now = _time.monotonic()
+        last = _gen_last_mono.get(name, 0.0)
+        if now - last < _GEN_MIN_INTERVAL_S:
+            return
+        _gen_last_mono[name] = now
+        import json as _json
+
+        payload = _json.dumps(
+            {"tool": name, "bytes": n},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[OAT_GENERATING] {payload}\n")
+            f.flush()
+    except (OSError, TypeError, ValueError) as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: emit_generating failed: %s", e)
+
+
+def _ensure_pulse_thread_unlocked() -> None:
+    """Start the generating-pulse ticker if needed. Caller holds ``_pulse_lock``."""
+    global _pulse_thread
+    if _pulse_thread is not None and _pulse_thread.is_alive():
+        return
+    t = threading.Thread(
+        target=_generating_pulse_loop,
+        name="oat-generating-pulse",
+        daemon=True,
+    )
+    _pulse_thread = t
+    t.start()
+
+
+def _generating_pulse_loop() -> None:
+    """Emit ``[OAT_GENERATING]`` every ~2s for open arg buffers until empty."""
+    global _pulse_thread
+    try:
+        while True:
+            _pulse_wake.wait(timeout=_GEN_MIN_INTERVAL_S)
+            _pulse_wake.clear()
+            with _pulse_lock:
+                items = [(k, dict(v)) for k, v in _pulse_state.items()]
+                if not items:
+                    _pulse_thread = None
+                    return
+            for _key, st in items:
+                tool = st.get("tool")
+                if not isinstance(tool, str):
+                    continue
+                try:
+                    n = int(st.get("bytes") or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                emit_generating(tool, n)
+    except Exception as e:  # noqa: BLE001 — never take down the agent
+        _log.warning("sidecar_emitter: generating pulse loop failed: %s", e)
+        with _pulse_lock:
+            _pulse_thread = None
+
+
+def start_generating_pulse(key: str | int, tool: str) -> None:
+    """Start timer heartbeats for an incomplete tool-arg buffer.
+
+    Call when the tool name is known but args are not yet parsed. Cancel
+    with ``stop_generating_pulse`` / ``stop_all_generating_pulses`` when
+    args parse, the stream ends, or the turn is interrupted. Best-effort;
+    never raises.
+    """
+    try:
+        name = str(tool or "").strip()
+        if not _valid_gen_tool_name(name):
+            return
+        key_s = str(key)
+        with _pulse_lock:
+            prev = _pulse_state.get(key_s)
+            bytes_n = int(prev.get("bytes") or 0) if isinstance(prev, dict) else 0
+            _pulse_state[key_s] = {"tool": name, "bytes": bytes_n}
+            _ensure_pulse_thread_unlocked()
+        _pulse_wake.set()
+    except Exception as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: start_generating_pulse failed: %s", e)
+
+
+def set_generating_pulse_bytes(key: str | int, byte_count: int) -> None:
+    """Update the byte count shown on the next timer pulse. Never raises."""
+    try:
+        key_s = str(key)
+        try:
+            n = int(byte_count)
+        except (TypeError, ValueError):
+            return
+        if n < 0:
+            n = 0
+        if n > _GEN_BYTES_MAX:
+            n = _GEN_BYTES_MAX
+        with _pulse_lock:
+            st = _pulse_state.get(key_s)
+            if st is None:
+                return
+            st["bytes"] = n
+    except Exception as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: set_generating_pulse_bytes failed: %s", e)
+
+
+def stop_generating_pulse(key: str | int) -> None:
+    """Stop timer heartbeats for one tool-arg buffer. Never raises."""
+    try:
+        with _pulse_lock:
+            _pulse_state.pop(str(key), None)
+    except Exception as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: stop_generating_pulse failed: %s", e)
+
+
+def stop_all_generating_pulses() -> None:
+    """Stop all generating timer heartbeats (stream end / interrupt). Never raises."""
+    try:
+        with _pulse_lock:
+            _pulse_state.clear()
+        _pulse_wake.set()
+    except Exception as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: stop_all_generating_pulses failed: %s", e)
 
 
 def emit_todos(todos: Any) -> None:

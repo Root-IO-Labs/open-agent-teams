@@ -55,15 +55,23 @@ The 95% safety net is gated by `OAT_CONTEXT_SAFETY_NET` (default `1` / on). Set 
 
 The 85% and 90% tiers (status pill, in-panel banner with Compact / Reset buttons) are planned but not yet shipped.
 
-## Self-healing: the assistant recovers from tool errors on its own
+## Harness liveness (primary) + self-healing (backstop)
 
-A persistent assistant used to occasionally go silent after a browser tool call failed — you'd have to prod it ("are you stuck?") before it explained what went wrong. That's fixed by a three-layer ladder:
+The side panel is designed so you usually do **not** need to prod a working assistant:
+
+- **Progress while generating.** Long tool-arg generation (e.g. a large `write_file`) shows a concrete label with **last tool + elapsed** (e.g. `writing a file… (1m 42s) — last: saved screenshot`). The runtime emits timer-based `[OAT_GENERATING]` heartbeats while args are still incomplete — even when the model buffers the whole body with no further stream chunks — so the panel should **not** show a false “no activity for 1 min” during a real write. Heartbeats are UI/observability only — they never re-enter the model context.
+- **Send while a turn is running = interrupt-then-route.** Typing a new message (status ask, "hello?", add-on work, correction) while the assistant is mid-turn **interrupts the current turn first**, then delivers your text. There is no silent queue behind a multi-minute write and no "busy" card that waits for the turn to finish. Stuck-flavored wording only adds a diagnose `[OAT-system]` prefix (and may grant a recovery parachute); interrupt itself is triggered by Send, not by the wording.
+- **Partial writes.** An interrupted `write_file` leaves bytes on disk; the next turn should mention the path may be partial unless you asked to delete/discard that work.
+- **Panel Stop** remains available for stop-without-new-text (interrupt only).
+
+Self-healing recovery remains a **backstop** when a turn still ends silent after tools:
 
 - **Silent retry (bridge):** transient failures on safe, read-only tools are retried automatically before the model ever sees them.
 - **Auto-recovery re-prompt (daemon):** if a turn ends with *no* reply to you, the daemon may inject one bounded, code-only nudge so the assistant re-plans and keeps going. Two triggers share one budget (`OAT_ASSISTANT_RECOVERY_MAX`, default `1`, `0` to disable):
   - **Allowlisted tool error** (stale element refs, wrong/closed tab, bad arguments, a transient screenshot failure) — same as before; user-fixable problems (extension reload, security/policy blocks, emergency stop) are always surfaced instead.
-  - **Incomplete silent stop** — the turn ran at least one tool successfully, then ended with no chat bubble (the model simply stopped generating). The nudge asks it to report the blocker or continue the next concrete step; if an unfinished Plan card exists, it biases toward that open item. If that nudge is followed by more tool progress (the model kept working), the incomplete-silent consume is **refunded once** so a later real stall in the same sequence can still get a parachute — at most one such refund per stuck sequence.
-  - **User Stop suppresses recovery** — an interrupt latches the turn so the daemon does not inject a recovery nudge after you cancelled it.
+  - **Incomplete silent stop** — the turn ran at least one tool successfully, then ended with no chat bubble (the model simply stopped generating). The nudge asks it to report the blocker or continue the next concrete step; if an unfinished Plan card exists, it biases toward that open item. If that nudge is followed by more tool progress (the model kept working), the incomplete-silent consume is **refunded once** so a later real stall in the same sequence can still get a parachute — at most one such refund per stuck sequence. Separately, if a prior recovery consume is followed by another silent turn with an allowlisted recoverable error (e.g. incomplete-silent → `REF_STALE`), Layer 2 may **chain one more** snapshot+retry inject without requiring a user poke.
+  - **Plan-stale nudge (separate budget):** if progress tools succeed (screenshot / write / navigate / click) while the Plan card still has unfinished items and the turn did not call `write_todos`, the daemon may inject one `[OAT-system]` reminder to update the checklist. This does **not** consume `OAT_ASSISTANT_RECOVERY_MAX` and never invents checkbox states — only the model updates the Plan via `write_todos`.
+  - **User Stop / mid-turn Send suppresses recovery** — an interrupt latches the turn so the daemon does not inject a recovery nudge after you cancelled it.
   - **Status questions vs new work:** a pure status ping gets a fixed diagnose-then-**continue** prefix and does **not** fully reset the recovery budget. Soft checks ("ping" / "hello?") leave the budget alone; stuck-flavored asks ("are you stuck?", "what happened?") grant a **one-shot parachute** if the budget was already spent so Layer-2 can fire again. Status-plus-new-instructions or any real new task **does** reset the budget.
 - **Graceful surface (panel):** anything not auto-recoverable shows as a short plain-language outcome so you always know how the turn ended.
 
@@ -81,6 +89,8 @@ Prompt placement: chat/status/silent-turn rules live in `assistant.md` only; pin
 ## System status (Manage tab)
 
 The side panel's **Manage** tab has a **System status** card showing the live health of the pieces the assistant depends on — OAT service (daemon), Bridge, Browser (extension/CDP link), and OAT CLI. If any of these goes unhealthy while you're chatting, an amber notice also appears in the chat tab with the fix action (e.g. "run `oat start`" when the daemon is down, or reload the extension when the browser link drops), so you don't have to open the Manage tab to notice.
+
+**Manage → Restart** on an assistant card kicks the same bridge-registry reconnect path as the chat burger Restart, so the first browser tool after restart should work without reloading the OAT extension (reload only if the reconnect budget fails and the panel shows that CTA).
 
 ## Coexistence with workflow-helper browser-agents
 

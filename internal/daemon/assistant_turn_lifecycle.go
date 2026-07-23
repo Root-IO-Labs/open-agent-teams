@@ -106,7 +106,13 @@ func (d *Daemon) startAssistantTurnTailer(repoName, sessionName, agentName, logP
 	// callback (turn_end still publishes, just with recovering=false).
 	if emitToolEvents {
 		tailer.onTurnEnd = func(info turnEndInfo) bool {
-			return d.maybeRecoverAssistantTurn(repoName, sessionName, agentName, info)
+			// Plan-stale nudge first (does not consume interrupt latch);
+			// Layer-2 recovery may then consume interrupt / inject.
+			// If plan-stale already asked the model to update + continue,
+			// skip incomplete-silent for this turn (avoid two [OAT-system]
+			// messages); allowlisted error recovery still runs.
+			planNudged := d.maybePlanStaleNudge(repoName, sessionName, agentName, info)
+			return d.maybeRecoverAssistantTurn(repoName, sessionName, agentName, info, planNudged)
 		}
 	}
 	d.assistantTurnTailers[key] = tailer
@@ -175,6 +181,9 @@ func (d *Daemon) armSidePanelAutoEmit(sessionName, agentName string, resetRecove
 		// sequence. Recovery re-prompts are injected via backend.SendMessage
 		// (NOT this path), so they never reset the budget.
 		d.assistantRecovery.resetForUser(sessionName, agentName)
+		if d.planStale != nil {
+			d.planStale.resetForUser(sessionName, agentName)
+		}
 		return
 	}
 	if looksLikeStuckStatusAsk(userText) {

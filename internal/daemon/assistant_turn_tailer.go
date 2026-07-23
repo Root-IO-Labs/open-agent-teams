@@ -72,6 +72,11 @@ type assistantTurnFrame struct {
 	// card. omitempty so non-todos frames stay byte-identical on the
 	// wire; old panels ignore the unknown field.
 	Todos []todoFrameItem `json:"todos,omitempty"`
+
+	// --- generating frame fields (Kind == "generating") ---
+	// Emitted while tool args are still streaming ([OAT_GENERATING]).
+	// Bytes is the in-progress arg length; Tool names the tool.
+	Bytes int `json:"bytes,omitempty"`
 }
 
 // todoFrameItem is the wire shape of one checklist row forwarded to the
@@ -206,6 +211,17 @@ func (b *turnBroadcaster) PublishTodos(items []TodoItem) {
 	}, "todos", "")
 }
 
+// PublishGenerating broadcasts a generating frame while tool args are
+// still streaming. UI/observability only — resets the panel stall clock.
+func (b *turnBroadcaster) PublishGenerating(tool string, bytes int) {
+	b.publishFrame(assistantTurnFrame{
+		Kind:  "generating",
+		Tool:  tool,
+		Bytes: bytes,
+		TS:    time.Now().UTC().Format(time.RFC3339Nano),
+	}, "generating", tool)
+}
+
 // publishFrame is the shared fan-out path for Publish / PublishTool.
 // `what` + `preview` only feed the 0-subscriber diagnostic log.
 func (b *turnBroadcaster) publishFrame(frame assistantTurnFrame, what, preview string) {
@@ -311,6 +327,16 @@ type assistantTurnTailer struct {
 	// the tailer goroutine.
 	sidePanelActive atomic.Bool
 
+	// turnInFlight is true from delivery-time arming (or a side-panel
+	// USER sentinel) until [OAT_TURN_END]. Mid-turn side-panel sends
+	// interrupt-then-route when this is set (see mid_turn_route.go).
+	turnInFlight atomic.Bool
+
+	// suppressTurnEndClearUntil (unix nano) ignores the next turn_end
+	// clear so a delayed [OAT_TURN_END] from an interrupted turn cannot
+	// clear the newly armed turn's in-flight latch.
+	suppressTurnEndClearUntil atomic.Int64
+
 	// emitToolEvents gates publishing of TOOL/RESULT blocks as
 	// tool_start/tool_end activity frames. Enabled ONLY for
 	// AgentTypeAssistant: the browser agent's tool calls are already
@@ -350,9 +376,14 @@ type turnEndInfo struct {
 	// HadTools is true when the turn saw at least one tool_start/tool_end
 	// (used for silent-after-successful-tools incomplete recovery).
 	HadTools bool
-	// HasUnfinishedTodos is true when the last [OAT_TODOS] in this turn
-	// still had pending/in_progress items (refines the incomplete nudge).
+	// HasUnfinishedTodos is true when the latest known plan (this turn's
+	// [OAT_TODOS] or a prior turn's) still has pending/in_progress items.
 	HasUnfinishedTodos bool
+	// SawTodosThisTurn is true when [OAT_TODOS] was emitted this turn.
+	SawTodosThisTurn bool
+	// ProgressToolsOK is true when at least one allowlisted progress tool
+	// succeeded this turn (plan-stale nudge gate).
+	ProgressToolsOK bool
 }
 
 // tailerPollInterval is how often the tailer wakes to check for new
@@ -441,12 +472,37 @@ func (t *assistantTurnTailer) Stop() {
 // replies (the sentinel could land in the log after the reply turns).
 // Safe to call concurrently with run(); idempotent.
 func (t *assistantTurnTailer) markSidePanelActive() {
+	// Always (re)arm turn-in-flight on delivery — even if side-panel
+	// auto-emit was already on from a prior turn.
+	t.turnInFlight.Store(true)
 	if t.sidePanelActive.Swap(true) {
 		return
 	}
 	if t.logf != nil {
 		t.logf("assistantTurnTailer: side-panel auto-emit ON via delivery (%s)", t.logPath)
 	}
+}
+
+func (t *assistantTurnTailer) isTurnInFlight() bool {
+	return t.turnInFlight.Load()
+}
+
+func (t *assistantTurnTailer) clearTurnInFlight() {
+	t.turnInFlight.Store(false)
+}
+
+// suppressNextTurnEndClear ignores turn_end→clear for the given duration
+// (interrupt-then-route: late end of the cancelled turn must not clear
+// the newly armed turn).
+func (t *assistantTurnTailer) suppressNextTurnEndClear(d time.Duration) {
+	t.suppressTurnEndClearUntil.Store(time.Now().Add(d).UnixNano())
+}
+
+func (t *assistantTurnTailer) clearTurnInFlightOnEnd() {
+	if time.Now().UnixNano() < t.suppressTurnEndClearUntil.Load() {
+		return
+	}
+	t.turnInFlight.Store(false)
 }
 
 func (t *assistantTurnTailer) run(ctx context.Context) {
@@ -515,15 +571,26 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 	// only the current turn. Held here (not on the struct) because it's
 	// single-goroutine state owned entirely by run().
 	var turnVisibleReply, turnHadError, turnRetryable, turnHadTools, turnUnfinishedTodos bool
+	var turnSawTodos, turnProgressToolsOK bool
 	var turnErrCode, turnErrMsg string
+	// Persists across turns so plan-stale / incomplete-silent can see an
+	// open Plan even when write_todos was not called this turn.
+	var lastTodosUnfinished bool
+	// Tools for which we already published a tool_start from an early
+	// generating… TOOL or the first [OAT_GENERATING] pulse. Cleared on
+	// tool_end so a later same-named call can open a fresh row.
+	turnOpenToolRow := map[string]bool{}
 	resetTurnState := func() {
 		turnVisibleReply = false
 		turnHadError = false
 		turnRetryable = false
 		turnHadTools = false
 		turnUnfinishedTodos = false
+		turnSawTodos = false
+		turnProgressToolsOK = false
 		turnErrCode = ""
 		turnErrMsg = ""
+		turnOpenToolRow = map[string]bool{}
 	}
 
 	flushBuffer := func(force bool) {
@@ -638,6 +705,10 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				if !wasActive && t.logf != nil {
 					t.logf("assistantTurnTailer: side-panel sentinel detected, auto-emit ON (%s)", t.logPath)
 				}
+				// Log-parse path also arms turn-in-flight (delivery-time
+				// arming is the primary path; this covers out-of-order
+				// / reconnect cases).
+				t.turnInFlight.Store(true)
 				// A fresh user turn resets the accumulated outcome so a
 				// prior turn's error can't leak into this one.
 				resetTurnState()
@@ -678,7 +749,27 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				// a post-tool bubble.
 				turnVisibleReply = false
 				turnHadTools = true
+				// One RUNNING row per in-flight tool call. Early
+				// generating TOOL / [OAT_GENERATING] already opened the
+				// row — a later args-ready TOOL must not open a second
+				// (that left orphan RUNNING + OK pairs in the panel).
+				if !noteAssistantToolStartOpen(turnOpenToolRow, ev.Tool) {
+					continue
+				}
 				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "", "")
+			case EventGenerating:
+				// Arg-streaming heartbeat (UI only). First pulse may
+				// open a tool_start if the early TOOL line was missed;
+				// later pulses only refresh the stall clock / progress.
+				if !t.emitToolEvents || !t.sidePanelActive.Load() {
+					continue
+				}
+				turnVisibleReply = false
+				turnHadTools = true
+				if noteAssistantToolStartOpen(turnOpenToolRow, ev.Tool) {
+					t.broadcaster.PublishTool("tool_start", ev.Tool, "generating…", "", "")
+				}
+				t.broadcaster.PublishGenerating(ev.Tool, ev.Bytes)
 			case EventToolEnd:
 				// Track the last tool outcome for the turn_end frame
 				// FIRST — regardless of whether we publish the row.
@@ -699,17 +790,28 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					turnErrCode = ""
 					turnErrMsg = ""
 					turnRetryable = false
+					if isPlanProgressTool(ev.Tool) {
+						turnProgressToolsOK = true
+					}
 				}
+				delete(turnOpenToolRow, ev.Tool)
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
 					continue
 				}
 				t.broadcaster.PublishTool("tool_end", ev.Tool, "", ev.ToolStatus, ev.ErrorMessage)
 			case EventTurnEnd:
+				// Clear the mid-turn interrupt latch (unless suppressed
+				// after interrupt-then-route — see suppressNextTurnEndClear).
+				t.clearTurnInFlightOnEnd()
 				if !t.sidePanelActive.Load() {
 					// Pre-side-panel turn ends aren't surfaced; still
 					// reset so the next (real) turn starts clean.
 					resetTurnState()
 					continue
+				}
+				unfinished := lastTodosUnfinished
+				if turnSawTodos {
+					unfinished = turnUnfinishedTodos
 				}
 				info := turnEndInfo{
 					HadError:           turnHadError,
@@ -718,7 +820,9 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					Retryable:          turnRetryable,
 					VisibleReply:       turnVisibleReply,
 					HadTools:           turnHadTools,
-					HasUnfinishedTodos: turnUnfinishedTodos,
+					HasUnfinishedTodos: unfinished,
+					SawTodosThisTurn:   turnSawTodos,
+					ProgressToolsOK:    turnProgressToolsOK,
 				}
 				recovering := false
 				if t.onTurnEnd != nil {
@@ -742,7 +846,9 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				if !t.sidePanelActive.Load() {
 					continue
 				}
+				turnSawTodos = true
 				turnUnfinishedTodos = todosHaveUnfinished(ev.Todos)
+				lastTodosUnfinished = turnUnfinishedTodos
 				t.broadcaster.PublishTodos(ev.Todos)
 			}
 		}

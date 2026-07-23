@@ -1297,9 +1297,12 @@ type routeTestBackend struct {
 	backend_pkg.ProcessBackend // nil: forces a panic on any un-overridden method
 	mu                         sync.Mutex
 	sent                       []routeSendCall
+	interrupts                 int
 	// sendErr lets the test plant a backend.SendMessage error
 	// (covers the "backend write failed" branch of the handler).
 	sendErr error
+	// interruptErr plants a SendInterrupt failure.
+	interruptErr error
 }
 
 type routeSendCall struct {
@@ -1318,12 +1321,28 @@ func (b *routeTestBackend) SendMessage(_ context.Context, session, agent, messag
 	return nil
 }
 
+func (b *routeTestBackend) SendInterrupt(_ context.Context, session, agent string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.interruptErr != nil {
+		return b.interruptErr
+	}
+	b.interrupts++
+	return nil
+}
+
 func (b *routeTestBackend) calls() []routeSendCall {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	out := make([]routeSendCall, len(b.sent))
 	copy(out, b.sent)
 	return out
+}
+
+func (b *routeTestBackend) interruptCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.interrupts
 }
 
 // TestHandleRouteUserMessage_Part7Commit3 covers the documented

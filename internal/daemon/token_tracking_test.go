@@ -178,6 +178,20 @@ func TestHandleTokenUsageEvent(t *testing.T) {
 		}
 	})
 
+	t.Run("stale cumulative warn deduped until catch-up", func(t *testing.T) {
+		s := newContextCapacityState()
+		if !s.shouldWarnStaleCumulative("r", "a") {
+			t.Fatal("first stale drop should warn")
+		}
+		if s.shouldWarnStaleCumulative("r", "a") {
+			t.Fatal("second stale drop must suppress WARN")
+		}
+		s.clearStaleCumulativeWarn("r", "a")
+		if !s.shouldWarnStaleCumulative("r", "a") {
+			t.Fatal("after catch-up clear, warn should re-arm")
+		}
+	})
+
 	t.Run("replayed same payload is idempotent", func(t *testing.T) {
 		d, cleanup := setupTestDaemon(t)
 		defer cleanup()

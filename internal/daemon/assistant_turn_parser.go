@@ -149,6 +149,11 @@ const (
 	// real plan. The tailer forwards it as a `todos` frame for the side
 	// panel's live checklist card.
 	EventTodos
+	// EventGenerating fires on `[OAT_GENERATING] {"tool","bytes"}` while
+	// the runtime is still assembling tool-call args (large write_file
+	// bodies). UI/observability only — never model context. Event.Tool +
+	// Event.Bytes carry the payload.
+	EventGenerating
 )
 
 // turnEndSentinel is the literal marker the runtime writes to
@@ -160,6 +165,20 @@ const turnEndSentinel = "[OAT_TURN_END]"
 // Format: "[OAT_TODOS] <json-array>". The JSON is the full checklist so
 // it deliberately bypasses the 200-byte tool-arg preview cap.
 const todosSentinel = "[OAT_TODOS]"
+
+// generatingSentinel is written while tool args are still streaming.
+// Format: `[OAT_GENERATING] {"tool":"write_file","bytes":123}`.
+// UI/observability only — forgeable like other sentinels; bounded parse.
+const generatingSentinel = "[OAT_GENERATING]"
+
+// generatingMaxBytes bounds the JSON payload for [OAT_GENERATING].
+const generatingMaxBytes = 512
+
+// generatingToolMaxLen caps the tool name field.
+const generatingToolMaxLen = 64
+
+// generatingBytesFieldMax caps the reported arg byte count.
+const generatingBytesFieldMax = 50_000_000
 
 // todosMaxBytes bounds the JSON payload we will attempt to json.Unmarshal
 // from an `[OAT_TODOS]` line — an allocation guard against a runaway /
@@ -210,6 +229,8 @@ type Event struct {
 	// RESULT body carries one. Defaults to false when absent. Secondary
 	// signal for recovery classification (the code allowlist is primary).
 	Retryable bool
+	// Bytes is the in-progress tool-arg byte count for EventGenerating.
+	Bytes int
 	// Todos is the parsed checklist for EventTodos. Bounded in count and
 	// per-field length by the parser. Nil for every other kind.
 	Todos []TodoItem
@@ -444,6 +465,13 @@ func parseEvents(lines []string) []Event {
 			}
 			continue
 		}
+		if strings.HasPrefix(line, generatingSentinel) {
+			flush()
+			if tool, n, ok := parseGeneratingSentinel(line); ok {
+				out = append(out, Event{Kind: EventGenerating, Tool: tool, Bytes: n})
+			}
+			continue
+		}
 		if current == none {
 			continue
 		}
@@ -643,6 +671,41 @@ func parseTodosSentinel(line string) ([]TodoItem, bool) {
 		})
 	}
 	return out, true
+}
+
+// parseGeneratingSentinel extracts tool + bytes from
+// `[OAT_GENERATING] {"tool":"…","bytes":N}`. Fail-closed on
+// missing/oversize/malformed payloads or invalid tool names.
+func parseGeneratingSentinel(line string) (tool string, bytes int, ok bool) {
+	payload := strings.TrimSpace(strings.TrimPrefix(line, generatingSentinel))
+	if payload == "" || len(payload) > generatingMaxBytes {
+		return "", 0, false
+	}
+	var raw struct {
+		Tool  string `json:"tool"`
+		Bytes int    `json:"bytes"`
+	}
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		return "", 0, false
+	}
+	tool = strings.TrimSpace(raw.Tool)
+	if tool == "" || len(tool) > generatingToolMaxLen {
+		return "", 0, false
+	}
+	for _, r := range tool {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '.' || r == '-' {
+			continue
+		}
+		return "", 0, false
+	}
+	bytes = raw.Bytes
+	if bytes < 0 {
+		bytes = 0
+	}
+	if bytes > generatingBytesFieldMax {
+		bytes = generatingBytesFieldMax
+	}
+	return tool, bytes, true
 }
 
 // buildToolArgPreview folds the leading `key: value` body lines of a

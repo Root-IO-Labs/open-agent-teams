@@ -46,23 +46,24 @@
 //  1. `OAT_MODEL_CONTEXT_<normalized-modelID>` env var (operator
 //     override; takes precedence over everything else; clamped to
 //     `[1024, 16_000_000]` tokens).
-//  2. `min(profile.MaxInputTokens, 128_000)` if a `ModelProfile`
+//  2. `min(profile.MaxInputTokens, 200_000)` if a `ModelProfile`
 //     exists for the agent's model and its `MaxInputTokens > 0`.
 //  3. 128 K fallback otherwise, with a WARN that names the model
 //     ID + the literal `oat model onboard <modelID>` recovery
 //     command. Deduped to once per agent process.
 //
-// The 128 K ceiling reflects the "lost-in-the-middle" attention
-// degradation finding -- past that, even on 200 K-context models
-// the assistant gets less reliable answers, so we trigger
-// compaction earlier rather than letting the user pay for
-// degraded outputs. 128 K is also the modern floor for shipping
-// models in 2026: every flagship from Anthropic / OpenAI / Google
-// supports at least this much, so an unprofiled model gets a
-// budget that's right for the common case (vs. the older 32 K
-// fallback that wedged a `google_genai:gemini-2.5-flash` agent at
-// "100% capacity" the instant a Wikipedia article landed in its
-// history).
+// The 200 K ceiling unlocks Anthropic Sonnet 4.6-class profiles
+// (and peers that advertise 200 K) while still capping larger
+// advertised windows (1 M+) so "lost-in-the-middle" degradation
+// and cost don't run unbounded for chat agents. Unprofiled models
+// still get the 128 K fallback floor (see contextFallbackTokens):
+// every flagship from Anthropic / OpenAI / Google supports at
+// least that much, so we avoid the older 32 K fallback that
+// wedged a `google_genai:gemini-2.5-flash` agent at "100% capacity"
+// the instant a Wikipedia article landed in its history.
+// Operators who want the full advertised window (e.g. Sonnet 5's
+// 1 M) can raise further via `OAT_MODEL_CONTEXT_<id>` or edit the
+// ModelProfile.
 //
 // The env-override exists as an escape hatch for true bring-your-
 // own-model setups (local Ollama instances, custom routers,
@@ -90,7 +91,7 @@ import (
 const (
 	contextTierHint      = 0.75 // PTY directive
 	contextTierSafetyNet = 0.95 // synthetic inject before user msg
-	contextCeilingTokens = int64(128_000)
+	contextCeilingTokens = int64(200_000)
 	// contextFallbackTokens is the budget used when no
 	// `ModelProfile` exists for an agent's model and no env
 	// override is set. Bumped from 32 K to 128 K in 2026 because
@@ -186,6 +187,13 @@ type contextCapacityState struct {
 	mu          sync.Mutex
 	lastHintAt  map[string]time.Time
 	fallbackLog map[string]bool // dedupe the "no profile, falling back" WARN per-agent
+	// staleCumulativeLog dedupes the "Dropped stale cumulative token usage"
+	// WARN after an agent/daemon restart. The monotonicity guard still
+	// runs on every event; without this, every post-restart [OAT_TOKENS]
+	// line re-logs the same WARN until the new session's cumulative
+	// exceeds the stored lifetime total (can be millions of lines).
+	// Cleared when cumulative catches up again.
+	staleCumulativeLog map[string]bool
 	// lastSafetyNetInjectAt is the most-recent time the 95% safety-net inject
 	// fired for an agent. Read+written under mu; drives contextSafetyNetCooldown
 	// so a stale-occupancy re-fire can't spam redundant compactions or hijack
@@ -204,9 +212,39 @@ func newContextCapacityState() *contextCapacityState {
 	return &contextCapacityState{
 		lastHintAt:            make(map[string]time.Time),
 		fallbackLog:           make(map[string]bool),
+		staleCumulativeLog:    make(map[string]bool),
 		lastTier:              make(map[string]string),
 		lastSafetyNetInjectAt: make(map[string]time.Time),
 	}
+}
+
+// shouldWarnStaleCumulative returns true the first time a stale
+// cumulative drop is observed for (repo, agent) after a restart.
+// Subsequent drops return false until clearStaleCumulativeWarn.
+func (s *contextCapacityState) shouldWarnStaleCumulative(repoName, agentName string) bool {
+	if s == nil {
+		return true
+	}
+	key := agentKey(repoName, agentName)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.staleCumulativeLog[key] {
+		return false
+	}
+	s.staleCumulativeLog[key] = true
+	return true
+}
+
+// clearStaleCumulativeWarn re-arms the stale-cumulative WARN after
+// cumulative totals are accepted again (new session caught up).
+func (s *contextCapacityState) clearStaleCumulativeWarn(repoName, agentName string) {
+	if s == nil {
+		return
+	}
+	key := agentKey(repoName, agentName)
+	s.mu.Lock()
+	delete(s.staleCumulativeLog, key)
+	s.mu.Unlock()
 }
 
 // agentKey is the composite-key string used inside
@@ -296,7 +334,7 @@ func contextEnvOverride(modelID string, logSink func(format string, args ...any)
 //     Returns `source = "env"`.
 //  2. ModelProfile for modelID with `MaxInputTokens > 0`. Returns
 //     `source = "profile"` when used as-is, or `"ceiling"` when
-//     clamped down to the 128 K attention-degradation ceiling.
+//     clamped down to the 200 K attention-degradation ceiling.
 //  3. Fallback to `contextFallbackTokens` (128 K). Returns
 //     `source = "fallback"` and emits a once-per-agent-process
 //     WARN naming the model ID + the literal

@@ -40,11 +40,15 @@ import (
 //     message (resetForUser, from armSidePanelAutoEmit) or when a turn
 //     produces a visible reply. A recovery turn that errors again — esp.
 //     with the same code — is NOT re-prompted; the panel surfaces it.
-//     Soft exception: if an INCOMPLETE_SILENT nudge is followed by more
-//     tool progress (the model kept working), that consume is refunded
-//     once so a later real stall can still get a parachute. At most one
-//     such refund per stuck sequence — guards against infinite silence
-//     loops while fixing "first minor silence ate the only nudge".
+//     Soft exceptions (at most one of each per stuck sequence):
+//     (1) if an INCOMPLETE_SILENT nudge is followed by more tool progress
+//     (the model kept working), that consume is refunded once so a later
+//     real stall can still get a parachute;
+//     (2) if a prior recovery consume is followed by another silent turn
+//     with an allowlisted recoverable error (e.g. incomplete-silent →
+//     REF_STALE silent), that consume is refunded once so Layer-2 can
+//     inject snapshot+retry — without this, the first soft silence ate
+//     the only budget and the user had to poke.
 //
 // The daemon's PTY input sanitizer remains the authoritative trust
 // boundary and action-gating still pauses consequential actions during
@@ -130,7 +134,7 @@ func recoveryInstructionForCode(code string) string {
 	case "STALE_REF", "REF_STALE", "ELEMENT_NOT_FOUND", "NODE_NOT_FOUND",
 		"CLICK_FAILED", "TYPE_FAILED", "FILL_FAILED", "SELECT_FAILED", "CHECK_FAILED",
 		"HOVER_FAILED", "DRAG_FAILED", "SCROLL_FAILED", "SCROLL_TO_FAILED", "KEY_PRESS_FAILED":
-		return "Take a fresh snapshot of the page and locate the element again — the reference you used is no longer valid."
+		return "Take a fresh snapshot of the page and locate the element again — the reference you used is no longer valid. Retry in this same turn; do not stop silently or wait for the user."
 	case "NAVIGATION_FAILED":
 		return "Re-check the URL and the target tab, then try the navigation again."
 	case "WAIT_TIMEOUT":
@@ -204,6 +208,11 @@ type recoveryBudget struct {
 	// INCOMPLETE_SILENT consume after subsequent tool progress.
 	// At most one refund per stuck sequence.
 	incompleteSilentRefunded bool
+	// recoveryChainRefunded is true once we've refunded a prior recovery
+	// consume because the next turn also ended silent with an allowlisted
+	// recoverable error (e.g. incomplete-silent → REF_STALE). At most one
+	// such chain refund per stuck sequence.
+	recoveryChainRefunded bool
 	// statusParachuteGranted is true once a stuck-flavored status ping
 	// ("are you stuck?") re-opened a spent budget this sequence.
 	statusParachuteGranted bool
@@ -242,6 +251,19 @@ func (c *assistantRecoveryController) consumeInterrupted(sessionName, agent stri
 	}
 	delete(c.interrupted, key)
 	return true
+}
+
+// isInterrupted reports whether an interrupt latch is currently set
+// without consuming it (used by the plan-stale nudge, which runs before
+// Layer-2 recovery consumes the latch).
+func (c *assistantRecoveryController) isInterrupted(sessionName, agent string) bool {
+	if c == nil {
+		return false
+	}
+	key := turnKey(sessionName, agent)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.interrupted[key]
 }
 
 // resetForUser clears the recovery budget for (session, agent). Called
@@ -287,6 +309,34 @@ func (c *assistantRecoveryController) noteToolProgressAfterIncompleteSilent(sess
 	}
 	b.lastCode = ""
 	b.incompleteSilentRefunded = true
+}
+
+// noteRecoverableSilentAfterPriorConsume refunds a prior recovery consume
+// once when the next turn ends silent with an allowlisted recoverable
+// error. Covers incomplete-silent → REF_STALE (or similar) without
+// requiring a tool-progress refund first. Does not clear same-code
+// loops for a repeated identical error after this refund is spent.
+// No-op if there is nothing to refund or a chain refund already happened.
+func (c *assistantRecoveryController) noteRecoverableSilentAfterPriorConsume(sessionName, agent string) {
+	if c == nil {
+		return
+	}
+	key := turnKey(sessionName, agent)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	b := c.budget[key]
+	if b == nil {
+		return
+	}
+	if b.attempts < 1 || b.lastCode == "" || b.recoveryChainRefunded {
+		return
+	}
+	b.attempts--
+	if b.attempts < 0 {
+		b.attempts = 0
+	}
+	b.lastCode = ""
+	b.recoveryChainRefunded = true
 }
 
 // grantStuckStatusParachute re-opens a spent recovery budget once when
@@ -351,7 +401,7 @@ func (c *assistantRecoveryController) tryConsume(sessionName, agent, code string
 // The recovery budget is keyed by (sessionName, agentName) to match the
 // tailer map + armSidePanelAutoEmit; state lookups + message delivery
 // use repoName.
-func (d *Daemon) maybeRecoverAssistantTurn(repoName, sessionName, agentName string, info turnEndInfo) bool {
+func (d *Daemon) maybeRecoverAssistantTurn(repoName, sessionName, agentName string, info turnEndInfo, skipIncompleteSilent bool) bool {
 	// No live process to re-prompt under test mode.
 	if os.Getenv("OAT_TEST_MODE") == "1" {
 		return false
@@ -400,9 +450,17 @@ func (d *Daemon) maybeRecoverAssistantTurn(repoName, sessionName, agentName stri
 		if code == "" || !recoverableErrorCodes[code] {
 			return false
 		}
+		// Prior recovery (often INCOMPLETE_SILENT) spent the budget;
+		// allow one chained inject for this recoverable silent error.
+		d.assistantRecovery.noteRecoverableSilentAfterPriorConsume(sessionName, agentName)
 		consumeCode = code
 		msg = buildRecoveryReprompt(code)
 	} else if info.HadTools {
+		// Plan-stale already asked to update todos + continue — don't
+		// stack a second incomplete-silent [OAT-system] on the same turn.
+		if skipIncompleteSilent {
+			return false
+		}
 		// Hybrid 2B: silent after successful tools — nudge once.
 		consumeCode = incompleteSilentCode
 		msg = buildIncompleteSilentReprompt(info.HasUnfinishedTodos)
