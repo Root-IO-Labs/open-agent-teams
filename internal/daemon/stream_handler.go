@@ -845,14 +845,16 @@ func (sh *streamHandler) handleStreamAgentLifecycle(req socket.Request, conn net
 	for repoName, repo := range sh.d.state.GetAllRepos() {
 		for agentName, agent := range repo.Agents {
 			frame := agentLifecycleFrame{
-				Kind:      lifecycleKindSnapshot,
-				Repo:      repoName,
-				Agent:     agentName,
-				AgentType: string(agent.Type),
-				PID:       agent.PID,
-				Model:     agent.Model,
-				LastError: agent.LastError,
-				TS:        time.Now().UTC().Format(time.RFC3339Nano),
+				Kind:            lifecycleKindSnapshot,
+				Repo:            repoName,
+				Agent:           agentName,
+				AgentType:       string(agent.Type),
+				PID:             agent.PID,
+				Model:           agentRunningModel(agent),
+				ConfiguredModel: agentConfiguredModel(agent),
+				DisplayName:     agent.DisplayName,
+				LastError:       agent.LastError,
+				TS:              time.Now().UTC().Format(time.RFC3339Nano),
 			}
 			conn.SetWriteDeadline(time.Now().Add(streamWriteTimeout)) //nolint:errcheck
 			if err := enc.Encode(frame); err != nil {

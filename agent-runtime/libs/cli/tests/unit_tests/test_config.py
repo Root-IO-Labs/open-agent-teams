@@ -24,6 +24,7 @@ from oat_cli.config import (
     detect_provider,
     fetch_langsmith_project_url,
     get_langsmith_project_name,
+    heal_anthropic_thinking_blocks,
     is_network_error,
     parse_shell_allow_list,
     reset_langsmith_url_cache,
@@ -1885,3 +1886,46 @@ class TestInjectOpenAIKeepalive:
         assert isinstance(t, httpx.Timeout)
         assert t.connect is not None
         assert t.connect <= t.read
+
+
+class TestHealAnthropicThinkingBlocks:
+    """Guard against Sonnet 5 signature-only thinking 400s."""
+
+    def test_fills_missing_thinking_field(self) -> None:
+        msgs = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "signature": "sig123"},
+                    {"type": "tool_use", "id": "t1", "name": "write_todos", "input": {}},
+                ],
+            }
+        ]
+        heal_anthropic_thinking_blocks(msgs)
+        assert msgs[0]["content"][0]["thinking"] == ""
+        assert msgs[0]["content"][0]["signature"] == "sig123"
+
+    def test_replaces_none_thinking(self) -> None:
+        msgs = [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": None, "signature": "s"}],
+            }
+        ]
+        heal_anthropic_thinking_blocks(msgs)
+        assert msgs[0]["content"][0]["thinking"] == ""
+
+    def test_preserves_existing_thinking_text(self) -> None:
+        msgs = [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "plan…", "signature": "s"}],
+            }
+        ]
+        heal_anthropic_thinking_blocks(msgs)
+        assert msgs[0]["content"][0]["thinking"] == "plan…"
+
+    def test_ignores_non_thinking_blocks(self) -> None:
+        msgs = [{"role": "user", "content": "hi"}]
+        heal_anthropic_thinking_blocks(msgs)
+        assert msgs[0]["content"] == "hi"

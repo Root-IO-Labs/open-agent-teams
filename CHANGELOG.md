@@ -7,8 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Orphan RUNNING activity rows after short tools (e.g. ping).** Late
+  `[OAT_GENERATING]` heartbeats after RESULT no longer reopen a tool_start
+  row; `turn_end` synthesizes `tool_end` for any still-open rows. Runtime
+  also stops generating pulses for a tool when its RESULT lands. A new
+  side-panel USER turn also synthesizes `tool_end` before reset so a
+  second same-named call (ping again) cannot be absorbed into a stale
+  RUNNING row in the panel.
+
+### Changed
+
+- **Context capacity uses the full profiled model window.** The daemon no
+  longer clamps `ModelProfile.MaxInputTokens` to a 200 K attention ceiling
+  (Sonnet 5's 1 M profile now budgets against 1 M). Safety-net tiers and
+  auto-compact still engage at 75% / 95% of that budget. Override with
+  `OAT_MODEL_CONTEXT_<id>` when needed.
+- **Anthropic many-image dimension clamp (model payload only).** Before
+  Anthropic requests are sent, base64 image blocks are downscaled so neither
+  side exceeds 2000 px (API many-image hard reject). This is a full-frame
+  resize, not a crop. `browser_save_screenshot` disk copies stay on the
+  higher-res path (≤4000 px) so Spark/Qwen fidelity is unchanged; the clamp
+  runs only on the Anthropic formatting path.
+
 ### Added
 
+- **Manage-tab agent settings (display alias + deferred model switch).**
+  `Agent.DisplayName` cosmetic alias (CLI `oat assistant|agent set-display-name`,
+  socket `set_agent_display_name`); lifecycle frames carry `display_name`,
+  `configured_model`, and kind `agent_updated`. Running model on frames is
+  `ResolvedModel` (fixes empty-`Model` cards showing `"default"`). Side-panel
+  model pick persists via `set_agent_model` only; daemon
+  `ensureDesiredModelBeforeSend` session-preserving-restarts on next Send when
+  preference ≠ running (flip-flop without Send = zero restarts).
 - **Self-healing turn ladder for the assistant (auto-recovery from silent tool
   errors).** When an assistant turn ends with its last tool call in error and no
   visible reply to the user — the "agent went silent after a tool error" symptom

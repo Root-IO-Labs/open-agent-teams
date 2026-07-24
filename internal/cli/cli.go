@@ -901,6 +901,18 @@ func (c *CLI) registerCommands() {
 	agentCmd.Subcommands["remove"] = agentRemoveCmd
 	agentCmd.Subcommands["rm"] = agentRemoveCmd
 
+	agentCmd.Subcommands["set-display-name"] = &Command{
+		Name:        "set-display-name",
+		Description: "Set a cosmetic Manage-tab / chat-picker alias (identity slug unchanged)",
+		Usage: "oat agent set-display-name <name> --display <alias> [--repo <repo>]\n" +
+			"oat agent set-display-name <name> --clear [--repo <repo>]\n\n" +
+			"Flags:\n" +
+			"  --display <alias>  Display alias for Manage cards / chat picker.\n" +
+			"  --clear            Remove the alias (show identity slug).\n" +
+			"  --repo <repo>      Repository the agent belongs to.\n",
+		Run: c.setAgentDisplayNameCmd,
+	}
+
 	agentCmd.Subcommands["set-model"] = &Command{
 		Name:        "set-model",
 		Description: "Change the LLM model an agent uses (e.g. anthropic:claude-opus-4-7)",
@@ -7477,6 +7489,51 @@ func assistantNameFromVirtualRepo(repoName string) string {
 		return ""
 	}
 	return strings.TrimPrefix(repoName, prefix)
+}
+
+// setAgentDisplayNameCmd sets Agent.DisplayName via set_agent_display_name.
+func (c *CLI) setAgentDisplayNameCmd(args []string) error {
+	flags, remaining := ParseFlags(args)
+	agentName, err := resolveAgentNameArg(flags, remaining)
+	if err != nil {
+		return err
+	}
+	clear := flags["clear"] == "true"
+	display := strings.TrimSpace(flags["display"])
+	if clear {
+		display = ""
+	} else if display == "" {
+		return errors.InvalidUsage("--display <alias> is required (or pass --clear)")
+	}
+	repoName := flags["repo"]
+	if repoName == "" {
+		inferred, err := c.inferRepoFromCwd()
+		if err != nil {
+			return errors.InvalidUsage("could not determine repository - use --repo flag or run from within a oat worktree")
+		}
+		repoName = inferred
+	}
+	client := socket.NewClient(c.paths.DaemonSock)
+	resp, err := client.Send(socket.Request{
+		Command: "set_agent_display_name",
+		Args: map[string]interface{}{
+			"repo":         repoName,
+			"agent":        agentName,
+			"display_name": display,
+		},
+	})
+	if err != nil {
+		return errors.DaemonCommunicationFailed("set agent display name", err)
+	}
+	if !resp.Success {
+		return errors.Wrap(errors.CategoryRuntime, "failed to set display name", fmt.Errorf("%s", resp.Error))
+	}
+	if display == "" {
+		fmt.Printf("✓ Agent %q display name cleared\n", agentName)
+	} else {
+		fmt.Printf("✓ Agent %q display name: %s\n", agentName, display)
+	}
+	return nil
 }
 
 // setAgentModelCmd changes which LLM model an agent uses. Thin

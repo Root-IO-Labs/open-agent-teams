@@ -1607,6 +1607,96 @@ def _keepalive_socket_options() -> list[tuple[int, int, int]]:
     return opts
 
 
+# Claude Sonnet 5 adaptive thinking can stream a signature_delta with no
+# thinking text. Without a `thinking` key on that block, the next tool-loop
+# request fails with Anthropic 400: thinking.thinking Field required.
+_anthropic_thinking_heal_applied = False
+
+
+def heal_anthropic_thinking_blocks(formatted_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure every thinking content block has a string `thinking` field.
+
+    Mutates blocks in place and returns the same list for chaining. Safe on
+    non-thinking messages. Empty string keeps the block API-valid so signatures
+    still accept.
+    """
+    for msg in formatted_messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "thinking":
+                continue
+            if not isinstance(block.get("thinking"), str):
+                block["thinking"] = ""
+    return formatted_messages
+
+
+def _apply_anthropic_thinking_field_heal() -> None:
+    """Ensure signature-only thinking blocks carry ``thinking: ""``.
+
+    On stream: default the field for signature_delta chunks so new checkpoints
+    are well-formed. On send: heal any already-corrupt blocks in history.
+
+    Idempotent and best-effort: import / attribute drift just skips the patch.
+    """
+    global _anthropic_thinking_heal_applied  # noqa: PLW0603
+    if _anthropic_thinking_heal_applied:
+        return
+    try:
+        import langchain_anthropic.chat_models as anthropic_chat
+    except ImportError:
+        return
+
+    chat_cls = getattr(anthropic_chat, "ChatAnthropic", None)
+    orig_chunk = getattr(chat_cls, "_make_message_chunk_from_anthropic_event", None)
+    if chat_cls is not None and callable(orig_chunk):
+
+        def _make_chunk_healed(self: Any, event: Any, **kwargs: Any) -> Any:
+            result = orig_chunk(self, event, **kwargs)
+            # Only signature_delta needs the default; thinking_delta already
+            # carries text.
+            delta = getattr(event, "delta", None)
+            delta_type = getattr(delta, "type", None)
+            if delta_type != "signature_delta":
+                return result
+            if not isinstance(result, tuple) or len(result) < 1:
+                return result
+            chunk = result[0]
+            content = getattr(chunk, "content", None)
+            if not isinstance(content, list):
+                return result
+            for i, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    if "thinking" not in block or block.get("thinking") is None:
+                        fixed = dict(block)
+                        fixed.setdefault("thinking", "")
+                        content[i] = fixed
+            return result
+
+        chat_cls._make_message_chunk_from_anthropic_event = _make_chunk_healed  # type: ignore[method-assign]
+
+    orig_format = getattr(anthropic_chat, "_format_messages", None)
+    if callable(orig_format):
+
+        def _format_messages_healed(messages: Any) -> Any:
+            system, formatted = orig_format(messages)
+            if isinstance(formatted, list):
+                heal_anthropic_thinking_blocks(formatted)
+                # Many-image dimension hard reject: clamp ONLY on the
+                # Anthropic request payload. Disk saves / non-Anthropic
+                # providers stay on the hi-res browser_save_screenshot path.
+                from oat_cli.image_utils import clamp_anthropic_formatted_images
+
+                clamp_anthropic_formatted_images(formatted)
+            return system, formatted
+
+        anthropic_chat._format_messages = _format_messages_healed  # type: ignore[attr-defined]
+
+    _anthropic_thinking_heal_applied = True
+    logger.info("Applied Anthropic thinking-block heal + many-image dimension clamp")
+
+
 def _apply_anthropic_connect_timeout(model: BaseChatModel) -> None:
     """Give a ChatAnthropic model a short connect timeout, long read timeout.
 
@@ -1894,6 +1984,10 @@ def create_model(
     # inject one post-construction (cloud only). See helper for the why.
     if provider == "anthropic" and not local_model:
         _apply_anthropic_connect_timeout(model)
+    # Sonnet 5 adaptive thinking: heal signature-only thinking blocks so
+    # tool-loop replay doesn't 400.
+    if provider == "anthropic" or model.__class__.__name__ == "ChatAnthropic":
+        _apply_anthropic_thinking_field_heal()
 
     resolved_provider = provider or getattr(model, "_model_provider", provider)
 

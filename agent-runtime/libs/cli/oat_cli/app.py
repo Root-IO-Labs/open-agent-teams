@@ -1133,11 +1133,11 @@ class OatSdksApp(App):
             value: The message text to process.
             mode: The input mode that determines message routing.
         """
-        # The side panel's "Compact conversation" button / capacity-banner
-        # "Compact now" / side-panel /compact all arrive here as an
-        # `[OAT-system]` PTY directive in normal mode. Run deterministic
-        # compaction directly (like the TUI /compact) instead of letting it
-        # ride through as a model turn that only *asks* the agent to compact.
+        # Side-panel /compact and daemon auto-compact injects arrive here
+        # as an `[OAT-system]` PTY directive in normal mode. Run
+        # deterministic compaction directly (like the TUI /compact)
+        # instead of letting it ride through as a model turn that only
+        # *asks* the agent to compact.
         if (
             mode == "normal"
             and value.lstrip().startswith("[OAT-system]")

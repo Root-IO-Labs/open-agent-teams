@@ -99,7 +99,8 @@ oat assistant restart [name] [--fresh]                # --fresh rotates session 
 oat assistant remove [name]                           # DESTROY: state record + worktree wiped
 oat assistant status [name] [--json]                  # Model / PID / state (--json for machine output)
 oat assistant attach [name]                           # Alias for `oat ui --repo`
-oat assistant set-model <id> [name]                   # Update model (next restart)
+oat assistant set-model <id> [name]                   # Persist model preference (next Send / restart)
+oat assistant set-display-name <name> <alias|--clear> # Cosmetic Manage-tab / picker alias
 oat assistant reset [name] [--full]                   # Wipe session JSONL
 oat assistant compact [name]                          # Synthetic compaction
 oat assistant logs [name] [--follow]                  # Tail output log
@@ -114,8 +115,12 @@ process killed, state record (worktree, session JSONL, model
 preference) preserved. `oat assistant restart <name>` resumes
 the same session. Use `oat assistant remove` for the
 destructive flow — wipes the `state.Agent` record AND the
-virtual repo. The side panel's Stop / Delete buttons map 1:1
-to these two verbs.
+virtual repo. The side panel maps Pause → `stop`, card Restart
+→ session-preserving `restart`, and **Delete** (under Manage ⚙
+settings) → `remove`. Model picks in Manage settings call
+`set-model` **persist-only** (no `--restart`); the daemon
+applies the new model on the next chat Send. `oat model list`
+feeds the settings / create-form combobox.
 
 **Universal stop:** `oat agent stop` accepts any
 `AgentType.IsPausable()` agent (Assistant + browser-agent).
@@ -348,7 +353,8 @@ oat agent waiting                           # Worker enters dormant state (PR or
 oat agent restart <name>                    # Restart a stuck agent
 oat agent stop <name>                       # Pause a pausable agent (Assistant + Browser)
 oat agent remove <name> [--repo <repo>]     # Remove any agent type (alias: `oat agent rm`)
-oat agent set-model <name> --model <id>     # Change the LLM model the agent uses
+oat agent set-model <name> --model <id>     # Persist model preference (optional --restart)
+oat agent set-display-name <name> [--display <alias>|--clear] --repo <repo>  # Cosmetic alias
 oat agent tell <name> "message"             # Send a message to an agent
 oat agent interrupt <name>                  # Send Ctrl-C to an agent
 oat agent attach <name> [--read-only]       # Tail an agent's PTY (interactive picker if <name> omitted)
@@ -404,7 +410,7 @@ You can still use the per-type CLIs directly (`oat assistant remove`, `oat worke
 
 ### `oat agent set-model`
 
-Change which LLM model an agent uses without hand-editing `~/.oat/state.json`. The model must already be onboarded (`oat model onboard <id>`); typos are rejected up front rather than at the agent's next restart.
+Change which LLM model an agent uses without hand-editing `~/.oat/state.json`. The model must already be onboarded (`oat model onboard <id>`); typos are rejected up front rather than at the agent's next restart. Without `--restart`, this only persists the preference. For Assistants/Browsers, the side-panel Manage settings use this persist-only path; the daemon session-preserving-restarts on the **next chat Send** when preference ≠ running model. CLI `--restart` remains opt-in for immediate bounce.
 
 ```bash
 oat agent set-model <name> --model <model-id> [--repo <repo>] [--restart]
@@ -414,7 +420,8 @@ Examples:
 
 ```bash
 # Persist the change; the running agent keeps the old model until its
-# next natural restart. Useful when you don't want to disturb in-flight work.
+# next natural restart (or next Send for chat agents). Useful when you
+# don't want to disturb in-flight work.
 oat agent set-model browser-agent --model anthropic:claude-opus-4-7
 
 # Persist and restart immediately so the new model is active right away.
@@ -424,6 +431,15 @@ oat agent set-model browser-agent --model anthropic:claude-opus-4-7 --restart
 ```
 
 The command accepts both prefixed (`anthropic:claude-opus-4-7`) and unprefixed (`claude-opus-4-7`) forms and persists the canonical prefixed form, matching the `oat model onboard` shape. When the agent is already on the requested model, it's a no-op success (`--restart` still fires in that case if requested).
+
+### `oat agent set-display-name`
+
+Set a cosmetic Manage-tab / chat-picker alias (`Agent.DisplayName`). Does not rename the agent slug or move paths. Empty / `--clear` / alias equal to own name clears. Uniqueness is global across Assistant + Browser agents.
+
+```bash
+oat agent set-display-name <name> --display "Work Sonnet" --repo <repo>
+oat agent set-display-name <name> --clear --repo <repo>
+```
 
 `oat agent waiting` marks the worker as dormant (zero token burn). When a PR exists, the daemon monitors it for CI failures, merge conflicts, new comments, merges, and closures, then wakes the worker with a targeted message when action is needed. When verification is pending (no PR yet), the daemon sets `WaitingForVerification` and returns a `dormant_verification` status. If the worker is already dormant for verification, the response includes explicit "STOP" instructions to prevent polling.
 

@@ -151,7 +151,7 @@ A recurring, trust-destroying failure is announcing a result that isn't real —
 
 ## Context Management Contract (Important for Persistent Assistants)
 
-Because you live for hours / days / weeks, the conversation history grows. The daemon watches your effective context capacity (computed against `MIN(model_context_limit, 200_000)`) and will nudge you to compact when you approach the limit. The signals you'll see:
+Because you live for hours / days / weeks, the conversation history grows. The daemon watches your effective context capacity (computed against the model's profiled context window, or an `OAT_MODEL_CONTEXT_*` override) and will nudge you to compact when you approach the limit. The signals you'll see:
 
 - **At 75% effective capacity** — a hint arrives on your stdin: `[OAT-system] You are at 75% effective context capacity. Call compact_conversation now to free working memory.` This is the right time to compact. Most well-behaved assistants do it here without ceremony.
 - **At 85%** — a stronger nudge plus a visible "compaction recommended" indicator in the side panel. If you still haven't compacted, do it now.

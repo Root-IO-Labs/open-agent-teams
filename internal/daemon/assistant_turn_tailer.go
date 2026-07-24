@@ -576,10 +576,10 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 	// Persists across turns so plan-stale / incomplete-silent can see an
 	// open Plan even when write_todos was not called this turn.
 	var lastTodosUnfinished bool
-	// Tools for which we already published a tool_start from an early
-	// generating… TOOL or the first [OAT_GENERATING] pulse. Cleared on
-	// tool_end so a later same-named call can open a fresh row.
-	turnOpenToolRow := map[string]bool{}
+	// Activity-row open/ended latch for this turn. Generating + TOOL:
+	// share one RUNNING row; late [OAT_GENERATING] after RESULT must not
+	// reopen (orphan RUNNING badge). See assistant_tool_row.go.
+	toolRows := newAssistantToolRowState()
 	resetTurnState := func() {
 		turnVisibleReply = false
 		turnHadError = false
@@ -590,7 +590,7 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 		turnProgressToolsOK = false
 		turnErrCode = ""
 		turnErrMsg = ""
-		turnOpenToolRow = map[string]bool{}
+		toolRows.reset()
 	}
 
 	flushBuffer := func(force bool) {
@@ -709,6 +709,16 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				// arming is the primary path; this covers out-of-order
 				// / reconnect cases).
 				t.turnInFlight.Store(true)
+				// Close orphan RUNNING rows from the previous turn before
+				// reset. If we only cleared local state, the panel could
+				// still show a stale RUNNING ping and coalesce the next
+				// same-named tool_start into it (second call invisible).
+				if t.emitToolEvents {
+					for _, tool := range toolRows.openTools() {
+						t.broadcaster.PublishTool("tool_end", tool, "", "ok", "")
+						toolRows.noteToolEnd(tool)
+					}
+				}
 				// A fresh user turn resets the accumulated outcome so a
 				// prior turn's error can't leak into this one.
 				resetTurnState()
@@ -750,10 +760,10 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				turnVisibleReply = false
 				turnHadTools = true
 				// One RUNNING row per in-flight tool call. Early
-				// generating TOOL / [OAT_GENERATING] already opened the
-				// row — a later args-ready TOOL must not open a second
-				// (that left orphan RUNNING + OK pairs in the panel).
-				if !noteAssistantToolStartOpen(turnOpenToolRow, ev.Tool) {
+				// [OAT_GENERATING] already opened the row — a later
+				// args-ready TOOL must not open a second. After RESULT,
+				// TOOL: may open a fresh same-named call.
+				if !toolRows.noteToolHeaderStart(ev.Tool) {
 					continue
 				}
 				t.broadcaster.PublishTool("tool_start", ev.Tool, ev.Arg, "", "")
@@ -761,12 +771,14 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 				// Arg-streaming heartbeat (UI only). First pulse may
 				// open a tool_start if the early TOOL line was missed;
 				// later pulses only refresh the stall clock / progress.
+				// After RESULT, stale pulses must NOT reopen (ping
+				// orphan RUNNING badge).
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
 					continue
 				}
 				turnVisibleReply = false
 				turnHadTools = true
-				if noteAssistantToolStartOpen(turnOpenToolRow, ev.Tool) {
+				if toolRows.noteGeneratingStart(ev.Tool) {
 					t.broadcaster.PublishTool("tool_start", ev.Tool, "generating…", "", "")
 				}
 				t.broadcaster.PublishGenerating(ev.Tool, ev.Bytes)
@@ -794,7 +806,7 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 						turnProgressToolsOK = true
 					}
 				}
-				delete(turnOpenToolRow, ev.Tool)
+				toolRows.noteToolEnd(ev.Tool)
 				if !t.emitToolEvents || !t.sidePanelActive.Load() {
 					continue
 				}
@@ -808,6 +820,14 @@ func (t *assistantTurnTailer) run(ctx context.Context) {
 					// reset so the next (real) turn starts clean.
 					resetTurnState()
 					continue
+				}
+				// Close any orphan RUNNING rows (e.g. generating reopen
+				// raced before the ended latch, or missing RESULT).
+				if t.emitToolEvents {
+					for _, tool := range toolRows.openTools() {
+						t.broadcaster.PublishTool("tool_end", tool, "", "ok", "")
+						toolRows.noteToolEnd(tool)
+					}
 				}
 				unfinished := lastTodosUnfinished
 				if turnSawTodos {

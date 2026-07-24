@@ -11,7 +11,10 @@ from unittest.mock import MagicMock, patch
 from PIL import Image
 
 from oat_cli.image_utils import (
+    ANTHROPIC_MANY_IMAGE_MAX_SIDE_PX,
     ImageData,
+    clamp_anthropic_formatted_images,
+    clamp_base64_image_max_side,
     create_multimodal_content,
     encode_image_to_base64,
     get_clipboard_image,
@@ -335,6 +338,54 @@ class TestGetImageFromPath:
 
         assert result is not None
         assert result.format == "jpeg"
+
+
+class TestClampAnthropicImages:
+    """Anthropic many-image ≤2000px clamp (model payload only)."""
+
+    def _png_b64(self, width: int, height: int) -> str:
+        buf = io.BytesIO()
+        Image.new("RGB", (width, height), color="blue").save(buf, format="PNG")
+        return encode_image_to_base64(buf.getvalue())
+
+    def test_undersized_unchanged(self) -> None:
+        data = self._png_b64(800, 600)
+        out, media, changed = clamp_base64_image_max_side(data, "image/png")
+        assert changed is False
+        assert out == data
+        assert media == "image/png"
+
+    def test_oversized_downscales_not_crops(self) -> None:
+        data = self._png_b64(2612, 1842)
+        out, media, changed = clamp_base64_image_max_side(data, "image/png")
+        assert changed is True
+        assert media == "image/png"
+        with Image.open(io.BytesIO(base64.b64decode(out))) as img:
+            assert max(img.size) <= ANTHROPIC_MANY_IMAGE_MAX_SIDE_PX
+            # Aspect ratio preserved (full frame, not a crop).
+            assert abs(img.size[0] / img.size[1] - 2612 / 1842) < 0.02
+
+    def test_formatted_messages_clamp_base64_source(self) -> None:
+        data = self._png_b64(2500, 1800)
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": data,
+                        },
+                    }
+                ],
+            }
+        ]
+        clamp_anthropic_formatted_images(msgs)
+        src = msgs[0]["content"][0]["source"]
+        with Image.open(io.BytesIO(base64.b64decode(src["data"]))) as img:
+            assert max(img.size) <= ANTHROPIC_MANY_IMAGE_MAX_SIDE_PX
 
 
 class TestSyncToTextWithIDGaps:

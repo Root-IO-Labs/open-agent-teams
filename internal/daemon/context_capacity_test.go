@@ -7,8 +7,8 @@
 //     normal range. No NaN, no panics.
 //   - safetyNetEnabled: every documented enable/disable token +
 //     the fail-safe-to-ON fallback for garbage values.
-//   - effectiveContextLimit: profile → MaxInputTokens, profile
-//     above ceiling → 200K, no profile → 128K fallback + WARN-once
+//   - effectiveContextLimit: profile → MaxInputTokens (full
+//     advertised window), no profile → 128K fallback + WARN-once
 //     dedupe.
 //   - maybeNudgeContextCapacity: non-assistant types ignored;
 //     in-memory dedupe suppresses repeats inside the window;
@@ -609,15 +609,12 @@ func TestEffectiveContextLimit_ProfileWinsWhenEnvUnset(t *testing.T) {
 	limit, source := d.effectiveContextLimit(
 		"google_genai:gemini-2.5-flash", "repo", "agent",
 	)
-	// Profile says 1M, ceiling is 200K → ceiling wins (path = "ceiling").
-	if source != "ceiling" {
-		t.Errorf("source = %q, want %q (profile MaxInputTokens > ceiling)", source, "ceiling")
+	// Profile says 1M → use the full advertised window.
+	if source != "profile" {
+		t.Errorf("source = %q, want %q", source, "profile")
 	}
-	if limit != contextCeilingTokens {
-		t.Errorf("limit = %d, want ceiling %d", limit, contextCeilingTokens)
-	}
-	if limit != 200_000 {
-		t.Errorf("limit = %d, want 200000 (cross-check constant)", limit)
+	if limit != 1_000_000 {
+		t.Errorf("limit = %d, want 1000000 (full profile MaxInputTokens)", limit)
 	}
 }
 
@@ -769,9 +766,10 @@ func TestShouldInject_ReservedBudgetFiresEarlier(t *testing.T) {
 }
 
 // testProfileQwenSmall mimics the DGX-Spark Qwen profile that triggered the
-// Phase 3 meter bug: a conservative max_input_tokens BELOW the 200K ceiling
-// (so effectiveContextLimit source == "profile"), while the model's real
-// window is larger. 96000 is the exact value from the real profile YAML.
+// Phase 3 meter bug: a conservative max_input_tokens that is the profile's
+// input budget (so effectiveContextLimit source == "profile"), while the
+// model's real window is larger. 96000 is the exact value from the real
+// profile YAML.
 const testProfileQwenSmall = `model_id: "spark:Qwen/Qwen3.5-35B-A3B-FP8"
 status: known
 provider:

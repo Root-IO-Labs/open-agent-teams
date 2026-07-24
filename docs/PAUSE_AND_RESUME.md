@@ -71,8 +71,10 @@ delete semantics that differ from worker semantics:
   (browser-agent, merge-queue, supervisor, workspace, pr-shepherd,
   review, verification, generic-persistent, agent-builder) get
   process-kill + state-record removal + an `agent_removed`
-  lifecycle frame. The side-panel Delete buttons dispatch this
-  verb. See `docs/COMMANDS.md` for the full routing table.
+  lifecycle frame. The side-panel **Delete…** control (under the
+  Manage-tab ⚙ settings gear; type-to-confirm the identity slug)
+  dispatches this verb. See `docs/COMMANDS.md` for the full
+  routing table.
 
 The **side-panel "Pause OAT" button** wraps the bulk-pause
 verb (`pause_web_agents`) which enumerates every Assistant

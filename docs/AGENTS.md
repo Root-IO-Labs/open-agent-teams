@@ -75,12 +75,15 @@ everything immediately," and remember it must be explicitly
 agent can respond again — there is no auto-expiry.
 
 **User-initiated cleanup with reason propagation:** the side-
-panel Delete flow calls `remove_agent` with
-`reason: "user_cleanup_after_pause"`.
+panel Delete flow (Manage-tab ⚙ settings → Delete…; type-to-
+confirm the identity slug, not a display alias) calls
+`remove_agent` with `reason: "user_cleanup_after_pause"`.
 The workspace-replacement notifier is suppressed for this
 reason so the user's explicit Delete does not trigger a
 replacement worker spawn. Audit log captures every removal
-with the reason for forensic visibility.
+with the reason for forensic visibility. Display aliases
+(`Agent.DisplayName`) are cosmetic only; set-model from Manage
+persists preference and switches on next Send.
 
 ### 1. Supervisor (`internal/prompts/supervisor.md`)
 
@@ -320,7 +323,7 @@ The "no" cases are deliberate: those providers do not expose context window via 
 **Effective context limit (precedence order, highest first):**
 
 1. **`OAT_MODEL_CONTEXT_<normalized-modelID>` env override** — operator escape hatch for bring-your-own-model setups and CI workflows. Normalization: lowercase + `:` and `/` replaced with `_`. Clamped to `[1024, 16_000_000]` tokens (out-of-range values emit a startup WARN; non-numeric values are rejected and fall through). See `AGENTS.md` for examples.
-2. **`ModelProfile.MaxInputTokens`** when a profile is loaded for the agent's model (the daemon's `routing.ProfileStore`, created from `~/.oat/model-profiles/`). A 200 K attention-degradation ceiling caps profiles that report a larger window — past that, "lost-in-the-middle" degrades reliability faster than the extra budget helps for many chat use cases, so the safety net still triggers compaction earlier than a raw 1 M advertised window. Raise further with `OAT_MODEL_CONTEXT_<id>` when you intentionally want the full profile budget.
+2. **`ModelProfile.MaxInputTokens`** when a profile is loaded for the agent's model (the daemon's `routing.ProfileStore`, created from `~/.oat/model-profiles/`). The safety net uses the full advertised window (e.g. Sonnet 5's 1 M). Override with `OAT_MODEL_CONTEXT_<id>` when you need a different budget than the profile.
 3. **128 K fallback** when neither (1) nor (2) applies. Emits a once-per-agent-process WARN naming the model ID + the literal `oat model onboard <modelID>` recovery command for copy-paste. 128 K is the modern shipping-model floor (Anthropic / OpenAI / Google flagships all support ≥ 128 K in 2026); the older 32 K fallback turned 1 M-context models into 100%-effective-capacity wedges the instant a single large tool result landed in history.
 
 **Context-overflow protections (defense-in-depth layers):**

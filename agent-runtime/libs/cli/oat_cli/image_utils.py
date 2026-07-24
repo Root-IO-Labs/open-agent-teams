@@ -281,6 +281,108 @@ def encode_image_to_base64(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode("utf-8")
 
 
+# Anthropic Messages API: when a request carries more than 20 images,
+# every image must fit within this long-edge (and short-edge) bound or
+# the API hard-rejects with `many-image requests` / 2000 pixels. Disk
+# screenshots (`browser_save_screenshot`) intentionally stay larger for
+# human/Spark fidelity — only Anthropic *model payloads* are clamped.
+ANTHROPIC_MANY_IMAGE_MAX_SIDE_PX = 2000
+
+
+def clamp_base64_image_max_side(
+    data_b64: str,
+    media_type: str,
+    max_side: int = ANTHROPIC_MANY_IMAGE_MAX_SIDE_PX,
+) -> tuple[str, str, bool]:
+    """Downscale a base64 image so neither side exceeds ``max_side``.
+
+    Returns ``(data_b64, media_type, changed)``. Preserves PNG/JPEG when
+    possible; falls back to PNG on unknown types. On decode failure,
+    returns the input unchanged (``changed=False``) so a bad block does
+    not abort the whole request path.
+    """
+    if not isinstance(data_b64, str) or not data_b64 or max_side <= 0:
+        return data_b64, media_type, False
+    try:
+        raw = base64.b64decode(data_b64, validate=False)
+    except Exception:  # noqa: BLE001 — best-effort clamp
+        return data_b64, media_type, False
+    if not raw:
+        return data_b64, media_type, False
+
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            width, height = img.size
+            if width <= max_side and height <= max_side:
+                return data_b64, media_type, False
+            scale = min(max_side / width, max_side / height)
+            new_size = (
+                max(1, int(width * scale)),
+                max(1, int(height * scale)),
+            )
+            # LANCZOS keeps UI text readable after the shrink that
+            # Anthropic's many-image rule forces.
+            resized = img.resize(new_size, Image.Resampling.LANCZOS)
+            if resized.mode not in ("RGB", "RGBA", "L", "P"):
+                resized = resized.convert("RGBA" if "A" in resized.mode else "RGB")
+
+            out = io.BytesIO()
+            fmt = "PNG"
+            out_media = "image/png"
+            mt = (media_type or "").lower()
+            if mt in ("image/jpeg", "image/jpg") or (
+                img.format or ""
+            ).upper() == "JPEG":
+                fmt = "JPEG"
+                out_media = "image/jpeg"
+                if resized.mode in ("RGBA", "P"):
+                    resized = resized.convert("RGB")
+            elif mt == "image/png" or (img.format or "").upper() == "PNG":
+                fmt = "PNG"
+                out_media = "image/png"
+            resized.save(out, format=fmt, optimize=True)
+            return encode_image_to_base64(out.getvalue()), out_media, True
+    except (UnidentifiedImageError, OSError, ValueError) as e:
+        logger.debug("clamp_base64_image_max_side skipped: %s", e)
+        return data_b64, media_type, False
+
+
+def clamp_anthropic_formatted_images(
+    formatted_messages: list[dict],
+    max_side: int = ANTHROPIC_MANY_IMAGE_MAX_SIDE_PX,
+) -> list[dict]:
+    """Clamp base64 image blocks in Anthropic-formatted message content.
+
+    Mutates blocks in place. Only touches ``type=image`` blocks whose
+    ``source.type`` is ``base64`` — URL / file-id sources are left alone.
+    Safe no-op on non-image content. Anthropic-only callers should use
+    this; do not run it for Spark/Qwen (disk saves stay hi-res for them).
+    """
+    for msg in formatted_messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "image":
+                continue
+            source = block.get("source")
+            if not isinstance(source, dict) or source.get("type") != "base64":
+                continue
+            data = source.get("data")
+            media_type = source.get("media_type") or "image/png"
+            if not isinstance(data, str):
+                continue
+            new_data, new_media, changed = clamp_base64_image_max_side(
+                data, media_type, max_side=max_side
+            )
+            if changed:
+                source["data"] = new_data
+                source["media_type"] = new_media
+    return formatted_messages
+
+
 def create_multimodal_content(text: str, images: list[ImageData]) -> list[dict]:
     """Create multimodal message content with text and images.
 

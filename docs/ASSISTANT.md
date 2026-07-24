@@ -35,7 +35,8 @@ oat assistant stop [name]                                   # gracefully stop
 oat assistant restart [name] [--fresh]                      # --fresh wipes JSONL
 oat assistant status [name] [--json]                        # model / PID / state (--json for machine output)
 oat assistant attach [name]                                 # alias for `oat ui --repo`
-oat assistant set-model <id> [name]                         # update model (next restart)
+oat assistant set-model <id> [name]                         # persist model preference (process switches on next Send / restart)
+oat assistant set-display-name <name> <alias|--clear>       # cosmetic Manage-tab / chat-picker alias
 oat assistant reset [name] [--full]                         # wipe session JSONL
 oat assistant compact [name]                                # synthetic compaction
 oat assistant logs [name] [--follow]                        # tail output log
@@ -91,6 +92,14 @@ Prompt placement: chat/status/silent-turn rules live in `assistant.md` only; pin
 The side panel's **Manage** tab has a **System status** card showing the live health of the pieces the assistant depends on — OAT service (daemon), Bridge, Browser (extension/CDP link), and OAT CLI. If any of these goes unhealthy while you're chatting, an amber notice also appears in the chat tab with the fix action (e.g. "run `oat start`" when the daemon is down, or reload the extension when the browser link drops), so you don't have to open the Manage tab to notice.
 
 **Manage → Restart** on an assistant card kicks the same bridge-registry reconnect path as the chat burger Restart, so the first browser tool after restart should work without reloading the OAT extension (reload only if the reconnect budget fails and the panel shows that CTA).
+
+### Manage list + settings
+
+Each assistant card shows **alias primary** (or the identity slug when no alias), optional `id: <slug>` secondary line, running model (never the literal `"default"`), and Pause / Resume / Restart / ⚙. **Delete** and **Restart with wiped memory** live under ⚙; Delete type-to-confirm always asks for the **slug**.
+
+**Model pick (⚙):** selecting a model only persists `Agent.Model` (no immediate process restart). The running process keeps `ResolvedModel` until your **next Send**, when the daemon session-preserving-restarts if preference ≠ running, then delivers the message. Intermediate picks with no Send never restart the process. Chat history is kept (very long chats may compact via the existing capacity ring). Flip-flop Sonnet→GPT→Sonnet without sending = zero restarts.
+
+**Display alias:** cosmetic only — does not rename the virtual repo or paths. Uniqueness is global across all Assistant + Browser agents (must not collide with another agent's name or alias after NFKC / case-fold normalization). Matching your own slug clears the alias.
 
 ## Coexistence with workflow-helper browser-agents
 

@@ -46,29 +46,22 @@
 //  1. `OAT_MODEL_CONTEXT_<normalized-modelID>` env var (operator
 //     override; takes precedence over everything else; clamped to
 //     `[1024, 16_000_000]` tokens).
-//  2. `min(profile.MaxInputTokens, 200_000)` if a `ModelProfile`
-//     exists for the agent's model and its `MaxInputTokens > 0`.
+//  2. `ModelProfile.MaxInputTokens` when a profile exists for the
+//     agent's model and `MaxInputTokens > 0` (full advertised
+//     window — e.g. Sonnet 5's 1 M).
 //  3. 128 K fallback otherwise, with a WARN that names the model
 //     ID + the literal `oat model onboard <modelID>` recovery
 //     command. Deduped to once per agent process.
 //
-// The 200 K ceiling unlocks Anthropic Sonnet 4.6-class profiles
-// (and peers that advertise 200 K) while still capping larger
-// advertised windows (1 M+) so "lost-in-the-middle" degradation
-// and cost don't run unbounded for chat agents. Unprofiled models
-// still get the 128 K fallback floor (see contextFallbackTokens):
-// every flagship from Anthropic / OpenAI / Google supports at
-// least that much, so we avoid the older 32 K fallback that
-// wedged a `google_genai:gemini-2.5-flash` agent at "100% capacity"
-// the instant a Wikipedia article landed in its history.
-// Operators who want the full advertised window (e.g. Sonnet 5's
-// 1 M) can raise further via `OAT_MODEL_CONTEXT_<id>` or edit the
-// ModelProfile.
-//
-// The env-override exists as an escape hatch for true bring-your-
-// own-model setups (local Ollama instances, custom routers,
-// internal proxies) where the operator already knows the correct
-// budget and either can't or doesn't want to run the full
+// Unprofiled models still get the 128 K fallback floor (see
+// contextFallbackTokens): every flagship from Anthropic / OpenAI /
+// Google supports at least that much, so we avoid the older 32 K
+// fallback that wedged a `google_genai:gemini-2.5-flash` agent at
+// "100% capacity" the instant a Wikipedia article landed in its
+// history. The env-override exists as an escape hatch for true
+// bring-your-own-model setups (local Ollama instances, custom
+// routers, internal proxies) where the operator already knows the
+// correct budget and either can't or doesn't want to run the full
 // `oat model onboard` probe. It also lets CI workflows skip the
 // onboard round-trip in unattended automation.
 
@@ -91,7 +84,6 @@ import (
 const (
 	contextTierHint      = 0.75 // PTY directive
 	contextTierSafetyNet = 0.95 // synthetic inject before user msg
-	contextCeilingTokens = int64(200_000)
 	// contextFallbackTokens is the budget used when no
 	// `ModelProfile` exists for an agent's model and no env
 	// override is set. Bumped from 32 K to 128 K in 2026 because
@@ -333,8 +325,8 @@ func contextEnvOverride(modelID string, logSink func(format string, args ...any)
 //  1. `OAT_MODEL_CONTEXT_<normalized-modelID>` env override.
 //     Returns `source = "env"`.
 //  2. ModelProfile for modelID with `MaxInputTokens > 0`. Returns
-//     `source = "profile"` when used as-is, or `"ceiling"` when
-//     clamped down to the 200 K attention-degradation ceiling.
+//     `source = "profile"` (full profile window — no artificial
+//     attention-degradation ceiling).
 //  3. Fallback to `contextFallbackTokens` (128 K). Returns
 //     `source = "fallback"` and emits a once-per-agent-process
 //     WARN naming the model ID + the literal
@@ -343,20 +335,17 @@ func contextEnvOverride(modelID string, logSink func(format string, args ...any)
 //
 // `source` is consumed by tests + by the WARN message so an
 // operator can tell at a glance whether they're seeing the env
-// override, the ceiling kicked in, or a missing-profile fallback.
+// override or a missing-profile fallback.
 func (d *Daemon) effectiveContextLimit(modelID, repoName, agentName string) (limit int64, source string) {
 	// 1. Env override wins. Reading per call (no cache) keeps the
 	// surface trivial to test via t.Setenv.
 	if val, ok := contextEnvOverride(modelID, d.warnf); ok {
 		return val, "env"
 	}
-	// 2. Profile.
+	// 2. Profile — use MaxInputTokens as advertised.
 	if d.modelProfiles != nil && modelID != "" {
 		if p := d.modelProfiles.Get(modelID); p != nil && p.MaxInputTokens > 0 {
-			if p.MaxInputTokens < contextCeilingTokens {
-				return p.MaxInputTokens, "profile"
-			}
-			return contextCeilingTokens, "ceiling"
+			return p.MaxInputTokens, "profile"
 		}
 	}
 	// 3. Fallback. Log once per agent process so the operator can
@@ -433,7 +422,7 @@ func (d *Daemon) effectiveContextBudget(modelID, repoName, agentName string) (bu
 	// is exactly the "why did it compact at 56%?" report. For the profile
 	// source the input budget IS the compaction budget; no further reservation.
 	//
-	// The window-representing sources (env / ceiling / fallback) DO carry a
+	// The window-representing sources (env / fallback) DO carry a
 	// single reservation, because for them `limit` is the full context window,
 	// so we must subtract output headroom once to leave room for the reply.
 	if source == "profile" {

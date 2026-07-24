@@ -184,7 +184,7 @@ func TestRegisterAssistantCommands_Part5d(t *testing.T) {
 	// (`remove`, `delete`, `rm`) point at the same Command struct.
 	want := []string{
 		"start", "stop", "restart", "status", "attach",
-		"set-model", "reset", "compact", "logs", "list",
+		"set-model", "set-display-name", "reset", "compact", "logs", "list",
 		"remove", "delete", "rm",
 	}
 	for _, verb := range want {

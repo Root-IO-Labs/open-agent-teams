@@ -23,6 +23,10 @@
 //   - "agent_stopped"   — handleStopAgent set PID to 0 with the
 //     LastError marker.
 //   - "agent_removed"   — handleRemoveAgent deleted the record.
+//   - "agent_updated"   — non-lifecycle metadata changed (display
+//     name, configured model preference) without a start/stop.
+//     Inventory merge only — MUST NOT trigger bridge reconnect
+//     retries (those listen for agent_started).
 //   - "emergency_stop"  — (Part 7 panic-redesign slice 3a, 2026-05-28)
 //     global emergency-stop fired. Every bridge that sees this
 //     frame must immediately invoke its local panicState.trigger(),
@@ -50,6 +54,8 @@ package daemon
 import (
 	"sync"
 	"time"
+
+	"github.com/Root-IO-Labs/open-agent-teams/internal/state"
 )
 
 // Frame kind constants. Stable strings on the wire — the bridge
@@ -60,6 +66,7 @@ const (
 	lifecycleKindAgentStarted    = "agent_started"
 	lifecycleKindAgentStopped    = "agent_stopped"
 	lifecycleKindAgentRemoved    = "agent_removed"
+	lifecycleKindAgentUpdated    = "agent_updated"
 	lifecycleKindEmergencyStop   = "emergency_stop"
 	lifecycleKindEmergencyResume = "emergency_resume"
 )
@@ -88,9 +95,16 @@ type agentLifecycleFrame struct {
 	Agent     string `json:"agent,omitempty"`
 	AgentType string `json:"agent_type,omitempty"`
 	PID       int    `json:"pid,omitempty"`
-	Model     string `json:"model,omitempty"`
-	LastError string `json:"last_error,omitempty"`
-	TS        string `json:"ts,omitempty"`
+	// Model is the running / last-spawned model (ResolvedModel when
+	// set). Never the literal UI word "default".
+	Model string `json:"model,omitempty"`
+	// ConfiguredModel is Agent.Model (operator preference). When it
+	// differs from Model, the panel shows a "on next message" cue.
+	ConfiguredModel string `json:"configured_model,omitempty"`
+	// DisplayName is the cosmetic alias; empty means show Agent slug.
+	DisplayName string `json:"display_name,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	TS          string `json:"ts,omitempty"`
 	// Reason is set only on Kind == "emergency_stop" /
 	// "emergency_resume" frames. Free-form short string surfaced
 	// in audit logs + the bridge's panicState.reason. Omitted
@@ -215,27 +229,22 @@ func (b *agentLifecycleBroadcaster) Close() {
 // clock-skew correction. Best-effort: nil broadcaster is a no-op
 // (test daemons may construct without one).
 //
-// Why a wrapper instead of direct Publish at each call site: the
-// frame has 5+ fields and call sites repeatedly forget one
-// (model, last_error). Centralising the construction means a
-// regression in one handler can't accidentally produce a frame
-// missing a field — the wrapper signature lists every input.
-func (d *Daemon) publishAgentLifecycle(
-	kind, repo, agent, agentType string,
-	pid int,
-	model, lastError string,
-) {
+// Model on the wire is always the running model (ResolvedModel when
+// set). ConfiguredModel + DisplayName ride along for Manage-tab UX.
+func (d *Daemon) publishAgentLifecycle(kind, repo, agentName string, a state.Agent) {
 	if d.agentLifecycleBroadcaster == nil {
 		return
 	}
 	d.agentLifecycleBroadcaster.Publish(agentLifecycleFrame{
-		Kind:      kind,
-		Repo:      repo,
-		Agent:     agent,
-		AgentType: agentType,
-		PID:       pid,
-		Model:     model,
-		LastError: lastError,
-		TS:        time.Now().UTC().Format(time.RFC3339Nano),
+		Kind:            kind,
+		Repo:            repo,
+		Agent:           agentName,
+		AgentType:       string(a.Type),
+		PID:             a.PID,
+		Model:           agentRunningModel(a),
+		ConfiguredModel: agentConfiguredModel(a),
+		DisplayName:     a.DisplayName,
+		LastError:       a.LastError,
+		TS:              time.Now().UTC().Format(time.RFC3339Nano),
 	})
 }

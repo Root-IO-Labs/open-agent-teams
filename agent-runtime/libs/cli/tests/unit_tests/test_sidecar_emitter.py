@@ -469,3 +469,14 @@ class TestEmitGenerating:
         sidecar_emitter.start_generating_pulse(0, "write_file")
         sidecar_emitter.stop_all_generating_pulses()
         assert sidecar_emitter._pulse_state == {}
+
+    def test_stop_generating_pulses_for_tool(self, monkeypatch, tmp_path):
+        """RESULT for one tool must not leave its timer heartbeats running."""
+        log = tmp_path / "tool.log"
+        monkeypatch.setenv("OAT_TOOL_LOG", str(log))
+        sidecar_emitter.start_generating_pulse("a", "ping")
+        sidecar_emitter.start_generating_pulse("b", "write_file")
+        sidecar_emitter.stop_generating_pulses_for_tool("ping")
+        assert "a" not in sidecar_emitter._pulse_state
+        assert "b" in sidecar_emitter._pulse_state
+        sidecar_emitter.stop_all_generating_pulses()

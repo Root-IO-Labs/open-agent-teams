@@ -2277,6 +2277,8 @@ func (d *Daemon) handleRequest(req socket.Request) socket.Response {
 		return d.handleResetAssistantSession(req)
 	case "set_agent_model":
 		return d.handleSetAgentModel(req)
+	case "set_agent_display_name":
+		return d.handleSetAgentDisplayName(req)
 
 	case "trigger_cleanup":
 		return d.handleTriggerCleanup(req)
@@ -2682,11 +2684,7 @@ func (d *Daemon) handleAddAgent(req socket.Request) socket.Response {
 	// so any connected side-panel renders a card reactively. PID
 	// is whatever AddAgent recorded (often 0 for register-only
 	// flows; start follow-ups will emit agent_started).
-	d.publishAgentLifecycle(
-		lifecycleKindAgentAdded,
-		repoName, agentName, string(agent.Type),
-		agent.PID, agent.Model, agent.LastError,
-	)
+	d.publishAgentLifecycle(lifecycleKindAgentAdded, repoName, agentName, agent)
 
 	return socket.SuccessResponse(nil)
 }
@@ -2812,6 +2810,11 @@ func (d *Daemon) handleSetAgentModel(req socket.Request) socket.Response {
 		d.logger.Info("Set agent %s/%s model: %q -> %q (cleared_swap_markers=%t)", repoName, agentName, priorModel, canonical, clearedMarkers)
 	} else if clearedMarkers {
 		d.logger.Info("Set agent %s/%s model: no model change (already %q); cleared auto-swap markers", repoName, agentName, canonical)
+	}
+	// Manage-tab: publish configured vs running so the card can show
+	// "→ new-model on next message" without claiming the process switched.
+	if updated, ok := d.state.GetAgent(repoName, agentName); ok && (changedModel || clearedMarkers) {
+		d.publishAgentLifecycle(lifecycleKindAgentUpdated, repoName, agentName, updated)
 	}
 	return socket.SuccessResponse(map[string]interface{}{
 		"prior_model": priorModel,
@@ -3094,6 +3097,20 @@ func (d *Daemon) handleAgentInput(req socket.Request) socket.Response {
 		midTurnInterrupted = d.interruptMidTurnIfNeeded(
 			repo.SessionName, windowForInterrupt, agentName, repoName,
 		)
+	}
+
+	// Deferred model switch: preference persisted via set_agent_model
+	// applies on this Send (session kept). Flip-flop without Send never
+	// reaches here with Model != ResolvedModel.
+	if !interrupt && !system {
+		switched, swErr := d.ensureDesiredModelBeforeSend(repoName, agentName, agent, repo)
+		if swErr != nil {
+			return socket.ErrorResponse(
+				"failed to apply selected model before send for agent '%s': %v — message was not delivered; retry Send",
+				agentName, swErr,
+			)
+		}
+		agent = switched
 	}
 
 	if !interrupt && !system {
@@ -3392,11 +3409,8 @@ func (d *Daemon) handleStopAgent(req socket.Request) socket.Response {
 	// LastError set). Best-effort: a missing record here would
 	// be a state-corruption symptom we don't want to mask.
 	if after, ok := d.state.GetAgent(repoName, agentName); ok {
-		d.publishAgentLifecycle(
-			lifecycleKindAgentStopped,
-			repoName, agentName, string(after.Type),
-			0, after.Model, after.LastError,
-		)
+		after.PID = 0
+		d.publishAgentLifecycle(lifecycleKindAgentStopped, repoName, agentName, after)
 	}
 
 	return socket.SuccessResponse(map[string]interface{}{
@@ -3572,11 +3586,8 @@ func (d *Daemon) handlePauseWebAgents(req socket.Request) socket.Response {
 			// Status-tab cards refresh reactively without a
 			// follow-up list_agents poll.
 			if after, ok := d.state.GetAgent(repoName, agentName); ok {
-				d.publishAgentLifecycle(
-					lifecycleKindAgentStopped,
-					repoName, agentName, string(after.Type),
-					0, after.Model, after.LastError,
-				)
+				after.PID = 0
+				d.publishAgentLifecycle(lifecycleKindAgentStopped, repoName, agentName, after)
 			}
 
 			mu.Unlock()
@@ -4230,6 +4241,21 @@ func (d *Daemon) handleRouteUserMessage(req socket.Request) socket.Response {
 		)
 	}
 
+	if !interrupt && !system {
+		switched, swErr := d.ensureDesiredModelBeforeSend(repoName, agentName, agent, repo)
+		if swErr != nil {
+			return socket.ErrorResponse(
+				"failed to apply selected model before send for agent '%s': %v — message was not delivered; retry Send",
+				agentName, swErr,
+			)
+		}
+		agent = switched
+		windowName = agent.WindowName
+		if windowName == "" {
+			windowName = agentName
+		}
+	}
+
 	// Part 5e safety net (parity with handleAgentInput ~3072): if the
 	// target is at >= 95 % effective context capacity, prepend a synthetic
 	// compact-conversation directive as a SEPARATE PTY message BEFORE the
@@ -4462,11 +4488,12 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 	// Capture lifecycle fields BEFORE wiping the record so the
 	// post-removal broadcast frame still carries useful info
 	// (type/model/last-error). Part 7 Commit 7.4.
-	var prevType, prevModel, prevLastError string
+	prevForFrame := agent
 	if agentExists {
-		prevType = string(agent.Type)
-		prevModel = agent.Model
-		prevLastError = agent.LastError
+		prevForFrame.PID = 0
+		if reason != RemovalReasonManual {
+			prevForFrame.LastError = "removed: " + reason
+		}
 	}
 
 	if err := d.state.RemoveAgent(repoName, agentName); err != nil {
@@ -4480,16 +4507,8 @@ func (d *Daemon) handleRemoveAgent(req socket.Request) socket.Response {
 	// is encoded in LastError so the panel can distinguish a
 	// user-initiated cleanup ("user_cleanup_after_pause") from
 	// a daemon-side removal (workspace replacement, etc.).
-	lastErrorForFrame := prevLastError
-	if reason != RemovalReasonManual {
-		lastErrorForFrame = "removed: " + reason
-	}
 	if agentExists {
-		d.publishAgentLifecycle(
-			lifecycleKindAgentRemoved,
-			repoName, agentName, prevType,
-			0, prevModel, lastErrorForFrame,
-		)
+		d.publishAgentLifecycle(lifecycleKindAgentRemoved, repoName, agentName, prevForFrame)
 	}
 
 	// Recovery-path gate #1 (Part 7 Commit 7.2 audit): if the user
@@ -5660,11 +5679,12 @@ func (d *Daemon) startRegisteredAgent(repoName string, repo *state.Repository, a
 	// created, and I've tried pressing resume and restart and neither
 	// button gets them unstopped."
 	if pid > 0 {
-		d.publishAgentLifecycle(
-			lifecycleKindAgentStarted,
-			repoName, agentName, string(agent.Type),
-			pid, agent.Model, agent.LastError,
-		)
+		started := agent
+		started.PID = pid
+		if a2, ok := d.state.GetAgent(repoName, agentName); ok {
+			started = a2
+		}
+		d.publishAgentLifecycle(lifecycleKindAgentStarted, repoName, agentName, started)
 	}
 
 	// Wake-up safeguard marker for assistants is delivered via the
@@ -6437,11 +6457,7 @@ func (d *Daemon) handleRestartAgent(req socket.Request) socket.Response {
 	// stopped pill would linger until the next health-check
 	// snapshot cycle (which is reactive only on connect, not
 	// during a steady-state subscription).
-	d.publishAgentLifecycle(
-		lifecycleKindAgentStarted,
-		repoName, agentName, string(updatedAgent.Type),
-		updatedAgent.PID, updatedAgent.Model, updatedAgent.LastError,
-	)
+	d.publishAgentLifecycle(lifecycleKindAgentStarted, repoName, agentName, updatedAgent)
 
 	return socket.SuccessResponse(map[string]interface{}{
 		"agent":   agentName,

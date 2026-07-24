@@ -12,6 +12,7 @@
 //	status [name]                              Bridge / PID / model / capacity
 //	attach [name]                              Alias for `oat ui --repo`
 //	set-model <id> [name]                      Update model preference
+//	set-display-name <name> <alias|--clear>    Cosmetic Manage-tab alias
 //	reset [name] [--full]                      Wipe session JSONL
 //	compact [name]                             Synthetic compact_conversation
 //	logs [name] [--follow]                     Tail agent log
@@ -69,7 +70,7 @@ func (c *CLI) registerAssistantCommands() {
 			"extension. Unlike browser-agents, they do not complete after a\n" +
 			"single task; they stay alive until you `oat assistant stop` them.\n\n" +
 			"Subcommands: start | stop | restart | remove | status | attach |\n" +
-			"             set-model | reset | compact | logs | list\n\n" +
+			"             set-model | set-display-name | reset | compact | logs | list\n\n" +
 			"The default assistant name is `" + defaultAssistantName + "`. Provide a\n" +
 			"different name to run multiple assistants in parallel (e.g.\n" +
 			"`oat assistant start work` alongside `oat assistant start personal`).",
@@ -124,9 +125,18 @@ func (c *CLI) registerAssistantCommands() {
 	}
 	assistantCmd.Subcommands["set-model"] = &Command{
 		Name:        "set-model",
-		Description: "Update the model an assistant will use on next (re)start",
-		Usage:       "oat assistant set-model <model-id> [name]",
-		Run:         c.assistantSetModel,
+		Description: "Persist model preference (process picks it up on next Send / restart)",
+		Usage: "oat assistant set-model <model-id> [name]\n\n" +
+			"Writes Agent.Model only — does not restart. Side-panel chat applies the\n" +
+			"new model on the next Send via a session-preserving restart. Chat history\n" +
+			"is kept unless you explicitly restart with --fresh / reset.",
+		Run: c.assistantSetModel,
+	}
+	assistantCmd.Subcommands["set-display-name"] = &Command{
+		Name:        "set-display-name",
+		Description: "Set a cosmetic Manage-tab / chat-picker alias (identity slug unchanged)",
+		Usage:       "oat assistant set-display-name <name> <alias|--clear>",
+		Run:         c.assistantSetDisplayName,
 	}
 	assistantCmd.Subcommands["reset"] = &Command{
 		Name:        "reset",
@@ -878,6 +888,48 @@ func (c *CLI) assistantAttach(args []string) error {
 	}
 	repoKey := virtualRepoNameFor(name)
 	return c.runUI([]string{"--repo", repoKey})
+}
+
+// assistantSetDisplayName sets or clears Agent.DisplayName via
+// set_agent_display_name. Alias is cosmetic only — virtual repo /
+// session paths stay keyed by the identity slug.
+func (c *CLI) assistantSetDisplayName(args []string) error {
+	_, remaining := ParseFlags(args)
+	if len(remaining) < 2 {
+		return errors.InvalidUsage("usage: oat assistant set-display-name <name> <alias|--clear>")
+	}
+	name := strings.TrimSpace(remaining[0])
+	aliasArg := strings.TrimSpace(remaining[1])
+	if err := validateVirtualRepoName(name); err != nil {
+		return err
+	}
+	displayName := aliasArg
+	if aliasArg == "--clear" || strings.EqualFold(aliasArg, "clear") {
+		displayName = ""
+	}
+	if err := c.ensureDaemonRunning(); err != nil {
+		return err
+	}
+	repoKey := virtualRepoNameFor(name)
+	agent := agentSlug(name)
+	resp, err := c.sendDaemonRequest("set_agent_display_name", map[string]interface{}{
+		"repo":         repoKey,
+		"agent":        agent,
+		"display_name": displayName,
+	})
+	if err != nil {
+		return err
+	}
+	title := ""
+	if data, ok := resp.Data.(map[string]interface{}); ok {
+		title, _ = data["display_title"].(string)
+	}
+	if title != "" {
+		fmt.Printf("✓ Assistant %q display name: %s\n", name, title)
+	} else {
+		fmt.Printf("✓ Assistant %q display name cleared (showing slug)\n", name)
+	}
+	return nil
 }
 
 // assistantSetModel changes the model on a registered assistant

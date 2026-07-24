@@ -421,6 +421,28 @@ def stop_generating_pulse(key: str | int) -> None:
         _log.warning("sidecar_emitter: stop_generating_pulse failed: %s", e)
 
 
+def stop_generating_pulses_for_tool(tool: str) -> None:
+    """Stop every generating pulse whose tool name matches.
+
+    Called when a RESULT lands so leftover timer heartbeats cannot
+    emit post-RESULT ``[OAT_GENERATING]`` lines (those reopen an
+    orphan RUNNING activity row in the side panel). Never raises.
+    """
+    try:
+        name = str(tool or "").strip()
+        if not _valid_gen_tool_name(name):
+            return
+        keys: list[str] = []
+        with _pulse_lock:
+            keys = [k for k, st in _pulse_state.items() if st.get("tool") == name]
+            for k in keys:
+                _pulse_state.pop(k, None)
+        if keys:
+            _pulse_wake.set()
+    except Exception as e:  # noqa: BLE001 — never raise
+        _log.warning("sidecar_emitter: stop_generating_pulses_for_tool failed: %s", e)
+
+
 def stop_all_generating_pulses() -> None:
     """Stop all generating timer heartbeats (stream end / interrupt). Never raises."""
     try:

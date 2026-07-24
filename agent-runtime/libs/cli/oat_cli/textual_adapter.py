@@ -899,6 +899,11 @@ async def execute_task_textual(
                                 tool_content_str,
                                 tool_status,
                             )
+                        # RESULT means args are done — kill any leftover
+                        # generating timer so post-RESULT [OAT_GENERATING]
+                        # cannot reopen an orphan RUNNING activity row.
+                        if tool_name:
+                            sidecar_emitter.stop_generating_pulses_for_tool(tool_name)
                         sidecar_emitter.emit_tool_result(
                             call_id=sidecar_call_id,
                             content=tool_content_str,

@@ -29,3 +29,64 @@ func TestNoteAssistantToolStartOpen_EmptySafe(t *testing.T) {
 		t.Fatal("empty tool must not publish")
 	}
 }
+
+func TestAssistantToolRowState_GeneratingAfterEndDoesNotReopen(t *testing.T) {
+	s := newAssistantToolRowState()
+	if !s.noteGeneratingStart("ping") {
+		t.Fatal("first generating should open")
+	}
+	if s.noteGeneratingStart("ping") {
+		t.Fatal("duplicate generating must not reopen")
+	}
+	s.noteToolEnd("ping")
+	if s.noteGeneratingStart("ping") {
+		t.Fatal("stale generating after RESULT must not reopen (orphan RUNNING bug)")
+	}
+	if len(s.openTools()) != 0 {
+		t.Fatalf("openTools after end = %v; want empty", s.openTools())
+	}
+}
+
+func TestAssistantToolRowState_ToolHeaderAllowsSecondCall(t *testing.T) {
+	s := newAssistantToolRowState()
+	if !s.noteGeneratingStart("ping") {
+		t.Fatal("first generating should open")
+	}
+	s.noteToolEnd("ping")
+	// Real second call: TOOL: header clears the ended latch.
+	if !s.noteToolHeaderStart("ping") {
+		t.Fatal("TOOL: after end should open a fresh row")
+	}
+	if s.noteGeneratingStart("ping") {
+		t.Fatal("generating while open must dedupe")
+	}
+	s.noteToolEnd("ping")
+}
+
+func TestAssistantToolRowState_GeneratingThenToolHeaderSharesRow(t *testing.T) {
+	s := newAssistantToolRowState()
+	if !s.noteGeneratingStart("write_file") {
+		t.Fatal("generating should open")
+	}
+	if s.noteToolHeaderStart("write_file") {
+		t.Fatal("args-ready TOOL must share the generating row")
+	}
+}
+
+func TestAssistantToolRowState_OpenToolsAndReset(t *testing.T) {
+	s := newAssistantToolRowState()
+	_ = s.noteGeneratingStart("ping")
+	_ = s.noteGeneratingStart("ls")
+	got := s.openTools()
+	if len(got) != 2 {
+		t.Fatalf("openTools = %v; want 2", got)
+	}
+	s.reset()
+	if len(s.openTools()) != 0 {
+		t.Fatal("reset must clear open tools")
+	}
+	// After reset, generating may open again (new turn).
+	if !s.noteGeneratingStart("ping") {
+		t.Fatal("after reset, generating should open")
+	}
+}
